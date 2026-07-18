@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-dev-agent.py — 项目推进流水线「控制面标准执行器」（ADR-0005）。
+dev-agent.py — 项目推进流水线「控制面标准执行器」（ADR-0006）。
 
 历史：原为各被控仓自带（ADR-0003「仓内自治 dev agent」），每仓一份
 dev-agent.{py,mjs}。2026-07-18 上收控制面：单一 Python 调度器服务所有被控仓，
 消除仓间漂移（N_STALL 等常量多仓不一致）+ 消解 run_daily.py 复刻的 slug shadow。
-详见 ADR-0005。
+详见 ADR-0006。
 
 本脚本是 **cwd-相对的纯调度器**：REPO_ROOT = Path.cwd()，所有 git/SDK 操作都用
 REPO_ROOT。dispatch 时 cwd=被控仓 worktree → 本脚本就地操作该仓。物理位置在
@@ -51,7 +51,12 @@ from claude_agent_sdk import (
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
+    PermissionResultAllow,            # ADR-0006 #7：can_use_tool 权限闸返回类型
+    PermissionResultDeny,
 )
+
+from slug_utils import dev_slugify   # ADR-0006 #5：dev_slugify 单一源头（无依赖模块，避免顶部 import 触发 sdk 连带加载拖垮 cron）
+from bash_allowlist import decide_bash   # ADR-0006 #7：Bash 命令放行判定（无依赖模块，同上）
 
 REPO_ROOT = Path.cwd()
 
@@ -63,10 +68,7 @@ MAX_BUDGET = 10              # maxBudgetUsd（降级兜底，宽松）
 STATE_RUNS_DIR = REPO_ROOT / "state" / "runs"
 
 
-def dev_slugify(stem: str) -> str:
-    """PRD 文件名 stem → 分支 slug。**单一源头**：run_daily.py 幂等前置闸按此匹配 auto/*，
-    必须直接 import 本函数，不得复刻（历史 shadow 耦合根因，ADR-0005 消解）。"""
-    return re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")[:24]
+# dev_slugify 已上移至 slug_utils.py（本文件顶部 import；ADR-0006 #5 单一源头，消解 ADR-0004 #4 shadow）
 
 
 def parse_args(argv: list[str]) -> dict:
@@ -309,6 +311,30 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     ])
 
 
+async def _can_use_tool(
+    tool_name: str, tool_input: dict, _context
+) -> PermissionResultAllow | PermissionResultDeny:
+    """ADR-0006 #7 长效修法：SDK can_use_tool 权限闸（摆脱机器本地 settings 依赖）。
+
+    - 非 Bash 工具：直接放行（可用性已由 ClaudeAgentOptions.tools= 硬白名单兜底；
+      acceptEdits 另自动批 Edit/Write，本回调实际主要落到 Bash）。
+    - Bash：经 bash_allowlist.decide_bash 判定——默认拒，仅放行测试/构建/VCS/只读族，
+      显式拒网络外传与破坏性操作。拒绝时回写 deny message 给 dev，并 stderr 留审计点。
+
+    背景：acceptEdits 不自动批 Bash，历史靠各仓 gitignored 的 .claude/settings.local.json
+    放行，worktree（尤其 /tmp 或跨机新克隆）摸不到 → headless 下 python/pytest 被拦死、
+    test_passed=false。本闸把放行规则收敛进控制面单一源头，任意 worktree 摆放都确定性可跑。
+    """
+    if tool_name != "Bash":
+        return PermissionResultAllow()
+    command = (tool_input or {}).get("command", "")
+    allowed, reason = decide_bash(command)
+    if allowed:
+        return PermissionResultAllow(updated_input=tool_input)
+    sys.stderr.write(f"[权限闸] 拦截 Bash: {reason}\n")
+    return PermissionResultDeny(message=f"[dev-agent 权限闸] {reason}")
+
+
 async def main() -> int:
     args = parse_args(sys.argv[1:])
     if args["help"]:
@@ -342,7 +368,8 @@ async def main() -> int:
         options = ClaudeAgentOptions(
             cwd=str(REPO_ROOT),
             # model 刻意省略 → 走 roc 代理默认（glm-5.2）；勿传裸 Anthropic model id
-            permission_mode="acceptEdits",          # 编辑类自动过（fail-safe，摩擦≈bypass 但不裸放）
+            permission_mode="acceptEdits",          # 编辑类自动过；Bash 不自动批 → 走 can_use_tool 闸（下）
+            can_use_tool=_can_use_tool,             # ADR-0006 #7：Bash 放行长效修法，摆脱机器本地 settings 依赖
             setting_sources=["project"],            # 加载仓 CLAUDE.md(仓特定守则) + .claude/hooks
             tools=["Read", "Grep", "Glob", "Edit", "Write", "MultiEdit",
                    "TodoWrite", "Bash", "Agent"],   # 硬白名单（Python SDK：tools=可用性限制；allowed_tools 仅批准列表，非白名单）

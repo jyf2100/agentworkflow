@@ -14,11 +14,13 @@
 
 4. **定制走 profile 参数，脚本本体不归仓**：被控仓个别需求（更严的刹车阈值等）通过 profile 参数注入，不在仓内 fork 脚本。
 
-5. **`dev_slugify()` 为分支 slug 单一源头**：dispatch 直接 `from scripts.dev_agent import dev_slugify`，**消解 ADR-0004 #4 的「slugify 算法须与 dev-agent 同步漂移」残留耦合**——shadow 根因（脚本在仓、控制面被迫复刻）随上收消失。
+5. **`dev_slugify()` 为分支 slug 单一源头**：抽到独立无依赖模块 `scripts/slug_utils.py`，dev-agent.py 与 run_daily.py 均 `from slug_utils import dev_slugify`，**消解 ADR-0004 #4 的「slugify 算法须与 dev-agent 同步漂移」残留耦合**——shadow 根因（脚本在仓、控制面被迫复刻）随上收消失。
+   > **落地修正（2026-07-18）**：原字面 `from scripts.dev_agent import dev_slugify` 不可行——① dev-agent.py 是连字符文件名（Python 标识符不允许 `-`）；② `scripts/` 无 `__init__.py` 非 package；③ **致命**：dev-agent.py 顶层 `from claude_agent_sdk import (...)` 会被 run_daily.py 顶部 import 连带加载，而 run_cron.sh 用裸 `/usr/bin/python3`（无 sdk）跑 run_daily.py 顶层 → 每晚 cron 崩。故抽 `slug_utils.py`（仅依赖 `re`）作单一源头，精神不变（单一源头 + 消 shadow）。
 
 6. **跨仓常量单一源头**：`N_STALL`/`MAX_BUDGET`/`WRITE_TOOLS` 只在 dev-agent.py 一处，消除多仓漂移（2026-07-18 实证：cc-web-control N_STALL=100、ashare=3，同一天人为制造的不一致）。
 
 7. **工具白名单用 SDK `tools=`（硬限制），非 `allowed_tools`**：Python SDK 的 `allowed_tools` 仅是权限批准列表、非可用性白名单（SDK 文档实证）；历史 dev-agent 误用 `allowed_tools` 当白名单是 headless 安全缺口。上收顺手修。
+   > **落地修正（2026-07-18）**：`tools=` 只限制工具**可用性**，但 `permission_mode="acceptEdits"` 下 Bash 仍需 approval、headless 无人批 → 测试跑不动。历史靠各仓 gitignored 的 `.claude/settings.local.json` 放行，worktree（尤其 `/tmp` 或跨机新克隆）摸不到 → `test_passed=false`（2026-07-18 dry-run 实证）。长效修法 = `ClaudeAgentOptions(can_use_tool=_can_use_tool)` 回调 + 无依赖模块 `scripts/bash_allowlist.py`（`decide_bash` 默认拒、放行测试/构建/VCS/只读族/仓内脚本、显式拒网络外传与破坏性操作；如实声明 prefix 匹配非硬沙箱，抗误操/注入但不抗定向逃逸），**把放行规则收敛进控制面单一源头、摆脱机器本地 settings 依赖**。验证：SDK `_warn_if_can_use_tool_shadowed` 无报警（回调不被 acceptEdits/tools= 架空），pytest 22 passed。
 
 ## 背景
 
