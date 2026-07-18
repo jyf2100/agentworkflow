@@ -1,0 +1,9 @@
+# 运行时状态（每次跑流水线都会变化，不入库）
+.project-auto/
+
+# Python 编译缓存
+__pycache__/
+*.pyc
+
+# 备份文件
+*.bak*

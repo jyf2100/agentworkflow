@@ -1,0 +1,21 @@
+# === pa 流水线运行时态（本地状态/日志/profiles，绝不入仓）===
+.project-auto/
+
+# === 雷达历史语料（微信公众号抓取+解读，版权/隐私顾虑，不入仓）===
+Knowledge/
+
+# === Python / 测试 / lint 缓存噪音 ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# === 系统 / 编辑器 ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
