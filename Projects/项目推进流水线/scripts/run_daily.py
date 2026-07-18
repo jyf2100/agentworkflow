@@ -43,6 +43,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（消解 ADR-0004 #4 shadow；无依赖模块，顶部 import 不触发 sdk 连带加载拖垮 cron）
+
 try:
     import yaml
 except ImportError:
@@ -563,15 +565,7 @@ def count_inflight_prs(owner_repo: str) -> int:
         return 0
 
 
-def dev_slugify(stem: str) -> str:
-    """复刻 dev-agent.mjs 分支 slug 算法（cc-web-control/scripts/dev-agent.mjs:259），幂等前置闸按 slug 匹配 auto/* 用。
-    JS: basename(prd,".md").toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,24)。
-    ⚠️ 残留耦合：算法须与 dev-agent.mjs 同步漂移，否则匹配静默失效（类比 Phase 3.5 stall E2E 的 mock 耦合）。"""
-    s = stem.lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = re.sub(r"^-", "", s)
-    s = re.sub(r"-$", "", s)
-    return s[:24]
+# dev_slugify 已上移至 slug_utils.py（顶部 import；ADR-0006 #5 单一源头，消解历史 shadow）
 
 
 # ─── inject 段（手动注入入口，SPEC §4.x）─────────────────────────────
@@ -734,10 +728,21 @@ def _run_capture(cmd: list[str], cwd: str, timeout: int, label: str,
 
 # ─── verify 闭环辅助（dev→独立验证→pa-verify，docs/verify-commit-loop-design.md §3/§5）──
 def _dev_cmd(prof: dict, py: Path, mjs: Path, prd_abs: str, base: str, src_abs: str) -> list[str] | None:
-    """构造 dev-agent 触发命令（ADR-0003）：Python 仓 dev-agent.py（conda env python）> Node 仓 dev-agent.mjs。
+    """构造 dev-agent 触发命令（ADR-0003 / ADR-0006 选源）。
+
+    dev_agent_source（profile 字段，默认 repo）：
+      vault → 控制面 dev-agent.py（与本文件同目录），忽略仓内 py/mjs；
+      repo  → 仓内 Python dev-agent.py（conda env python）> Node dev-agent.mjs（现状不变）。
     --base 由调用方按 verify 闭环轮次传入（round1=默认分支；round≥2=上次 dev 分支，增量重投）。
-    仓内无运行时 → None（dispatch_one 判 fail）。"""
-    if py.exists():
+    选定源缺运行时 → None（dispatch_one 判 fail）。"""
+    source = prof.get("dev_agent_source", "repo")
+    if source == "vault":
+        vault_py = Path(__file__).resolve().parent / "dev-agent.py"
+        if not vault_py.exists():
+            return None
+        cmd = [_env_python(prof.get("conda_env", "")), str(vault_py),
+               "--prd", prd_abs, "--branch-prefix", "auto", "--base", base]
+    elif py.exists():
         cmd = [_env_python(prof.get("conda_env", "")), str(py),
                "--prd", prd_abs, "--branch-prefix", "auto", "--base", base]
     elif mjs.exists():
@@ -874,7 +879,10 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     for round_n in range(1, VERIFY_MAX_ROUNDS + 1):
         cmd = _dev_cmd(prof, py, mjs, prd_abs, cur_base, src_abs)
         if cmd is None:
-            rec.update(status="fail", skip_reason="仓内无 scripts/dev-agent.{py,mjs}（ADR-0003 准入未满足）")
+            _src = prof.get("dev_agent_source", "repo")
+            _why = ("vault 版 dev-agent.py 缺失（控制面安装异常）" if _src == "vault"
+                    else "仓内无 scripts/dev-agent.{py,mjs}（ADR-0003 准入未满足）")
+            rec.update(status="fail", skip_reason=_why)
             log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
         script_json = _run_dev_agent(cmd, wt, slug, log_file)
         if script_json:
