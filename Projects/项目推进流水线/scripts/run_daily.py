@@ -290,19 +290,24 @@ def _extract_first_json(s: str) -> str | None:
     return None   # 花括号未配平（输出被截断）
 
 
-def run_persona(name: str, prompt: str, stage: str, label: str) -> tuple[dict, dict]:
+def run_persona(name: str, prompt: str, stage: str, label: str,
+                allowed_tools: list[str] | None = None) -> tuple[dict, dict]:
     """调 `claude --agent <name> -p <prompt> --output-format json`，两层解析返回 (payload, meta)。
 
     内层 result 容错：先严格 json.loads，失败则 _extract_first_json 抽取（容忍散文前后缀）；
-    仍失败重试 1 次（拼 _JSON_RETRY_SUFFIX 加强 JSON-only 契约）。两轮均失败才 raise。"""
+    仍失败重试 1 次（拼 _JSON_RETRY_SUFFIX 加强 JSON-only 契约）。两轮均失败才 raise。
+    allowed_tools：MCP 工具白名单透传（fetch 段调 exa 必须，--allowedTools 逗号分隔）。"""
     base_cmd = [resolve_claude_bin(), "--agent", name, "--output-format", "json",
                 "--max-turns", str(MAX_TURNS[stage])]
+    if allowed_tools:
+        base_cmd += ["--allowedTools", ",".join(allowed_tools)]
     cur_prompt = prompt
     last_err = "（未知）"
     for attempt in (1, 2):
         cmd = base_cmd + ["-p", cur_prompt]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT[stage])
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=TIMEOUT[stage], stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"[{label}] wall-clock 超时（{TIMEOUT[stage]}s），已 kill")
         if proc.returncode != 0:
