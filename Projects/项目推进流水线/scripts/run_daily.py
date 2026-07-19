@@ -342,22 +342,20 @@ def run_persona(name: str, prompt: str, stage: str, label: str) -> tuple[dict, d
 
 
 # ─── 三段 prompt 构造 ────────────────────────────────────────────────
-def radar_prompt(today_new: list[Path], profiles: dict, dedup: dict) -> str:
+def radar_prompt(project: str, today_new: list[Path], prof: dict, dedup_items: list[str]) -> str:
+    """per-project radar prompt（ADR-0007 决定 #5）。
+
+    只含这一个项目的 match_surface + 它订阅到的文件 + 它的去重清单。多源时 stage_radar 按项目各调一次，
+    避免单源混喂让无关项目白读（现状 ashare 被 wechat 文件淹没、全进低分桶）。"""
     files = "\n".join(f"- {p.relative_to(VAULT_ROOT)}" for p in today_new)
-    surf = []
-    for name, prof in profiles.items():
-        ms = prof.get("match_surface", {})
-        surf.append(f"- {name}: one_liner=\"{ms.get('one_liner','')}\" keywords={ms.get('keywords',[])}")
-    dd = []
-    for name, items in dedup.items():
-        if items:
-            dd.append(f"- {name}: {items}")
-    dd_block = "\n".join(dd) if dd else "（无未关闭 PR / 在途 PRD）"
-    return f"""今日新内容文件（共 {len(today_new)} 篇，逐篇 Read 后抽技术信号）：
+    ms = prof.get("match_surface", {})
+    surf = f"- {project}: one_liner=\"{ms.get('one_liner','')}\" keywords={ms.get('keywords',[])}"
+    dd_block = "\n".join(dedup_items) if dedup_items else "（无未关闭 PR / 在途 PRD）"
+    return f"""今日新内容文件（共 {len(today_new)} 篇，逐篇 Read 后抽技术信号，只针对项目【{project}】）：
 {files}
 
 白名单项目 match_surface：
-{chr(10).join(surf)}
+{surf}
 
 去重清单（命中则丢弃该信号）：
 {dd_block}
@@ -445,30 +443,83 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
         log(f"[radar] 复用已有 {cand_file.name}（--force 重跑）")
         return json.loads(cand_file.read_text(encoding="utf-8"))
 
-    source = sources[0]   # v1 仅 wechat
-    marker = read_marker(source)
-    today_new = discover_today_new(source, marker, args.limit)
-    log(f"[radar] marker={marker}｜今日新（>marker, glob={source['content_glob']}）：{len(today_new)} 篇")
-    for p in today_new:
-        log(f"        - {p.relative_to(VAULT_ROOT)}")
-    if not today_new:
-        log("[radar] 今日无新内容，跳过")
-        empty = {"candidates": [], "today_new_count": 0, "stats": {}}
+    # 1) 每源 discover（marker 在「全部 radar 成功后」才 bump——保持原失败不 bump 语义；
+    #    先记 new_max，不立即写 marker）。dry_run 时同样延后到末尾跳过。
+    per_source_new: dict[str, list[Path]] = {}
+    per_source_newmax: dict[str, str] = {}
+    for src in sources:                                   # ← 去 sources[0] 硬编码（ADR-0007 决定 #3）
+        marker = read_marker(src)
+        today_new = discover_today_new(src, marker, args.limit)
+        per_source_new[src["name"]] = today_new
+        if today_new:
+            per_source_newmax[src["name"]] = max(re.match(r"(\d{8})", p.name).group(1) for p in today_new)
+        log(f"[radar] source={src['name']} kind={src.get('kind','directory')} "
+            f"marker={marker}｜今日新（>marker）={len(today_new)}")
+        for p in today_new:
+            log(f"        - {p.relative_to(VAULT_ROOT)}")
+
+    total_new = sum(len(v) for v in per_source_new.values())
+    if total_new == 0:
+        log("[radar] 全源今日无新内容，跳过")
+        empty = {"candidates": [], "today_new_count": 0, "per_source": {}, "stats": {}, "per_project_stats": {}}
         cand_file.write_text(json.dumps(empty, ensure_ascii=False, indent=2), encoding="utf-8")
         return empty
 
-    dedup = fetch_dedup_list(profiles)
-    payload, meta = run_persona("pa-radar", radar_prompt(today_new, profiles, dedup), "radar", "radar")
-    log(f"[radar] ✅ candidates={len(payload.get('candidates',[]))}｜cost=${meta['cost']:.4f} turns={meta['turns']}")
-    cand_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 2) 按项目聚合：project → [(source_name, [该源喂进来的文件])]
+    #    target_projects 缺省 = 不喂任何项目（grilling Q4 定，防新源忘标喂到不相关项目）
+    proj_src_files: dict[str, list[tuple[str, list[Path]]]] = {}
+    for src in sources:
+        for proj in (src.get("target_projects") or []):
+            if proj in profiles:
+                proj_src_files.setdefault(proj, []).append((src["name"], per_source_new[src["name"]]))
 
+    # 3) 按项目调 radar（只有「订阅到新文件」的项目才调——无订阅不调，比现状更省）
+    dedup = fetch_dedup_list(profiles)
+    all_candidates: list[dict] = []
+    per_project_stats: dict[str, dict] = {}
+    for proj, src_files in proj_src_files.items():
+        flat = [f for _, fs in src_files for f in fs]
+        if not flat:
+            continue                                      # 无订阅文件 → 不调
+        payload, meta = run_persona(
+            "pa-radar", radar_prompt(proj, flat, profiles[proj], dedup.get(proj, [])),
+            "radar", f"radar-{proj}")
+        for c in payload.get("candidates", []):
+            c.setdefault("project", proj)
+            c.setdefault("source", _source_of(c, src_files))   # 追溯来自哪个源（决定 #6）
+            all_candidates.append(c)
+        per_project_stats[proj] = {**payload.get("stats", {}), "cost": meta["cost"], "turns": meta["turns"]}
+        log(f"[radar] ✅ {proj}: candidates={len(payload.get('candidates', []))}｜"
+            f"cost=${meta['cost']:.4f} turns={meta['turns']}")
+
+    # 4) stats 扁平聚合（report 段向后兼容：仍读 stats.signals_extracted / dropped_*）
+    flat_stats = {"signals_extracted": 0, "dropped_low_relevance": 0, "dropped_dedup": 0}
+    for s in per_project_stats.values():
+        for k in flat_stats:
+            flat_stats[k] += s.get(k, 0)
+
+    out = {"candidates": all_candidates,
+           "today_new_count": total_new,
+           "per_source": {k: len(v) for k, v in per_source_new.items()},
+           "stats": flat_stats,
+           "per_project_stats": per_project_stats}
+    cand_file.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 5) radar 全成功后才 bump：只 bump「有新文件 且 至少喂了一个有效订阅项目」的源。
+    #    无 target_projects / 目标不是已知 profile 的源不 bump——文件保持可发现，待日后接源（防静默丢失）。
     if not args.dry_run:
-        new_marker = max(re.match(r"(\d{8})", p.name).group(1) for p in today_new)
-        bump_marker(source, new_marker)
-        log(f"[radar] marker bump → {new_marker}")
+        for src in sources:
+            newmax = per_source_newmax.get(src["name"])
+            if newmax is None:
+                continue
+            valid_targets = [t for t in (src.get("target_projects") or []) if t in profiles]
+            if not valid_targets:
+                continue
+            bump_marker(src, newmax)
+            log(f"[radar] {src['name']} marker bump → {newmax}")
     else:
         log("[radar] --dry-run，不 bump marker")
-    return payload
+    return out
 
 
 def stage_prd(args, candidates_payload, profiles, stamp) -> dict:
