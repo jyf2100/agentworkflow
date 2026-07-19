@@ -4,6 +4,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 import run_daily
 
 
+class A:
+    dry_run = False
+
+
 def test_run_persona_allowed_tools_appended(monkeypatch):
     captured = {}
     class _P:
@@ -156,3 +160,59 @@ def test_stage_fetch_per_source_isolation(tmp_path, monkeypatch):
     out = run_daily.stage_fetch(A(), srcs, "20260719")
     assert [p["source"] for p in out["produced"]] == ["good"]   # bad 被隔离，good 正常
     assert (tmp_path / "good/20260719_good.md").is_file()
+
+
+def test_stage_fetch_dispatches_by_kind_via_fetch_config(tmp_path, monkeypatch):
+    """FETCH_CONFIG[kind] 分发：kind 在配置里 → 用对应 agent/tools；不在 → 跳过。"""
+    run_daily.VAULT_ROOT = tmp_path; run_daily.STATE_DIR = tmp_path / "state"; run_daily.STATE_DIR.mkdir()
+    called = {}
+    def fake_persona(name, prompt, stage, label, allowed_tools=None):
+        called[name] = allowed_tools
+        return ({"items": [{"title": "T1", "markdown": "# T1"}, {"title": "T2", "markdown": "# T2"}]},
+                {"cost": 0.1, "turns": 3, "session_id": "s", "duration_ms": 1, "model": {}})
+    monkeypatch.setattr(run_daily, "run_persona", fake_persona)
+    run_daily.FETCH_CONFIG["wechat-url"] = {
+        "agent": "pa-fetch-wechat-url", "tools": ["mcp__web_reader__webReader"],
+        "prompt": lambda s: "p", "mode": "items"}
+    try:
+        src = {"name": "wx", "kind": "wechat-url", "root": "wx", "marker": "m",
+               "params": {"urls": ["http://x"]}}
+        out = run_daily.stage_fetch(A(), [src], "20260719")
+        assert called["pa-fetch-wechat-url"] == ["mcp__web_reader__webReader"]
+        paths = [p["path"] for p in out["produced"]]
+        assert any("20260719_t1" in p for p in paths)
+        assert any("20260719_t2" in p for p in paths)
+        assert (tmp_path / "wx/20260719_t1.md").read_text(encoding="utf-8") == "# T1"
+    finally:
+        run_daily.FETCH_CONFIG.pop("wechat-url", None)
+
+
+def test_stage_fetch_items_mode_skips_empty_md(tmp_path, monkeypatch):
+    """items 模式：某 item markdown 空 → 跳该 item，其余照落（per-item fault isolation）。"""
+    run_daily.VAULT_ROOT = tmp_path; run_daily.STATE_DIR = tmp_path / "state"; run_daily.STATE_DIR.mkdir()
+    monkeypatch.setattr(run_daily, "run_persona", lambda *a, **k:
+        ({"items": [{"title": "ok", "markdown": "# OK"}, {"title": "blank", "markdown": "   "}]},
+         {"cost": 0.1, "turns": 2, "session_id": "s", "duration_ms": 1, "model": {}}))
+    run_daily.FETCH_CONFIG["wechat-url"] = {
+        "agent": "pa-fetch-wechat-url", "tools": [], "prompt": lambda s: "p", "mode": "items"}
+    try:
+        out = run_daily.stage_fetch(A(), [{"name": "wx", "kind": "wechat-url", "root": "wx", "marker": "m"}], "20260719")
+        titles = [p["title"] for p in out["produced"]]
+        assert titles == ["ok"]
+        assert not (tmp_path / "wx/20260719_blank.md").exists()
+    finally:
+        run_daily.FETCH_CONFIG.pop("wechat-url", None)
+
+
+def test_stage_fetch_skips_kind_not_in_fetch_config(tmp_path, monkeypatch):
+    """directory / local-file / 未知 kind 不在 FETCH_CONFIG → 跳过，不调 agent。"""
+    run_daily.VAULT_ROOT = tmp_path; run_daily.STATE_DIR = tmp_path / "state"; run_daily.STATE_DIR.mkdir()
+    called = []
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda *a, **k: called.append(a) or ({"markdown": "x"}, {"cost": 0, "turns": 1}))
+    run_daily.stage_fetch(A(), [
+        {"name": "d", "kind": "directory", "root": "d", "marker": "m1"},
+        {"name": "lf", "kind": "local-file", "root": "lf", "marker": "m2"},
+        {"name": "?", "kind": "no-such-kind", "root": "x", "marker": "m3"},
+    ], "20260719")
+    assert called == []

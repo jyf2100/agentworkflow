@@ -441,7 +441,7 @@ git diff（{base}..{branch}）：{diff_path}
 只吐那一行 JSON，多一个字都算失败。"""
 
 
-# ─── fetch 段（agent-deepresearch 源：调 pa-fetch-deepresearch 深研 → 落 YYYYMMDD_*.md）────
+# ─── fetch 段（persona-based 源 fetcher：按 FETCH_CONFIG[kind] 分发 → 落 YYYYMMDD_*.md）────
 FETCH_AGENT = "pa-fetch-deepresearch"
 # exa MCP 工具白名单（ECC plugin 提供；firecrawl 缺席，单 exa 即可——冒烟已证可用）
 FETCH_ALLOWED_TOOLS = ["mcp__plugin_ecc_exa__web_search_exa",
@@ -458,41 +458,98 @@ def fetch_prompt(src: dict) -> str:
 严格按 persona 输出契约：只吐一行 JSON，结构 {{"title":"...","markdown":"<完整带引用 md 全文>","sources_count":N,"confidence":"High|Medium|Low"}}。markdown 字段内换行用 \\n 转义。"""
 
 
-def stage_fetch(args, sources, stamp) -> dict:
-    """agent-deepresearch 源 fetcher：调 pa-fetch-deepresearch agent 深研 → 落 YYYYMMDD_<slug>.md 到 source.root。
+def wechat_url_prompt(src: dict) -> str:
+    """① wechat-url：把 params.urls 喂给 pa-fetch-wechat-url，要 Contract A items JSON。"""
+    urls = (src.get("params") or {}).get("urls") or []
+    url_block = "\n".join(f"- {u}" for u in urls) if urls else f"- {src['name']}"
+    return f"""你是 pa-fetch-wechat-url。抓取以下微信文章（mp.weixin.qq.com）正文，逐篇 normalize 成 markdown。
+文章 URL（采集源 {src['name']}）：
+{url_block}
 
-    其他 kind 跳过（directory/local-file 无 fetcher；wechat-url/github-repo 后续 follow-up ①②）。
+每篇先试 mcp__web_reader__webReader(url=..., return_format='markdown')；抓失败/正文明显残缺（如只剩导航）→ 用 mcp__plugin_ecc_exa__web_fetch_exa(urls=[url]) 兜底；都失败该篇 fetched_via='failed'、markdown 留空。
+严格按 persona 输出契约：只吐一行 JSON，结构 {{"items":[{{"url":"...","title":"<篇名（ascii 优先便于 slug）>","markdown":"<干净正文 md，换行 \\n 转义>","fetched_via":"web_reader|exa|failed","ok":true}}]}}。"""
+
+
+def github_repo_prompt(src: dict) -> str:
+    """② github-repo：把 params.repos + window 喂给 pa-fetch-github-repo，gh CLI 拉活动，要 items JSON。"""
+    params = src.get("params") or {}
+    repos = params.get("repos") or []
+    window = params.get("window", "7d")
+    repo_block = "\n".join(f"- {r}" for r in repos) if repos else f"- {src['name']}"
+    return f"""你是 pa-fetch-github-repo。监控以下 GitHub 仓库近 {window} 的活动，逐仓 summarize 成 markdown digest（radar 可消费）。
+仓库（采集源 {src['name']}）：
+{repo_block}
+窗口：{window}
+
+每仓用 Bash 跑 gh CLI：`gh api repos/OWNER/REPO/commits?per_page=30` 拉最近 commit、`gh api repos/OWNER/REPO/pulls?state=all&sort=updated&per_page=20` 拉最近 PR；按窗口筛日期；summarize 成「近期 commit（msg/日期/作者）+ 合并 PR（标题/url）」markdown。github MCP 在 headless 不可用，**必须用 gh CLI**。
+严格按 persona 输出契约：只吐一行 JSON，结构 {{"items":[{{"repo":"owner/repo","title":"<owner-repo 窗口摘要（ascii）>","markdown":"<digest md，换行 \\n 转义>","commits_count":N,"prs_count":M}}]}}。"""
+
+
+# kind → fetcher 配置。mode: "single"=一份合成 md（agent-deepresearch）；
+#       "items"=一次调用产 N 篇（wechat-url/github-repo，Contract A 每 item 一文件）。
+FETCH_CONFIG: dict[str, dict] = {
+    "agent-deepresearch": {"agent": FETCH_AGENT, "tools": FETCH_ALLOWED_TOOLS,
+                           "prompt": fetch_prompt, "mode": "single"},
+    "wechat-url":         {"agent": "pa-fetch-wechat-url",
+                           "tools": ["mcp__web_reader__webReader",
+                                     "mcp__plugin_ecc_exa__web_fetch_exa"],
+                           "prompt": wechat_url_prompt, "mode": "items"},
+    "github-repo":        {"agent": "pa-fetch-github-repo",
+                           "tools": ["Bash(gh api:*)"],
+                           "prompt": github_repo_prompt, "mode": "items"},
+}
+
+
+def _payload_to_items(payload: dict, mode: str, src: dict) -> list[tuple[str, str, dict]]:
+    """统一落盘视角：single → [(title, md, payload)]；items → payload['items'] 逐条。
+    返回 (title, markdown_stripped, raw) 三元组列表，raw 透传 kind-specific 字段（如 sources_count）。"""
+    if mode == "items":
+        return [(it.get("title") or src["name"], (it.get("markdown") or "").strip(), it)
+                for it in (payload.get("items") or [])]
+    return [(payload.get("title") or src["name"], (payload.get("markdown") or "").strip(), payload)]
+
+
+def stage_fetch(args, sources, stamp) -> dict:
+    """persona-based 源 fetcher：按 FETCH_CONFIG[kind] 分发 agent → 落 YYYYMMDD_<slug>.md 到 source.root。
+
+    directory/local-file/未知 kind 不在 FETCH_CONFIG → 跳过（无 fetcher）。
+    mode=items：一次 agent 调用产 N 篇 → N 文件（Contract A）；mode=single：一份合成 md（agent-deepresearch）。
     fetch 不碰 marker（radar 消费后才 bump，ADR-0007 #3）；--dry-run 不影响 fetch（写文件是 fetch 的全部意义）。
-    stamp = 采集日（编排器传入的 YYYYMMDD），满足「文件名 = 采集戳」契约。
-    复用门：fetch_{stamp}.json 已存在且非 --force → 复用（成本护栏，镜像 stage_radar:497-500，防重跑重花 ~$0.9/次）。
-    per-source try/except：一个源炸（exa 断/JSON 烂）只跳过它，不拖垮整段 fetch（fault isolation）。"""
+    复用门：fetch_{stamp}.json 已存在且非 --force → 复用（成本护栏，镜像 stage_radar:507-509，防重跑重花）。
+    per-source try/except + per-item 跳空 md：一个源/一篇炸只跳过它，不拖垮整段 fetch（fault isolation）。"""
     fetch_file = STATE_DIR / f"fetch_{stamp}.json"
     if fetch_file.is_file() and not getattr(args, "force", False):
         log(f"[fetch] 复用已有 {fetch_file.name}（--force 重跑）")
         return json.loads(fetch_file.read_text(encoding="utf-8"))
     produced = []
     for src in sources:
-        if src.get("kind") != "agent-deepresearch":
+        cfg = FETCH_CONFIG.get(src.get("kind"))
+        if not cfg:                                   # directory/local-file/未知 → 无 fetcher，跳过
             continue
         try:
             root = VAULT_ROOT / src["root"]
             root.mkdir(parents=True, exist_ok=True)
-            payload, meta = run_persona(FETCH_AGENT, fetch_prompt(src), "fetch",
-                                        f"fetch-{src['name']}", allowed_tools=FETCH_ALLOWED_TOOLS)
-            md = (payload.get("markdown") or "").strip()
-            if not md:
-                log(f"[fetch] ⚠ {src['name']} agent 未返回 markdown（跳过落盘）")
+            payload, meta = run_persona(cfg["agent"], cfg["prompt"](src), "fetch",
+                                        f"fetch-{src['name']}", allowed_tools=cfg["tools"])
+            items = _payload_to_items(payload, cfg["mode"], src)
+            if not items:
+                log(f"[fetch] ⚠ {src['name']} agent 未返回任何 item（跳过落盘）")
                 continue
-            title = payload.get("title") or src["name"]
-            slug = dev_slugify(title) or src["name"]            # 复用 ADR-0006 单一源头
-            out = root / f"{stamp}_{slug}.md"
-            out.write_text(md, encoding="utf-8")
-            produced.append({"source": src["name"],
-                             "path": str(out.relative_to(VAULT_ROOT)),
-                             "sources_count": payload.get("sources_count"),
-                             "cost": meta["cost"], "turns": meta["turns"]})
-            log(f"[fetch] ✅ {src['name']} → {out.relative_to(VAULT_ROOT)}｜"
-                f"sources={payload.get('sources_count')} cost=${meta['cost']:.4f} turns={meta['turns']}")
+            for title, md, raw in items:
+                if not md:
+                    log(f"[fetch] ⚠ {src['name']} item「{title}」markdown 空（跳过该 item）")
+                    continue
+                slug = dev_slugify(title) or src["name"]            # 复用 ADR-0006 单一源头
+                out = root / f"{stamp}_{slug}.md"
+                out.write_text(md, encoding="utf-8")
+                entry = {"source": src["name"], "title": title,
+                         "path": str(out.relative_to(VAULT_ROOT)),
+                         "cost": meta["cost"], "turns": meta["turns"]}
+                if "sources_count" in raw:            # kind-specific 透传（agent-deepresearch；保 ③ 既有测试绿）
+                    entry["sources_count"] = raw["sources_count"]
+                produced.append(entry)
+                log(f"[fetch] ✅ {src['name']} → {out.relative_to(VAULT_ROOT)}｜「{title}」"
+                    + (f" sources={raw['sources_count']}" if "sources_count" in raw else ""))
         except Exception as e:
             log(f"[fetch] ✗ {src['name']} 失败（跳过，不拖垮其他源）：{e}")
             continue
