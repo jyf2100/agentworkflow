@@ -90,3 +90,15 @@ def test_stage_fetch_empty_markdown_skipped(tmp_path, monkeypatch):
     out = run_daily.stage_fetch(A(), [src], "20260719")
     assert out["produced"] == []
     assert not (tmp_path / "q").glob("20260719_*.md") or not list((tmp_path / "q").glob("*.md"))
+
+
+def test_stages_has_fetch_at_zero():
+    import importlib
+    importlib.reload(run_daily)
+    assert run_daily.STAGES[0] == "fetch"
+    assert run_daily.STAGES[1] == "radar"   # 原 radar 顺位后移
+
+
+def test_fetch_timeout_and_maxturns_defined():
+    assert "fetch" in run_daily.TIMEOUT and run_daily.TIMEOUT["fetch"] > run_daily.TIMEOUT["radar"]
+    assert "fetch" in run_daily.MAX_TURNS and run_daily.MAX_TURNS["fetch"] >= 20

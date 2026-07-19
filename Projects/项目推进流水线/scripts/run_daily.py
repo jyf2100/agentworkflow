@@ -75,10 +75,10 @@ def _nvm_claude() -> Path | None:
 
 # 每段 wall-clock 超时（秒）——防挂死，非成本控制（SPEC §6/R2）
 # verify=pa-verify 裁判段（dev 产出验证闸，docs/verify-commit-loop-design.md §5-②）
-TIMEOUT = {"radar": 600, "prd": 900, "critic": 300, "verify": 300}
-MAX_TURNS = {"radar": 60, "prd": 90, "critic": 40, "verify": 30}
+TIMEOUT = {"fetch": 1500, "radar": 600, "prd": 900, "critic": 300, "verify": 300}
+MAX_TURNS = {"fetch": 40, "radar": 60, "prd": 90, "critic": 40, "verify": 30}
 
-STAGES = ["radar", "prd", "inject", "critic", "dispatch", "report"]
+STAGES = ["fetch", "radar", "prd", "inject", "critic", "dispatch", "report"]
 
 # dispatch 段 wall-clock（不调 claude persona；触发目标仓 dev-agent.mjs + 独立 npm 验证）
 DEV_LOOP_TIMEOUT = 3600          # 触发 dev-agent.mjs（SDK maxTurns 150）外包超时（≈60min；maxTurns 在 glm-5.2 下约 12-37min，原 30min 偏紧会误杀正常 dev loop）
@@ -1616,19 +1616,21 @@ def _run_pipeline(args) -> None:
     stamp = args.stamp   # inject 段可能自增（避碰），下游 critic/dispatch/report 用此 stamp 对齐文件名
     try:
         if lo <= 0 <= hi:
-            candidates_payload = stage_radar(args, sources, profiles, args.stamp)
+            stage_fetch(args, sources, args.stamp)
         if lo <= 1 <= hi:
+            candidates_payload = stage_radar(args, sources, profiles, args.stamp)
+        if lo <= 2 <= hi:
             manifest = stage_prd(args, candidates_payload, profiles, args.stamp)
-        if lo <= 2 <= hi and getattr(args, "inject_prd", None):
+        if lo <= 3 <= hi and getattr(args, "inject_prd", None):
             manifest, stamp = stage_inject(args, profiles, stamp)   # 手动注入 PRD（替 radar→prd）
-        if lo <= 3 <= hi:
-            gate = stage_critic(args, manifest, profiles, stamp)
         if lo <= 4 <= hi:
+            gate = stage_critic(args, manifest, profiles, stamp)
+        if lo <= 5 <= hi:
             if not gate:   # --from-stage dispatch：critic 未跑，从盘读 prd_gate
                 gf = STATE_DIR / f"prd_gate_{stamp}.json"
                 gate = json.loads(gf.read_text(encoding="utf-8")) if gf.is_file() else []
             dispatch = stage_dispatch(args, gate, profiles, stamp)
-        if lo <= 5 <= hi:
+        if lo <= 6 <= hi:
             stage_report(args, profiles, stamp)
     except RuntimeError as e:
         log(f"✗ {e}")
