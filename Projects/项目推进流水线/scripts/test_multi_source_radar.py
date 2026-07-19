@@ -269,3 +269,86 @@ def test_stage_radar_no_sources0_hardcode(tmp_path, monkeypatch):
         SimpleNamespace(force=False, dry_run=True, limit=None), sources, profiles, "20260719")
     # Assert：两源都被发现（不只 sources[0]）
     assert out["per_source"] == {"drop-zone": 1, "wechat": 0}
+
+
+# ─── 每个来源 kind 的消费侧行为（ADR-0007 决定 #2：消费侧零分支）────────
+# 决定 #2：消费侧完全不读 kind——5 种 kind 在 radar/discover 完全等价（都 glob 目录）。
+# 故「每个来源都测」= 证明 kind 不改变消费行为 + 未就绪 fetcher 静默降级 + 源卫生（exclude）。
+_KINDS = ["directory", "local-file", "wechat-url", "github-repo", "agent-deepresearch"]
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_stage_radar_kind_agnostic(tmp_path, monkeypatch, kind):
+    """5 种 kind 消费侧完全等价：同样文件 → 同样 discover/route/bump（决定 #2 零分支）。
+
+    不论 directory / local-file / 三个 fetcher kind，消费侧只按 content_glob 扫目录，
+    kind 从不进分支。本用例对每种 kind 跑同一场景，断言产出逐字相同。
+    顺带覆盖「正向 bump happy-path」（files + 有效订阅 + radar 成功 → marker bump）。"""
+    sources = [{"name": "s", "kind": kind, "root": "Knowledge/src",
+                "content_glob": "**/[0-9]*.md", "target_projects": ["cc-web-control"],
+                "marker": "state/consumed_m"}]
+    profiles = {"cc-web-control": {"name": "cc-web-control", "match_surface": {}}}
+    _setup_radar(tmp_path, monkeypatch, sources, profiles)
+    _put("Knowledge/src", "20260719_a.md", tmp_path)
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda n, p, s, lbl: ({"candidates": [], "stats": {}}, {"cost": 0.0, "turns": 0}))
+    monkeypatch.setattr(run_daily, "fetch_dedup_list", lambda profs: {})
+
+    out = run_daily.stage_radar(
+        SimpleNamespace(force=False, dry_run=False, limit=None), sources, profiles, "20260719")
+
+    # 无论哪种 kind：发现 1 篇、喂 cc-web-control、marker bump 到 20260719
+    assert out["per_source"] == {"s": 1}
+    assert out["today_new_count"] == 1
+    assert (tmp_path / ".pa" / "state" / "consumed_m").read_text(encoding="utf-8").strip() == "20260719"
+
+
+def test_unready_fetcher_source_silent_at_stage(tmp_path, monkeypatch):
+    """fetcher 未就绪的源（3 个 follow-up kind）在 stage_radar 静默降级：
+    root 空（fetcher 没跑）→ 0 文件 → 不调 radar、不 bump、不崩。
+    把「决定 #2 未就绪 warn 不阻断」从 load_sources 级延伸到 stage_radar 级验证。"""
+    sources = [
+        {"name": "deep", "kind": "agent-deepresearch", "root": "Knowledge/深研",
+         "content_glob": "**/[0-9]*.md", "fetcher": "scripts/fetchers/deepresearch.py",
+         "target_projects": ["ashare"], "marker": "state/consumed_deep"},
+    ]
+    profiles = {"ashare": {"name": "ashare", "match_surface": {}}}
+    _setup_radar(tmp_path, monkeypatch, sources, profiles)
+    # root 故意不放任何 YYYYMMDD 文件（fetcher 未跑 → 无产出）
+    called = []
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda *a: called.append(a) or ({"candidates": [], "stats": {}}, {"cost": 0.0, "turns": 0}))
+    monkeypatch.setattr(run_daily, "fetch_dedup_list", lambda profs: {})
+
+    out = run_daily.stage_radar(
+        SimpleNamespace(force=False, dry_run=False, limit=None), sources, profiles, "20260719")
+
+    # root 空 → 全源 0 新内容 → 早退：不调 radar、不 bump
+    assert called == []
+    assert out["today_new_count"] == 0
+    assert out["candidates"] == []
+    assert not (tmp_path / ".pa" / "state" / "consumed_deep").exists()
+
+
+def test_directory_source_exclude_glob_filters_meta(tmp_path, monkeypatch):
+    """wechat 源的 exclude_glob 跳 meta（审校报告 / URL参考列表 / 文章清单）——
+    源特定采集卫生：discover 须排除这些、不进 radar。"""
+    sources = [{"name": "wechat", "kind": "directory", "root": "Knowledge/微信",
+                "content_glob": "**/[0-9]*.md",
+                "exclude_glob": "**/*{审校报告,URL参考列表,文章清单}*.md",
+                "target_projects": ["cc-web-control"], "marker": "state/consumed_wechat"}]
+    profiles = {"cc-web-control": {"name": "cc-web-control", "match_surface": {}}}
+    _setup_radar(tmp_path, monkeypatch, sources, profiles)
+    _put("Knowledge/微信", "20260719_正文.md", tmp_path)           # 留
+    _put("Knowledge/微信", "20260719_审校报告.md", tmp_path)        # 排
+    _put("Knowledge/微信", "20260719_URL参考列表.md", tmp_path)     # 排
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda n, p, s, lbl: ({"candidates": [], "stats": {}}, {"cost": 0.0, "turns": 0}))
+    monkeypatch.setattr(run_daily, "fetch_dedup_list", lambda profs: {})
+
+    out = run_daily.stage_radar(
+        SimpleNamespace(force=False, dry_run=True, limit=None), sources, profiles, "20260719")
+
+    # 只剩正文 1 篇（meta 被 exclude_glob 排掉）
+    assert out["per_source"] == {"wechat": 1}
+    assert out["today_new_count"] == 1
