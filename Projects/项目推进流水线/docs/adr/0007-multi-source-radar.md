@@ -40,7 +40,7 @@
 - **单源硬编码 `sources[0]` 消除**；`stage_radar` 变 source 驱动遍历。
 - **radar 调用 1 → N**，但「订阅到新文件才调」→ 总成本不升反降（现状 ashare 白读 wechat 的开销消失）。
 - **fetcher 契约确立**：所有 kind 产出 `YYYYMMDD_*.md` 到 `source.root`（`discover_today_new` 的 `re.match(r"\d{8}")` 依赖此前缀）。采集层与消费层解耦，后续各自演进。
-- **follow-up 待办**：① `wechat-url` fetcher；② `github-repo` fetcher（gh API 拉 releases/readme/issues）；③ `agent-deepresearch` fetcher（调 agent + deep-research skill）。
+- **follow-up 待办**：① `wechat-url` fetcher；② `github-repo` fetcher（gh API 拉 releases/readme/issues）；③ `agent-deepresearch` fetcher ✅ 已实现（专用 headless agent `pa-fetch-deepresearch` + ECC-MCP `deep-research` skill/exa 后端；计划见 `docs/plans/2026-07-19-pa-fetch-deepresearch.md`）。
 
 > **2026-07-19 终审记录（消费接口实现完成后，独立 reviewer）**——发现 stage_radar 现实现「任一项目 radar 抛错 → **全源** marker 都不 bump」（抛错在 `cand_file.write_text` / bump 循环之前 propagate）。单源时这连贯，多源下变成**跨源耦合**：一个 flaky 的 ashare radar 会拖累 wechat→cc-web-control 重复 radar 已处理的旧文件（token 白烧 + 旧信号污染 candidate 流）。
 >
@@ -81,11 +81,10 @@ sources:
     marker: state/consumed_dropzone_ashare_llm_analyst
 
   # 以下三种 fetcher 后续各自做，schema 先就位
-  - name: quant-research                      # ① agent + deep-research 搜索
-    kind: agent-deepresearch
+  - name: quant-research                      # ① agent + deep-research 深研（fetcher = pa-fetch-deepresearch agent）
+    kind: agent-deepresearch                  # fetcher 是专用 headless agent（非 .py 脚本）：见 docs/plans/2026-07-19-pa-fetch-deepresearch.md
     root: Knowledge/深研/quant
-    fetcher: scripts/fetchers/deepresearch.py
-    params: { agent: general-purpose, skill: deep-research, prompts: ["A股量化最新进展…"] }
+    params: { prompts: ["A股量化最新进展…"] }   # 研究 topic；agent=ECC-MCP deep-research（exa 后端）内定，不需声明
     target_projects: [ashare-llm-analyst]
     marker: state/consumed_quant_research
 
