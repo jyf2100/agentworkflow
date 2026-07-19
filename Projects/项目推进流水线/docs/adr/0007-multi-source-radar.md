@@ -84,6 +84,7 @@ sources:
   - name: quant-research                      # ① agent + deep-research 深研（fetcher = pa-fetch-deepresearch agent）
     kind: agent-deepresearch                  # fetcher 是专用 headless agent（非 .py 脚本）：见 docs/plans/2026-07-19-pa-fetch-deepresearch.md
     root: Knowledge/深研/quant
+    content_glob: "**/[0-9]*.md"              # 必填：discover_today_new 按 glob 扫（kind 无关）；fetcher 产 YYYYMMDD_*.md
     params: { prompts: ["A股量化最新进展…"] }   # 研究 topic；agent=ECC-MCP deep-research（exa 后端）内定，不需声明
     target_projects: [ashare-llm-analyst]
     marker: state/consumed_quant_research

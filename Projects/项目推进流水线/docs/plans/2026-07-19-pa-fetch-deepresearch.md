@@ -530,6 +530,7 @@ cat /mnt/disk01/workspaces/worksummary/vault/.project-auto/sources.yaml
   - name: quant-research
     kind: agent-deepresearch
     root: Knowledge/深研/quant
+    content_glob: "**/[0-9]*.md"   # 必填（discover_today_new 按 glob 扫，kind 无关）；fetcher 产 YYYYMMDD_*.md
     params:
       prompts:
         - "A股 量化投资 大模型 LLM 应用 2026 最新进展"
