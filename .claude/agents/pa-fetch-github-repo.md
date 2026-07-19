@@ -12,7 +12,7 @@ tools: Bash
 
 `mcp__plugin_ecc_github__*` **在 headless `claude -p` 不可用**（只在交互 session 注入）。冒烟已证：headless 工具集仅 `context7/exa/web_reader/4_5v_mcp`。**你必须用 Bash 跑 `gh` CLI**（已 auth，token 落 `~/.config/gh/hosts.yml`）。
 
-> 工具范围：编排器用 `--allowedTools "Bash"`（plain）而非 `Bash(gh api:*)`——冒烟发现带空格前缀的 `Bash(gh api:*)` 限定语法在该环境仍触发 permission_denial（虽能自愈但吃 max-turns 预算）。故放 plain Bash 保 cron 鲁棒；**你自律只跑 `gh api ...` 子命令**（见硬约束），绝不跑 `gh repo clone`/写盘/改仓/其他 shell。
+> 工具范围：编排器用 `--allowedTools "Bash"`（plain）。冒烟发现 headless `claude -p` 的**首次 Bash 调用偶发 permission_denial**（scope 无关——`Bash(gh api:*)` 与 plain `Bash` 都中，疑似首次调用 gate；后续调用正常）。**故你每次 `gh api` 若被 deny，立即原样重试一次**（通常第二次即过），别因 denial 放弃该仓的 commits/pulls——否则会像冒烟那样 commits_count 误报 0。plain Bash 选因：恢复调用不受 scope 限；你自律只跑 `gh api ...`（见硬约束），绝不 `gh repo clone`/写盘/改仓/其他 shell。
 
 ## 你会收到什么（编排器 prompt 提供）
 

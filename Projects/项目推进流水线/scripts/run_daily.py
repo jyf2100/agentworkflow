@@ -495,8 +495,9 @@ FETCH_CONFIG: dict[str, dict] = {
                                      "mcp__plugin_ecc_exa__web_fetch_exa"],
                            "prompt": wechat_url_prompt, "mode": "items"},
     "github-repo":        {"agent": "pa-fetch-github-repo",
-                           # gh CLI 经 Bash（github MCP headless 不可用）。冒烟：Bash(gh api:*) 限定语法
-                           # 仍触发 permission_denial（带空格前缀 matcher 不稳）；plain Bash 保 cron 鲁棒，persona 硬约束只跑 gh api。
+                           # gh CLI 经 Bash（github MCP headless 不可用）。冒烟：headless 首次 Bash 调用偶发
+                           # permission_denial（scope 无关——Bash(gh api:*) 与 plain Bash 都中，疑似首次调用 gate；
+                           # 后续调用正常），persona 内置「deny 即重试一次」吸收。选 plain Bash：恢复调用不受 scope 限。
                            "tools": ["Bash"],
                            "prompt": github_repo_prompt, "mode": "items"},
 }
