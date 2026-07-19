@@ -62,8 +62,12 @@ _Avoid_: 信号（太早）、spec、ticket、pull request。
 已通过 [[PRD 质量闸]]、但因临时条件尚未成功交给项目的 PRD。流水线保留它的状态，但后续日跑不自动重试；只有 roc 明确要求时才重新投递。
 _Avoid_: 已跳过 PRD、失败 PRD、当日遗留。
 
+**采集源 (Ingest)**:
+pa-radar 扫描的**输入**通道——`sources.yaml` 里的一条配置（如 wechat 目录、指定 github 仓库、deep-research agent），由 fetcher 把外部内容 normalize 成 `YYYYMMDD_*.md` 落盘，radar 按 `target_projects` 路由读取。方向与「信息源」**相反**（信息源是 radar 抽出信号后、随 PRD 投递给 dev 的**输出**侧原始材料）。见 ADR-0007。
+_Avoid_: source（与「信息源」撞名）、feed、输入源、内容源。
+
 **信息源 (Source)**:
-与 PRD 一起投递给项目的**原始材料**——PRD 所依据的那篇公众号/deep-research 文章或其信号片段。给项目是为了让它独立做需求分析、不只能盲信 PRD。属控制面，随 PRD 经 headless 输入投递，不写进目标仓。
+与 PRD 一起投递给项目的**原始材料**——PRD 所依据的那篇公众号/deep-research 文章或其信号片段。给项目是为了让它独立做需求分析、不只能盲信 PRD。属控制面，随 PRD 经 headless 输入投递，不写进目标仓。注意是 radar **输出**侧（与「采集源」输入侧方向相反）。
 _Avoid_: 原文、reference、引用（太泛）。
 
 **PR**:

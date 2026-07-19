@@ -1,14 +1,19 @@
 # 0007 — radar 多源：target_projects 白名单 + source kind + 消费/采集解耦
 
+> **术语**：本文 `source`（`sources.yaml` 一条）= **采集源 (Ingest)**，radar 输入侧；与 CONTEXT.md「信息源 (Source)」（radar 输出侧、随 PRD 投递给 dev）是不同概念，勿混。代码标识符 `source`/`sources.yaml` 保留（实现细节）。
+>
 > 不违背 [[0001-vault-target-isolation]]（radar 仍只读 vault）；延续 [[0004-dispatch-devagent-source-of-truth]] 的去重清单（per-project 不变）。
 > 把 `sources.yaml` 从单源（v1 仅 wechat、`stage_radar` 硬编码 `sources[0]`）扩为多源，并引入「源↔项目」路由，让非 AI-coding 项目（如 ashare）也能被合适的源喂到。
 
 ## 决定
 
-1. **`sources.yaml` 每个 source 加 `target_projects` 白名单**：声明该源的文件只喂哪些项目；缺省 = 喂所有 `admission: true` 项目（向后兼容，wechat 不写也不破坏现状）。一个源可喂多项目，一个项目可被多源喂。
+1. **`sources.yaml` 每个 source 加 `target_projects` 白名单**：声明该源的文件只喂哪些项目；**缺省 = 不喂任何项目**（必须显式声明，grilling 2026-07-19 改——原「缺省=喂所有 admission」是默认开放，新源忘标 target_projects 会喂到不相关项目、radar 白读 + 噪音）。一个源可喂多项目，一个项目可被多源喂。
 2. **source 加 `kind` 维度**：`directory` / `local-file` / `wechat-url` / `github-repo` / `agent-deepresearch`。kind 是**采集层**分类，消费侧（radar/discover）kind 无关。
+   > **消费侧完全不读 kind（零分支）**（grilling 2026-07-19 定）：stage_radar/discover 不出现 `if kind==` 分支，5 种 kind 在消费侧完全等价（都 glob 目录）。声明了 `fetcher:` 路径但脚本不存在的源（如本次未实现的 3 种），sources.yaml 加载时 log warn（「该源 fetcher 未就绪、今日无产出」），**但不阻断 radar**——root 不存在/空即该源今日 0 新内容、其订阅项目不调 radar（静默）。fetcher 是否就绪是采集层的事，消费侧只看目录有没有新文件。
 3. **全被动 + fetcher 解耦**：每种 kind 配一个独立 fetcher，预先把内容 normalize 成 `YYYYMMDD_*.md` 落到 `source.root`；**radar/discover 永远只按 `content_glob` 扫目录**，不关心 kind、不关心源怎么来的。
+   > **日期戳契约（grilling 2026-07-19 定）**：文件名 `YYYYMMDD` = **采集戳**（内容进入采集源的日期：fetcher 跑/用户投的那天），**不是内容本身日期**。保证 marker 单调递增、旧日期文件（如 local-file 投的旧研报）也能被 `> marker` 拾——根治「文件名日期 vs 抓取时间」歧义（Bug B 多源泛化）。内容本身日期存 md frontmatter `date:`，不进文件名、不参与 marker。**迁移**：wechat 现状文件名标内容日（`20260717_*.md`），采集器需改为盖采集戳（生成日）；历史文件迁移时按 mtime 重盖戳。
 4. **`stage_radar` 去 `sources[0]` 硬编码**：遍历全部 source，各自 `discover_today_new`；按 `target_projects` 把文件聚合到 `project → [它订阅的所有源的文件并集]`；marker 各源独立 bump（per-source 已是）。
+   > **采集源身份 + root 排他**（grilling 2026-07-19 定）：`name` 是采集源唯一 key；一个 `root` 只能属一个采集源（`load_sources` 加载时校验 root 唯一、重复拒载并报错），杜绝双扫 / marker 互相污染 / candidate 重复。marker 路径（`source.marker`）随 name 唯一而隐含唯一。
 5. **radar 按项目调 N 次**：只有「订阅到了新文件」的项目才调 `pa-radar`；`radar_prompt` 签名从 `(today_new, profiles, dedup)` 改为 `(project, 该项目订阅文件, 该项目 match_surface, 该项目去重清单)`。**无订阅的项目（如 ashare 暂未接 finance 源）→ 0 文件 → 不调 → 比现状更省**（现状 ashare 要白读全部 wechat 文件、全进低分桶）。
 6. **`candidates_{stamp}.json` 带 `source` 字段**：每条 candidate 既有的 `project` 之外加 `source`（追溯来自哪个源），`stats` 升级为 per-project 明细。**dispatch 零改动**（已按 `candidate.project` 分发）。
 7. **本次实现范围 = 消费接口**：`directory`（现状 wechat）+ `local-file`（directory 特例，用户直接丢文件到 root）跑通；5 种 kind 的 schema 全定义。`wechat-url` / `github-repo` / `agent-deepresearch` 三个 fetcher 各自后续独立任务。
@@ -48,7 +53,7 @@ sources:
     root: Knowledge/微信
     content_glob: "**/[0-9]*.md"
     exclude_glob: "**/*{审校报告,URL参考列表,文章清单}*.md"
-    target_projects: [cc-web-control]         # 缺省=喂所有 admission 项目
+    target_projects: [cc-web-control]         # 缺省=不喂（必须显式声明）
     marker: state/consumed_wechat
 
   - name: drop-zone                           # local-file：用户/脚本直接丢文件
@@ -122,7 +127,7 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
     # 2) 按项目聚合：project → [(source, [files])]
     proj_files: dict[str, list[tuple[str, list[Path]]]] = {}
     for src in sources:
-        targets = src.get("target_projects") or list(profiles)  # 缺省=全部 admission
+        targets = src.get("target_projects") or []              # 缺省=不喂（grilling 定）
         for proj in targets:
             if proj in profiles:
                 proj_files.setdefault(proj, []).append((src["name"], per_source_new[src["name"]]))
@@ -172,7 +177,7 @@ def radar_prompt(project: str, today_new: list[Path], prof: dict, dedup_items: l
 
 - `test_discover_multi_source`：两条 source（wechat directory + dropzone local-file），各自 marker 独立、各自 discover。
 - `test_target_projects_routes_files`：wechat `target_projects:[cc-web-control]`、dropzone `[ashare]` → cc-web-control 只收到 wechat 文件、ashare 只收到 dropzone 文件。
-- `test_target_projects_default_all`：source 无 `target_projects` → 喂所有 admission 项目（向后兼容）。
+- `test_target_projects_default_none`：source 无 `target_projects` → 不喂任何项目（targets=[]，订阅空，该项目 0 文件不调 radar）。
 - `test_project_with_no_files_skips_radar`：ashare 订阅的源今日 0 新文件 → 该项目不调 radar（省）。
 - `test_marker_per_source_bump`：两源各自按自己文件名最大日期 bump，互不干扰。
 - `test_radar_prompt_per_project`：prompt 只含该项目 match_surface + 该项目订阅文件。
