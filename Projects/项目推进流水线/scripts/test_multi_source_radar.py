@@ -70,3 +70,34 @@ def test_load_sources_warns_missing_fetcher_but_keeps_source(tmp_path, monkeypat
     assert out[0]["name"] == "deep"
     captured = capsys.readouterr()
     assert "fetcher" in captured.out and "不存在" in captured.out
+
+
+# ─── _source_of 候选源追溯（ADR-0007 决定 #6）────────────────────────
+def test_source_of_traces_candidate_to_source(tmp_path, monkeypatch):
+    # Arrange：VAULT_ROOT 置 tmp，源文件在 vault 相对路径下
+    monkeypatch.setattr(run_daily, "VAULT_ROOT", tmp_path)
+    root = tmp_path / "Knowledge/微信"
+    root.mkdir(parents=True)
+    f = root / "20260719_x.md"
+    f.write_text("#", encoding="utf-8")
+    src_files = [("wechat", [f]), ("drop-zone", [])]
+    cand = {"source_path": "Knowledge/微信/20260719_x.md"}   # persona 吐的 vault 相对路径
+    # Act / Assert：回溯到 wechat
+    assert run_daily._source_of(cand, src_files) == "wechat"
+
+
+def test_source_of_unknown_when_no_match(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_daily, "VAULT_ROOT", tmp_path)
+    root = tmp_path / "Knowledge/微信"
+    root.mkdir(parents=True)
+    f = root / "20260719_x.md"
+    f.write_text("#", encoding="utf-8")
+    src_files = [("wechat", [f])]
+    cand = {"source_path": "Knowledge/别处/missing.md"}      # 命中不到
+    assert run_daily._source_of(cand, src_files) == "unknown"
+
+
+def test_source_of_unknown_when_source_path_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_daily, "VAULT_ROOT", tmp_path)
+    src_files = [("wechat", [])]
+    assert run_daily._source_of({}, src_files) == "unknown"  # 无 source_path 字段

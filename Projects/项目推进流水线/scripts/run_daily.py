@@ -236,6 +236,20 @@ def fetch_dedup_list(profiles: dict) -> dict:
     return dedup
 
 
+def _source_of(cand: dict, src_files: list[tuple[str, list[Path]]]) -> str:
+    """candidate.source_path（vault 相对）回溯到所属采集源 name；命中不到回 'unknown'。
+
+    一个 candidate 来自一个文件，一个文件只属一个源（root 排他，决定 #4），故首匹配即定。
+    src_files = [(source_name, [该源喂进来的绝对路径])]，由 stage_radar 聚合时传入。"""
+    sp = cand.get("source_path", "")
+    if sp:
+        target = str(VAULT_ROOT / sp)
+        for sname, files in src_files:
+            if any(str(f) == target for f in files):
+                return sname
+    return "unknown"
+
+
 # ─── 核心：调 persona ────────────────────────────────────────────────
 # glm-5.2 在 headless `-p` 下偶尔不守"只吐 JSON"契约——先散文叙述发现再（或干脆不）吐 JSON。
 # 两道防线：① _extract_first_json brace-matching 容忍 JSON 前后的散文/markdown；② 仍失败则重试 1 次（加强 JSON-only 指令）。
