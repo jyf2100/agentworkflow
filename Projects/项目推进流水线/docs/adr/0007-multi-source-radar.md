@@ -40,7 +40,7 @@
 - **单源硬编码 `sources[0]` 消除**；`stage_radar` 变 source 驱动遍历。
 - **radar 调用 1 → N**，但「订阅到新文件才调」→ 总成本不升反降（现状 ashare 白读 wechat 的开销消失）。
 - **fetcher 契约确立**：所有 kind 产出 `YYYYMMDD_*.md` 到 `source.root`（`discover_today_new` 的 `re.match(r"\d{8}")` 依赖此前缀）。采集层与消费层解耦，后续各自演进。
-- **follow-up 待办**：① `wechat-url` fetcher；② `github-repo` fetcher（gh API 拉 releases/readme/issues）；③ `agent-deepresearch` fetcher ✅ 已实现（专用 headless agent `pa-fetch-deepresearch` + ECC-MCP `deep-research` skill/exa 后端；计划见 `docs/plans/2026-07-19-pa-fetch-deepresearch.md`）。
+- **follow-up 待办**：① `wechat-url` fetcher ✅ 已实现（专用 headless agent `pa-fetch-wechat-url` + web_reader/exa 兜底；冒烟证 web_reader headless 可用）；② `github-repo` fetcher ✅ 已实现（专用 headless agent `pa-fetch-github-repo` + gh CLI/Bash——**冒烟发现 `mcp__plugin_ecc_github__*` 在 headless `claude -p` 不可用**，只在交互 session 注入，故 ② 走 gh CLI 而非 github MCP；计划见 `docs/plans/2026-07-19-pa-fetch-wechat-github.md`）；③ `agent-deepresearch` fetcher ✅ 已实现（专用 headless agent `pa-fetch-deepresearch` + ECC-MCP `deep-research` skill/exa 后端；计划见 `docs/plans/2026-07-19-pa-fetch-deepresearch.md`）。
 
 > **2026-07-19 终审记录（消费接口实现完成后，独立 reviewer）**——发现 stage_radar 现实现「任一项目 radar 抛错 → **全源** marker 都不 bump」（抛错在 `cand_file.write_text` / bump 循环之前 propagate）。单源时这连贯，多源下变成**跨源耦合**：一个 flaky 的 ashare radar 会拖累 wechat→cc-web-control 重复 radar 已处理的旧文件（token 白烧 + 旧信号污染 candidate 流）。
 >
@@ -89,19 +89,19 @@ sources:
     target_projects: [ashare-llm-analyst]
     marker: state/consumed_quant_research
 
-  - name: wechat-picked                       # ② 指定微信文章
+  - name: wechat-picked                       # ② 指定微信文章（fetcher = pa-fetch-wechat-url agent，web_reader + exa 兜底）
     kind: wechat-url
     root: Knowledge/微信精选
-    fetcher: scripts/fetchers/wechat_url.py
+    content_glob: "**/[0-9]*.md"
     params: { urls: ["https://mp.weixin.qq.com/s/…"] }
     target_projects: [ashare-llm-analyst]
     marker: state/consumed_wechat_picked
 
-  - name: github-watch                        # ④ 指定 github 仓库
+  - name: github-watch                        # ④ 指定 github 仓库（fetcher = pa-fetch-github-repo agent，gh CLI）
     kind: github-repo
     root: Knowledge/gh-watch
-    fetcher: scripts/fetchers/github_repo.py
-    params: { repos: ["akfamily/akshare"], watch: [releases, readme] }
+    content_glob: "**/[0-9]*.md"
+    params: { repos: ["akfamily/akshare"], window: "7d" }
     target_projects: [ashare-llm-analyst]
     marker: state/consumed_github_watch
 ```
@@ -112,9 +112,9 @@ sources:
 |---|---|---|---|
 | `directory` | 无（目录现成） | `YYYYMMDD_*.md` | ✅ 跑通 |
 | `local-file` | 无（用户/脚本直接丢文件到 root） | 同上 | ✅ 等同 directory |
-| `wechat-url` | 解析指定 mp.weixin URL → md，落 root | 同上 | ⏳ fetcher 后续 |
-| `github-repo` | gh API 拉 releases/readme/issues → md，落 root | 同上 | ⏳ fetcher 后续 |
-| `agent-deepresearch` | 调 agent + deep-research skill 搜 → md，落 root | 同上 | ⏳ fetcher 后续 |
+| `wechat-url` | web_reader 抓指定 mp.weixin URL（exa 兜底）→ md，落 root | 同上 | ✅ follow-up ① |
+| `github-repo` | gh CLI 拉 window 内 commits/pulls → md，落 root（github MCP headless 不可用，走 gh CLI） | 同上 | ✅ follow-up ② |
+| `agent-deepresearch` | 调 agent + deep-research skill 搜 → md，落 root | 同上 | ✅ follow-up ③ |
 
 **统一消费契约**：不论 kind，fetcher 保证产出 `YYYYMMDD_*.md` 到 `source.root`，`discover_today_new` 按 `content_glob` 扫——radar 完全 kind 无关。`local-file` 是 `directory` 的特例（无 fetcher、用户直接丢文件），消费侧代码零分支。
 
