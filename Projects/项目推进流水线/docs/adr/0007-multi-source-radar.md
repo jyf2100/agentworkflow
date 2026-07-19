@@ -64,12 +64,21 @@ sources:
     target_projects: [cc-web-control]         # 缺省=不喂（必须显式声明）
     marker: state/consumed_wechat
 
-  - name: drop-zone                           # local-file：用户/脚本直接丢文件
+  # 投递箱：每个 admission 项目一道 per-project lane（默认模型——不只 ashare，
+  # 任何项目都可有自己的手动投递通道；新项目准入时加一道）。一源喂多项目=混喂，禁。
+  - name: drop-zone-cc-web-control            # local-file：用户/脚本直接丢文件
     kind: local-file                          # directory 特例，本次即可用
-    root: Knowledge/投递箱
+    root: Knowledge/投递箱/cc-web-control
     content_glob: "**/[0-9]*.md"
-    target_projects: [ashare-llm-analyst]     # 给 ashare 的手动投递通道
-    marker: state/consumed_dropzone
+    target_projects: [cc-web-control]         # 该道只喂 cc-web-control
+    marker: state/consumed_dropzone_cc_web_control
+
+  - name: drop-zone-ashare-llm-analyst
+    kind: local-file
+    root: Knowledge/投递箱/ashare-llm-analyst
+    content_glob: "**/[0-9]*.md"
+    target_projects: [ashare-llm-analyst]     # 该道只喂 ashare
+    marker: state/consumed_dropzone_ashare_llm_analyst
 
   # 以下三种 fetcher 后续各自做，schema 先就位
   - name: quant-research                      # ① agent + deep-research 搜索
