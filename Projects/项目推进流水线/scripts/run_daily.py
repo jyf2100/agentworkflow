@@ -441,6 +441,57 @@ git diff（{base}..{branch}）：{diff_path}
 只吐那一行 JSON，多一个字都算失败。"""
 
 
+# ─── fetch 段（agent-deepresearch 源：调 pa-fetch-deepresearch 深研 → 落 YYYYMMDD_*.md）────
+FETCH_AGENT = "pa-fetch-deepresearch"
+# exa MCP 工具白名单（ECC plugin 提供；firecrawl 缺席，单 exa 即可——冒烟已证可用）
+FETCH_ALLOWED_TOOLS = ["mcp__plugin_ecc_exa__web_search_exa",
+                       "mcp__plugin_ecc_exa__web_fetch_exa"]
+
+
+def fetch_prompt(src: dict) -> str:
+    prompts = (src.get("params") or {}).get("prompts") or []
+    topic_block = "\n".join(f"- {p}" for p in prompts) if prompts else f"- {src['name']}"
+    return f"""你是 pa-fetch-deepresearch。对以下研究主题做多源深研（exa 搜 → 深读 → 合成带引用 markdown），产出 radar 可消费的信号文件。
+研究主题（采集源 {src['name']}）：
+{topic_block}
+
+严格按 persona 输出契约：只吐一行 JSON，结构 {{"title":"...","markdown":"<完整带引用 md 全文>","sources_count":N,"confidence":"High|Medium|Low"}}。markdown 字段内换行用 \\n 转义。"""
+
+
+def stage_fetch(args, sources, stamp) -> dict:
+    """agent-deepresearch 源 fetcher：调 pa-fetch-deepresearch agent 深研 → 落 YYYYMMDD_<slug>.md 到 source.root。
+
+    其他 kind 跳过（directory/local-file 无 fetcher；wechat-url/github-repo 后续 follow-up ①②）。
+    fetch 不碰 marker（radar 消费后才 bump，ADR-0007 #3）；--dry-run 不影响 fetch（写文件是 fetch 的全部意义）。
+    stamp = 采集日（编排器传入的 YYYYMMDD），满足「文件名 = 采集戳」契约。"""
+    produced = []
+    for src in sources:
+        if src.get("kind") != "agent-deepresearch":
+            continue
+        root = VAULT_ROOT / src["root"]
+        root.mkdir(parents=True, exist_ok=True)
+        payload, meta = run_persona(FETCH_AGENT, fetch_prompt(src), "fetch",
+                                    f"fetch-{src['name']}", allowed_tools=FETCH_ALLOWED_TOOLS)
+        md = (payload.get("markdown") or "").strip()
+        if not md:
+            log(f"[fetch] ⚠ {src['name']} agent 未返回 markdown（跳过落盘）")
+            continue
+        title = payload.get("title") or src["name"]
+        slug = dev_slugify(title) or src["name"]            # 复用 ADR-0006 单一源头
+        out = root / f"{stamp}_{slug}.md"
+        out.write_text(md, encoding="utf-8")
+        produced.append({"source": src["name"],
+                         "path": str(out.relative_to(VAULT_ROOT)),
+                         "sources_count": payload.get("sources_count"),
+                         "cost": meta["cost"], "turns": meta["turns"]})
+        log(f"[fetch] ✅ {src['name']} → {out.relative_to(VAULT_ROOT)}｜"
+            f"sources={payload.get('sources_count')} cost=${meta['cost']:.4f} turns={meta['turns']}")
+    out_json = {"produced": produced, "stamp": stamp}
+    (STATE_DIR / f"fetch_{stamp}.json").write_text(
+        json.dumps(out_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_json
+
+
 # ─── 三段执行 ────────────────────────────────────────────────────────
 def stage_radar(args, sources, profiles, stamp) -> dict:
     cand_file = STATE_DIR / f"candidates_{stamp}.json"
