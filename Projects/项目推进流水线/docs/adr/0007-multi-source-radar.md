@@ -40,7 +40,15 @@
 - **单源硬编码 `sources[0]` 消除**；`stage_radar` 变 source 驱动遍历。
 - **radar 调用 1 → N**，但「订阅到新文件才调」→ 总成本不升反降（现状 ashare 白读 wechat 的开销消失）。
 - **fetcher 契约确立**：所有 kind 产出 `YYYYMMDD_*.md` 到 `source.root`（`discover_today_new` 的 `re.match(r"\d{8}")` 依赖此前缀）。采集层与消费层解耦，后续各自演进。
-- **follow-up 待办**：① `wechat-url` fetcher；② `github-repo` fetcher（gh API 拉 releases/readme/issues）；③ `agent-deepresearch` fetcher（调 agent + deep-research skill）；④ radar 按项目调 N 次的并发与单项目失败隔离测试。
+- **follow-up 待办**：① `wechat-url` fetcher；② `github-repo` fetcher（gh API 拉 releases/readme/issues）；③ `agent-deepresearch` fetcher（调 agent + deep-research skill）。
+
+> **2026-07-19 终审记录（消费接口实现完成后，独立 reviewer）**——发现 stage_radar 现实现「任一项目 radar 抛错 → **全源** marker 都不 bump」（抛错在 `cand_file.write_text` / bump 循环之前 propagate）。单源时这连贯，多源下变成**跨源耦合**：一个 flaky 的 ashare radar 会拖累 wechat→cc-web-control 重复 radar 已处理的旧文件（token 白烧 + 旧信号污染 candidate 流）。
+>
+> **决定：本次不改，接受现状。** 理由：① 现配置每源只喂一个项目（wechat→cc-web-control、drop-zone→ashare），且 drop-zone 暂无文件，耦合近期咬不到；② 失败模型从「全崩 loud」改「部分继续」是行为契约变更（影响 cron 是否因单项目失败而整体报错），应独立决策，不混入消费接口交付。原 follow-up ④ 即此项。
+>
+> 终审另发现 3 项，一并留 follow-up：⑤ `c.setdefault("project", proj)` 应改 **override**（per-project prompt 下编排器才是 project 归属权威，persona 回显的 project 不可信、可能错派到他仓）；⑥ 测试缺**正向 bump happy-path** + **跨源耦合**用例（现 `test_..._bumps_marker_only_after_success` 仅锁既有不变量、对新 bump 门控不判别）；⑦ `--dry-run` 仍写 `candidates_<stamp>.json`（既有、被多源放大 N 倍 persona 调用）——dry-run 后同 stamp 真跑会复用缓存致 radar 静默空转。
+>
+> **follow-up 待办（续）**：④ stage_radar per-source 失败隔离（try/except per-project + 仅 bump「全部订阅项目成功」的源，解跨源耦合）；⑤ `c["project"] = proj` override；⑥ 补正向 bump + 跨源耦合测试；⑦ dry-run 跳写或独立命名 `candidates_<stamp>.dry.json`。
 
 ## 详细设计（供 writing-plans 出实现计划）
 
