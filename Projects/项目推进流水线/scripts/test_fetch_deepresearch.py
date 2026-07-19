@@ -171,20 +171,17 @@ def test_stage_fetch_dispatches_by_kind_via_fetch_config(tmp_path, monkeypatch):
         return ({"items": [{"title": "T1", "markdown": "# T1"}, {"title": "T2", "markdown": "# T2"}]},
                 {"cost": 0.1, "turns": 3, "session_id": "s", "duration_ms": 1, "model": {}})
     monkeypatch.setattr(run_daily, "run_persona", fake_persona)
-    run_daily.FETCH_CONFIG["wechat-url"] = {
+    monkeypatch.setitem(run_daily.FETCH_CONFIG, "wechat-url", {
         "agent": "pa-fetch-wechat-url", "tools": ["mcp__web_reader__webReader"],
-        "prompt": lambda s: "p", "mode": "items"}
-    try:
-        src = {"name": "wx", "kind": "wechat-url", "root": "wx", "marker": "m",
-               "params": {"urls": ["http://x"]}}
-        out = run_daily.stage_fetch(A(), [src], "20260719")
-        assert called["pa-fetch-wechat-url"] == ["mcp__web_reader__webReader"]
-        paths = [p["path"] for p in out["produced"]]
-        assert any("20260719_t1" in p for p in paths)
-        assert any("20260719_t2" in p for p in paths)
-        assert (tmp_path / "wx/20260719_t1.md").read_text(encoding="utf-8") == "# T1"
-    finally:
-        run_daily.FETCH_CONFIG.pop("wechat-url", None)
+        "prompt": lambda s: "p", "mode": "items"})
+    src = {"name": "wx", "kind": "wechat-url", "root": "wx", "marker": "m",
+           "params": {"urls": ["http://x"]}}
+    out = run_daily.stage_fetch(A(), [src], "20260719")
+    assert called["pa-fetch-wechat-url"] == ["mcp__web_reader__webReader"]
+    paths = [p["path"] for p in out["produced"]]
+    assert any("20260719_t1" in p for p in paths)
+    assert any("20260719_t2" in p for p in paths)
+    assert (tmp_path / "wx/20260719_t1.md").read_text(encoding="utf-8") == "# T1"
 
 
 def test_stage_fetch_items_mode_skips_empty_md(tmp_path, monkeypatch):
@@ -193,15 +190,12 @@ def test_stage_fetch_items_mode_skips_empty_md(tmp_path, monkeypatch):
     monkeypatch.setattr(run_daily, "run_persona", lambda *a, **k:
         ({"items": [{"title": "ok", "markdown": "# OK"}, {"title": "blank", "markdown": "   "}]},
          {"cost": 0.1, "turns": 2, "session_id": "s", "duration_ms": 1, "model": {}}))
-    run_daily.FETCH_CONFIG["wechat-url"] = {
-        "agent": "pa-fetch-wechat-url", "tools": [], "prompt": lambda s: "p", "mode": "items"}
-    try:
-        out = run_daily.stage_fetch(A(), [{"name": "wx", "kind": "wechat-url", "root": "wx", "marker": "m"}], "20260719")
-        titles = [p["title"] for p in out["produced"]]
-        assert titles == ["ok"]
-        assert not (tmp_path / "wx/20260719_blank.md").exists()
-    finally:
-        run_daily.FETCH_CONFIG.pop("wechat-url", None)
+    monkeypatch.setitem(run_daily.FETCH_CONFIG, "wechat-url", {
+        "agent": "pa-fetch-wechat-url", "tools": [], "prompt": lambda s: "p", "mode": "items"})
+    out = run_daily.stage_fetch(A(), [{"name": "wx", "kind": "wechat-url", "root": "wx", "marker": "m"}], "20260719")
+    titles = [p["title"] for p in out["produced"]]
+    assert titles == ["ok"]
+    assert not (tmp_path / "wx/20260719_blank.md").exists()
 
 
 def test_stage_fetch_skips_kind_not_in_fetch_config(tmp_path, monkeypatch):
@@ -216,3 +210,25 @@ def test_stage_fetch_skips_kind_not_in_fetch_config(tmp_path, monkeypatch):
         {"name": "?", "kind": "no-such-kind", "root": "x", "marker": "m3"},
     ], "20260719")
     assert called == []
+
+
+def test_wechat_url_prompt_embeds_urls():
+    src = {"name": "wx", "kind": "wechat-url", "params": {"urls": ["https://mp.weixin.qq.com/s/AAA", "https://mp.weixin.qq.com/s/BBB"]}}
+    p = run_daily.wechat_url_prompt(src)
+    assert "https://mp.weixin.qq.com/s/AAA" in p and "https://mp.weixin.qq.com/s/BBB" in p
+    assert "pa-fetch-wechat-url" in p and "items" in p          # 契约点名
+
+
+def test_stage_fetch_wechat_url_writes_one_file_per_url(tmp_path, monkeypatch):
+    """wechat-url 端到端：mock run_persona 吐 items → 每篇一文件，slug 来自 title。"""
+    run_daily.VAULT_ROOT = tmp_path; run_daily.STATE_DIR = tmp_path / "state"; run_daily.STATE_DIR.mkdir()
+    monkeypatch.setattr(run_daily, "run_persona", lambda *a, **k:
+        ({"items": [{"url": "u1", "title": "Wechat Article One", "markdown": "# One\n正文", "fetched_via": "web_reader", "ok": True},
+                    {"url": "u2", "title": "Article Two", "markdown": "# Two", "fetched_via": "exa", "ok": True}]},
+         {"cost": 0.2, "turns": 5, "session_id": "s", "duration_ms": 1, "model": {}}))
+    src = {"name": "wx-picked", "kind": "wechat-url", "root": "微信精选",
+           "params": {"urls": ["u1", "u2"]}, "marker": "m"}
+    out = run_daily.stage_fetch(A(), [src], "20260719")
+    assert len(out["produced"]) == 2
+    assert (tmp_path / "微信精选/20260719_wechat-article-one.md").read_text(encoding="utf-8").startswith("# One")
+    assert (tmp_path / "微信精选/20260719_article-two.md").is_file()
