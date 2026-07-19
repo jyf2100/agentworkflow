@@ -130,7 +130,27 @@ def expand_braces(pattern: str) -> list[str]:
 def load_sources() -> list[dict]:
     with open(SOURCES_FILE, encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    return data["sources"]
+    sources = data["sources"]
+    # 采集源身份（ADR-0007 决定 #4）：name 唯一 + root 排他（一个 root 只属一个源）。
+    # 杜绝双扫 / marker 互相污染 / candidate 重复。重复即拒载（硬错，不静默）。
+    seen_names: set[str] = set()
+    seen_roots: set[str] = set()
+    for src in sources:
+        name = src.get("name")
+        root = src.get("root")
+        if name in seen_names:
+            sys.exit(f"✗ sources.yaml 采集源 name 重复：{name}（name 必须唯一）")
+        seen_names.add(name)
+        if root in seen_roots:
+            sys.exit(f"✗ sources.yaml root 被多源共用：{root}（一个 root 只属一个采集源）")
+        seen_roots.add(root)
+        src.setdefault("kind", "directory")   # 缺省 directory（消费侧零分支，决定 #2）
+        # fetcher 声明了但脚本不存在 → warn 不阻断（消费侧只看目录；未实现 kind 的源今日 0 产出、订阅项目不调 radar）
+        fetcher = src.get("fetcher")
+        if fetcher and not (PROJECT_DIR / fetcher).is_file():
+            log(f"⚠ [sources] {name} 声明 fetcher={fetcher} 但脚本不存在（未实现？）——"
+                f"该源今日无产出、其订阅项目不调 radar（静默，不阻断）")
+    return sources
 
 
 def load_profiles() -> dict:
