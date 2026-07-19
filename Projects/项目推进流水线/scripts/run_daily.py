@@ -495,7 +495,9 @@ FETCH_CONFIG: dict[str, dict] = {
                                      "mcp__plugin_ecc_exa__web_fetch_exa"],
                            "prompt": wechat_url_prompt, "mode": "items"},
     "github-repo":        {"agent": "pa-fetch-github-repo",
-                           "tools": ["Bash(gh api:*)"],
+                           # gh CLI 经 Bash（github MCP headless 不可用）。冒烟：Bash(gh api:*) 限定语法
+                           # 仍触发 permission_denial（带空格前缀 matcher 不稳）；plain Bash 保 cron 鲁棒，persona 硬约束只跑 gh api。
+                           "tools": ["Bash"],
                            "prompt": github_repo_prompt, "mode": "items"},
 }
 

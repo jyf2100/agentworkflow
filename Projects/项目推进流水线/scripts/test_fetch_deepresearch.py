@@ -232,3 +232,34 @@ def test_stage_fetch_wechat_url_writes_one_file_per_url(tmp_path, monkeypatch):
     assert len(out["produced"]) == 2
     assert (tmp_path / "微信精选/20260719_wechat-article-one.md").read_text(encoding="utf-8").startswith("# One")
     assert (tmp_path / "微信精选/20260719_article-two.md").is_file()
+
+
+def test_github_repo_prompt_embeds_repos_and_window():
+    src = {"name": "gh", "kind": "github-repo",
+           "params": {"repos": ["akfamily/akshare", "pallets/flask"], "window": "3d"}}
+    p = run_daily.github_repo_prompt(src)
+    assert "akfamily/akshare" in p and "pallets/flask" in p
+    assert "3d" in p and "gh api" in p and "pa-fetch-github-repo" in p
+
+
+def test_stage_fetch_github_repo_writes_one_file_per_repo(tmp_path, monkeypatch):
+    run_daily.VAULT_ROOT = tmp_path; run_daily.STATE_DIR = tmp_path / "state"; run_daily.STATE_DIR.mkdir()
+    monkeypatch.setattr(run_daily, "run_persona", lambda *a, **k:
+        ({"items": [{"repo": "pallets/flask", "title": "pallets-flask 7d digest",
+                     "markdown": "# flask 近 7 天\n- commit A", "commits_count": 5, "prs_count": 1}]},
+         {"cost": 0.15, "turns": 6, "session_id": "s", "duration_ms": 1, "model": {}}))
+    src = {"name": "gh-watch", "kind": "github-repo", "root": "gh-watch",
+           "params": {"repos": ["pallets/flask"], "window": "7d"}, "marker": "m"}
+    out = run_daily.stage_fetch(A(), [src], "20260719")
+    assert len(out["produced"]) == 1
+    f = tmp_path / "gh-watch/20260719_pallets-flask-7d-digest.md"
+    assert f.is_file() and "commit A" in f.read_text(encoding="utf-8")
+
+
+def test_fetch_config_github_repo_uses_bash_not_github_mcp():
+    """② 走 gh CLI 经 Bash（非 mcp__plugin_ecc_github__*——headless 不可用）。
+    冒烟：Bash(gh api:*) 限定语法仍触发 denial → plain Bash 保 cron 鲁棒（persona 硬约束只跑 gh api）。"""
+    cfg = run_daily.FETCH_CONFIG["github-repo"]
+    assert cfg["agent"] == "pa-fetch-github-repo"
+    assert cfg["tools"] == ["Bash"]            # 非 mcp__plugin_ecc_github__*；plain Bash（scoped 冒烟有 denial）
+    assert cfg["mode"] == "items"
