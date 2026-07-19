@@ -102,3 +102,57 @@ def test_stages_has_fetch_at_zero():
 def test_fetch_timeout_and_maxturns_defined():
     assert "fetch" in run_daily.TIMEOUT and run_daily.TIMEOUT["fetch"] > run_daily.TIMEOUT["radar"]
     assert "fetch" in run_daily.MAX_TURNS and run_daily.MAX_TURNS["fetch"] >= 20
+
+
+def test_stage_fetch_reuse_gate_short_circuits(tmp_path, monkeypatch):
+    """fetch_{stamp}.json 已存在且非 --force → 复用，不调 agent（成本护栏，镜像 radar:497-500）。"""
+    run_daily.VAULT_ROOT = tmp_path; run_daily.STATE_DIR = tmp_path / "state"; run_daily.STATE_DIR.mkdir()
+    pre = {"produced": [{"source": "quant-research", "path": "深研/quant/20260719_x.md",
+                         "sources_count": 9, "cost": 0.5, "turns": 7}], "stamp": "20260719"}
+    (run_daily.STATE_DIR / "fetch_20260719.json").write_text(
+        json.dumps(pre, ensure_ascii=False), encoding="utf-8")
+    called = []
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda *a, **k: called.append(a) or ({"markdown": "x"}, {"cost": 0, "turns": 1}))
+    class A:
+        dry_run = False
+    out = run_daily.stage_fetch(A(), [{"name": "q", "kind": "agent-deepresearch",
+                                       "root": "q", "marker": "m"}], "20260719")
+    assert called == []          # 没调 agent（不重花 ~$0.9/次）
+    assert out == pre            # 返回已有产物
+
+
+def test_stage_fetch_force_bypasses_reuse_gate(tmp_path, monkeypatch):
+    """--force → 即使 fetch_{stamp}.json 存在也重跑（镜像 radar，锁 force-bypass 契约）。"""
+    run_daily.VAULT_ROOT = tmp_path; run_daily.STATE_DIR = tmp_path / "state"; run_daily.STATE_DIR.mkdir()
+    (run_daily.STATE_DIR / "fetch_20260719.json").write_text(
+        '{"produced": [], "stamp": "20260719"}', encoding="utf-8")
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda *a, **k: ({"title": "T", "markdown": "# T", "sources_count": 1},
+                                         {"cost": 0, "turns": 1, "session_id": "s",
+                                          "duration_ms": 1, "model": {}}))
+    class A:
+        dry_run = False; force = True
+    out = run_daily.stage_fetch(A(), [{"name": "q", "kind": "agent-deepresearch",
+                                       "root": "q", "params": {"prompts": ["x"]}, "marker": "m"}], "20260719")
+    assert out["produced"] and out["produced"][0]["source"] == "q"   # 重跑了
+
+
+def test_stage_fetch_per_source_isolation(tmp_path, monkeypatch):
+    """一个 agent-deepresearch 源 run_persona 抛错 → 跳过它，不拖垮其他源，fetch_{stamp}.json 照写。"""
+    run_daily.VAULT_ROOT = tmp_path; run_daily.STATE_DIR = tmp_path / "state"; run_daily.STATE_DIR.mkdir()
+    srcs = [{"name": "bad", "kind": "agent-deepresearch", "root": "bad", "marker": "m1"},
+            {"name": "good", "kind": "agent-deepresearch", "root": "good",
+             "params": {"prompts": ["x"]}, "marker": "m2"}]
+
+    def fake_persona(name, prompt, stage, label, allowed_tools=None):
+        if label == "fetch-bad":
+            raise RuntimeError("exa outage")
+        return ({"title": "Good", "markdown": "# Good", "sources_count": 2},
+                {"cost": 0.1, "turns": 3, "session_id": "s", "duration_ms": 1, "model": {}})
+    monkeypatch.setattr(run_daily, "run_persona", fake_persona)
+    class A:
+        dry_run = False
+    out = run_daily.stage_fetch(A(), srcs, "20260719")
+    assert [p["source"] for p in out["produced"]] == ["good"]   # bad 被隔离，good 正常
+    assert (tmp_path / "good/20260719_good.md").is_file()

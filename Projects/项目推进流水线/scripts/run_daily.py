@@ -463,32 +463,41 @@ def stage_fetch(args, sources, stamp) -> dict:
 
     其他 kind 跳过（directory/local-file 无 fetcher；wechat-url/github-repo 后续 follow-up ①②）。
     fetch 不碰 marker（radar 消费后才 bump，ADR-0007 #3）；--dry-run 不影响 fetch（写文件是 fetch 的全部意义）。
-    stamp = 采集日（编排器传入的 YYYYMMDD），满足「文件名 = 采集戳」契约。"""
+    stamp = 采集日（编排器传入的 YYYYMMDD），满足「文件名 = 采集戳」契约。
+    复用门：fetch_{stamp}.json 已存在且非 --force → 复用（成本护栏，镜像 stage_radar:497-500，防重跑重花 ~$0.9/次）。
+    per-source try/except：一个源炸（exa 断/JSON 烂）只跳过它，不拖垮整段 fetch（fault isolation）。"""
+    fetch_file = STATE_DIR / f"fetch_{stamp}.json"
+    if fetch_file.is_file() and not getattr(args, "force", False):
+        log(f"[fetch] 复用已有 {fetch_file.name}（--force 重跑）")
+        return json.loads(fetch_file.read_text(encoding="utf-8"))
     produced = []
     for src in sources:
         if src.get("kind") != "agent-deepresearch":
             continue
-        root = VAULT_ROOT / src["root"]
-        root.mkdir(parents=True, exist_ok=True)
-        payload, meta = run_persona(FETCH_AGENT, fetch_prompt(src), "fetch",
-                                    f"fetch-{src['name']}", allowed_tools=FETCH_ALLOWED_TOOLS)
-        md = (payload.get("markdown") or "").strip()
-        if not md:
-            log(f"[fetch] ⚠ {src['name']} agent 未返回 markdown（跳过落盘）")
+        try:
+            root = VAULT_ROOT / src["root"]
+            root.mkdir(parents=True, exist_ok=True)
+            payload, meta = run_persona(FETCH_AGENT, fetch_prompt(src), "fetch",
+                                        f"fetch-{src['name']}", allowed_tools=FETCH_ALLOWED_TOOLS)
+            md = (payload.get("markdown") or "").strip()
+            if not md:
+                log(f"[fetch] ⚠ {src['name']} agent 未返回 markdown（跳过落盘）")
+                continue
+            title = payload.get("title") or src["name"]
+            slug = dev_slugify(title) or src["name"]            # 复用 ADR-0006 单一源头
+            out = root / f"{stamp}_{slug}.md"
+            out.write_text(md, encoding="utf-8")
+            produced.append({"source": src["name"],
+                             "path": str(out.relative_to(VAULT_ROOT)),
+                             "sources_count": payload.get("sources_count"),
+                             "cost": meta["cost"], "turns": meta["turns"]})
+            log(f"[fetch] ✅ {src['name']} → {out.relative_to(VAULT_ROOT)}｜"
+                f"sources={payload.get('sources_count')} cost=${meta['cost']:.4f} turns={meta['turns']}")
+        except Exception as e:
+            log(f"[fetch] ✗ {src['name']} 失败（跳过，不拖垮其他源）：{e}")
             continue
-        title = payload.get("title") or src["name"]
-        slug = dev_slugify(title) or src["name"]            # 复用 ADR-0006 单一源头
-        out = root / f"{stamp}_{slug}.md"
-        out.write_text(md, encoding="utf-8")
-        produced.append({"source": src["name"],
-                         "path": str(out.relative_to(VAULT_ROOT)),
-                         "sources_count": payload.get("sources_count"),
-                         "cost": meta["cost"], "turns": meta["turns"]})
-        log(f"[fetch] ✅ {src['name']} → {out.relative_to(VAULT_ROOT)}｜"
-            f"sources={payload.get('sources_count')} cost=${meta['cost']:.4f} turns={meta['turns']}")
     out_json = {"produced": produced, "stamp": stamp}
-    (STATE_DIR / f"fetch_{stamp}.json").write_text(
-        json.dumps(out_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    fetch_file.write_text(json.dumps(out_json, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_json
 
 
