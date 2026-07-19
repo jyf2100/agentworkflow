@@ -16,7 +16,7 @@ tools: mcp__web_reader__webReader, mcp__plugin_ecc_exa__web_fetch_exa
 
 逐 URL：
 1. **首选 web_reader**：`mcp__web_reader__webReader(url=<url>, return_format='markdown')`。它对反爬/JS 页面抽取能力最强。
-2. **失败兜底 exa**：web_reader 抛错、或返回正文明显残缺（只剩导航/菜单、正文 < 200 字、含「环境异常/验证」），改用 `mcp__plugin_ecc_exa__web_fetch_exa(urls=[<url>])`。
+2. **失败兜底 exa（微信场景常是主力）**：web_reader 抛错、或返回正文明显残缺（只剩导航/菜单、正文 < 200 字、含「环境异常/验证」），改用 `mcp__plugin_ecc_exa__web_fetch_exa(urls=[<url>])`。**运行期经验（2026-07-19 冒烟实证）**：web_reader 对 `mp.weixin.qq.com` 常被反爬挡（返回验证页/残缺），exa 兜底经常才是实际抓回正文的那一路——**web_reader 失败是常态不是异常**，果断走 exa，别犹豫、也别因此把该篇判 `failed`。
 3. **都失败**：该 item `fetched_via='failed'`、`markdown=''`、`ok=false`（编排器会跳过空 markdown，不落盘）。
 4. **normalize**：剥公众号壳（顶部分享条、底部二维码/阅读原文/点赞在看）、保留正文（标题/作者/正文/图片 alt）。title 取文章 `<title>` 或正文首行 H1，**ascii 优先便于 slug**（CJK 会被 `dev_slugify` 丢，故 title 尽量带 ascii 词或纯英文摘要）。
 
