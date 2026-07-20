@@ -1435,7 +1435,7 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
     target_repos = sorted({d.get("project", "?") for d in disp})
 
     def repo_of(d: dict) -> str:
-        url = d.get("pr_url", "")
+        url = d.get("pr_url") or ""   # pr_url 可能显式为 None（skip/planned 项无 PR）→ coerce 防 re.search TypeError
         m = re.search(r"github\.com/([^/]+/[^/]+)/pull/", url)
         if m:                                   # pr_url 有则取 GitHub owner/name（最可读）
             return m.group(1)
@@ -1445,7 +1445,7 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
         return d.get("project", "?")
 
     def pr_no(d: dict) -> str:
-        return d.get("pr_url", "").rstrip("/").split("/")[-1] or "PR"
+        return (d.get("pr_url") or "").rstrip("/").split("/")[-1] or "PR"
 
     L: list[str] = [f"# 项目推进报告 {date_disp}", "",
                     "## 概览",
@@ -1464,7 +1464,7 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
         L += ["| 目标仓 | PR | 分支 | PRD |", "|---|---|---|---|"]
         for d in review:
             mark = " ⏸中断PR" if d.get("status") == "interrupted_pr" else ""
-            L.append(f"| {repo_of(d)} | [{pr_no(d)}]({d.get('pr_url', '')}){mark} | "
+            L.append(f"| {repo_of(d)} | [{pr_no(d)}]({d.get('pr_url') or ''}){mark} | "
                      f"`{d.get('branch', '')}` | {d.get('slug', '')} |")
     else:
         L.append("（无）")
@@ -1477,7 +1477,7 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
         L += ["| 目标仓 | PR | 失败测试 | 说明 |", "|---|---|---|---|"]
         for d in failing:
             v = d.get("verify") or {}
-            L.append(f"| {repo_of(d)} | [{pr_no(d)}]({d.get('pr_url', '')}) | "
+            L.append(f"| {repo_of(d)} | [{pr_no(d)}]({d.get('pr_url') or ''}) | "
                      f"`{v.get('test_cmd', '')}` | {v.get('note', '')} |")
     else:
         L.append("（无）")
@@ -1526,7 +1526,7 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
                 mark = "⏸" if d.get("status") == "interrupted_pr" else ""
                 log_link = f"`.project-auto/state/runs/{proj}/{stamp}_{d.get('slug', '')}.log`"
                 tail = f"  （skip：{d.get('skip_reason')}）" if d.get("skip_reason") else ""
-                L.append(f"- `{d.get('slug', '')}` — [{tag}]{mark} {d.get('pr_url', '')} ｜"
+                L.append(f"- `{d.get('slug', '')}` — [{tag}]{mark} {d.get('pr_url') or ''} ｜"
                          f" run log {log_link}{tail}")
             L.append("")
     else:
