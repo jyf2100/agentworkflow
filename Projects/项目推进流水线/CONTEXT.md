@@ -29,8 +29,14 @@ _Avoid_: pipeline-home、orchestrator-state。
 _Avoid_: target-repo（用「目标面」强调与控制面的隔离）。
 
 **开发 agent (dev)**:
-每个白名单目标仓**自带**的开发 agent = 仓内的 **SDK 脚本**（`<目标仓>/scripts/dev-agent.*` + 仓自己的 CLAUDE.md），归属目标面、随仓走。用 `claude-agent-sdk` 的 `query()` 接收 dispatch 投递的 PRD + [[信息源]]，**自治跑完整 dev loop**（需求分析 → 设计 → 开发 → review → 回归 → 自己开 PR）。文件范围/设计/质量/测试/review 流程 + budget/turns/model 全归仓自管（[[项目自治]]），pipeline 不规定。见 ADR-0003。
-_Avoid_: pa-dev（暗示 vault 侧 persona，已弃用）、markdown dev persona（已弃，换 SDK 脚本）。
+**控制面标准执行器**：单一 `vault/Projects/项目推进流水线/scripts/dev-agent.py`（Python + `claude-agent-sdk` `query()`）服务**所有**被控仓——源码归控制面、随 vault 走（ADR-0006 上收；修订 ADR-0003 #1/#2 的「仓自带脚本」）。被控仓**零 dev-agent 脚本**（灰度后删 `<仓>/scripts/dev-agent.{py,mjs}`）；仓特定知识（目录/测试入口/受保护路径/环境名）由各仓根 CLAUDE.md 承载（SDK `setting_sources=["project"]` 加载）。运行时仍贴目标仓：dispatch 以 `cwd=<目标仓> worktree` 调起，执行器就地操作该仓、自治跑完整 dev loop（需求→设计→开发→review→回归→自己开 PR）——**源码在 vault、执行贴目标仓**，运行时平面隔离与 ADR-0001 一致。见 ADR-0006（+ 落地状态）、ADR-0003。
+_Avoid_: pa-dev（暗示 vault 侧 persona，已弃用）、markdown dev persona（已弃）、`<仓>/scripts/dev-agent.*`（仓内遗留脚本，灰度后删；`dev_agent_source` profile 字段容忍但已忽略——选源逻辑随全量切 vault 移除）。
+
+**fail-safe 投递 (fail-safe-dispatch)**:
+dispatch 准入与对账对 GitHub/Git 远程态的查询一律三态——`FOUND`（确定存在）/ `NOT_FOUND`（确定不存在）/ `UNKNOWN`（查询本身失败：超时/非零/缺凭证/坏 JSON）。**UNKNOWN 是 fail-safe 信号**：准入见之即记 `blocked_external_state` 不起 dev loop（不超额、不重复投递）；对账见之即保留分支、不创建/删除/覆盖 PR。诊断上下文经 `external_state.sanitize()` 脱敏（抹 PAT/Bearer/basic-auth）后落 state 记录与报告。模块 `scripts/external_state.py`（零依赖，cron 安全）。
+
+**测试发布门 (verified-dev-execution)**:
+dev-agent 的发布硬门——`commit`/`push`/`gh pr create` 之前，须有**新鲜绿色结构化测试证据**（`evidence.TestEvidence` + `evaluate_gate()`，无新鲜绿证据 → 不发布）。门拦即 `exit 14` 吐 `blocked_by_gate` JSON：`gate_status ∈ {test_not_run, test_failed, test_stale}`。dispatch 见之即记 `blocked_test_gate` 终态短路（不验证、不开 PR，分支保留待运维 triage）。模块 `scripts/evidence.py`（零依赖）。独立验证（dispatch 侧 `npm test`/`pytest` 比对）继续兜底抓「自报绿、实测红」。
 
 **项目自治 (Project Autonomy)**:
 pipeline 对项目的唯一契约 = 投递 [[PRD]] + [[信息源]]；之后项目用自己的 [[开发 agent]] 跑完整闭环、自管 scope 与质量。pipeline 只保留投递层机械刹车（branch-only / 永不 merge / max PRs / wall-clock / 不污染 / 独立验证闸），不画 boundaries、不规定开发流程。见 ADR-0002。

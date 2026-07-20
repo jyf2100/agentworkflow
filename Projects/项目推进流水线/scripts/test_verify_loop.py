@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 import run_daily  # noqa: E402
+from external_state import ExtState, found, not_found, unknown  # noqa: E402
 
 PROJ = "cc-web-control"
 
@@ -36,15 +37,16 @@ def _setup(tmp_path, monkeypatch):
 
 def _admit(monkeypatch):
     """让 dispatch 准入 1-4 全过（mock 掉运行时实查 + 远程查询）。"""
-    monkeypatch.setattr(run_daily, "check_branch_protection", lambda *a, **k: (True, "ok"))
-    monkeypatch.setattr(run_daily, "count_inflight_prs", lambda *a, **k: 0)
-    monkeypatch.setattr(run_daily, "already_dispatched", lambda *a, **k: (False, ""))
+    monkeypatch.setattr(run_daily, "check_branch_protection", lambda *a, **k: found(True, "ok"))
+    monkeypatch.setattr(run_daily, "count_inflight_prs", lambda *a, **k: found(0))
+    monkeypatch.setattr(run_daily, "already_dispatched", lambda *a, **k: not_found())
     monkeypatch.setattr(run_daily, "repo_owner_repo", lambda *a, **k: "o/r")
     monkeypatch.setattr(run_daily, "_run_capture", lambda *a, **k: (0, "", ""))   # worktree add
 
 
 def _repo(tmp_path) -> Path:
-    """造一个仓骨架（含 scripts/dev-agent.py，让 _dev_cmd 选 Python 运行时）。"""
+    """造一个仓骨架。仓内 legacy scripts/dev-agent.py 现已被忽略（ADR-0006 控制面执行器唯一源），
+    保留仅为兼容现役 dispatch 断言，不影响选源。"""
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "scripts" / "dev-agent.py").write_text("# stub", encoding="utf-8")
@@ -122,51 +124,52 @@ class _Proc:
         self.returncode = 0
 
 
-def test_has_commits_true_false(monkeypatch):
+def test_has_commits_found_true_false(monkeypatch):
     monkeypatch.setattr(run_daily.subprocess, "run", lambda *a, **k: _Proc("abc\n"))
-    assert run_daily._has_commits("r", "b", "br") is True
+    r = run_daily._has_commits("r", "b", "br")
+    assert r.state is ExtState.FOUND and r.value is True
     monkeypatch.setattr(run_daily.subprocess, "run", lambda *a, **k: _Proc(""))
-    assert run_daily._has_commits("r", "b", "br") is False
+    r = run_daily._has_commits("r", "b", "br")
+    assert r.state is ExtState.FOUND and r.value is False
 
 
-def test_has_commits_tolerates_error(monkeypatch):
+def test_has_commits_unknown_on_error(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("x")
     monkeypatch.setattr(run_daily.subprocess, "run", boom)
-    assert run_daily._has_commits("r", "b", "br") is False   # 失败容忍→False
+    r = run_daily._has_commits("r", "b", "br")
+    assert r.state is ExtState.UNKNOWN    # fail-safe：失败→UNKNOWN（旧版容忍→False）
 
 
-# ─── _dev_cmd ───────────────────────────────────────────────────────
-def test_dev_cmd_prefers_python_and_appends_source(tmp_path):
-    repo = tmp_path / "repo"
-    (repo / "scripts").mkdir(parents=True)
-    py = repo / "scripts" / "dev-agent.py"
-    py.write_text("#", encoding="utf-8")
-    mjs = repo / "scripts" / "dev-agent.mjs"
-    mjs.write_text("#", encoding="utf-8")
-    cmd = run_daily._dev_cmd({"conda_env": ""}, py, mjs, "PRD", "main", "")
+# ─── _dev_cmd（控制面执行器唯一源，ADR-0006）────────────────────────
+def test_dev_cmd_builds_vault_cmd_and_appends_source():
+    """始终构造控制面 dev-agent.py 命令；空 source 不追加 --source，传则追加。"""
+    cmd = run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "")
+    assert cmd is not None
+    assert str(run_daily.DEV_AGENT_PY) in cmd
     assert "--base" in cmd and cmd[cmd.index("--base") + 1] == "main"
     assert "--source" not in cmd                # 空 source 不追加
-    cmd2 = run_daily._dev_cmd({"conda_env": ""}, py, mjs, "PRD", "main", "SRC")
+    cmd2 = run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "SRC")
     assert cmd2[cmd2.index("--source") + 1] == "SRC"
 
 
-def test_dev_cmd_node_fallback(tmp_path):
+def test_dev_cmd_ignores_target_repo_language(tmp_path):
+    """目标仓是 Node 仓（package.json + legacy mjs）→ 执行器仍是控制面 Python，不走 node 兜底。
+
+    目标仓语言不决定执行器语言（ADR-0006 控制面单一源）。"""
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
-    mjs = repo / "scripts" / "dev-agent.mjs"
-    mjs.write_text("#", encoding="utf-8")
-    py = repo / "scripts" / "dev-agent.py"      # 不存在
-    cmd = run_daily._dev_cmd({"conda_env": ""}, py, mjs, "PRD", "main", "")
-    assert cmd[0] == "node"
+    (repo / "package.json").write_text("{}", encoding="utf-8")
+    (repo / "scripts" / "dev-agent.mjs").write_text("# legacy", encoding="utf-8")
+    cmd = run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "")
+    assert cmd is not None and cmd[0] != "node"          # 不走 node
+    assert str(run_daily.DEV_AGENT_PY) in cmd
 
 
-def test_dev_cmd_none_when_no_runtime(tmp_path):
-    repo = tmp_path / "repo"
-    (repo / "scripts").mkdir(parents=True)
-    py = repo / "scripts" / "dev-agent.py"      # 均不存在
-    mjs = repo / "scripts" / "dev-agent.mjs"
-    assert run_daily._dev_cmd({"conda_env": ""}, py, mjs, "PRD", "main", "") is None
+def test_dev_cmd_none_when_vault_executor_missing(tmp_path, monkeypatch):
+    """控制面 dev-agent.py 缺失 → None（dispatch 判 fail：控制面安装异常）。"""
+    monkeypatch.setattr(run_daily, "DEV_AGENT_PY", tmp_path / "nonexistent.py")
+    assert run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "") is None
 
 
 # ─── _run_dev_agent ─────────────────────────────────────────────────
@@ -225,6 +228,52 @@ def test_reconcile_interrupted_flag(monkeypatch):
     assert any("⏸ pa-dev 中断" in " ".join(c) for c in created)       # 中断标题
 
 
+# ─── reconcile_pr fail-safe：UNKNOWN 保留分支不补开/删除（6.4 rollback compat）───
+def test_reconcile_preserves_on_pr_lookup_unknown(monkeypatch):
+    # Arrange：_lookup_pr UNKNOWN（如 gh 超时）→ 须保留分支、零破坏性远程写
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd)); return _Proc("")
+    monkeypatch.setattr(run_daily.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_daily, "_lookup_pr", lambda *a, **k: unknown("gh timeout"))
+    rec = {"branch": "auto/x", "prd_path": "p", "dev_killed": False, "stalled": False}
+
+    # Act
+    run_daily.reconcile_pr("repo", "o/r", rec, "main", "slug", interrupted=True)
+    # Assert：blocked_external_state / pr_lookup；分支保留；无 pr create / branch -D / push --delete
+    assert rec["status"] == "blocked_external_state"
+    assert rec["blocked_check"] == "pr_lookup"
+    assert rec["branch"] == "auto/x"
+    joined = [" ".join(c) for c in cmds]
+    assert not any("pr create" in x for x in joined)
+    assert not any("branch -D" in x for x in joined)
+    assert not any("push origin --delete" in x for x in joined)
+
+
+def test_reconcile_preserves_on_commit_lookup_unknown(monkeypatch):
+    # Arrange：_lookup_pr NOT_FOUND（明确无 PR）但 _has_commits UNKNOWN → 仍保留分支不删
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd)); return _Proc("")
+    monkeypatch.setattr(run_daily.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_daily, "_lookup_pr", lambda *a, **k: not_found())
+    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: unknown("git ls-remote fail"))
+    rec = {"branch": "auto/y", "prd_path": "p", "dev_killed": False, "stalled": False}
+
+    # Act
+    run_daily.reconcile_pr("repo", "o/r", rec, "main", "slug", interrupted=False)
+    # Assert：blocked_external_state / commit_lookup；分支保留；零破坏性远程写
+    assert rec["status"] == "blocked_external_state"
+    assert rec["blocked_check"] == "commit_lookup"
+    assert rec["branch"] == "auto/y"
+    joined = [" ".join(c) for c in cmds]
+    assert not any("pr create" in x for x in joined)
+    assert not any("branch -D" in x for x in joined)
+    assert not any("push origin --delete" in x for x in joined)
+
+
 # ─── dispatch_one 闭环循环（mock 驱动）──────────────────────────────
 def test_dispatch_green_round1(tmp_path, monkeypatch):
     # Arrange：dev r1 出分支+测试绿+pa-verify 判绿
@@ -233,7 +282,7 @@ def test_dispatch_green_round1(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
     monkeypatch.setattr(run_daily, "_run_dev_agent",
                         lambda *a, **k: {"branch": "auto/r1", "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
-    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: True)
+    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
     monkeypatch.setattr(run_daily, "independent_verify",
                         lambda *a, **k: {"pass": True, "test_rc": 0, "test_log": "L"})
     monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
@@ -259,7 +308,7 @@ def test_dispatch_red_then_green(tmp_path, monkeypatch):
     branches = iter(["auto/r1", "auto/r2"])
     monkeypatch.setattr(run_daily, "_run_dev_agent",
                         lambda *a, **k: {"branch": next(branches), "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
-    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: True)
+    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
     monkeypatch.setattr(run_daily, "independent_verify",
                         lambda *a, **k: {"pass": False, "test_rc": 1, "test_log": "L"})
     monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
@@ -272,7 +321,7 @@ def test_dispatch_red_then_green(tmp_path, monkeypatch):
     bases: list[str] = []
     real = run_daily._dev_cmd
     monkeypatch.setattr(run_daily, "_dev_cmd",
-                        lambda prof, py, mjs, prd, base, src: (bases.append(base), real(prof, py, mjs, prd, base, src))[1])
+                        lambda prof, prd, base, src: (bases.append(base), real(prof, prd, base, src))[1])
 
     # Act
     rec = run_daily.dispatch_one(_entry(), _prof(repo), "20260718", _args())
@@ -292,7 +341,7 @@ def test_dispatch_red_used_up(tmp_path, monkeypatch):
     branches = iter(["auto/r1", "auto/r2"])
     monkeypatch.setattr(run_daily, "_run_dev_agent",
                         lambda *a, **k: {"branch": next(branches), "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
-    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: True)
+    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
     monkeypatch.setattr(run_daily, "independent_verify",
                         lambda *a, **k: {"pass": False, "test_rc": 1, "test_log": "L"})
     monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
@@ -328,3 +377,34 @@ def test_dispatch_no_branch_stall(tmp_path, monkeypatch):
     assert rec["verify_round"] is None and rec["verify_verdict"] is None
     assert pv_calls == []                       # 从未调 pa-verify
     assert rec["status"] == "fail"
+
+
+def test_dispatch_blocked_test_gate(tmp_path, monkeypatch):
+    # Arrange：dev r1 跑完 dev loop 但测试发布门拦截（exit 14 JSON）→ 终态短路，不进 verify/reconcile、不开 PR
+    _setup(tmp_path, monkeypatch)
+    _admit(monkeypatch)
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(run_daily, "_run_dev_agent",
+                        lambda *a, **k: {"ok": False, "blocked_by_gate": True, "gate_status": "test_failed",
+                                         "gate_reason": "evidence not fresh", "branch": "auto/r1",
+                                         "test_status": "red", "evidence_fresh": False,
+                                         "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
+    pv_calls: list[str] = []
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda *a, **k: (pv_calls.append("hit"), {"verdict": "pass"})[1])
+    recon_calls, fake_rec = _recon_recorder()
+    monkeypatch.setattr(run_daily, "reconcile_pr", fake_rec)
+
+    # Act
+    rec = run_daily.dispatch_one(_entry(), _prof(repo), "20260718", _args())
+    # Assert：终态 blocked_test_gate；带门诊断字段；dev_killed=False；未触 pa-verify/reconcile；未进 r2
+    assert rec["status"] == "blocked_test_gate"
+    assert rec["gate_status"] == "test_failed"
+    assert rec["gate_reason"] == "evidence not fresh"
+    assert rec["test_status"] == "red" and rec["evidence_fresh"] is False
+    assert rec["branch"] == "auto/r1"          # 分支已建（门在 commit 前），保留待 triage
+    assert rec["dev_killed"] is False
+    assert rec["verify_round"] is None and rec["verify_verdict"] is None
+    assert pv_calls == []                       # 从未调 pa-verify（门拦截先于 verify）
+    assert recon_calls == []                    # 从未对账（不补开 PR、不删分支）
+    assert "test_failed" in rec["skip_reason"]

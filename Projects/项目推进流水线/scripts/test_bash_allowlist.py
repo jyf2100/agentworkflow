@@ -127,3 +127,47 @@ def test_first_command_token_strips_leading_noise():
     assert bash_allowlist.first_command_token("FOO=1 BAR=2 pytest") == "pytest"
     assert bash_allowlist.first_command_token("cd x && y=z /a/b/python3 -m pytest") == "python3"
     assert bash_allowlist.first_command_token("") == ""
+
+
+# ─── 拒绝：git 远程破坏 / rm 逃逸（2026-07-20 code-review 廉价加固）────────
+def test_denies_git_push_delete():
+    # dev 守则禁删远程分支；reconcile 的 push --delete 走 run_daily 直 subprocess、不经本闸
+    assert bash_allowlist.decide_bash("git push origin --delete main")[0] is False
+    assert bash_allowlist.decide_bash("git push --delete origin feature")[0] is False
+
+
+def test_denies_git_clone():
+    # 网络克隆（dev 在预建 worktree 内干活，无需 clone）
+    assert bash_allowlist.decide_bash("git clone https://github.com/x/y")[0] is False
+
+
+def test_denies_git_remote_reconfig():
+    # 改 remote 配置（add/set-url/remove/rename）
+    assert bash_allowlist.decide_bash("git remote add upstream https://github.com/x/y")[0] is False
+    assert bash_allowlist.decide_bash("git remote set-url origin git@x:y")[0] is False
+
+
+def test_denies_rm_parent_escape():
+    # rm .. 逃出 worktree
+    assert bash_allowlist.decide_bash("rm -rf ..")[0] is False
+    assert bash_allowlist.decide_bash("rm -rf ../..")[0] is False
+    assert bash_allowlist.decide_bash("rm -rf ../sibling")[0] is False
+
+
+def test_denies_rm_home_var():
+    # $HOME / ${HOME} 家目录变量逃逸
+    assert bash_allowlist.decide_bash("rm -rf $HOME")[0] is False
+    assert bash_allowlist.decide_bash("rm -rf ${HOME}/.ssh")[0] is False
+
+
+def test_allows_normal_git_push_no_delete():
+    # 普通 push（无 --delete）不误伤
+    assert bash_allowlist.decide_bash("git push -u origin feature")[0] is True
+    assert bash_allowlist.decide_bash("git remote -v")[0] is True   # 只读 remote 查询不误伤
+
+
+def test_allows_inrepo_rm_does_not_false_positive():
+    # 仓内 rm build/ / rm ./dist / rm foo.bar 不误伤（.. 与 $VAR 形态才拦）
+    assert bash_allowlist.decide_bash("rm -rf build/")[0] is True
+    assert bash_allowlist.decide_bash("rm -rf ./dist")[0] is True
+    assert bash_allowlist.decide_bash("rm foo.bar")[0] is True

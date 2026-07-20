@@ -18,9 +18,11 @@
    > **落地修正（2026-07-18）**：原字面 `from scripts.dev_agent import dev_slugify` 不可行——① dev-agent.py 是连字符文件名（Python 标识符不允许 `-`）；② `scripts/` 无 `__init__.py` 非 package；③ **致命**：dev-agent.py 顶层 `from claude_agent_sdk import (...)` 会被 run_daily.py 顶部 import 连带加载，而 run_cron.sh 用裸 `/usr/bin/python3`（无 sdk）跑 run_daily.py 顶层 → 每晚 cron 崩。故抽 `slug_utils.py`（仅依赖 `re`）作单一源头，精神不变（单一源头 + 消 shadow）。
 
 6. **跨仓常量单一源头**：`N_STALL`/`MAX_BUDGET`/`WRITE_TOOLS` 只在 dev-agent.py 一处，消除多仓漂移（2026-07-18 实证：cc-web-control N_STALL=100、ashare=3，同一天人为制造的不一致）。
+   > **降级兜底 caveat（2026-07-20，canary 实证）**：`MAX_BUDGET`/`max_turns` 是**降级兜底**而非硬保证——canary 实跑 325 turn（远超 `max_turns=150`）、`total_cost_usd=None`（`max_budget_usd` 未触发），实际仅 SPEC #27 stall 刹车（连续 N 轮无写进展）兜住失控预算。根因疑 SDK 0.2.121 的 cost/turn 上报未生效；budget/turn 硬执行 + cost 上报机制排查列为 follow-up（stall 刹车作为有效 guard 保留）。
 
 7. **工具白名单用 SDK `tools=`（硬限制），非 `allowed_tools`**：Python SDK 的 `allowed_tools` 仅是权限批准列表、非可用性白名单（SDK 文档实证）；历史 dev-agent 误用 `allowed_tools` 当白名单是 headless 安全缺口。上收顺手修。
    > **落地修正（2026-07-18）**：`tools=` 只限制工具**可用性**，但 `permission_mode="acceptEdits"` 下 Bash 仍需 approval、headless 无人批 → 测试跑不动。历史靠各仓 gitignored 的 `.claude/settings.local.json` 放行，worktree（尤其 `/tmp` 或跨机新克隆）摸不到 → `test_passed=false`（2026-07-18 dry-run 实证）。长效修法 = `ClaudeAgentOptions(can_use_tool=_can_use_tool)` 回调 + 无依赖模块 `scripts/bash_allowlist.py`（`decide_bash` 默认拒、放行测试/构建/VCS/只读族/仓内脚本、显式拒网络外传与破坏性操作；如实声明 prefix 匹配非硬沙箱，抗误操/注入但不抗定向逃逸），**把放行规则收敛进控制面单一源头、摆脱机器本地 settings 依赖**。验证：SDK `_warn_if_can_use_tool_shadowed` 无报警（回调不被 acceptEdits/tools= 架空），pytest 22 passed。
+   > **落地修正（2026-07-20，canary 实证）**：`can_use_tool` 回调要求 **streaming 模式**——SDK `_internal/client.py:103` 见 `prompt` 为 `str` 即 raise「can_use_tool callback requires streaming mode. Please provide prompt as an AsyncIterable」。本执行器原用 string-prompt `query(prompt=<str>)`，加了 `can_use_tool` 后与真实 SDK 不兼容（此前仅 mock-query 单测覆盖、未跑真 SDK，故 22-passed 绿但实跑即崩）。修法：把 string prompt 包成单 yield 的 AsyncIterable（`{"type":"user","session_id":"","message":{"role":"user","content":prompt},"parent_tool_use_id":None}`，结构对齐 SDK 字符串路径 `_internal/client.py:214-219`），`query(prompt=_prompt_stream(), options=options)`。dev loop 单轮 prompt→多轮工具调用，单 yield 即足。顺带：`pyproject.toml` pin `claude-agent-sdk>=0.2.121,<0.2.123`（0.2.123 行为未验，保守上界）；SDK streaming 全量迁移为 follow-up（如需中途追加 user 消息/中断）。
 
 ## 背景
 
@@ -47,3 +49,15 @@ dev-agent 是 **cwd-相对纯调度器**（`REPO_ROOT=cwd()`，SDK 与 git 全�
 - **准入重定义**：run_daily.py:877 从「仓内有 `scripts/dev-agent.{py,mjs}`」改为「profile `dev_ready:true` opt-in + dev-agent 运行时自探测 test_cmd（看 package.json/pyproject 标志）+ 第一次 loop test 跑不动即 fail」。比「文件存在」更强（真跑过 test 才算 ready），贴 ADR 既有的「平台态运行时实查不进静态 profile」原则。
 - **DXP**：dev-agent 调试改在 vault fixtures（极简 node+python 假仓），brakes 单元 + dev-loop 集成就地回归两语言，不碰真实被控仓。fixtures + brakes pytest = follow-up。
 - **follow-up 待办**：① fixtures + brakes pytest；② run_daily.py 选源 + 准入 + slug import；③ 被控仓 CLAUDE.md 迁入仓特定 (B) 段；④ `tools=` 字段 0.2.x 实跑验证；⑤ ADR-0003 顶加修订注。
+
+## 落地状态（2026-07-20，harden-project-pipeline 收尾）
+
+灰度完成 → **vault-only 执行器为唯一运行模型**：
+
+- `_dev_cmd()` 始终构造控制面 `dev-agent.py` 命令（4 参：prof/prd/base/source）；仓内遗留 `dev-agent.{py,mjs}` 一律忽略。profile `dev_agent_source` 字段**容忍但已忽略**（全量切 vault 后选源分支逻辑移除，字段留作旧 profile 向后兼容、不报错）。
+- **⑤ 已完成**：ADR-0003 顶修订注已补（指向本 ADR，标 #1/#2 为历史决策）；ADR-0001 顶亦补「源码归属 vs 运行时归属」再修订注。
+- **运行时模型增项（harden-project-pipeline）**：执行器上收之外，本变更补齐两条 fail-safe 运行时能力——
+  - **三态 fail-safe 投递**（`scripts/external_state.py`，零依赖）：准入/对账远程态查询从「失败返默认（fail-open）」升级为 `FOUND/NOT_FOUND/UNKNOWN` 三态；UNKNOWN 阻断 dispatch、保留分支、不创建/删除 PR。诊断脱敏后落 state 与报告。
+  - **测试发布门**（`scripts/evidence.py` + dev-agent `exit 14`）：commit/push/PR 前须新鲜绿色结构化证据；门拦 → dispatch 记 `blocked_test_gate` 终态短路（不开 PR、分支保留待 triage）。
+  - 两者状态记入 dispatch state JSON（`blocked_external_state` / `blocked_test_gate` + 脱敏原因 / 门诊断字段），并在 report 段独立成节、不计入「产出 PR」与「verify 绿/红」——见 [[0005-report-mechanical-not-persona]] 的报告聚合。
+- **质量基线**：`scripts/quality.sh`（compileall + pytest + ruff E9,F）全绿，130 单测覆盖三态脱敏、五种失败模式、verify 闭环、控制面选源、报告渲染。

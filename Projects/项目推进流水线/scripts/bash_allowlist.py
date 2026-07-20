@@ -18,8 +18,15 @@ vault dev-agent 在被控仓 worktree 里跑 SDK，``permission_mode="acceptEdit
 显式拒绝网络外传与破坏性操作（sudo / curl / wget / ssh / rm 系统路径 / mkfs / base64 解码等）。
 
 局限（如实声明）：prefix 匹配**不是硬沙箱**——shell 元字符 / ``python -c "os.system('...')"`` 类
-内嵌调用理论上可绕。威胁模型为「可信内部仓的自家流水线」，本闸旨在挡住**模型误操与注入触发的明显
-危险命令**并提供审计点，不抗定向沙箱逃逸。需要硬隔离时应叠加 OS 级沙箱。
+内嵌调用、dev 刚 Write 出的 ``./脚本.sh``、``pip install`` typo-squat 等理论上可绕。威胁模型为「可控
+内部仓的自家流水线」：本闸旨在挡住**模型误操与注入触发的明显危险命令**（网络外传/提权/系统破坏/
+远程分支删除/克隆/家目录逃逸）并提供审计点，**不抗定向沙箱逃逸**。
+
+⚠ 威胁模型升级提示（2026-07-20 code-review）：本变更的 streaming 修复使本闸成为 dev loop 的**实时**
+Bash 屏障（此前 ``can_use_tool`` 未真生效）。部分 PRD 由外源信号（radar 扫 wechat/github）生成 → 对抗性
+PRD 是现实向量，docstring 的「可信内部」框架不应低估。本次已补廉价 deny（``git push --delete`` / ``clone``
+/ ``remote`` 改配 / ``rm`` ``..`` 与 ``$HOME`` 逃逸）；**深度隔离（容器 / 网络出口 allowlist）应单列
+ADR/issue**，本闸只作第一层。需要硬隔离时叠加 OS 级沙箱（firejail / 容器 + 出口代理）。
 
 依赖：仅 ``re``（与 slug_utils.py 同，无 sdk，cron /usr/bin/python3 可裸 import）。
 """
@@ -52,6 +59,13 @@ _DENY_CLAUSES = [
     r"\bhalt\b",
     # rm 系统路径 / 家目录（仓内 rm build/ 等不命中）
     r"\brm\b\s+(?:-\S+\s+)*(?:/+|~)",
+    # rm 父目录(..)/家目录变量($HOME)逃逸（仓内 rm build/、rm ./dist 不命中——只拦 .. 与 $VAR 形态）
+    r"\brm\b\s+(?:-\S+\s+)*(?:\.\.|\$\{?[A-Za-z])",
+    # git 远程破坏 / 网络克隆 / 改 remote（dev 守则禁；reconcile 的 push --delete 走 run_daily 直
+    # subprocess、不经本 can_use_tool 闸，故此拒只作用于 dev loop 内的 Bash）
+    r"\bgit\b[^|;&\n]*\bpush\b[^|;&\n]*--delete\b",
+    r"\bgit\b[^|;&\n]*\bclone\b",
+    r"\bgit\b[^|;&\n]*\bremote\b[^|;&\n]*\b(?:add|set-url|remove|rename)\b",
     # 写系统目录
     r">\s*/(?:etc|boot|proc|sys|usr|var)/",
     # 混淆 / 解码外传

@@ -1,6 +1,8 @@
 # 0001 — 控制面与目标面隔离：vault 不污染目标仓
 
 > **2026-07-15 修订（见 ADR-0003）：** dev agent 产物已从 `.claude/agents/dev.md` 改为仓自带 SDK 脚本 `scripts/dev-agent.*`；本 ADR 的隔离**原则不变**（dev agent 仍归目标仓、随仓走），仅产物名变。
+>
+> **2026-07-18 再修订（见 ADR-0006）：** dev agent **源码归属**已上收控制面——单一 `vault/Projects/项目推进流水线/scripts/dev-agent.py` 服务所有被控仓，被控仓零 dev-agent 脚本。隔离**原则仍不变**：源码在 vault、**运行时仍贴目标仓 worktree**（`cwd=<目标仓>`，执行器就地操作该仓），控制面进程与目标仓 worktree 的平面隔离照旧。即「源码归属」与「运行时归属」分离——本 ADR 约束的是后者（不污染目标仓），不被前者（源码上收）推翻。
 
 ## 决定
 

@@ -233,7 +233,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--subject", help="邮件标题（--self-test 时可省略）")
     ap.add_argument("--body", help="邮件正文（与 --body-file 二选一）")
     ap.add_argument("--body-file", help="从文件读正文")
-    ap.add_argument("--to", help=f"收件人（默认取 profile.sender）")
+    ap.add_argument("--to", help="收件人（默认取 profile.sender）")
     ap.add_argument(
         "--from",
         dest="sender",

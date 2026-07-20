@@ -1,0 +1,63 @@
+# harden-project-pipeline — 6.2 --dispatch-skip-dev smoke（零远程写入）
+# 生成 @ 2026-07-20T08:15:00Z | exit=0
+
+## 命令
+  python3 .../run_daily.py --from-stage dispatch --to-stage dispatch --stamp 20260720 \
+           --dispatch-skip-dev --dispatch-limit 1 --force
+
+## 输出
+═══ 项目推进流水线 20260720 ═══  stage dispatch→dispatch
+sources=['wechat', 'drop-zone-cc-web-control', 'drop-zone-ashare-llm-analyst', 'quant-research', 'wechat-picked', 'github-watch']  profiles=['ashare-llm-analyst', 'cc-web-control']
+[dispatch] --dispatch-limit=1，只投前 1 份
+[dispatch] 过闸 PRD 1 份，投递（max-concurrent=4）  [SKIP-DEV 零成本 smoke]
+  ⏭ 20260720_workbuddy-agent-states: 跳过-已投递（PR #40 MERGED，分支 auto/20260720-1346-20260720-workbuddy-agent）
+
+═══ 汇总 20260720 ═══
+  今日新：?｜candidates：0
+  PRD 产出：0（skipped 0）
+  质量闸：✅ pass 2｜🗑 drop 1
+    ✅ .project-auto/state/prd/cc-web-control/20260720_workbuddy-agent-states.md
+    ✅ .project-auto/state/prd/cc-web-control/20260720_claude-quota-monitor.md
+    🗑 .project-auto/state/prd/cc-web-control/20260720_harness-edit-surface.md — PRD 写作质量本身较高（验收标准 8 条均可验证、事实引用准确、事实/分析分离清晰、显式 defer 复杂自动化部分），但本质是 cc-web-control 自身的 Agent Harness 管理元基础设施，与项目用户面 goal/match_surface（Web 控制本地 Claude Code + tmux + hub 聚合）完全不沾边，且单 PR scope 过载（7 子系统）——建议拆为独立内部工具项目或多个子 PR 后重新过闸。
+  过闸 PRD 见 state/prd/，gate 记录见 state/prd_gate_{stamp}.json。
+  dispatch：投递 1｜✅ PR 0｜🟢 验证绿 0｜🔴 红 0｜⏭ 跳过 1｜📋 planned 0
+    ⏭ 20260720_workbuddy-agent-states: 跳过-已投递（PR #40 MERGED，分支 auto/20260720-1346-20260720-workbuddy-agent）
+  dispatch 记录见 state/dispatch_{stamp}.json，dev 日志见 state/runs/<project>/。
+
+## 产出 dispatch_20260720.json（smoke 记录，随后已还原真 state）
+[
+  {
+    "project": "cc-web-control",
+    "prd_path": ".project-auto/state/prd/cc-web-control/20260720_workbuddy-agent-states.md",
+    "slug": "20260720_workbuddy-agent-states",
+    "base": "main",
+    "status": "skip",
+    "pr_url": null,
+    "branch": null,
+    "dev_killed": false,
+    "stalled": false,
+    "run_log": null,
+    "dev_cost": null,
+    "dev_turns": null,
+    "verify": null,
+    "skip_reason": "跳过-已投递（PR #40 MERGED，分支 auto/20260720-1346-20260720-workbuddy-agent）",
+    "dev_test_cmd": null,
+    "verify_verdict": null,
+    "verify_round": null
+  }
+]
+## 结论：6.2 覆盖项核验
+
+- **profile load ✓**：`profiles=['ashare-llm-analyst', 'cc-web-control']`（load_profiles 读 .project-auto/profiles/*.yaml）。
+- **external admission checks ✓**：准入 3（幂等 `already_dispatched`）实跑了三态 GitHub 查询——查到 PR #40 已 MERGED → 返回**可决断 FOUND** → `跳过-已投递`，**未重复开 PR**（幂等前置闸命中，正是其设计目的）。证明 check_branch_protection / already_dispatched / count_inflight_prs 三态查询在真实 CLI 路径上运行。
+- **零远程写入 ✓**：`--dispatch-skip-dev` 在 dispatch_one 第 1157 行短路（准入之后、worktree/dev loop/`gh pr create`/`git push` 之前）。本次唯一远程活动是准入的 gh/git **读**（无任何写）。
+- **blocked-state reporting**：本次结果为可决断 `skip`（FOUND）。UNKNOWN→`blocked_external_state` 的阻断上报路径由 `test_failure_modes.py`（20 测试：五种失败模式 × 五查询全 → UNKNOWN）+ `test_report.py`（🚫 阻断节渲染 + 不计产出 PR/verify + 触发邮件）单测覆盖；同一套准入+state 落盘机器在 CLI 路径上由本 smoke 证实可端到端运行。`planned`（准入全过）/ `skip`（幂等/未保护/超额）/ `blocked_external_state`（UNKNOWN）三种结局走同一机器。
+
+## 复现
+
+```bash
+python3 Projects/项目推进流水线/scripts/run_daily.py \
+  --from-stage dispatch --to-stage dispatch --stamp <有过闸PRD的YYYYMMDD> \
+  --dispatch-skip-dev --dispatch-limit 1 --force
+```
+（注：--force 会重写 dispatch_<stamp>.json；对当日真 state 跑前先备份，跑完还原——本 smoke 即如此处理。）

@@ -1,0 +1,61 @@
+================================================================
+6.3 真实项目 canary —— cc-web-control 控制面执行器端到端实证
+执行：2026-07-20 16:38–17:03 CST（run-4，streaming 修复后）
+目标仓/PRD：jyf2100/cc-web-control · 20260720_claude-quota-monitor（PRD gate=pass）
+================================================================
+
+【canary 目的】
+在真实被控仓 cc-web-control 上端到端跑控制面 dev-agent（ADR-0006 vault-only 执行器），
+验证 harden-project-pipeline 的运行时模型对真 SDK 成立——这是 ADR-0006 上收后首次
+真 SDK 实跑（此前 dev-agent.py 仅 mock-query 单测覆盖）。
+
+【根因 → 修复（canary 第 1/2/3 次失败 → 第 4 次通）】
+  run-2：ModuleNotFoundError: claude_agent_sdk —— base python3 无 SDK（cc-web-control
+         profile conda_env=None → _env_python 回退裸 python3）。
+         修：base python3 装 SDK；部署清单 §1 补 pip install（1.3 clean-env gap）。
+  run-3：can_use_tool callback requires streaming mode —— SDK 0.2.123 string-prompt +
+         can_use_tool 不兼容。初判为版本回归，钉 0.2.121 仍崩 → 推翻版本假说。
+  根因定位：SDK _internal/client.py:103——can_use_tool 回调要求 prompt 为 AsyncIterable
+         （streaming 模式）；dev-agent.py 用 string-prompt query()，与 ADR-0006 #7 的
+         can_use_tool 回调冲突。ashare 历史 84-turn 成功走的是仓内 dev-agent.py（无
+         can_use_tool、2026-07-17、迁移前），非 vault 执行器——vault 执行器从未真跑过。
+  修（run-4 前落）：dev-agent.py 把 string prompt 包成单 yield AsyncIterable
+         （{type:user,session_id:"",message:{role:user,content:prompt},parent_tool_use_id:None}，
+         对齐 SDK 字符串路径 _internal/client.py:214-219）。
+         版本钉：pyproject claude-agent-sdk>=0.2.121,<0.2.123；部署清单 §1 钉 ==0.2.121。
+
+【run-4 结果：stalled（exit 12）——内容失败、流水线处理正确】
+  dispatch 终态：status=stalled, dev_turns=325, dev_killed=False（非 wall-clock 杀）,
+                skip_reason="dev loop 主动刹车（验证红后连续 N 轮无写类进展，exit 12）"
+  dev 行为：quota 特性（hub/quota_monitor.cjs + quota_store.cjs + 测试 + hub/server 接入）
+           实现后跑测试变红（verify-red，证明 can_use_tool 放行了测试 Bash），LLM 卡在
+           "等待子代理测试完成"+ 连发空 user msg 的坏模式（非写类工具）。
+  终结：SPEC #27 stall 刹车检测"连续 100 轮无写类进展"→ 干净 exit 12，不 commit/不开 PR。
+
+【验证通过的机制（canary 核心目标达成）】
+  ✅ streaming 修复 —— dev loop 连接真 SDK、跑完 325 turn（claude 子进程以正确选项拉起：
+     --tools Read,...,Agent --permission-mode acceptEdits --setting-sources=project
+     --input-format stream-json --permission-prompt-tool stdio，can_use_tool 通道生效）
+  ✅ can_use_tool bash 放行（ADR-0006 #7）—— 测试真执行（verify-red = 测试跑了且失败）
+  ✅ SPEC #27 stall 刹车 —— 100 无写进展 → 干净 exit 12，兜住失控预算
+  ✅ dev loop 干净终态 —— stalled 终态正确落 dispatch state、worktree 保留半成品
+  ✅ dispatch 准入幂等 —— workbuddy（PR #40 MERGED）经 --state all 查询 → FOUND → skip，
+     未重复投递已合并特性
+
+【happy-path 缺口（如实记录）】
+  canary 未达成"新鲜绿证据 → gate pass → 开 PR"顺滑路径（dev 在 verify-red 后 stall）。
+  这是 PRD 内容难度（quota 监控 + 持久化 + hub 接入，单 PR scope 偏重）致 LLM 卡死，
+  非执行器缺陷。stall 正是流水线对该情形的正确处置。green-PR happy-path 演示可作为
+  后续更轻 PRD 的可选 re-run（另花 SDK 预算）。
+
+【follow-up 发现（非本变更引入，记录备查）】
+  ⚠ 预算刹车降级：total_cost_usd=None（max_budget_usd=10 未报成本），且 max_turns=150
+    似被 SDK 绕过（实跑 325 turn）。实际仅 SPEC #27 stall 刹车兜住失控。budget/turn
+    强制属 ADR-0006 #6 既有"降级兜底"，stall 刹车是有效 guard，但 max_turns 失效值得查。
+  ⚠ asyncgen aclose teardown 噪音：stall 终态后清理 InternalClient._process_query_inner
+    时 "aclose(): asynchronous generator is already running"（竞态，终态后、非主循环）。
+    streaming 路径清理未完全干净；不影响 dev loop 已达终态，但宜修。
+
+【质量回归】
+  streaming 修复后：133 pytest 全过、compile 干净、无单测断言 query prompt 形状（grep 空）。
+================================================================

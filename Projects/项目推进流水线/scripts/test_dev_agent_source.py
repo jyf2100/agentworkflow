@@ -58,41 +58,59 @@ def test_run_daily_import_does_not_load_claude_sdk():
     )
 
 
-# ─── _dev_cmd 选源（ADR-0006）─────────────────────────────────────────
-def test_dev_cmd_source_vault_ignores_repo_files(tmp_path):
-    """source=vault：仓内无任何 dev-agent 文件，仍返回有效 cmd（指向控制面 dev-agent.py）。"""
-    # Arrange
-    repo = tmp_path / "repo"
-    (repo / "scripts").mkdir(parents=True)
-    py = repo / "scripts" / "dev-agent.py"      # 不存在
-    mjs = repo / "scripts" / "dev-agent.mjs"    # 不存在
-    prof = {"dev_agent_source": "vault", "conda_env": ""}
-    vault_py = Path(run_daily.__file__).resolve().parent / "dev-agent.py"
-    # Act
-    cmd = run_daily._dev_cmd(prof, py, mjs, "PRD.md", "main", "")
+# ─── _dev_cmd 控制面执行器唯一源（ADR-0006 / OpenSpec verified-dev-execution / fail-safe-dispatch）─────
+def test_dev_cmd_always_uses_vault_executor_without_local_executor():
+    """仓内无任何 dev-agent 文件 → 仍返回有效 cmd，指向控制面 dev-agent.py。
+
+    「控制面执行器为唯一源」核心断言：目标仓不自带执行器即可投递。"""
+    # Arrange / Act
+    cmd = run_daily._dev_cmd({"conda_env": ""}, "PRD.md", "main", "")
     # Assert
     assert cmd is not None
-    assert str(vault_py) in cmd                  # 指向 vault 版（忽略仓内文件）
+    assert str(run_daily.DEV_AGENT_PY) in cmd
     assert "--prd" in cmd and cmd[cmd.index("--prd") + 1] == "PRD.md"
     assert "--base" in cmd and cmd[cmd.index("--base") + 1] == "main"
+    assert "--source" not in cmd                      # 空 source 不追加
 
 
-def test_dev_cmd_source_vault_appends_source(tmp_path):
-    """source=vault 且传 src_abs → 追加 --source。"""
-    repo = tmp_path / "repo"
-    prof = {"dev_agent_source": "vault", "conda_env": ""}
-    cmd = run_daily._dev_cmd(prof, repo / "x.py", repo / "x.mjs", "PRD", "main", "SRC.md")
+def test_dev_cmd_appends_source():
+    """传 src_abs → 追加 --source。"""
+    cmd = run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "SRC.md")
     assert cmd is not None
     assert "--source" in cmd and cmd[cmd.index("--source") + 1] == "SRC.md"
 
 
-def test_dev_cmd_source_repo_default_falls_back_to_repo_python(tmp_path):
-    """无 dev_agent_source（默认 repo）：仓内 py 存在 → 用仓内 py（现状不变）。"""
+def test_dev_cmd_ignores_legacy_repo_executor(tmp_path):
+    """仓内遗留 scripts/dev-agent.{py,mjs} 存在 → 仍走控制面执行器（legacy ignored）。
+
+    旧 profile 字段 dev_agent_source=repo 也不再分支（向后兼容：读取不报错，但值被忽略）。"""
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
-    py = repo / "scripts" / "dev-agent.py"
-    py.write_text("#", encoding="utf-8")
-    mjs = repo / "scripts" / "dev-agent.mjs"
-    cmd = run_daily._dev_cmd({"conda_env": ""}, py, mjs, "PRD", "main", "")   # 无 dev_agent_source
-    assert cmd is not None
-    assert str(py) in cmd                                                       # 用仓内 py，非 vault 版
+    (repo / "scripts" / "dev-agent.py").write_text("# legacy", encoding="utf-8")
+    (repo / "scripts" / "dev-agent.mjs").write_text("# legacy", encoding="utf-8")
+    prof = {"dev_agent_source": "repo", "conda_env": ""}    # 旧字段，值被忽略
+    cmd = run_daily._dev_cmd(prof, "PRD", "main", "")
+    cmd_str = " ".join(cmd)
+    assert str(run_daily.DEV_AGENT_PY) in cmd_str          # 控制面执行器
+    assert str(repo) not in cmd_str                        # 仓内 legacy 路径不在命令里
+    assert cmd[0] != "node"                                # 不走 Node 兜底
+
+
+def test_dev_cmd_none_when_vault_executor_missing(tmp_path, monkeypatch):
+    """控制面 dev-agent.py 缺失（DEV_AGENT_PY 不存在）→ None（dispatch 判 fail：控制面安装异常）。"""
+    monkeypatch.setattr(run_daily, "DEV_AGENT_PY", tmp_path / "nonexistent.py")
+    assert run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "") is None
+
+
+# ─── 目标仓语言不决定执行器语言（用 conftest 的 Node/Python 仓骨架，task 3.1 × 3.5）─────
+def test_dev_cmd_node_repo_without_local_executor_uses_control_plane(node_target_repo):
+    """Node 目标仓（package.json，无 scripts/dev-agent.*）→ 执行器仍是控制面 Python，不走 node。"""
+    cmd = run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "")
+    assert str(run_daily.DEV_AGENT_PY) in " ".join(cmd)
+    assert cmd[0] != "node"
+
+
+def test_dev_cmd_python_repo_without_local_executor_uses_control_plane(python_target_repo):
+    """Python 目标仓（pyproject.toml，无 scripts/dev-agent.*）→ 执行器仍是控制面 dev-agent.py。"""
+    cmd = run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "")
+    assert str(run_daily.DEV_AGENT_PY) in " ".join(cmd)

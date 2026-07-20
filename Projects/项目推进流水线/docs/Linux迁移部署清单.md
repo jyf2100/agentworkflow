@@ -40,6 +40,17 @@
 sudo apt update
 sudo apt install python3 python3-yaml git pass gnupg
 
+# claude_agent_sdk —— 控制面标准执行器 dev-agent.py 的硬依赖（ADR-0006 上收后：Python 执行器
+# 需 Python SDK；旧版用仓内 node dev-agent.mjs 走 Node SDK，已废弃）。装进控制面 python3（本机
+# = miniconda base，即 `python3` 解析到的那个）。dev-agent 由 run_daily 经 `_env_python` 调起，
+# profile 无 conda_env 时回退 python3 → 故 python3 必须有 SDK，否则 dispatch 记 dev_killed/fail
+# （ModuleNotFoundError: claude_agent_sdk，2026-07-20 canary 实证）。
+# ⚠️ 必须钉版本 ==0.2.121：0.2.123 起 can_use_tool 回调要求 streaming（AsyncIterable prompt），
+#   dev-agent 用 string-prompt query() 会崩 "can_use_tool callback requires streaming mode"
+#   （2026-07-20 canary 第 2 次失败实证；0.2.121 经 ashare 84-turn dev loop 验证可用）。
+python3 -m pip install 'claude-agent-sdk==0.2.121'
+python3 -c "import claude_agent_sdk; print('sdk', claude_agent_sdk.__version__)"   # 须显 0.2.121
+
 # gh CLI（按官方源装：https://github.com/cli/cli#installation），然后：
 gh auth login                                   # 写 ~/.config/gh/hosts.yml（不跨机拷）
 
@@ -103,7 +114,7 @@ rsync -av .claude/agents/pa-radar.md .claude/agents/pa-prd.md .claude/agents/pa-
 # 信号源（radar 输入，否则天天空跑）
 rsync -av Knowledge/微信/ ubuntu@172.32.153.184:/mnt/disk01/workspaces/worksummary/vault/Knowledge/微信/
 
-# 目标仓（含 scripts/dev-agent.mjs + .claude/hooks/scope-bash.cjs）
+# 目标仓（仓 CLAUDE.md + .claude/hooks/scope-bash.cjs；**不再需要 scripts/dev-agent.*** —— 执行器已上收控制面，见 ADR-0006）
 rsync -av /Users/roc/workspace/cc-web-control/ ubuntu@172.32.153.184:/mnt/disk01/workspaces/worksummary/cc-web-control/
 ```
 
@@ -144,7 +155,7 @@ cd /mnt/disk01/workspaces/worksummary/vault    # run_daily.py 必须从 vault �
 # ① cheap 段先验（不投递、不花钱）：radar→prd→critic
 python3 Projects/项目推进流水线/scripts/run_daily.py --to-stage critic
 
-# ② dispatch smoke（真投一个 PR，验 dev-agent.mjs + gh + git push + npm test 全链路）
+# ② dispatch smoke（真投一个 PR，验控制面 dev-agent.py + gh + git push + npm test + 发布门/三态准入 全链路）
 python3 Projects/项目推进流水线/scripts/run_daily.py --from-stage dispatch --to-stage dispatch --dispatch-limit 1
 
 # ③ report 段（sina 发到 juyf，验跨域 + .md 附件 + cron 同款路径）
@@ -174,7 +185,7 @@ crontab -l | grep run_daily                                                     
 | 自测通过 | 证明的链路 |
 |---|---|
 | ① critic 段 | python3 + pyyaml + claude CLI + 3 persona + LiteLLM proxy 全通 |
-| ② dispatch smoke | node + dev-agent.mjs + gh + git push + npm test + branch protection 全通 |
+| ② dispatch smoke | python3 + 控制面 dev-agent.py + gh + git push + npm test + branch protection + 发布门/三态准入 全通 |
 | ③ report 段 | pass 凭据 + sina:465 可达 + 报告/日报落盘 + 邮件附件 |
 | ④ SMTP self-test | pass 凭据 + smtp.vip.sina.com:465 + gpg-agent 缓存（cron 前置） |
 | cron 次日 | cron 包装器 PA_CLAUDE_BIN/VAULT 推导 + run_daily 全流程 |
@@ -197,7 +208,44 @@ crontab -l | grep run_daily                                                     
 
 - **gpg-agent 非交互缓存**：见 §2 坑。这是 Linux 版的「Keychain 解锁」问题，不配缓存则 cron 邮件 rc=2（报告仍落盘，不阻塞）。
 - **LiteLLM proxy = 服务器本机**：`172.32.153.184:4000` 既是服务器 IP 也是 proxy 地址，proxy 跑在本机，本地回环可达。认证已跑通即不用动 `settings.json`；若 proxy 实际不在本机，改 `ANTHROPIC_BASE_URL` 到服务器可达地址。
-- **slugify 耦合**：`run_daily.py` 幂等闸 ↔ `dev-agent.mjs` slugify 子串匹配，两侧算法须同步漂移；迁移不改算法，仅随 rsync 带过去保持一致。
+- **slugify 耦合（已消解，ADR-0006）**：旧版 `run_daily.py` 幂等闸须与仓内 `dev-agent.mjs` 的 slugify 子串匹配同步漂移；执行器上收后 `dev_slugify` 抽到单一源头 `scripts/slug_utils.py`，两侧 `from slug_utils import dev_slugify`，shadow 耦合消失，迁移无需再操心两侧一致。
 - **L15 模式**：目标仓 cc-web-control 是外部仓，本次只 rsync 现状 + 重配 git 身份，**不改其代码**；日后若有代码改动走用户终端 PR。
 - **vault 无 remote**：代码改动在 Mac 提交后随 rsync 带 Linux；Mac git 历史是唯一回滚依据。
 - **Mac/Linux profile 并存**：Mac 上的 `cc-web-control.yaml` 仍指 `/Users/roc/workspace/cc-web-control`（Mac 还在跑）；只改 Linux rsync 过来的那份。两边 `repo` 不同不影响（各自本机路径）。
+
+---
+
+## 阻断处置（fail-safe / 发布门 — 运维 triage 指南）
+
+> harden-project-pipeline 之后，dispatch 会因「远程态不明」或「测试发布门未过」记两类**阻断**状态（`blocked_external_state` / `blocked_test_gate`）。它们**既不算投递成功、也不算 verify 绿/红**，在报告「🚫 阻断」节单独列出、并触发邮件（subject 含「K 阻断」）。本节给出重试语义与运维动作。
+
+### 重试语义（何时不需手动干预）
+
+- **阻断当轮终态、不自动重试**：两类阻断都是当轮（当夜）的终态——不进 verify 闭环、不开 PR、不删分支（fail-safe：宁可不动，等运维判明）。`blocked_test_gate` **不**走 verify 的「红→增量重投」：门拦是 dev 自治产出质量问题，不是 pa-verify 语义修订。
+- **次夜 cron 自动重试**：下一次 cron 全量重跑准入。远程态若已恢复可决断（`FOUND/NOT_FOUND`）→ PRD 正常推进；`already_dispatched` 幂等闸确保**已成功的 PRD 不会重复开 PR**。故绝大多数瞬时故障（GitHub 抖动 / token 短暂失效 / flaky test / 证据窗刚过期）**等次夜自愈即可**，无需手动。
+
+### 运维动作（按阻断类型）
+
+| 阻断类型（报告「🚫 阻断」节） | 判读 | 动作 |
+|---|---|---|
+| `blocked_external_state` · reason 含 `401`/`Bad credentials` | GitHub PAT 失效/过期 | `gh auth login` 刷新 → `gh auth status` 验证 → 次夜自愈；急则手动重投（见下） |
+| `blocked_external_state` · reason 含 `timeout`/非零退出 | GitHub/Git 远程瞬时抖动、rate-limit | `gh api rate_limit` 看配额 + `ping github.com`；通常次夜自愈 |
+| `blocked_external_state` · `blocked_check=inflight_count` | 在途 PR 查询不明 | 同上（远程态）；若持续，查 `gh pr list --state open` 手动核对在途数 |
+| `blocked_test_gate` · `test_status=red` | dev 产出测试红（真缺陷） | 查 `state/runs/<proj>/<stamp>_<slug>.log` + 测试输出；**真缺陷需改 PRD/补反馈**后重投，非 flaky |
+| `blocked_test_gate` · `gate_status=test_stale` | 证据窗过期（dev 跑测后又有候选写） | 多为 flaky/竞态；查 log，通常次夜自愈 |
+| `blocked_test_gate` · `gate_status=test_not_run` | dev 未跑测试就到发布门 | 查 log——dev loop 是否被 budget/turns 截断或测试入口探测失败；仓 CLAUDE.md 测试入口可能要补 |
+
+### 手动重投（急用，跳过等次夜）
+
+```bash
+# 同 stamp 重读那夜的 gate state，重跑 dispatch（幂等：已成功的不会重复开 PR）
+python3 Projects/项目推进流水线/scripts/run_daily.py \
+  --from-stage dispatch --to-stage dispatch --stamp <受阻那夜的YYYYMMDD>
+# 或一次性走完 dispatch→report（重投 + 重出报告 + 发邮件）
+python3 Projects/项目推进流水线/scripts/run_daily.py \
+  --from-stage dispatch --to-stage report --stamp <YYYYMMDD>
+```
+
+- 先修根因（刷新 token / 等 GitHub 恢复 / 改 PRD）再重投——否则只会再次阻断。
+- `--dispatch-skip-dev` 可只验「准入 + 阻断上报」不真起 dev loop（不写远程），适合排查准入链路本身。
+- 安全网：即便手动重投，三态准入 + 幂等闸 + 发布门三重保护仍在——**不会因重投而超额或开脏 PR**。

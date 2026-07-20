@@ -44,6 +44,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（消解 ADR-0004 #4 shadow；无依赖模块，顶部 import 不触发 sdk 连带加载拖垮 cron）
+from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
 
 try:
     import yaml
@@ -86,6 +87,7 @@ VERIFY_INSTALL_TIMEOUT = 600     # 独立验证 npm ci
 VERIFY_TEST_TIMEOUT = 600        # 独立验证 npm test
 VERIFY_MAX_ROUNDS = 2            # pa-verify 判红增量重做机会（verify 闭环，docs/verify-commit-loop-design.md §3-③）
 CONDA_ENVS_DIR = Path("/home/ubuntu/miniconda3/envs")   # conda env 根（控制面主机固定）；Python 仓 dev-agent.py / 独立验证闸用
+DEV_AGENT_PY = PROJECT_DIR / "scripts" / "dev-agent.py"  # 控制面标准执行器（ADR-0006：dispatch 唯一调用源；仓内遗留 dev-agent.{py,mjs} 不再使用）
 
 # Phase 4：run 级互斥 + 并行 + 幂等前置闸（SPEC #30 / ADR-0004 §4）
 MAX_RUN_WALL = DEV_LOOP_TIMEOUT + 1800     # run 锁陈旧阈值（≈90min）：PID 失活 OR 锁龄超此 → 自动接管
@@ -110,7 +112,7 @@ def resolve_claude_bin() -> str:
     nvm = _nvm_claude()
     if nvm and nvm.is_file():
         return str(nvm)
-    sys.exit(f"✗ 找不到 claude CLI（试 PA_CLAUDE_BIN 环境变量或装 Claude Code）")
+    sys.exit("✗ 找不到 claude CLI（试 PA_CLAUDE_BIN 环境变量或装 Claude Code）")
 
 
 def today_stamp() -> str:
@@ -745,34 +747,51 @@ def _env_python(env_name: str) -> str:
     return "python3"
 
 
-def check_branch_protection(owner_repo: str, base: str) -> tuple[bool, str]:
+def check_branch_protection(owner_repo: str, base: str) -> ExtResult:
     """运行时实查 main 分支保护（SPEC §4.4：protection 是平台态可被外部改动，故运行时实查、不进静态 profile）。
-    返回 (protected, reason)。404→(False, "未保护，拒投")。"""
+
+    三态（OpenSpec fail-safe-dispatch）：
+      FOUND(True)  200 → 已保护（可投）；
+      NOT_FOUND    404 → 明确未保护（拒投，属「可决断」非阻断态）；
+      UNKNOWN      超时/非零/缺 gh/异常 → 状态不明，fail-safe：准入见之即 blocked_external_state。"""
     try:
         r = subprocess.run(
             ["gh", "api", f"repos/{owner_repo}/branches/{base}/protection", "--silent",
              "-H", "Accept: application/vnd.github+json"],
             capture_output=True, text=True, timeout=20)
         if r.returncode == 0:
-            return True, "已保护"
+            return found(True, "已保护")
         if "404" in (r.stderr or ""):
-            return False, "未保护（404），拒投"
-        return False, f"查询失败 rc={r.returncode}: {(r.stderr or '').strip()[:120]}"
+            return not_found("未保护（404），拒投")
+        return unknown(f"查询失败 rc={r.returncode}: {(r.stderr or '').strip()[:120]}")
     except subprocess.TimeoutExpired:
-        return False, "查询超时"
+        return unknown("查询超时")
+    except FileNotFoundError:
+        return unknown("缺 gh 命令（未安装/不在 PATH）")
     except Exception as e:
-        return False, f"查询异常: {e}"
+        return unknown(f"查询异常: {e}")
 
 
-def count_inflight_prs(owner_repo: str) -> int:
-    """在途开放 PR 数（SPEC R1：≤ max_prs_in_flight）。失败返 0（容忍）。"""
+def count_inflight_prs(owner_repo: str) -> ExtResult:
+    """在途开放 PR 数（SPEC R1：≤ max_prs_in_flight）。
+
+    三态：FOUND(count) 查询成功（0 个开放 PR 亦为 FOUND(0)，可决断）；UNKNOWN 查询失败。
+    旧版「失败返 0（容忍）」是 fail-open——可能超额投递；现改 fail-safe：UNKNOWN → 准入阻断。"""
     try:
         js = subprocess.run(
             ["gh", "pr", "list", "-R", owner_repo, "--state", "open", "--limit", "50", "--json", "number"],
             capture_output=True, text=True, timeout=20)
-        return len(json.loads(js.stdout or "[]"))
-    except Exception:
-        return 0
+        if js.returncode != 0:
+            return unknown(f"gh pr list rc={js.returncode}: {(js.stderr or '').strip()[:120]}")
+        return found(len(json.loads(js.stdout or "[]")))
+    except json.JSONDecodeError as e:
+        return unknown(f"坏 JSON: {e}")
+    except subprocess.TimeoutExpired:
+        return unknown("查询超时")
+    except FileNotFoundError:
+        return unknown("缺 gh 命令（未安装/不在 PATH）")
+    except Exception as e:
+        return unknown(f"查询异常: {e}")
 
 
 # dev_slugify 已上移至 slug_utils.py（顶部 import；ADR-0006 #5 单一源头，消解历史 shadow）
@@ -892,33 +911,68 @@ def stage_inject(args, profiles: dict, stamp: str) -> tuple[dict, str]:
     return manifest, actual
 
 
-def already_dispatched(owner_repo: str, repo: str, devslug: str) -> tuple[bool, str]:
+def already_dispatched(owner_repo: str, repo: str, devslug: str) -> ExtResult:
     """幂等前置闸（SPEC #30 ④ / ADR-0004 §4）：按 slug 子串查 GitHub PR(all state) + 远端 auto/* 分支。
-    命中→(True, reason)；slug=date+24字描述够特异、子串误命中可忽略；任一查询失败容忍（不阻断，reconcile_pr 仍兜底对账）。
-    用 slug 子串而非精确 --head <branch>，因 dev-agent.mjs stamp()=YYYYMMDD-HHMM（含时分）run_daily.py 不可预测
-    （SPEC #30 ④ 选型 ii：纯控制面，不动 dev-agent.mjs）。"""
+
+    三态（OpenSpec fail-safe-dispatch）：
+      FOUND(True)  命中已有 PR 或远端 auto/* 分支（slug=date+24字描述够特异，子串误命中可忽略）；
+      NOT_FOUND    两路查询都成功且无命中；
+      UNKNOWN      任一查询失败（旧版「任一失败容忍返 (False,"")」是 fail-open——可能重复投递；现改 fail-safe 阻断）。
+    用 slug 子串而非精确 --head <branch>，因 dev-agent stamp()=YYYYMMDD-HHMM（含时分）不可预测。"""
+    pr_err, pr_hit = _scan_pr_list_for_slug(owner_repo, devslug)
+    if pr_hit:
+        return found(True, pr_hit)
+    branch_err, branch_hit = _scan_remote_branches_for_slug(repo, devslug)
+    if branch_hit:
+        return found(True, branch_hit)
+    if pr_err or branch_err:
+        return unknown(" / ".join(e for e in (pr_err, branch_err) if e))
+    return not_found()
+
+
+def _scan_pr_list_for_slug(owner_repo: str, devslug: str) -> tuple[str | None, str | None]:
+    """gh pr list(all state) 里找含 devslug 的分支名。返回 (err, hit_reason)；成功无命中→(None, None)。"""
     try:
         js = subprocess.run(
             ["gh", "pr", "list", "-R", owner_repo, "--state", "all", "--limit", "100",
              "--json", "number,headRefName,state"],
             capture_output=True, text=True, timeout=20)
+        if js.returncode != 0:
+            return f"gh pr list rc={js.returncode}: {(js.stderr or '').strip()[:80]}", None
         for pr in json.loads(js.stdout or "[]"):
             if devslug in (pr.get("headRefName") or ""):
-                return True, f"已投递（PR #{pr.get('number')} {pr.get('state')}，分支 {pr.get('headRefName')}）"
-    except Exception:
-        pass
+                return None, f"已投递（PR #{pr.get('number')} {pr.get('state')}，分支 {pr.get('headRefName')}）"
+        return None, None
+    except json.JSONDecodeError as e:
+        return f"坏 PR JSON: {e}", None
+    except subprocess.TimeoutExpired:
+        return "PR 查询超时", None
+    except FileNotFoundError:
+        return "缺 gh 命令", None
+    except Exception as e:
+        return f"PR 查询异常: {e}", None
+
+
+def _scan_remote_branches_for_slug(repo: str, devslug: str) -> tuple[str | None, str | None]:
+    """git ls-remote origin 里找 auto/* 且含 devslug 的分支。返回 (err, hit_reason)；成功无命中→(None, None)。"""
     try:
         out = subprocess.run(["git", "-C", repo, "ls-remote", "--heads", "origin"],
-                             capture_output=True, text=True, timeout=20).stdout
-        for line in out.splitlines():
+                             capture_output=True, text=True, timeout=20)
+        if out.returncode != 0:
+            return f"ls-remote rc={out.returncode}: {(out.stderr or '').strip()[:80]}", None
+        for line in out.stdout.splitlines():
             if "\t" not in line:
                 continue
             ref = line.split("\t", 1)[1].replace("refs/heads/", "")
             if ref.startswith("auto/") and devslug in ref:
-                return True, f"已投递（远端分支 {ref}，无 PR）"
-    except Exception:
-        pass
-    return False, ""
+                return None, f"已投递（远端分支 {ref}，无 PR）"
+        return None, None
+    except subprocess.TimeoutExpired:
+        return "ls-remote 超时", None
+    except FileNotFoundError:
+        return "缺 git 命令", None
+    except Exception as e:
+        return f"ls-remote 异常: {e}", None
 
 
 def _run_capture(cmd: list[str], cwd: str, timeout: int, label: str,
@@ -937,28 +991,21 @@ def _run_capture(cmd: list[str], cwd: str, timeout: int, label: str,
 
 
 # ─── verify 闭环辅助（dev→独立验证→pa-verify，docs/verify-commit-loop-design.md §3/§5）──
-def _dev_cmd(prof: dict, py: Path, mjs: Path, prd_abs: str, base: str, src_abs: str) -> list[str] | None:
-    """构造 dev-agent 触发命令（ADR-0003 / ADR-0006 选源）。
+def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str) -> list[str] | None:
+    """构造 dev-agent 触发命令（ADR-0006：控制面标准执行器为唯一源）。
 
-    dev_agent_source（profile 字段，默认 repo）：
-      vault → 控制面 dev-agent.py（与本文件同目录），忽略仓内 py/mjs；
-      repo  → 仓内 Python dev-agent.py（conda env python）> Node dev-agent.mjs（现状不变）。
-    --base 由调用方按 verify 闭环轮次传入（round1=默认分支；round≥2=上次 dev 分支，增量重投）。
-    选定源缺运行时 → None（dispatch_one 判 fail）。"""
-    source = prof.get("dev_agent_source", "repo")
-    if source == "vault":
-        vault_py = Path(__file__).resolve().parent / "dev-agent.py"
-        if not vault_py.exists():
-            return None
-        cmd = [_env_python(prof.get("conda_env", "")), str(vault_py),
-               "--prd", prd_abs, "--branch-prefix", "auto", "--base", base]
-    elif py.exists():
-        cmd = [_env_python(prof.get("conda_env", "")), str(py),
-               "--prd", prd_abs, "--branch-prefix", "auto", "--base", base]
-    elif mjs.exists():
-        cmd = ["node", str(mjs), "--prd", prd_abs, "--branch-prefix", "auto", "--base", base]
-    else:
+    始终调用控制面 ``scripts/dev-agent.py``（DEV_AGENT_PY）——执行器贴目标仓跑（cwd=调用方传入的
+    worktree，见 ``_run_capture`` 的 ``wt``），源码归控制面。目标仓语言不决定执行器语言；Python 运行时
+    按 profile.conda_env / 宿主解析（``_env_python``）。仓内遗留 ``scripts/dev-agent.{py,mjs}`` 不再使用
+    （legacy ignored，OpenSpec verified-dev-execution）——``dev_agent_source`` 旧 profile 字段保留读取兼容
+    （不报错），但其值不再分支：无论 vault 还是 repo，都走控制面执行器。
+
+    --base 由 verify 闭环调用方按轮次传入（round1=默认分支；round≥2=上次 dev 分支，增量重投）。
+    控制面 dev-agent.py 缺失（DEV_AGENT_PY 不存在）→ None（dispatch_one 判 fail：控制面安装异常）。"""
+    if not DEV_AGENT_PY.exists():
         return None
+    cmd = [_env_python(prof.get("conda_env", "")), str(DEV_AGENT_PY),
+           "--prd", prd_abs, "--branch-prefix", "auto", "--base", base]
     if src_abs:
         cmd += ["--source", src_abs]
     return cmd
@@ -975,13 +1022,48 @@ def _run_dev_agent(cmd: list[str], wt: Path, slug: str, log_file: Path) -> dict 
         return None
 
 
-def _has_commits(repo: str, base_ref: str, branch: str) -> bool:
-    """branch 相对 base_ref 是否有新 commit（verify 闸门 + verify 闭环判增量产出用）。失败容忍→False。"""
+def _has_commits(repo: str, base_ref: str, branch: str) -> ExtResult:
+    """branch 相对 base_ref 是否有新 commit（verify 闸门 + verify 闭环判增量产出用）。
+
+    三态：FOUND(bool) 查询成功；UNKNOWN 查询失败。旧版「失败容忍→False」是 fail-open——reconcile 会把
+    「查不出 commit」当成「无 commit」误删有产出的分支；现改 fail-safe：reconcile 见 UNKNOWN 即保留分支。"""
     try:
-        return bool(subprocess.run(["git", "-C", repo, "log", f"{base_ref}..{branch}", "--oneline"],
-                                   capture_output=True, text=True, timeout=20).stdout.strip())
-    except Exception:
-        return False
+        r = subprocess.run(["git", "-C", repo, "log", f"{base_ref}..{branch}", "--oneline"],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return unknown(f"git log rc={r.returncode}: {(r.stderr or '').strip()[:120]}")
+        return found(bool(r.stdout.strip()))
+    except subprocess.TimeoutExpired:
+        return unknown("查询超时")
+    except FileNotFoundError:
+        return unknown("缺 git 命令")
+    except Exception as e:
+        return unknown(f"查询异常: {e}")
+
+
+def _lookup_pr(owner_repo: str, branch: str) -> ExtResult:
+    """实查 GitHub 是否已有该分支的 PR（reconcile 对账用，OpenSpec fail-safe-dispatch）。
+
+    三态：FOUND(pr_dict) 命中；NOT_FOUND 明确无；UNKNOWN 查询失败（reconcile 见之即保留分支不补开/删除）。"""
+    try:
+        js = subprocess.run(
+            ["gh", "pr", "list", "-R", owner_repo, "--head", branch, "--state", "all",
+             "--limit", "5", "--json", "number,url,state"],
+            capture_output=True, text=True, timeout=20)
+        if js.returncode != 0:
+            return unknown(f"gh pr list rc={js.returncode}: {(js.stderr or '').strip()[:120]}")
+        prs = json.loads(js.stdout or "[]")
+        if prs:
+            return found(prs[0])
+        return not_found(f"无 {branch} 的 PR")
+    except json.JSONDecodeError as e:
+        return unknown(f"坏 PR JSON: {e}")
+    except subprocess.TimeoutExpired:
+        return unknown("PR 查询超时")
+    except FileNotFoundError:
+        return unknown("缺 gh 命令")
+    except Exception as e:
+        return unknown(f"PR 查询异常: {e}")
 
 
 def _dump_branch_diff(repo: str, base_ref: str, branch: str, out_path: Path) -> None:
@@ -1021,7 +1103,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     proj = prof.get("name", "?")
     repo = prof.get("repo", "")
     slug = Path(entry.get("prd_path", "")).stem or "unknown"
-    devslug = dev_slugify(slug)   # 复刻 dev-agent.mjs 分支 slug（幂等前置闸按 slug 匹配 auto/* 用）
+    devslug = dev_slugify(slug)   # dev 分支 slug（slug_utils 单一源头，ADR-0006 #5；幂等前置闸按 slug 匹配 auto/* 用）
     base = prof.get("default_branch", "main")   # SPEC：默认分支从 profile 来（main | master）；check_branch_protection 实查该分支保护
     owner_repo = repo_owner_repo(repo) if repo else ""
     prd_abs = str(VAULT_ROOT / entry.get("prd_path", ""))    # 控制面 PRD 绝对路径（只读喂 dev-agent）
@@ -1039,21 +1121,34 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     if not (prof.get("admission") and prof.get("dev_agent_ready") and prof.get("type") == "code"):
         rec.update(status="skip", skip_reason="profile 不满足（admission/dev_agent_ready/type≠code）")
         log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
-    # ── 准入 2：branch protection 运行时实查
+    # ── 准入 2：branch protection 运行时实查（三态）
     if not owner_repo:
         rec.update(status="skip", skip_reason="跳过-无 remote（取不到 owner/repo）")
         log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
-    ok, why = check_branch_protection(owner_repo, base)
-    if not ok:
-        rec.update(status="skip", skip_reason=f"跳过-{why}")
+    prot = check_branch_protection(owner_repo, base)
+    if prot.is_unknown:   # fail-safe：保护态不明 → 阻断，不起 dev loop（OpenSpec fail-safe-dispatch / tasks 4.3）
+        rec.update(status="blocked_external_state", blocked_check="branch_protection",
+                   skip_reason=f"阻断-分支保护态不明: {prot.reason}")
+        log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
+    if prot.state is not ExtState.FOUND or not prot.value:   # NOT_FOUND（明确未保护）/ 兜底 → 拒投
+        rec.update(status="skip", skip_reason=f"跳过-{prot.reason}")
         log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 3：幂等前置闸（SPEC #30 ④ / ADR-0004 §4：投递前去重，已投递→skip 不起 dev loop，省 SDK 启动+$）
-    hit, why_idem = already_dispatched(owner_repo, repo, devslug)
-    if hit:
-        rec.update(status="skip", skip_reason=f"跳过-{why_idem}")
+    idem = already_dispatched(owner_repo, repo, devslug)
+    if idem.is_unknown:   # fail-safe：幂等态不明 → 阻断（旧版容忍可能重复投递）
+        rec.update(status="blocked_external_state", blocked_check="idempotency",
+                   skip_reason=f"阻断-幂等态不明: {idem.reason}")
+        log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
+    if idem.state is ExtState.FOUND:   # 明确已投递 → skip
+        rec.update(status="skip", skip_reason=f"跳过-{idem.reason}")
         log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 4：在途 PR 限量（R1）
-    inflight = count_inflight_prs(owner_repo)
+    inflight_res = count_inflight_prs(owner_repo)
+    if inflight_res.is_unknown:   # fail-safe：在途数不明 → 阻断（旧版返 0 容忍可能超额投递）
+        rec.update(status="blocked_external_state", blocked_check="inflight_count",
+                   skip_reason=f"阻断-在途PR数不明: {inflight_res.reason}")
+        log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
+    inflight = inflight_res.value
     if inflight >= int(prof.get("max_prs_in_flight", 2)):
         rec.update(status="skip", skip_reason=f"跳过-超额（在途 {inflight} ≥ {prof.get('max_prs_in_flight', 2)}）")
         log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
@@ -1065,7 +1160,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         log(f"  📋 {slug}: 将投递（已过准入，in-flight {inflight}）— skip-dev 未触发")
         return rec
 
-    # ── 投递：detached worktree on main → 触发 dev-agent.mjs（分支设计 A）
+    # ── 投递：detached worktree on main → 触发控制面 dev-agent.py（ADR-0006 vault-only 执行器）
     if not log_file.exists():
         log_file.parent.mkdir(parents=True, exist_ok=True)
     wt = Path(repo) / ".worktrees" / f"{stamp}-{slug}"
@@ -1079,22 +1174,33 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         rec.update(status="fail", skip_reason=f"建 worktree 失败: {e}")
         log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
 
-    # 运行时探测 dev-agent 运行时（ADR-0003 通用化）：Python 仓 dev-agent.py（conda env python）> Node 仓 dev-agent.mjs
-    mjs = Path(repo) / "scripts" / "dev-agent.mjs"
-    py = Path(repo) / "scripts" / "dev-agent.py"
-
     # ── verify 闭环（docs/verify-commit-loop-design.md §3）：dev→独立验证→pa-verify 裁判；判红保留分支+反馈进 PRD+增量重投；判绿兜底开 PR
     #    同构模板：stage_critic revise loop（§4.3）。reconcile 顺位后移到「裁定后收尾」——不预先为中间红的分支补开 PR。
+    #    执行器选源已固化（ADR-0006）：控制面 scripts/dev-agent.py 唯一，不再探测仓内 dev-agent.{py,mjs}。
     cur_base = base
     for round_n in range(1, VERIFY_MAX_ROUNDS + 1):
-        cmd = _dev_cmd(prof, py, mjs, prd_abs, cur_base, src_abs)
+        cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs)
         if cmd is None:
-            _src = prof.get("dev_agent_source", "repo")
-            _why = ("vault 版 dev-agent.py 缺失（控制面安装异常）" if _src == "vault"
-                    else "仓内无 scripts/dev-agent.{py,mjs}（ADR-0003 准入未满足）")
-            rec.update(status="fail", skip_reason=_why)
+            rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
             log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
         script_json = _run_dev_agent(cmd, wt, slug, log_file)
+        # 5.1 测试发布门拦截（dev-agent exit 14 → blocked_by_gate）——终态短路，不进 verify/reconcile、不开 PR。
+        # dev-agent 已跑完 dev loop 但结构化测试证据不达发布门（test_not_run / test_failed / test_stale）：
+        # 门在 commit/push/PR **之前**触发 → 分支已建但无发布提交。宁拦勿错放：既不算 dispatch 成功、也不算
+        # verify 绿；本地分支与证据保留待运维 triage（flaky test？证据窗过期？测试基建？——非 verify 闭环可自愈）。
+        if script_json and script_json.get("blocked_by_gate"):
+            rec.update(status="blocked_test_gate",
+                       branch=script_json.get("branch"),                 # 已建但未 push（门在 commit 前）
+                       gate_status=script_json.get("gate_status"),        # test_not_run | test_failed | test_stale
+                       gate_reason=sanitize(script_json.get("gate_reason")),   # 脱敏落 state（机械文本，defense-in-depth）
+                       test_status=script_json.get("test_status"),        # green | red | none
+                       evidence_fresh=script_json.get("evidence_fresh"),
+                       dev_cost=script_json.get("cost"), dev_turns=script_json.get("turns"),
+                       dev_test_cmd=script_json.get("test_cmd"),
+                       dev_killed=False,
+                       skip_reason=f"阻断-测试发布门: {script_json.get('gate_status')}")
+            log(f"  🚫 {slug}: dev r{round_n} 测试发布门拦截（{rec['gate_status']}）→ 不验证/不开 PR，待运维 triage")
+            return rec
         if script_json:
             rec["dev_cost"] = script_json.get("cost"); rec["dev_turns"] = script_json.get("turns")
             rec["branch"] = script_json.get("branch")
@@ -1109,7 +1215,10 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
             reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True); break
 
         # 独立验证（门=branch+相对 cur_base 有 commit；与 reconcile status 解耦——闭环内 verify 先于对账）
-        has_commits = _has_commits(repo, cur_base, branch)
+        commits = _has_commits(repo, cur_base, branch)
+        has_commits = commits.state is ExtState.FOUND and bool(commits.value)
+        if commits.is_unknown:      # fail-safe：commit 态不明 → 跳过独立验证（不臆断有无产出）
+            log(f"  ⚠ {slug}: r{round_n} commit 态不明，跳过独立验证: {commits.reason}")
         if has_commits:
             rec["verify"] = independent_verify(repo, branch, stamp, slug, log_file, prof,
                                                test_cmd_hint=(script_json.get("test_cmd") if script_json else None))
@@ -1159,30 +1268,25 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
             rec["status"] = "fail"; rec["skip_reason"] = "dev loop 未吐 branch（建分支前崩/超时）"
         return
 
-    # 1) 实查 GitHub 是否已有该分支的 PR
-    pr_url = pr_state = None
-    try:
-        js = subprocess.run(
-            ["gh", "pr", "list", "-R", owner_repo, "--head", branch, "--state", "all",
-             "--limit", "5", "--json", "number,url,state"],
-            capture_output=True, text=True, timeout=20)
-        prs = json.loads(js.stdout or "[]")
-        if prs:
-            pr_url, pr_state = prs[0]["url"], prs[0]["state"]
-    except Exception as e:
-        log(f"  ⚠ {slug}: 查 PR 失败（容忍）: {e}")
-    if pr_url:
+    # 1) 实查 GitHub 是否已有该分支的 PR（三态；UNKNOWN → 保留分支，不补开/删除/覆盖，OpenSpec fail-safe-dispatch / tasks 4.4）
+    pr = _lookup_pr(owner_repo, branch)
+    if pr.is_unknown:
+        rec.update(status="blocked_external_state", blocked_check="pr_lookup",
+                   skip_reason=f"保留分支-PR态不明不补开/删除: {pr.reason}")
+        log(f"  ⛔ {slug}: {rec['skip_reason']}"); return
+    if pr.state is ExtState.FOUND:
+        pr_url, pr_state = pr.value.get("url"), pr.value.get("state")
         rec["pr_url"] = pr_url
         rec["status"] = "pr_open" if pr_state == "OPEN" else f"pr_{(pr_state or '').lower()}"
         log(f"  ✅ {slug}: 已开 PR {pr_url}（{pr_state}）"); return
 
-    # 2) 无 PR：查分支有无 commit
-    try:
-        has_commit = bool(subprocess.run(
-            ["git", "-C", repo, "log", f"{base}..{branch}", "--oneline"],
-            capture_output=True, text=True, timeout=20).stdout.strip())
-    except Exception:
-        has_commit = False
+    # 2) 无 PR（NOT_FOUND）：查分支有无 commit（三态；UNKNOWN → 保留分支不删——旧版容忍可能误删有产出分支）
+    commits = _has_commits(repo, base, branch)
+    if commits.is_unknown:
+        rec.update(status="blocked_external_state", blocked_check="commit_lookup",
+                   skip_reason=f"保留分支-commit态不明不补开/删除: {commits.reason}")
+        log(f"  ⛔ {slug}: {rec['skip_reason']}"); return
+    has_commit = commits.state is ExtState.FOUND and bool(commits.value)
     if has_commit:
         try:   # dev loop 留了 commit：dispatch 补开 PR（interrupted=True=⏸中断PR / False=verify绿正常PR）
             if interrupted:
@@ -1195,10 +1299,15 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
                 body = (f"dev-agent 产出经 pa-verify 判绿（verify 闭环收尾）。commit 在 `{branch}`。"
                         f"PRD：{rec.get('prd_path')}")
                 new_status = "pr_open"
-            url = subprocess.run(
+            r = subprocess.run(
                 ["gh", "pr", "create", "-R", owner_repo, "--base", base, "--head", branch,
                  "--title", title, "--body", body],
-                capture_output=True, text=True, timeout=30).stdout.strip()
+                capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:   # fail-safe：补开 PR 失败 → 保留分支不臆断成功（旧版无视 rc → 空 url 却标 pr_open=幻影绿 PR）
+                rec.update(status="blocked_external_state", blocked_check="pr_create",
+                           skip_reason=f"保留分支-补开PR失败(rc={r.returncode}): {sanitize(r.stderr)}")
+                log(f"  ⛔ {slug}: {rec['skip_reason']}"); return
+            url = r.stdout.strip()
             rec["pr_url"] = url or None; rec["status"] = new_status
             log(f"  {'⏸' if interrupted else '✅'} {slug}: {'中断' if interrupted else '正常'} PR 已补开 {url}")
             return   # 坑3 修复（2026-07-17）：has_commit 且 PR 已补开 → 到此为止，不再落到下方删分支。原代码漏 return，导致失败时「开完中断 PR 又删它的分支 + status 被覆盖成 orphan_deleted + dev 工作 branch -D 丢失」
@@ -1420,7 +1529,6 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     cand = _read_json(STATE_DIR / f"candidates_{stamp}.json",
                       {"candidates": [], "today_new_count": 0, "stats": {}})
-    manifest = _read_json(STATE_DIR / f"prd_manifest_{stamp}.json", {"prds": [], "skipped": []})
     gate = _read_json(STATE_DIR / f"prd_gate_{stamp}.json", [])
     disp = _read_json(STATE_DIR / f"dispatch_{stamp}.json", [])
 
@@ -1430,8 +1538,14 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
     dropped = [g for g in gate if g.get("verdict") == "drop"]
     review = [d for d in disp
               if d.get("status") in ("pr_open", "interrupted_pr") and (d.get("verify") or {}).get("pass")]
-    failing = [d for d in disp if d.get("verify") and not d["verify"].get("pass")]
-    abnormal = [d for d in disp if d.get("status") in ("skip", "planned", "fail", "interrupted_pr")]
+    failing = [d for d in disp
+               if d.get("verify") and not d["verify"].get("pass")
+               and d.get("status") not in ("blocked_external_state", "blocked_test_gate")]   # 5.2 正交：阻断桶（未投递/门未过）不计 failing，独立成节促 triage
+    abnormal = [d for d in disp if d.get("status") in ("skip", "planned", "fail")]   # interrupted_pr 必带 verify（reconcile 仅在有 commit 时补开）→ 已落 review/failing，不混入 abnormal（5.2 桶正交，与概览行一致）
+    # 5.2 阻断（fail-safe-dispatch / verified-dev-execution）：远程态不明 / 测试发布门未过——未投递，
+    # 既不计入「产出 PR」也不计入「verify 绿/红」。独立成节促运维 triage（auth/远程服务/flaky test）。
+    blocked_external = [d for d in disp if d.get("status") == "blocked_external_state"]
+    blocked_gate = [d for d in disp if d.get("status") == "blocked_test_gate"]
     target_repos = sorted({d.get("project", "?") for d in disp})
 
     def repo_of(d: dict) -> str:
@@ -1456,7 +1570,9 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
                     f"投递目标仓：{len(target_repos)}｜"
                     f"产出 PR：{len([d for d in disp if d.get('status') in ('pr_open', 'interrupted_pr')])}｜"
                     f"验证 failing：{len(failing)}｜"
-                    f"失败/超时/跳过：{len([d for d in disp if d.get('status') in ('skip', 'planned', 'fail')])}", ""]
+                    f"失败/超时/跳过：{len([d for d in disp if d.get('status') in ('skip', 'planned', 'fail')])}｜"
+                    f"阻断（未投递）：{len(blocked_external) + len(blocked_gate)}"
+                    f"（远程态不明 {len(blocked_external)} / 测试门未过 {len(blocked_gate)}）", ""]
 
     # ✅ 待 review 绿 PR
     L += ["## ✅ 待你 review 合并的 PR（验证绿）"]
@@ -1504,6 +1620,21 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
         L.append("（无）")
     L.append("")
 
+    # 🚫 阻断（fail-safe-dispatch / verified-dev-execution）——远程态不明或测试发布门未过，**未投递**。
+    # 单独成节、不计入产出 PR / verify 绿红——运维须 triage：auth 失效 / 远程服务抖动 / flaky test / 证据窗过期。
+    L += ["## 🚫 阻断（远程态不明 / 测试发布门未过，未投递）"]
+    if blocked_external or blocked_gate:
+        L += ["| 目标仓 | 分支 | 阻断类型 | 原因（已脱敏） |", "|---|---|---|---|"]
+        for d in blocked_external:
+            L.append(f"| {repo_of(d)} | `{d.get('branch') or '—'}` | "
+                     f"远程态不明（{d.get('blocked_check') or '?'}） | {d.get('skip_reason') or ''} |")
+        for d in blocked_gate:
+            L.append(f"| {repo_of(d)} | `{d.get('branch') or '—'}` | "
+                     f"测试发布门（{d.get('gate_status') or '?'}） | {d.get('gate_reason') or d.get('skip_reason') or ''} |")
+    else:
+        L.append("（无）")
+    L.append("")
+
     # 📭 未匹配信号
     sig_total = stats.get("signals_extracted", 0)
     matched = len(cand.get("candidates", []))
@@ -1534,31 +1665,36 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
 
     report_path = REPORT_DIR / f"项目推进报告_{stamp}.md"
     report_path.write_text("\n".join(L) + "\n", encoding="utf-8")
-    log(f"[report] 已生成 {report_path}（review {len(review)} / failing {len(failing)} / drop {len(dropped)}）")
+    n_blocked = len(blocked_external) + len(blocked_gate)
+    log(f"[report] 已生成 {report_path}（review {len(review)} / failing {len(failing)} / "
+        f"drop {len(dropped)} / 阻断 {n_blocked}）")
 
-    _append_daily_pointer(date_disp, stamp, len(review), len(failing))
+    _append_daily_pointer(date_disp, stamp, len(review), len(failing), n_blocked)
 
     # SMTP 直发（§8：有活才发，全绿不发；--dry-run/--no-notify 只落盘）
     # 心跳模式（PA_HEARTBEAT=1，cron 触发）：全绿也发一封状态邮件——无头服务器上邮件断了即流水线挂了。
-    active = bool(review or failing)
+    # 阻断（远程态不明 / 测试门未过）计入 active：须运维 triage（auth / 远程服务 / flaky test），不能静默。
+    active = bool(review or failing or n_blocked)
     heartbeat = os.environ.get("PA_HEARTBEAT", "").lower() in ("1", "true", "yes")
     if not active and not heartbeat:
-        log("[report] 全绿（无待 review 绿 PR / 无 failing）——不发邮件（SPEC §8 全绿不投递）")
+        log("[report] 全绿（无待 review 绿 PR / 无 failing / 无阻断）——不发邮件（SPEC §8 全绿不投递）")
         return report_path
     if getattr(args, "dry_run", False) or getattr(args, "no_notify", False):
         tag = "DRY-RUN" if getattr(args, "dry_run", False) else "--no-notify"
         state = "有活但 " + tag if active else "全绿（心跳模式）但 " + tag
         log(f"[report] {state}——不发邮件，报告已落盘")
         return report_path
-    _smtp_notify(stamp, report_path, len(review), len(failing), active=active)
+    _smtp_notify(stamp, report_path, len(review), len(failing), n_blocked, active=active)
     return report_path
 
 
-def _append_daily_pointer(date_disp: str, stamp: str, n_review: int, n_failing: int) -> None:
+def _append_daily_pointer(date_disp: str, stamp: str, n_review: int, n_failing: int,
+                          n_blocked: int = 0) -> None:
     """日报加一行指针指向本报告（§8）；日报不存在则极简创建（仅指针，不侵入既有日报）。"""
     DAILY_DIR.mkdir(parents=True, exist_ok=True)
     daily = DAILY_DIR / f"work-daily-{date_disp}.md"
-    pointer = f"- 项目推进报告 → [[项目推进报告_{stamp}]]（{n_review} 待 review / {n_failing} failing）"
+    pointer = (f"- 项目推进报告 → [[项目推进报告_{stamp}]]（{n_review} 待 review / "
+               f"{n_failing} failing / {n_blocked} 阻断）")
     if daily.is_file():
         txt = daily.read_text(encoding="utf-8")
         if f"项目推进报告_{stamp}" not in txt:        # 幂等：同日重出报告不重复加指针
@@ -1567,14 +1703,15 @@ def _append_daily_pointer(date_disp: str, stamp: str, n_review: int, n_failing: 
         daily.write_text(f"# 工作日报 {date_disp}\n\n{pointer}\n", encoding="utf-8")
 
 
-def _smtp_notify(stamp: str, report_path: Path, n_review: int, n_failing: int, *, active: bool = True) -> None:
-    """发简讯（§8/§10）：标题=N 待 review / M failing；报告为正文+附件。失败退化为告警，不阻塞流水线。
+def _smtp_notify(stamp: str, report_path: Path, n_review: int, n_failing: int,
+                 n_blocked: int = 0, *, active: bool = True) -> None:
+    """发简讯（§8/§10）：标题=N 待 review / M failing / K 阻断；报告为正文+附件。失败退化为告警，不阻塞流水线。
 
     active=False 时为「全绿心跳」（PA_HEARTBEAT 触发的 cron 模式）——无头服务器上
     邮件断了即流水线挂了，故全绿也发一封状态邮件做心跳。
     """
     suffix = "" if active else "（全绿心跳）"
-    subject = f"项目推进 {stamp}｜{n_review} 待 review / {n_failing} failing{suffix}"
+    subject = f"项目推进 {stamp}｜{n_review} 待 review / {n_failing} failing / {n_blocked} 阻断{suffix}"
     # 收件人：观察期发自己（dvs），稳定后改回 juyf@newland.com.cn（居燕峰）——2026-07-17 上线初用户决策。
     # 如需更灵活可挪到 profile/env（PA_REPORT_TO），当前按用户选择保持简单硬编码 + 醒目注释。
     report_to = "dvs@vip.sina.com"   # 观察期；稳定后改 "juyf@newland.com.cn"

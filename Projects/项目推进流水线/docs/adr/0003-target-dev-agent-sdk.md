@@ -1,6 +1,8 @@
 # 0003 — 目标面 dev agent = 仓自带 SDK 脚本；控制面留 CLI；刹车由平台兜底
 
 > **2026-07-16 修订（见 ADR-0005）：** 控制面最终为 3 个 CLI persona（radar / prd / critic）+ 2 个机械 stage（dispatch / report）。本 ADR 的目标面 SDK 决策不变；下文「控制面 5 persona」是当时的原始决策，已由 ADR-0005 部分取代。
+>
+> **2026-07-18 再修订（见 ADR-0006）：** 本 ADR **#1/#2「dev agent 归仓、随仓走」已被推翻**——dev agent 源码上收控制面（单一 `scripts/dev-agent.py`，被控仓零脚本），`dev_slugify` 抽 `slug_utils.py` 单一源头消解 ADR-0004 #4 slugify shadow。下文 #1/#2/#5 的「仓自带脚本 / dispatch 复刻 slugify」为**历史决策**，保留以示决策脉络；运行时归属仍贴目标仓（ADR-0001 平面隔离不变）。仓特定知识改由仓 CLAUDE.md（B1）承载、定制走 profile 参数（决定 #3/#4）。
 
 ## 决定
 

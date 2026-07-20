@@ -20,7 +20,8 @@ vault，但执行贴被控仓。被控仓零脚本。
 契约（与历史 dev-agent.{py,mjs} 一一对应，pa-dispatch 解析端零改动）：
   CLI: --prd/--source/--base/--branch-prefix/--dry-run
   退出码: 0=成功（开 PR 或 dry-run 完成）| 10=PRD 缺失/读不到 | 11=SDK dev loop 失败 |
-          12=stalled（SPEC #27 主动刹车）| 13=git/push/PR 失败 | 99=未捕获
+          12=stalled（SPEC #27 主动刹车）| 13=git/push/PR 失败 |
+          14=发布门拦截（测试未跑/失败/过期，OpenSpec verified-dev-execution）| 99=未捕获
   stdout: 仅最终一行 JSON（字段名与历史完全一致）
 
 用法（pa-dispatch 自动调，或人手动）：
@@ -57,6 +58,9 @@ from claude_agent_sdk import (
 
 from slug_utils import dev_slugify   # ADR-0006 #5：dev_slugify 单一源头（无依赖模块，避免顶部 import 触发 sdk 连带加载拖垮 cron）
 from bash_allowlist import decide_bash   # ADR-0006 #7：Bash 命令放行判定（无依赖模块，同上）
+from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # OpenSpec verified-dev-execution：结构化测试证据 + 发布硬门（无依赖模块，同上）
+from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
+from external_state import sanitize   # C2 脱敏：git()/gh() stderr 进 JSON error 前抹 token（无依赖模块，同上）
 
 REPO_ROOT = Path.cwd()
 
@@ -103,7 +107,7 @@ def git(args: list[str]) -> str:
         r = subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=120)
         if r.returncode != 0:
-            raise RuntimeError((r.stderr or "").strip() or f"git {args[0]} 退出 {r.returncode}")
+            raise RuntimeError(sanitize((r.stderr or "").strip() or f"git {args[0]} 退出 {r.returncode}"))   # C2：stderr 脱敏（抹 token）后进异常消息，防落 JSON error/run log 泄密钥
         return r.stdout.strip()
     except FileNotFoundError:
         raise RuntimeError("git 不在 PATH")
@@ -116,7 +120,7 @@ def gh(args: list[str]) -> str:
         r = subprocess.run(["gh", *args], cwd=REPO_ROOT, capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=60)
         if r.returncode != 0:
-            raise RuntimeError((r.stderr or "").strip() or f"gh {args[0]} 退出 {r.returncode}")
+            raise RuntimeError(sanitize((r.stderr or "").strip() or f"gh {args[0]} 退出 {r.returncode}"))   # C2：stderr 脱敏（抹 token）后进异常消息
         return r.stdout.strip()
     except FileNotFoundError:
         raise RuntimeError("gh 不在 PATH")
@@ -191,7 +195,8 @@ def append_run_line(run_log: Path, obj: dict) -> None:
 
 def create_loop_state(run_log: Path) -> dict:
     return {"run_log": run_log, "turn": 0, "last_test": None, "last_test_cmd": None,
-            "no_write_streak": 0, "stalled": False, "pending_test_ids": set()}
+            "no_write_streak": 0, "stalled": False, "pending_test_ids": set(),
+            "test_evidence": None}   # OpenSpec verified-dev-execution：结构化测试证据（None=未采集）
 
 
 async def process_dev_loop(messages, state: dict) -> ResultMessage | None:
@@ -219,7 +224,11 @@ async def process_dev_loop(messages, state: dict) -> ResultMessage | None:
                         if is_clean_test_cmd(inp["command"].strip()):
                             state["pending_test_ids"].add(b.id)   # 等下个 user msg 配对 tool_result
                             state["last_test_cmd"] = inp["command"].strip()   # 记最后一次干净 test 命令，上报给 dispatch 重放
-            if has_write: state["no_write_streak"] = 0
+            if has_write:
+                state["no_write_streak"] = 0
+                # OpenSpec verified-dev-execution：绿后又发生候选写 → 证据过期（mark_stale 返回新副本，None 原样）
+                if state["test_evidence"] is not None:
+                    state["test_evidence"] = mark_stale(state["test_evidence"])
             elif state["last_test"] == "red": state["no_write_streak"] += 1
             append_run_line(state["run_log"], {
                 "turn": state["turn"], "tool_use": tool_uses, "diff_stat": git_diff_stat(),
@@ -240,6 +249,11 @@ async def process_dev_loop(messages, state: dict) -> ResultMessage | None:
                     res = classify_test_exit(b, txt)
                     if res:
                         state["last_test"] = res
+                        # OpenSpec verified-dev-execution：记录结构化证据（整体替换为最新测试，fresh=True）
+                        state["test_evidence"] = TestEvidence(
+                            command=state.get("last_test_cmd") or "",
+                            exit_code=0 if res == "green" else 1,
+                            completed_at=stamp(), fresh=True)
                         sys.stderr.write(f"[dev] test → {res}（is_error={getattr(b,'is_error',None)}, {len(txt)} chars）\n")
                     else:
                         sys.stderr.write(f"[dev] test 结果未识别（is_error={getattr(b,'is_error',None)}, {len(txt)} chars）\n")
@@ -269,8 +283,8 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     SDK 经 setting_sources=["project"] 自动加载。本 prompt 只放跨仓一致的守则。"""
     base = args["base"]
     dry = args["dry_run"]
-    head = (f"你是本仓的自治 dev agent。**dry-run 模式**：在当前工作区跑，"
-            f"不切分支 / 不 commit / 不 push，改动留工作树供 review。"
+    head = ("你是本仓的自治 dev agent。**dry-run 模式**：在当前工作区跑，"
+            "不切分支 / 不 commit / 不 push，改动留工作树供 review。"
             if dry else
             f"你是本仓的自治 dev agent。当前分支 {branch}（基点 {base}）。")
     prot = "" if dry else f"主干 {base} 有 branch protection——你永远只在这个 feature 分支上干活，绝不直推主干。"
@@ -373,11 +387,18 @@ async def main() -> int:
             setting_sources=["project"],            # 加载仓 CLAUDE.md(仓特定守则) + .claude/hooks
             tools=["Read", "Grep", "Glob", "Edit", "Write", "MultiEdit",
                    "TodoWrite", "Bash", "Agent"],   # 硬白名单（Python SDK：tools=可用性限制；allowed_tools 仅批准列表，非白名单）
+            # ⚠ follow-up（canary 2026-07-20 实证）：max_turns/max_budget_usd 在 SDK 0.2.121 似被绕过
+            #   （canary 实跑 325 turn 远超 150、total_cost_usd=None 未报成本）——实际仅 SPEC #27 stall
+            #   刹车兜住失控。budget/turn 硬执行 + SDK cost 上报机制排查列为 follow-up（ADR-0006 #6）。
             max_turns=150,
-            max_budget_usd=MAX_BUDGET,               # 预算刹车（降级兜底）
+            max_budget_usd=MAX_BUDGET,               # 预算刹车（降级兜底，非硬保证——见上 follow-up）
             env=build_env_for_sdk(),                 # PATH 前置 runtime python + claude CLI
         )
-        result_msg = await process_dev_loop(query(prompt=prompt, options=options), state)
+        # can_use_tool 回调要求 streaming 模式（SDK 0.2.x：_internal/client.py:103 见 prompt 为
+        # str 即 raise「can_use_tool callback requires streaming mode」）。string prompt 经
+        # prompt_stream() 包成单条 user 消息异步流（dict 对齐 _internal/client.py:214-219）。
+        # 实现抽到零依赖模块 prompt_stream.py 以便单测锁定 dict 结构（ADR-0006 #7）。
+        result_msg = await process_dev_loop(query(prompt=prompt_stream(prompt), options=options), state)
     except Exception as e:
         sys.stderr.write(f"✗ SDK dev loop 异常: {e}\n"); return 11
 
@@ -406,6 +427,21 @@ async def main() -> int:
                          ensure_ascii=False))
         return 0
 
+    # 4.5 发布硬门（OpenSpec verified-dev-execution）：无新鲜绿色证据 → 不 commit/push/PR。
+    # 宁拦勿错放：dev 自治产出的「绿」必须落到结构化证据、且采集后无后续候选写，才允许发布动作。
+    verdict, reason = evaluate_gate(state.get("test_evidence"))
+    if verdict != GATE_PUBLISH:
+        ev = state.get("test_evidence")
+        gate_status = verdict   # test_not_run | test_failed | test_stale
+        sys.stderr.write(f"🚫 发布门拦截（{gate_status}）: {reason}\n")
+        print(json.dumps({"ok": False, "blocked_by_gate": True, "gate_status": gate_status,
+                          "gate_reason": reason, "branch": branch, "base": base,
+                          "cost": cost, "turns": turns,
+                          "test_cmd": (ev.command if ev else state.get("last_test_cmd")),
+                          "test_status": ("green" if (ev and ev.exit_code == 0) else ("red" if ev else "none")),
+                          "evidence_fresh": bool(ev and ev.fresh)}, ensure_ascii=False))
+        return 14
+
     # 5. commit + push + 开 PR（branch protection 要求走 PR）
     try:
         git(["add", "-A"])
@@ -421,8 +457,12 @@ async def main() -> int:
         pr_url = gh(["pr", "create", "--base", base, "--head", branch,
                      "--title", f"pa-dev: {title}",
                      "--body", "自治 dev agent 产出（PRD 见任务投递）。验证闸（dev-agent 自治）已绿。"])
+        ev = state.get("test_evidence")
+        # 发布门已放行 → test_passed=True 现为可证（新鲜绿色证据），并补结构化 gate/test 字段（2.5 truthful JSON）
         print(json.dumps({"ok": True, "branch": branch, "base": base, "pr_url": pr_url,
-                          "cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd"), "test_passed": state.get("last_test") == "green"}, ensure_ascii=False))
+                          "cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd"),
+                          "test_passed": True, "test_status": "green",
+                          "gate_status": GATE_PUBLISH, "evidence_fresh": bool(ev and ev.fresh)}, ensure_ascii=False))
         return 0
     except Exception as e:
         sys.stderr.write(f"✗ git/push/PR 阶段失败: {e}\n")

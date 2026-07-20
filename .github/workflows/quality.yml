@@ -1,0 +1,36 @@
+# quality.yml — 项目推进流水线 CI 闸（OpenSpec reproducible-pipeline-validation）。
+# 每个 PR 与 main 推送：装声明环境 → 跑与本地同一的 scripts/quality.sh（compile + pytest + ruff）。
+# path 过滤：仅在流水线自身或本 workflow 改动时触发，避免 vault 其余内容变动无谓跑 CI。
+name: quality
+
+on:
+  pull_request:
+    paths:
+      - "Projects/项目推进流水线/**"
+      - ".github/workflows/quality.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Projects/项目推进流水线/**"
+      - ".github/workflows/quality.yml"
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Projects/项目推进流水线
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: Projects/项目推进流水线/pyproject.toml
+
+      - name: Install declared env
+        run: pip install -e ".[dev]"
+
+      - name: Quality (compile + pytest + ruff)
+        run: bash scripts/quality.sh
