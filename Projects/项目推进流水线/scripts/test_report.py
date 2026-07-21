@@ -138,3 +138,34 @@ def test_report_reads_legacy_records_without_new_fields(tmp_path, monkeypatch):
     assert "old-slug" in txt and "legacy skip" in txt
     assert "产出 PR：1" in txt                  # 仅 pr_open 那条计产出
     assert "阻断（未投递）：0" in txt           # 无新阻断字段 → 不误计
+
+
+def test_report_skip_with_explicit_null_pr_url_does_not_crash(tmp_path, monkeypatch):
+    # 回归（fix f98086a）：dispatch 对超额 skip 项写 "pr_url": null（显式 None），
+    # 旧 repo_of 用 d.get("pr_url", "") → default 不覆盖显式 null → 返回 None →
+    # re.search(pattern, None) 抛 TypeError，致 20260720 cron stage_report 整段崩、报告+简讯未出。
+    # 修复 url = d.get("pr_url") or "" 后 None coerce 成 "" 不崩。此测试锁该修复、防回退。
+    # 复现 07-20 cron 实况：过闸 PRD 9 份全部超额 skip（在途 2 ≥ 2）、pr_url=null。
+    disp = [
+        {"project": "cc-web-control", "status": "skip", "pr_url": None,   # 显式 null（不是缺键）
+         "slug": "hub-supervised-autonomy", "skip_reason": "跳过-超额（在途 2 ≥ 2）"},
+        {"project": "ashare-llm-analyst", "status": "skip", "pr_url": None,
+         "slug": "fin-report-llm-screen", "skip_reason": "跳过-超额（在途 2 ≥ 2）"},
+    ]
+    _setup_report(tmp_path, monkeypatch, disp)
+    args = SimpleNamespace(dry_run=True, no_notify=False)   # dry_run：不触 SMTP，只验不崩 + 渲染
+
+    # Act：旧代码此处抛 TypeError；修复后正常落报告
+    rp = run_daily.stage_report(args, {}, STAMP)
+    txt = rp.read_text(encoding="utf-8")
+
+    # Assert ① 不崩 + 报告落盘（能读到就算过——这是回归核心）
+    assert "项目推进报告" in txt
+    # Assert ② 两条 skip 渲染进「异常/超时/跳过」节；repo_of 对 pr_url=None 回退到 project 名，不崩
+    abnormal = txt.split("## ⚠️ 异常 / 超时 / 跳过", 1)[1]
+    assert "cc-web-control" in abnormal
+    assert "ashare-llm-analyst" in abnormal
+    assert "跳过-超额（在途 2 ≥ 2）" in abnormal
+    # Assert ③ 概览计数：全 skip 无 PR（产出 PR=0）；失败/超时/跳过=2
+    assert "产出 PR：0" in txt
+    assert "失败/超时/跳过：2" in txt
