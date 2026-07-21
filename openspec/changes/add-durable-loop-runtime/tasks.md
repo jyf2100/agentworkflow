@@ -34,13 +34,13 @@
 
 ## 5. Session-Aware Retry Policy
 
-- [ ] 5.1 Persist SDK session ID, ResultMessage subtype, stop reason, turns, usage, optional cost, compaction count, and exception classification for every iteration.
-- [ ] 5.2 Implement normalized failure fingerprints and progress signals based on diff/test/artifact hashes.
-- [ ] 5.3 Implement the versioned RetryPolicy with `resume`, `fork`, `new_session`, `block`, and `stop` decisions.
-- [ ] 5.4 Generate evidence-derived recovery context from immutable PRD content and journal artifacts.
-- [ ] 5.5 Reconcile branch, commit, PR, test, and publication idempotency keys before every retry mode.
-- [ ] 5.6 Enforce independent limits for Stop continuations, SDK retries, outer verify iterations, total wall-clock, turns, and trusted cost.
-- [ ] 5.7 Add tests for transient resume, verifier-driven resume, alternative fork, repeated-failure new session, missing session fallback, external-state block, and exhausted budget.
+- [x] 5.1 Persist SDK session ID, ResultMessage subtype, stop reason, turns, usage, optional cost, compaction count, and exception classification for every iteration.
+- [x] 5.2 Implement normalized failure fingerprints and progress signals based on diff/test/artifact hashes.
+- [x] 5.3 Implement the versioned RetryPolicy with `resume`, `fork`, `new_session`, `block`, and `stop` decisions.
+- [x] 5.4 Generate evidence-derived recovery context from immutable PRD content and journal artifacts.
+- [x] 5.5 Reconcile branch, commit, PR, test, and publication idempotency keys before every retry mode.
+- [x] 5.6 Enforce independent limits for Stop continuations, SDK retries, outer verify iterations, total wall-clock, turns, and trusted cost.
+- [x] 5.7 Add tests for transient resume, verifier-driven resume, alternative fork, repeated-failure new session, missing session fallback, external-state block, and exhausted budget.
 
 ## 6. Execution Sandbox
 
