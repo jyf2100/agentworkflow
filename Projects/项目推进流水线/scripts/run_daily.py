@@ -40,7 +40,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（消解 ADR-0004 #4 shadow；无依赖模块，顶部 import 不触发 sdk 连带加载拖垮 cron）
@@ -192,17 +192,61 @@ def discover_today_new(source: dict, marker_stamp: str, limit: int | None) -> li
         for pat in expand_braces(excl):
             for p in root.glob(pat):
                 seen.pop(p, None)
+    # 取数窗口：window_days>0 → [today-N, today] 滚动窗口（回溯，ADR-0007 follow-up，
+    #   防整理产品晚产出被水位线跳过）；缺省/0 → 现状水位线（>marker，单调不回溯）。
+    #   window 源幂等不靠 marker，靠 stage_radar 出口的 source_path 去重 + dispatch GitHub 去重。
+    window_days = int(source.get("window_days", 0) or 0)
+    floor = (date.today() - timedelta(days=window_days)).strftime("%Y%m%d") if window_days > 0 else None
     out = []
     for p in sorted(seen):
         m = re.match(r"(\d{8})", p.name)
         if not m:
             continue
-        if m.group(1) <= marker_stamp:   # 只取 > marker
+        fd = m.group(1)
+        if window_days > 0:
+            if fd < floor:               # 早于窗口下沿 → 太老，跳过（窗口内全取，不读 marker 下界）
+                continue
+        elif fd <= marker_stamp:         # 现状水位线：只取 > marker
             continue
         out.append(p)
     if limit:
         out = out[:limit]
     return out
+
+
+def _prd_frontmatter_source(path: Path) -> str:
+    """读一份 PRD 的 frontmatter source_path（内容指纹键）。无 frontmatter / 解析失败 → ""。"""
+    try:
+        txt = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    if not txt.startswith("---"):
+        return ""
+    parts = txt.split("---", 2)
+    if len(parts) < 3:
+        return ""
+    try:
+        return (yaml.safe_load(parts[1]) or {}).get("source_path") or ""
+    except Exception:
+        return ""
+
+
+def already_prd_sources(profiles: dict) -> set[str]:
+    """各项目 state/prd/<project>/*.md frontmatter source_path 集合。
+
+    窗口源回溯重取时的内容指纹去重键（ADR-0007 follow-up）：source_path 已产过 PRD
+    → 不再重喂下游，防重复 PRD 文件 + critic 重审。PRD frontmatter 契约已有 source_path
+    （pa-prd 实证），无需改契约。"""
+    done: set[str] = set()
+    for name in profiles:
+        d = STATE_DIR / "prd" / name
+        if not d.is_dir():
+            continue
+        for p in d.glob("*.md"):
+            sp = _prd_frontmatter_source(p)
+            if sp:
+                done.add(sp)
+    return done
 
 
 def fetch_dedup_list(profiles: dict) -> dict:
@@ -580,8 +624,9 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
         per_source_new[src["name"]] = today_new
         if today_new:
             per_source_newmax[src["name"]] = max(re.match(r"(\d{8})", p.name).group(1) for p in today_new)
+        wd = src.get("window_days", 0) or 0
         log(f"[radar] source={src['name']} kind={src.get('kind','directory')} "
-            f"marker={marker}｜今日新（>marker）={len(today_new)}")
+            f"marker={marker} window={'off' if not wd else wd}｜今日新={len(today_new)}")
         for p in today_new:
             log(f"        - {p.relative_to(VAULT_ROOT)}")
 
@@ -602,6 +647,7 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
 
     # 3) 按项目调 radar（只有「订阅到新文件」的项目才调——无订阅不调，比现状更省）
     dedup = fetch_dedup_list(profiles)
+    done_sources = already_prd_sources(profiles)   # 窗口源回溯去重：source_path 已产 PRD 的不再喂下游
     all_candidates: list[dict] = []
     per_project_stats: dict[str, dict] = {}
     for proj, src_files in proj_src_files.items():
@@ -614,6 +660,10 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
         for c in payload.get("candidates", []):
             c.setdefault("project", proj)
             c.setdefault("source", _source_of(c, src_files))   # 追溯来自哪个源（决定 #6）
+            sp = c.get("source_path")
+            if sp and sp in done_sources:                      # 已为该 source 产过 PRD → 去重，防重复 PRD/critic
+                log(f"[radar] ⏭ 去重：{sp} 已有 PRD，跳过 candidate")
+                continue
             all_candidates.append(c)
         per_project_stats[proj] = {**payload.get("stats", {}), "cost": meta["cost"], "turns": meta["turns"]}
         log(f"[radar] ✅ {proj}: candidates={len(payload.get('candidates', []))}｜"
