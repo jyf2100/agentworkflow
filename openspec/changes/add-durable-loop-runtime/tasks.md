@@ -1,25 +1,25 @@
 ## 1. Phase-One Readiness and Contracts
 
-- [ ] 1.1 Verify every `harden-project-pipeline` task is complete and its TestEvidence, external lookup, and executor contracts are covered by passing tests.
-- [ ] 1.2 Pin and document the Claude Agent SDK version used by the control-plane executor and add contract tests for required ResultMessage fields and lifecycle hooks.
-- [ ] 1.3 Add feature flags for journal shadow mode, journal-driven dispatch, session-aware retry, lifecycle hooks, container sandbox, and telemetry export.
+- [x] 1.1 Verify every `harden-project-pipeline` task is complete and its TestEvidence, external lookup, and executor contracts are covered by passing tests.
+- [x] 1.2 Pin and document the Claude Agent SDK version used by the control-plane executor and add contract tests for required ResultMessage fields and lifecycle hooks.
+- [x] 1.3 Add feature flags for journal shadow mode, journal-driven dispatch, session-aware retry, lifecycle hooks, container sandbox, and telemetry export.
 
 ## 2. Durable Journal and Artifact Store
 
-- [ ] 2.1 Define versioned journal event, iteration state, artifact reference, failure classification, and recovery snapshot data models.
-- [ ] 2.2 Implement atomic append, flush, read, validation, and reduction for per-run JSONL journals.
-- [ ] 2.3 Implement incomplete-tail recovery and fail-closed middle-corruption detection with focused tests.
-- [ ] 2.4 Implement a SHA-256 content-addressed artifact store for diffs, test output, verifier feedback, and recovery snapshots.
-- [ ] 2.5 Add artifact digest verification, metadata allowlists, secret redaction, and evidence-integrity failure tests.
-- [ ] 2.6 Implement the explicit iteration state machine and reject invalid or duplicate transitions.
-- [ ] 2.7 Add compatibility readers for historical dispatch JSON and report fixtures with no journal.
+- [x] 2.1 Define versioned journal event, iteration state, artifact reference, failure classification, and recovery snapshot data models.
+- [x] 2.2 Implement atomic append, flush, read, validation, and reduction for per-run JSONL journals.
+- [x] 2.3 Implement incomplete-tail recovery and fail-closed middle-corruption detection with focused tests.
+- [x] 2.4 Implement a SHA-256 content-addressed artifact store for diffs, test output, verifier feedback, and recovery snapshots.
+- [x] 2.5 Add artifact digest verification, metadata allowlists, secret redaction, and evidence-integrity failure tests.
+- [x] 2.6 Implement the explicit iteration state machine and reject invalid or duplicate transitions.
+- [x] 2.7 Add compatibility readers for historical dispatch JSON and report fixtures with no journal.
 
 ## 3. Shadow Journaling Integration
 
-- [ ] 3.1 Assign stable run, PRD, iteration, action, and idempotency IDs at dispatch entry.
+- [x] 3.1 Assign stable run, PRD, iteration, action, and idempotency IDs at dispatch entry.
 - [ ] 3.2 Emit planned/running/agent-finished/test/verifier/reconcile/publish journal events alongside the existing dispatch flow without changing decisions.
 - [ ] 3.3 Replace PRD feedback appends with journal feedback artifacts for new runs while preserving read compatibility for historical PRDs.
-- [ ] 3.4 Add a comparison command/test that proves journal-reduced terminal states match existing dispatch records in shadow mode.
+- [x] 3.4 Add a comparison command/test that proves journal-reduced terminal states match existing dispatch records in shadow mode.
 - [ ] 3.5 Add crash-injection tests at every side-effect boundary and verify recovery performs reconciliation before retry.
 
 ## 4. SDK Lifecycle Hooks and Evidence
