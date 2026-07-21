@@ -17,10 +17,10 @@
 ## 3. Shadow Journaling Integration
 
 - [x] 3.1 Assign stable run, PRD, iteration, action, and idempotency IDs at dispatch entry.
-- [ ] 3.2 Emit planned/running/agent-finished/test/verifier/reconcile/publish journal events alongside the existing dispatch flow without changing decisions.
-- [ ] 3.3 Replace PRD feedback appends with journal feedback artifacts for new runs while preserving read compatibility for historical PRDs.
+- [x] 3.2 Emit planned/running/agent-finished/test/verifier/reconcile/publish journal events alongside the existing dispatch flow without changing decisions.
+- [x] 3.3 Replace PRD feedback appends with journal feedback artifacts for new runs while preserving read compatibility for historical PRDs.
 - [x] 3.4 Add a comparison command/test that proves journal-reduced terminal states match existing dispatch records in shadow mode.
-- [ ] 3.5 Add crash-injection tests at every side-effect boundary and verify recovery performs reconciliation before retry.
+- [x] 3.5 Add crash-injection tests at every side-effect boundary and verify recovery performs reconciliation before retry.
 
 ## 4. SDK Lifecycle Hooks and Evidence
 
