@@ -24,13 +24,13 @@
 
 ## 4. SDK Lifecycle Hooks and Evidence
 
-- [ ] 4.1 Implement a hook adapter that journals PreToolUse, PostToolUse, Stop, PreCompact, SubagentStart, and SubagentStop with stable correlation IDs.
-- [ ] 4.2 Move path, command, network, and protected-resource checks into deterministic PreToolUse policy components while retaining the first-phase permission gate.
-- [ ] 4.3 Pair PostToolUse results to tool-use IDs and persist structured exit status, changed paths, sanitized output artifacts, and TestEvidence updates.
-- [ ] 4.4 Implement a bounded Stop hook that blocks completion without fresh green TestEvidence and permits completion without replacing outer independent verification.
-- [ ] 4.5 Implement PreCompact recovery snapshots and block automatic recovery when a required snapshot cannot be persisted.
-- [ ] 4.6 Record subagent ownership, objective, tools, effort, status, and result artifact while preventing subagent publication actions.
-- [ ] 4.7 Add mock-SDK contract tests for denied tools, unpaired results, no-test Stop, stale-test Stop, compaction, hook failure, and subagent events.
+- [x] 4.1 Implement a hook adapter that journals PreToolUse, PostToolUse, Stop, PreCompact, SubagentStart, and SubagentStop with stable correlation IDs.
+- [x] 4.2 Move path, command, network, and protected-resource checks into deterministic PreToolUse policy components while retaining the first-phase permission gate.
+- [x] 4.3 Pair PostToolUse results to tool-use IDs and persist structured exit status, changed paths, sanitized output artifacts, and TestEvidence updates.
+- [x] 4.4 Implement a bounded Stop hook that blocks completion without fresh green TestEvidence and permits completion without replacing outer independent verification.
+- [x] 4.5 Implement PreCompact recovery snapshots and block automatic recovery when a required snapshot cannot be persisted.
+- [x] 4.6 Record subagent ownership, objective, tools, effort, status, and result artifact while preventing subagent publication actions.
+- [x] 4.7 Add mock-SDK contract tests for denied tools, unpaired results, no-test Stop, stale-test Stop, compaction, hook failure, and subagent events.
 
 ## 5. Session-Aware Retry Policy
 
