@@ -53,12 +53,12 @@
 
 ## 7. OpenTelemetry and Operational Metrics
 
-- [ ] 7.1 Define metadata-only span and metric conventions for run, iteration, SDK session, tool, test, verify, reconcile, and publish.
-- [ ] 7.2 Implement trace-context persistence and span links across resume, fork, subprocess, and cross-process recovery.
-- [ ] 7.3 Add OTLP export with bounded timeouts and a local observability-degradation journal event when the backend is unavailable.
-- [ ] 7.4 Implement metrics for success, blocked/failed states, iteration count, test pass rate, repeated failures, recovery success, cost, and wall-clock.
-- [ ] 7.5 Add telemetry field-allowlist and secret-leak tests that reject prompts, source code, full tool output, credentials, cookies, and environment values.
-- [ ] 7.6 Extend reports with trace IDs, assurance tier, recovery mode, compaction count, and observability degradation without exposing sensitive data.
+- [x] 7.1 Define metadata-only span and metric conventions for run, iteration, SDK session, tool, test, verify, reconcile, and publish.
+- [x] 7.2 Implement trace-context persistence and span links across resume, fork, subprocess, and cross-process recovery.
+- [x] 7.3 Add OTLP export with bounded timeouts and a local observability-degradation journal event when the backend is unavailable.
+- [x] 7.4 Implement metrics for success, blocked/failed states, iteration count, test pass rate, repeated failures, recovery success, cost, and wall-clock.
+- [x] 7.5 Add telemetry field-allowlist and secret-leak tests that reject prompts, source code, full tool output, credentials, cookies, and environment values.
+- [x] 7.6 Extend reports with trace IDs, assurance tier, recovery mode, compaction count, and observability degradation without exposing sensitive data.
 
 ## 8. Cutover, Canary, and Recovery Drills
 
