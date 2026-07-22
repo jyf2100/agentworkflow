@@ -148,14 +148,26 @@ def decide(*,
            progress: ProgressSignal | None,
            external_known: bool = True,
            verifier_signal: VerifierSignal = VerifierSignal.NONE,
-           failure_history=None) -> RetryDecision:
+           failure_history=None,
+           integrity_block: str | None = None) -> RetryDecision:
     """RetryPolicy 主决策——纯函数，对齐 design L45-54 决策表（优先级自上而下）。
 
-    前置门（停机/外部/session 健康）→ 失败分类驱动 resume/fork/new。绝不依赖模型自述。
+    前置门（停机/integrity/外部/session 健康）→ 失败分类驱动 resume/fork/new。绝不依赖模型自述。
+
+    task 4.3：``integrity_block``（``"evidence_integrity"`` | ``"journal_integrity"`` | None）显式
+    表达证据/日志完整性阻塞——喂进 retry/fork/new 的 recovery context 本身不可信时，重试无意义，
+    一律 BLOCK 不消耗 retry（spec verified-publication「Test artifact write fails」+ durable-runtime
+    「Reducer failure during driven mode」的 fail-closed 阻塞，需运维 triage）。
     """
-    # 1. 预算耗尽 → STOP（design L54 / risk#92 硬 kill）
+    # 1. 预算耗尽 → STOP（design L54 / risk#92 硬 kill，最高优先级）
     if budget.exhausted:
         return RetryDecision(RetryMode.STOP, reason=budget.exhaustion_reason, consumes_retry=False)
+    # 1.5 task 4.3：evidence/journal-integrity 阻塞 → BLOCK，不消耗 retry
+    #    （证据/日志不可信时 retry/fork/new 都无意义——喂进去的 context 本身不可信；spec fail-closed）
+    if integrity_block:
+        return RetryDecision(RetryMode.BLOCK,
+                             reason=f"{integrity_block}: integrity block; operator triage before retry",
+                             consumes_retry=False)
     # 2. 外部真源未知 → BLOCK，不消耗 retry（design L53；先 reconcile 再决策）
     if not external_known:
         return RetryDecision(RetryMode.BLOCK,

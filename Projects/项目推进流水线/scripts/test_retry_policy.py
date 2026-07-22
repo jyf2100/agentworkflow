@@ -184,3 +184,47 @@ def test_priority_stop_beats_block_beats_new_session():
     # 预算未耗尽 + 外部已知 + session 缺失 → NEW_SESSION
     assert RP.decide(budget=_fresh_budget(), session=None, fingerprint=None,
                      progress=None, external_known=True).mode is RP.RetryMode.NEW_SESSION
+
+
+# ─── task 4.3：evidence/journal-integrity 阻塞显式输入 ──────────────────────
+def test_block_when_evidence_integrity_block_does_not_consume_retry():
+    """task 4.3：evidence-integrity 阻塞（green test evidence artifact 无法持久化/校验）
+    → BLOCK，不消耗 retry（spec verified-publication「Test artifact write fails」：记
+    integrity-block reason，不当 complete fresh evidence）。优先于 session/verifier。"""
+    d = RP.decide(budget=_fresh_budget(), session=_sess(), fingerprint=None,
+                  progress=_progress(), external_known=True, integrity_block="evidence_integrity")
+    assert d.mode is RP.RetryMode.BLOCK and not d.consumes_retry
+    assert d.budget_dimension is None
+    assert "evidence" in d.reason
+
+
+def test_block_when_journal_integrity_block_does_not_consume_retry():
+    """task 4.3：journal-integrity 阻塞（malformed tail / reducer failure fail-closed）
+    → BLOCK，不消耗 retry（spec「Complete malformed journal tail」+ durable-runtime
+    「Reducer failure during driven mode」：fail-closed blocked，需运维 triage）。reason 含 journal。"""
+    d = RP.decide(budget=_fresh_budget(), session=_sess(), fingerprint=None,
+                  progress=_progress(), external_known=True, integrity_block="journal_integrity")
+    assert d.mode is RP.RetryMode.BLOCK and not d.consumes_retry
+    assert "journal" in d.reason
+
+
+def test_integrity_block_priority_over_session_and_external():
+    """task 4.3 优先级：预算耗尽 > integrity_block（BLOCK）> 外部未知 > session 健康。
+    即使 session 可用 + external_known=True + verifier 建议换方案，integrity_block 仍 BLOCK——
+    证据/日志不可信时 resume/fork/new 都无意义（喂进去的 recovery context 本身不可信）。"""
+    # 预算耗尽仍最高（硬 kill）
+    b_exhaust = RP.BudgetState(limits=RP.BudgetLimits(), sdk_retries_used=5)
+    assert RP.decide(budget=b_exhaust, session=_sess(), fingerprint=None,
+                     progress=_progress(), integrity_block="evidence_integrity").mode is RP.RetryMode.STOP
+    # 预算未耗尽 + integrity_block → BLOCK（即使 session 健康 + external 已知 + 建议换方案）
+    d = RP.decide(budget=_fresh_budget(), session=_sess(), fingerprint=None,
+                  progress=_progress(), external_known=True,
+                  verifier_signal=VS.SUGGEST_ALTERNATIVE, integrity_block="journal_integrity")
+    assert d.mode is RP.RetryMode.BLOCK and not d.consumes_retry
+
+
+def test_no_integrity_block_preserves_existing_decisions():
+    """task 4.3 回归：integrity_block=None（默认）不影响原决策表（resume/fork/new/block/stop 不变）。"""
+    d = RP.decide(budget=_fresh_budget(), session=_sess(exception_class=EC.TRANSIENT),
+                  fingerprint=None, progress=_progress())
+    assert d.mode is RP.RetryMode.RESUME

@@ -74,6 +74,15 @@ def test_suggested_next_step_known_statuses():
     assert "operator" in RC.suggested_next_step("state_corrupt")
 
 
+def test_suggested_next_step_blocked_evidence_is_operator_triage():
+    """task 4.3：blocked_evidence（green test evidence artifact 无法持久化/校验）→ operator triage，
+    与 state_corrupt 同属完整性阻塞（不自动 retry，需运维介入；spec verified-publication
+    「Test artifact write fails」integrity-block reason）。"""
+    nxt = RC.suggested_next_step("blocked_evidence")
+    assert "operator" in nxt
+    assert "evidence" in nxt
+
+
 def test_suggested_next_step_unknown_falls_back_to_resume():
     assert "resume" in RC.suggested_next_step("weird_status")
 

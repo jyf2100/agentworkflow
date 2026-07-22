@@ -169,3 +169,32 @@ def test_report_skip_with_explicit_null_pr_url_does_not_crash(tmp_path, monkeypa
     # Assert ③ 概览计数：全 skip 无 PR（产出 PR=0）；失败/超时/跳过=2
     assert "产出 PR：0" in txt
     assert "失败/超时/跳过：2" in txt
+
+
+def test_report_renders_integrity_blocked_separately_from_failing(tmp_path, monkeypatch):
+    """task 4.3：blocked_evidence（evidence-integrity）+ state_corrupt（journal-integrity）渲染进
+    独立「证据/日志完整性阻断」节，**不**计入「验证 failing」——blocked_evidence 虽 verify.pass=False，
+    但语义是「绿灯证据无法持久化」（非「项目自报绿但独立测试红」），混进 failing 会误导 review。
+    概览显式列完整性阻断计数（运维 triage 信号，与未投递阻断分开）。"""
+    disp = [
+        {"project": "o/r1", "status": "pr_open", "pr_url": "https://github.com/o/r1/pull/1",
+         "branch": "auto/a", "slug": "slug-a", "verify": {"pass": False, "test_cmd": "pytest"}},  # 真 failing
+        {"project": "o/r2", "status": "blocked_evidence", "branch": "auto/b", "slug": "slug-b",
+         "verify": {"pass": False}, "skip_reason": "green evidence artifact 持久化失败"},
+        {"project": "o/r3", "status": "state_corrupt", "branch": "auto/c", "slug": "slug-c",
+         "skip_reason": "journal 中部损坏 fail-closed"},
+    ]
+    _setup_report(tmp_path, monkeypatch, disp)
+    rp = run_daily.stage_report(SimpleNamespace(dry_run=True, no_notify=False), {}, STAMP)
+    txt = rp.read_text(encoding="utf-8")
+
+    # 完整性阻断节渲染两类（带 block 类别 + 脱敏原因）
+    assert "## 🚫 证据/日志完整性阻断" in txt
+    integ = txt.split("## 🚫 证据/日志完整性阻断", 1)[1]
+    assert "slug-b" in integ and "evidence" in integ.lower()
+    assert "slug-c" in integ and "journal" in integ.lower()
+
+    # failing 只算真 failing 那 1 条（blocked_evidence 不双计）
+    assert "验证 failing：1" in txt
+    # 概览显式列完整性阻断计数
+    assert "完整性阻断：2" in txt

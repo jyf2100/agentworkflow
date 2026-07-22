@@ -1786,12 +1786,17 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
               if d.get("status") in ("pr_open", "interrupted_pr") and (d.get("verify") or {}).get("pass")]
     failing = [d for d in disp
                if d.get("verify") and not d["verify"].get("pass")
-               and d.get("status") not in ("blocked_external_state", "blocked_test_gate")]   # 5.2 正交：阻断桶（未投递/门未过）不计 failing，独立成节促 triage
+               and d.get("status") not in ("blocked_external_state", "blocked_test_gate",
+                                           "blocked_evidence")]   # 5.2 正交：阻断桶不计 failing；task 4.3：blocked_evidence 虽 verify.pass=False 但语义是「绿灯证据无法持久化」（非自报绿但独立红），独立成完整性节
     abnormal = [d for d in disp if d.get("status") in ("skip", "planned", "fail")]   # interrupted_pr 必带 verify（reconcile 仅在有 commit 时补开）→ 已落 review/failing，不混入 abnormal（5.2 桶正交，与概览行一致）
     # 5.2 阻断（fail-safe-dispatch / verified-dev-execution）：远程态不明 / 测试发布门未过——未投递，
     # 既不计入「产出 PR」也不计入「verify 绿/红」。独立成节促运维 triage（auth/远程服务/flaky test）。
     blocked_external = [d for d in disp if d.get("status") == "blocked_external_state"]
     blocked_gate = [d for d in disp if d.get("status") == "blocked_test_gate"]
+    # task 4.3：证据/日志完整性阻断——green test evidence 无法持久化（blocked_evidence）或 journal
+    # 损坏 fail-closed（state_corrupt）。独立桶：既非测试红（不进 failing）、也非未投递（不在
+    # blocked_external/gate）——运维须 triage artifact 存储 / journal 恢复，不能混进 verify 绿红。
+    integrity_blocked = [d for d in disp if d.get("status") in ("blocked_evidence", "state_corrupt")]
     target_repos = sorted({d.get("project", "?") for d in disp})
 
     def repo_of(d: dict) -> str:
@@ -1816,6 +1821,7 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
                     f"投递目标仓：{len(target_repos)}｜"
                     f"产出 PR：{len([d for d in disp if d.get('status') in ('pr_open', 'interrupted_pr')])}｜"
                     f"验证 failing：{len(failing)}｜"
+                    f"完整性阻断：{len(integrity_blocked)}｜"
                     f"失败/超时/跳过：{len([d for d in disp if d.get('status') in ('skip', 'planned', 'fail')])}｜"
                     f"阻断（未投递）：{len(blocked_external) + len(blocked_gate)}"
                     f"（远程态不明 {len(blocked_external)} / 测试门未过 {len(blocked_gate)}）", ""]
@@ -1881,6 +1887,21 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
         L.append("（无）")
     L.append("")
 
+    # 🚫 证据/日志完整性阻断（task 4.3）——green test evidence 无法持久化（evidence）或 journal
+    # 损坏 fail-closed（journal）。非测试红、非未投递：独立成节促运维 triage（artifact 存储 / journal
+    # 恢复），不计 verify 绿红（spec verified-publication「Test artifact write fails」integrity-block reason）。
+    L += ["## 🚫 证据/日志完整性阻断"]
+    if integrity_blocked:
+        L += ["| 目标仓 | PRD | 分支 | 完整性类别 | 原因（已脱敏） |", "|---|---|---|---|---|"]
+        for d in integrity_blocked:
+            kind = "证据完整性（evidence）" if d.get("status") == "blocked_evidence" \
+                else "日志完整性（journal）"
+            L.append(f"| {repo_of(d)} | {d.get('slug', '')} | `{d.get('branch') or '—'}` | "
+                     f"{kind} | {d.get('skip_reason') or ''} |")
+    else:
+        L.append("（无）")
+    L.append("")
+
     # 📭 未匹配信号
     sig_total = stats.get("signals_extracted", 0)
     matched = len(cand.get("candidates", []))
@@ -1920,7 +1941,7 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
     # SMTP 直发（§8：有活才发，全绿不发；--dry-run/--no-notify 只落盘）
     # 心跳模式（PA_HEARTBEAT=1，cron 触发）：全绿也发一封状态邮件——无头服务器上邮件断了即流水线挂了。
     # 阻断（远程态不明 / 测试门未过）计入 active：须运维 triage（auth / 远程服务 / flaky test），不能静默。
-    active = bool(review or failing or n_blocked)
+    active = bool(review or failing or n_blocked or integrity_blocked)   # task 4.3：完整性阻断也计入 active（须 triage）
     heartbeat = os.environ.get("PA_HEARTBEAT", "").lower() in ("1", "true", "yes")
     if not active and not heartbeat:
         log("[report] 全绿（无待 review 绿 PR / 无 failing / 无阻断）——不发邮件（SPEC §8 全绿不投递）")

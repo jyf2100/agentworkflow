@@ -70,6 +70,7 @@ _NEXT_STEP = {
     "aborted": "halt: iteration aborted; diagnose skip reason before re-planning",
     "failed": "diagnose: iteration failed; consider new session if failure repeats",
     "state_corrupt": "operator: journal corruption detected; manual recovery required",
+    "blocked_evidence": "operator: green-test evidence artifact could not be persisted (evidence integrity block); manual recovery required",
 }
 
 
