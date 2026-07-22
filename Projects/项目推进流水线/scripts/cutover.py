@@ -21,7 +21,7 @@ drill 一律返不可变结果 dataclass（``*_DrillResult``），便于测试�
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import artifact_store
@@ -35,7 +35,6 @@ import reconcile as RC
 import retry_policy as RP
 import sandbox as SB
 import sandbox_publication as SP
-import telemetry as TEL
 import trace_context as TC
 
 

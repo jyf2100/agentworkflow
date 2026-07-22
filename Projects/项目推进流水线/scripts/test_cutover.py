@@ -27,7 +27,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 import container_sandbox as CS  # noqa: E402
 import cutover as CT  # noqa: E402
-import hook_policy as HP  # noqa: E402
 import loop_state as L  # noqa: E402
 import retry_policy as RP  # noqa: E402
 import sandbox as SB  # noqa: E402

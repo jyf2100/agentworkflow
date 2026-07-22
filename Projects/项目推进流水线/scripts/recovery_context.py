@@ -16,7 +16,7 @@ recovery snapshot 的精神：目标 / 验收 / 最后 diff / 最后 test / 失�
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # ─── immutable PRD 解析（只读，绝不改 PRD 文件；spec「Immutable PRD source」）────────
 _FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.S)

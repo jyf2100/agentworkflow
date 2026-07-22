@@ -1,5 +1,6 @@
 # 运行时状态（每次跑流水线都会变化，不入库）
 .project-auto/
+.quality-evidence/
 
 # Python 编译缓存
 __pycache__/

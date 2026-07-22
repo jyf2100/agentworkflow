@@ -1,8 +1,8 @@
 ## 1. Restore a Trustworthy Baseline
 
-- [ ] 1.1 Remove the current Ruff failures and make `scripts/quality.sh` pass under the declared Python 3.11+ runtime.
-- [ ] 1.2 Add a quality-evidence command that records interpreter version, exact command, test counts, Ruff result, timestamp, and artifact digests from the real process result.
-- [ ] 1.3 Add regression tests for tests-green/semantic-revise, complete malformed journal tail, failed test-artifact persistence, and every previously unmapped terminal state.
+- [x] 1.1 Remove the current Ruff failures and make `scripts/quality.sh` pass under the declared Python 3.11+ runtime.
+- [x] 1.2 Add a quality-evidence command that records interpreter version, exact command, test counts, Ruff result, timestamp, and artifact digests from the real process result.
+- [x] 1.3 Add regression tests for tests-green/semantic-revise, complete malformed journal tail, failed test-artifact persistence, and every previously unmapped terminal state.
 
 ## 2. Production Runtime Coordinator
 

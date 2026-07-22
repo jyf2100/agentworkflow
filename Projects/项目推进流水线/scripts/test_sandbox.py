@@ -15,7 +15,6 @@ AAA；模块零 docker / 零 SDK 依赖（LocalWorktreeSandbox.run 的 subproces
 """
 from __future__ import annotations
 
-import json
 import shutil
 import sys
 from pathlib import Path

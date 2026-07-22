@@ -17,10 +17,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-import evidence as EV  # noqa: E402
 import hook_adapter as HA  # noqa: E402
 import hook_events as HE  # noqa: E402
 import hook_policy as HP  # noqa: E402

@@ -31,7 +31,7 @@ journal → 调 ``hook_policy`` / ``evidence`` / ``artifact_store`` / recovery s
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import artifact_store
