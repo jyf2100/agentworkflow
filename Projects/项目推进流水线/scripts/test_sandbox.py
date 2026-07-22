@@ -59,13 +59,17 @@ class FakeContainerRunner:
 
 
 class StaticEgress:
-    """task 5.1 测试用 egress enforcement adapter：``enforceable`` 固定 bool（模拟已部署/未部署）。"""
-    def __init__(self, enforceable: bool, desc: str = "static"):
+    """task 5.1/5.2 测试用 egress enforcement adapter：``enforceable``/``install_ok`` 固定 bool。"""
+    def __init__(self, enforceable: bool, desc: str = "static", install_ok: bool = True):
         self._ok = enforceable
         self._desc = desc
+        self._install_ok = install_ok
 
     def enforceable(self) -> bool:
         return self._ok
+
+    def install(self, allowlist) -> bool:   # noqa: ARG002
+        return self._install_ok
 
     def describe(self) -> str:
         return self._desc
@@ -324,6 +328,53 @@ def test_docker_network_egress_preflights_inspect(monkeypatch):
     # 无 docker → 不 enforceable
     monkeypatch.setattr(CS.shutil, "which", lambda _: None)
     assert e.enforceable() is False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 5 task 5.2：enforceable egress policy 替代 label-only intent（design #5）
+# label-only domain intent 不再被接受为 enforcement；egress adapter 必须为 allowlist 安装/验证
+# enforceable policy（install），install/verify 失败 → sandbox_blocked。
+# ════════════════════════════════════════════════════════════════════════════
+def test_container_prepare_egress_install_failure_blocked(tmp_path):
+    """5.2 核心：egress enforceable（边界就绪）但为 allowlist 安装/验证策略失败 → sandbox_blocked
+    （policy_violation）——绝不以 label 充当 enforcement。"""
+    wt = tmp_path / "wt"; wt.mkdir()
+    c = CS.ContainerSandbox(FakeContainerRunner(),
+                             egress=StaticEgress(True, install_ok=False))
+    result = c.prepare(SB.SandboxSpec(worktree_dir=str(wt), network_allowlist=("pypi.org",)))
+    assert isinstance(result, SB.SandboxBlocked)
+    assert result.policy_violation is True
+    assert "egress" in result.reason.lower()
+
+
+def test_label_only_egress_install_returns_false():
+    """5.2：LabelOnlyEgress.install() 恒 False——label 不是 enforceable policy，无法 install/verify。"""
+    assert CS.LabelOnlyEgress().install(("pypi.org",)) is False
+
+
+def test_docker_network_egress_install_three_paths(monkeypatch):
+    """5.2：DockerNetworkEgress.install 真实 ensure named network——inspect 已存在→True（不 create）；
+    missing→create 成功→True；create 失败→False（不 claim enforcement）。"""
+    e = CS.DockerNetworkEgress(network="pa-egress")
+
+    class _R:
+        def __init__(self, rc): self.returncode = rc
+    monkeypatch.setattr(CS.shutil, "which", lambda _: "/usr/bin/docker")
+    # 已存在（inspect 0）→ True，不 create
+    monkeypatch.setattr(CS.subprocess, "run", lambda cmd, **k: _R(0))
+    assert e.install(("pypi.org",)) is True
+    # missing（inspect 1）→ create 成功（0）→ True
+    created = []
+
+    def run_missing_then_create(cmd, **k):
+        created.append(cmd)
+        return _R(1) if "inspect" in str(cmd) else _R(0)
+    monkeypatch.setattr(CS.subprocess, "run", run_missing_then_create)
+    assert e.install(("pypi.org",)) is True
+    assert any("create" in str(c) for c in created)
+    # create 失败（inspect 1 + create 1）→ False
+    monkeypatch.setattr(CS.subprocess, "run", lambda cmd, **k: _R(1))
+    assert e.install(("pypi.org",)) is False
 
 
 # ════════════════════════════════════════════════════════════════════════════

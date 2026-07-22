@@ -85,6 +85,7 @@ class EgressEnforcement(Protocol):
     task 5.1：claim higher assurance 前 preflight ``enforceable()``，不可执行 → sandbox_blocked。
     """
     def enforceable(self) -> bool: ...     # preflight：egress 策略是否真的可执行（已部署/可达）
+    def install(self, allowlist: tuple[str, ...]) -> bool: ...  # task 5.2：为 allowlist 安装/验证 enforceable policy
     def describe(self) -> str: ...          # 强制机制描述（审计：label / proxy / network namespace）
 
 
@@ -97,6 +98,9 @@ class LabelOnlyEgress:
     """
     def enforceable(self) -> bool:
         return False
+
+    def install(self, allowlist) -> bool:   # noqa: ARG002
+        return False   # label 不是 enforceable policy，无法 install/verify（task 5.2 替代 label-only intent）
 
     def describe(self) -> str:
         return "label-only (docker --label pa.network_allowlist; audit metadata, not enforcement)"
@@ -123,6 +127,24 @@ class DockerNetworkEgress:
             r = subprocess.run([self.runtime, "network", "inspect", self.network],
                                capture_output=True, timeout=self.timeout)
             return r.returncode == 0
+        except Exception:
+            return False
+
+    def install(self, allowlist) -> bool:   # noqa: ARG002
+        """task 5.2：为 allowlist 安装/验证 enforceable policy——ensure named egress network 就绪
+        （幂等：inspect 已存在则跳过 create，缺失则 create）。allowlist 的实际过滤规则由部署侧在该
+        network 落实（iptables/proxy）；adapter 层 ensure 边界存在 = 可执行。失败 → False（不 claim）。"""
+        if shutil.which(self.runtime) is None:
+            return False
+        try:
+            r = subprocess.run([self.runtime, "network", "inspect", self.network],
+                               capture_output=True, timeout=self.timeout)
+            if r.returncode != 0:
+                r = subprocess.run([self.runtime, "network", "create", self.network],
+                                   capture_output=True, timeout=self.timeout)
+                if r.returncode != 0:
+                    return False
+            return True
         except Exception:
             return False
 
@@ -284,13 +306,21 @@ class ContainerSandbox:
                         f"enforceable egress boundary—a label is audit metadata only (design #5)"),
                 tier=self.tier, policy_violation=True,
             )
-        # 3. worktree 必须存在且唯一可写
+        # 3. task 5.2：为 allowlist 安装/验证 enforceable egress policy（替代 label-only intent）
+        #    install/verify 失败 → sandbox_blocked（design #5：label 不是 enforcement）
+        if not self.egress.install(spec.network_allowlist):
+            return SandboxBlocked(
+                reason=(f"egress policy installation/verification failed ({self.egress.describe()}); "
+                        f"cannot enforce allowlist—a label is audit metadata only (design #5)"),
+                tier=self.tier, policy_violation=True,
+            )
+        # 4. worktree 必须存在且唯一可写
         wt = Path(spec.worktree_dir)
         if not wt.is_dir():
             return SandboxBlocked(reason=f"worktree not found: {spec.worktree_dir}",
                                   tier=self.tier, policy_violation=False)
         ro = tuple(d for d in spec.prd_source_dirs if Path(d).is_dir())
-        # 4. network policy（task 6.3）
+        # 5. network policy（task 6.3）
         policy = NetworkPolicy(allowlist=tuple(spec.network_allowlist), strict=True)
         viol = policy.violations(spec.requested_hosts)
         if viol:
@@ -298,7 +328,7 @@ class ContainerSandbox:
                 reason=f"undeclared network destinations blocked: {list(viol)}",
                 tier=self.tier, policy_violation=True,
             )
-        # 5. create container（runner 抛 → blocked）
+        # 6. create container（runner 抛 → blocked）
         try:
             cid = self.runner.create(
                 image=self.image,

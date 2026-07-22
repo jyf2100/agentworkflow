@@ -75,13 +75,16 @@ class FakeContainerRunner:
 
 
 class _StaticEgress:
-    """task 5.1 egress enforcement 桩：``enforceable`` 固定 bool（让 prepare 过 egress preflight）。"""
+    """task 5.1/5.2 egress enforcement 桩：``enforceable``/``install`` 固定 bool（过 preflight+install）。"""
     __test__ = False
 
     def __init__(self, enforceable: bool = True):
         self._ok = enforceable
 
     def enforceable(self) -> bool:
+        return self._ok
+
+    def install(self, allowlist) -> bool:   # noqa: ARG002
         return self._ok
 
     def describe(self) -> str:

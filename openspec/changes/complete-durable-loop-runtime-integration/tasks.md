@@ -32,7 +32,7 @@
 ## 5. Enforced Sandbox and Credential Boundary
 
 - [x] 5.1 Define the approved host/container egress enforcement adapter and preflight its availability before claiming higher assurance.
-- [ ] 5.2 Replace label-only domain intent with enforceable egress policy, and return `sandbox_blocked` when policy installation or verification fails.
+- [x] 5.2 Replace label-only domain intent with enforceable egress policy, and return `sandbox_blocked` when policy installation or verification fails.
 - [ ] 5.3 Route real dev and independent-test commands through the selected sandbox adapter and forbid silent fallback from container to local.
 - [ ] 5.4 Keep GitHub, SMTP, cloud, and model publication credentials host-side and prove they are absent from sandbox environment and artifacts.
 - [ ] 5.5 Add real Node and Python fixture canaries covering allowed network, denied network, denied credential access, resource limits, and unavailable runtime behavior.
