@@ -1233,9 +1233,15 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     # ── task 2.1：coordinator 集中 own 运行时设施（design 决策#1；替代散建 _run/_prd/_iter/_sj）。
     #    一次解析所有 loop flag + 建 IDs/journal/artifact_root；flag 全关→baseline no-op（dispatch 决策零变化）。
     #    _run/_prd/_iter/_sj 局部别名保留，后续主体零改动；adapter（hooks/sandbox/telemetry）从 _coord.flags 挂载。
+    # task 3.1：dispatch entry 捕获 PRD 内容 digest（spec「Immutable new-run input」）——读 prd_abs 内容算
+    #    sha256:<hex>，纳入 prd_id（content-addressed）+ planned event payload；读失败→None（baseline 容错）。
+    try:
+        prd_content = Path(prd_abs).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        prd_content = None
     _coord = build_coordinator(stamp=stamp, prd_path=entry.get("prd_path") or "",
                                proj=proj, slug=slug, state_dir=STATE_DIR, profile=prof,
-                               stamp_fn=_now_iso)
+                               stamp_fn=_now_iso, prd_content=prd_content)
     _run, _prd, _iter, _sj = (_coord.run_id, _coord.prd_id, _coord.iteration_id, _coord.journal)
     # task 2.5：preflight 校验 loop flag 组合一致性（design 决策#1 防 impossible partial 组合）。
     #   违规→阻断不投递（status=skip + 结构化 reason），在 admission profile 门**之前**拦截，不起 dev loop。
@@ -1244,8 +1250,10 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         rec.update(status="skip",
                    skip_reason="阻断-loop flag 组合非法: " + "; ".join(_pf.blocked.violations))
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
-    _sj.emit("planned", _iter, _prd,
-             payload={"base": base, "prd_path": entry.get("prd_path"), "project": proj})
+    _planned_payload = {"base": base, "prd_path": entry.get("prd_path"), "project": proj}
+    if _coord.prd_digest is not None:    # task 3.1：PRD 可读→initial event 锚定内容版本（不可读省略）
+        _planned_payload["prd_digest"] = _coord.prd_digest
+    _sj.emit("planned", _iter, _prd, payload=_planned_payload)
     _sj.emit("running", _iter, _prd, payload={"round": 1})
 
     # ── 准入 1：profile 门

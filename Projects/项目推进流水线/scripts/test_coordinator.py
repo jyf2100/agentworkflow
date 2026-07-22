@@ -205,3 +205,46 @@ def test_preflight_records_all_violations_structured():
     assert len(r.blocked.violations) == 3
     assert "journal_shadow" in r.blocked.reason
 
+
+# ─── task 3.1：immutable PRD content digest（content-addressed prd_id + planned event 真源）──
+def test_build_with_prd_content_captures_digest_and_content_addresses_prd_id(tmp_path):
+    """spec「Immutable new-run input」+ task 3.1：build_coordinator(prd_content=...) 在 dispatch entry
+    捕获 PRD 内容 digest（artifact_store ``sha256:<hex>`` 格式），Coordinator.prd_digest 存真源，prd_id
+    纳入 content_hash（content-addressed：PRD 改动→新 prd_id，不可变真源；ids.prd_id 已支持 content_hash）。
+    """
+    import artifact_store
+    # Arrange
+    content = "# PRD\n实现 X\n验收: tests green"
+    expected_digest = artifact_store.compute_digest(content.encode("utf-8"))
+    # Act
+    coord = CO.build_coordinator(
+        stamp=_STAMP, prd_path="prd/proj/x.md", proj="proj", slug="x",
+        state_dir=tmp_path, env={}, stamp_fn=lambda: "T", prd_content=content,
+    )
+    # Assert — digest 捕获 + prd_id content-addressed（含 content_hash，≠ path-only）
+    assert coord.prd_digest == expected_digest
+    assert coord.prd_id == loop_ids.prd_id("prd/proj/x.md", expected_digest)
+    assert coord.prd_id != loop_ids.prd_id("prd/proj/x.md")
+
+
+def test_build_without_prd_content_baseline_has_no_digest_path_only_prd_id(tmp_path):
+    """baseline：prd_content=None → prd_digest=None（无 content 捕获），prd_id path-only（向后兼容：
+    test_build_creates_stable_deterministic_ids 仍 path-only；旧调用方不传 prd_content 不破）。"""
+    coord = CO.build_coordinator(
+        stamp=_STAMP, prd_path="prd/proj/x.md", proj="proj", slug="x",
+        state_dir=tmp_path, env={}, stamp_fn=lambda: "T",
+    )
+    assert coord.prd_digest is None
+    assert coord.prd_id == loop_ids.prd_id("prd/proj/x.md")     # path-only，向后兼容
+
+
+def test_prd_digest_differs_when_prd_content_changes(tmp_path):
+    """不可变真源：PRD 内容改 → digest 变 → prd_id 变（每个 PRD 版本独立 content-addressed id；
+    spec「original PRD remains byte-for-byte unchanged」由 digest 锚定具体内容版本）。"""
+    c1 = CO.build_coordinator(stamp=_STAMP, prd_path="p.md", proj="p", slug="s",
+                              state_dir=tmp_path, env={}, stamp_fn=lambda: "T", prd_content="v1")
+    c2 = CO.build_coordinator(stamp=_STAMP, prd_path="p.md", proj="p", slug="s",
+                              state_dir=tmp_path, env={}, stamp_fn=lambda: "T", prd_content="v2")
+    assert c1.prd_digest != c2.prd_digest
+    assert c1.prd_id != c2.prd_id
+

@@ -137,3 +137,49 @@ def test_dispatch_one_preflight_blocks_invalid_flag_combo(tmp_path, monkeypatch)
     assert "loop flag 组合非法" in rec["skip_reason"]
     assert "lifecycle_hooks requires journal_shadow" in rec["skip_reason"]
 
+
+# ─── task 3.1：dispatch entry 捕获 PRD 内容 digest → planned event 携带 ──────────
+def test_dispatch_one_planned_event_carries_prd_digest(tmp_path, monkeypatch):
+    """task 3.1：dispatch_one 在 dispatch entry 读 PRD 内容 → build_coordinator(prd_content=...) →
+    planned journal event payload 携带 ``prd_digest``（spec「Immutable new-run input」：initial event
+    锚定 PRD 内容版本；prd_abs=VAULT_ROOT/prd_path，run_daily:1222）。
+
+    admission 1 fail（prof 无 admission）→ planned emit 后 skip return，不跑 dev-agent（短路重依赖）。
+    """
+    from types import SimpleNamespace
+    import artifact_store
+    # Arrange — tmp PRD（entry["prd_path"] 相对 VAULT_ROOT）+ prof（journal_shadow on 满足 preflight，
+    # 无 admission → admission 1 fail 短路在 dev-agent 前）
+    prd_content = "# PRD\n实现 X\n验收: tests green"
+    (tmp_path / "prd.md").write_text(prd_content, encoding="utf-8")
+    monkeypatch.setattr(run_daily, "VAULT_ROOT", tmp_path)
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
+    prof = {"name": "p", "loop": {"journal_shadow": True}}
+    entry = {"prd_path": "prd.md"}
+    # Act
+    run_daily.dispatch_one(entry, prof, "20260722", SimpleNamespace())
+    # Assert — planned event 落盘 + payload 含 prd_digest（content-addressed 真源）
+    journals = list(tmp_path.rglob("*.journal.jsonl"))
+    assert journals, "journal_shadow on → planned/running 事件应落盘"
+    planned = [e for e in J.read_events(journals[0]) if e.event_type == "planned"]
+    assert planned, "dispatch entry 应 emit planned 事件"
+    expected = artifact_store.compute_digest(prd_content.encode("utf-8"))
+    assert planned[0].payload["prd_digest"] == expected
+
+
+def test_dispatch_one_planned_omits_digest_when_prd_unreadable(tmp_path, monkeypatch):
+    """baseline 容错：PRD 文件缺失/不可读 → prd_content=None → prd_digest 不进 planned payload
+    （design「store the PRD content digest」只在能读时捕获；读失败不崩，dispatch 继续baseline）。"""
+    from types import SimpleNamespace
+    monkeypatch.setattr(run_daily, "VAULT_ROOT", tmp_path)
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
+    prof = {"name": "p", "loop": {"journal_shadow": True}}
+    entry = {"prd_path": "missing.md"}        # 文件不存在
+    # Act
+    run_daily.dispatch_one(entry, prof, "20260722", SimpleNamespace())
+    # Assert — planned 落盘但 payload 不含 prd_digest（未捕获）
+    journals = list(tmp_path.rglob("*.journal.jsonl"))
+    planned = [e for e in J.read_events(journals[0]) if e.event_type == "planned"]
+    assert planned
+    assert "prd_digest" not in planned[0].payload
+

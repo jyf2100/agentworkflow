@@ -14,7 +14,7 @@
 
 ## 3. Immutable Iterations and Journal Authority
 
-- [ ] 3.1 Capture the immutable PRD content digest at dispatch entry and include it in `prd_id` and the initial journal event.
+- [x] 3.1 Capture the immutable PRD content digest at dispatch entry and include it in `prd_id` and the initial journal event.
 - [ ] 3.2 Stop appending verifier feedback to PRDs for new runs; store feedback as sanitized content-addressed artifacts.
 - [ ] 3.3 Allocate a distinct deterministic iteration ID for every revise, resume, fork, and new-session attempt and record parent relationships.
 - [ ] 3.4 Build each retry prompt from immutable PRD content plus verified journal artifacts and remaining acceptance criteria.

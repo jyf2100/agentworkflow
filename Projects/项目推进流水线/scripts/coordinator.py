@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 import ids as loop_ids
+from artifact_store import compute_digest
 from feature_flags import LoopFlags, resolve_flags
 from loop_runtime import ShadowJournal
 
@@ -44,7 +45,7 @@ class Coordinator:
     """task 2.1：一次 dispatch 的运行时协调器边界（design 决策#1）。
 
     集中 own：flags（一次解析快照）/ IDs（run·prd·iteration）/ journal（``ShadowJournal``）/
-    artifact_root（内容寻址工件存储根）。lifecycle 经 ``emit`` 委托 journal 落盘；新 iteration 经
+    artifact_root（内容寻址工件存储根）/ ``prd_digest``（task 3.1 dispatch entry 捕获的 PRD 内容 digest）。lifecycle 经 ``emit`` 委托 journal 落盘；新 iteration 经
     ``next_iteration`` 衍生（parent run/prd + seq，task 3.3 revise/resume/fork 用）。
 
     flags 全关 → ``is_baseline`` True，``emit`` no-op，dispatch first-phase 决策零变化。
@@ -57,6 +58,7 @@ class Coordinator:
     iteration_id: str               # 初始 iteration（seq=0）；next_iteration(seq) 衍生后续
     journal: ShadowJournal
     artifact_root: str
+    prd_digest: str | None = None        # task 3.1：dispatch entry PRD 内容 digest（``sha256:<hex>``；None=未捕获）
 
     @property
     def is_baseline(self) -> bool:
@@ -86,7 +88,8 @@ class Coordinator:
 
 def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
                       state_dir, profile: dict | None = None, env: dict | None = None,
-                      stamp_fn: Callable[[], str] | None = None) -> Coordinator:
+                      stamp_fn: Callable[[], str] | None = None,
+                      prd_content: str | None = None) -> Coordinator:
     """dispatch/dev-agent 入口：一次解析 flag + 建 IDs/journal/artifact_root，返回 ``Coordinator``。
 
     替代 ``dispatch_one`` 散建的 ``_run``/``_prd``/``_iter``/``_sj``。所有 adapter 从返回的
@@ -101,17 +104,21 @@ def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
         profile: 项目 profile（``profile["loop"][flag]`` per-project canary）。
         env: 环境变量字典（None 读 ``os.environ``，运维 kill switch 压 profile）；测试传 ``{}`` 隔离。
         stamp_fn: 时间戳函数（None → ``_real_stamp`` 调系统时间；测试注入固定函数）。
+        prd_content: PRD 文本内容（task 3.1 dispatch entry 捕获）——非 None → 算 ``sha256:<hex>`` digest 存
+            ``coord.prd_digest`` + content-addressed ``prd_id``；None → baseline（path-only prd_id，无 digest）。
+            调用方（dispatch_one / dev-agent）读 PRD 文件后注入（IO 在边界，本函数纯）。
     """
     flags = resolve_flags(env=env, profile=profile)
     run = loop_ids.run_id(stamp)
-    prd = loop_ids.prd_id(prd_path)
+    prd_digest = compute_digest(prd_content.encode("utf-8")) if prd_content is not None else None
+    prd = loop_ids.prd_id(prd_path, prd_digest)        # task 3.1：content-addressed（PRD 改→新 prd_id）
     iteration = loop_ids.iteration_id(run, prd, 0)
     journal_path = Path(state_dir) / "runs" / proj / f"{stamp}_{slug}.journal.jsonl"
     journal = ShadowJournal(journal_path, run, stamp_fn or _real_stamp,
                             enabled=flags.journal_shadow)
     artifact_root = str(Path(state_dir) / "artifacts" / run)
     return Coordinator(flags=flags, run_id=run, prd_id=prd, iteration_id=iteration,
-                       journal=journal, artifact_root=artifact_root)
+                       journal=journal, artifact_root=artifact_root, prd_digest=prd_digest)
 
 
 # ─── task 2.5：preflight 校验 loop flag 组合一致性（design 决策#1 防 impossible partial 组合）──
