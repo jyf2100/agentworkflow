@@ -378,6 +378,82 @@ def test_docker_network_egress_install_three_paths(monkeypatch):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Section 5 task 5.3：route dev/test 命令经 sandbox adapter + 禁止 container→local 静默 fallback
+# local tier 经 LocalWorktreeSandbox（cwd=worktree subprocess，与 dev/test 现状等价，baseline 零变化）；
+# container tier 经 ContainerSandbox；container prepare blocked → 默认返回 blocked，**绝不静默切 local**
+# （design #5 / Migration Plan L5）；仅 dev smoke 显式 allow_local_fallback=True 才切 local（标记可审计）。
+# ════════════════════════════════════════════════════════════════════════════
+def test_select_adapter_local_when_container_flag_off():
+    """5.3：container_sandbox flag 关 → 选 local adapter（baseline LOCAL_WORKTREE tier）。"""
+    tier, adapter = SB.select_adapter(
+        container_sandbox_enabled=False,
+        local_adapter=SB.LocalWorktreeSandbox(),
+        container_adapter=CS.ContainerSandbox(FakeContainerRunner(), egress=StaticEgress(True)))
+    assert tier is SB.AssuranceTier.LOCAL_WORKTREE
+    assert isinstance(adapter, SB.LocalWorktreeSandbox)
+
+
+def test_select_adapter_container_when_flag_and_prefer():
+    """5.3：container_sandbox flag 开 + profile prefer_container → 选 container adapter。"""
+    cont = CS.ContainerSandbox(FakeContainerRunner(), egress=StaticEgress(True))
+    tier, adapter = SB.select_adapter(
+        container_sandbox_enabled=True, prefer_container=True,
+        local_adapter=SB.LocalWorktreeSandbox(), container_adapter=cont)
+    assert tier is SB.AssuranceTier.CONTAINER
+    assert adapter is cont
+
+
+def test_route_command_local_tier_executes_real_subprocess(tmp_path):
+    """5.3：local tier 经 adapter 路由执行真实命令（LocalWorktreeSandbox subprocess；dev/test 命令经此路由）。"""
+    wt = tmp_path / "wt"; wt.mkdir()
+    spec = SB.SandboxSpec(worktree_dir=str(wt))
+    rr = SB.route_command(adapter=SB.LocalWorktreeSandbox(), spec=spec,
+                          command=["python3", "-c", "print('DEV_OK')"])
+    assert rr.ok and rr.blocked is None
+    assert rr.result.exit_code == 0 and "DEV_OK" in rr.result.stdout
+    assert rr.fell_back_to_local is False
+
+
+def test_route_command_container_tier_executes(tmp_path):
+    """5.3：container tier 经 adapter 路由执行（FakeContainerRunner 模拟容器 exec，egress 可执行）。"""
+    wt = tmp_path / "wt"; wt.mkdir()
+    runner = FakeContainerRunner(exec_result=(0, "TEST_OK", ""))
+    spec = SB.SandboxSpec(worktree_dir=str(wt), network_allowlist=("pypi.org",))
+    rr = SB.route_command(adapter=CS.ContainerSandbox(runner, egress=StaticEgress(True)),
+                          spec=spec, command=["pytest", "-q"], requested_hosts=("pypi.org",))
+    assert rr.ok and rr.result.exit_code == 0 and "TEST_OK" in rr.result.stdout
+
+
+def test_route_command_container_blocked_no_silent_fallback(tmp_path):
+    """5.3 核心：container prepare blocked（egress 不可执行）+ 不允许 fallback → 返回 blocked，
+    **绝不静默切 local**（fell_back_to_local=False；生产路径调用方据此 abort/记 sandbox_blocked）。"""
+    wt = tmp_path / "wt"; wt.mkdir()
+    spec = SB.SandboxSpec(worktree_dir=str(wt))
+    rr = SB.route_command(
+        adapter=CS.ContainerSandbox(FakeContainerRunner(), egress=StaticEgress(False)),
+        spec=spec, command=["pytest", "-q"],
+        allow_local_fallback=False, local_adapter=SB.LocalWorktreeSandbox())
+    assert not rr.ok
+    assert isinstance(rr.blocked, SB.SandboxBlocked)
+    assert rr.fell_back_to_local is False        # 不静默切 local
+    assert rr.result is None
+
+
+def test_route_command_dev_smoke_explicit_local_fallback(tmp_path):
+    """5.3：container blocked + dev smoke 显式 allow_local_fallback=True → 切 local tier 执行，
+    fell_back_to_local=True（显式标记可审计，非静默降级）。"""
+    wt = tmp_path / "wt"; wt.mkdir()
+    spec = SB.SandboxSpec(worktree_dir=str(wt))
+    rr = SB.route_command(
+        adapter=CS.ContainerSandbox(FakeContainerRunner(), egress=StaticEgress(False)),
+        spec=spec, command=["python3", "-c", "print('SMOKE_OK')"],
+        allow_local_fallback=True, local_adapter=SB.LocalWorktreeSandbox())
+    assert rr.ok                                            # fallback 到 local 后执行成功
+    assert rr.fell_back_to_local is True                    # 显式标记（非静默）
+    assert rr.result.exit_code == 0 and "SMOKE_OK" in rr.result.stdout
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 6.4 host-side verified publication（长期凭据留 host）
 # ════════════════════════════════════════════════════════════════════════════
 def test_host_publish_with_credential_published():

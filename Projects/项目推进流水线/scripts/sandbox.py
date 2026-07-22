@@ -192,3 +192,78 @@ def open_sandbox(spec: SandboxSpec, adapter: ExecutionSandbox) -> SandboxHandle 
     ``SandboxBlocked`` 后**显式**重新选 adapter（且仅 dev smoke 允许，生产路径 abort）。
     """
     return adapter.prepare(spec)
+
+
+# ─── task 5.3：route dev/test 命令经选定 adapter + 禁止 container→local 静默 fallback ──────────
+@dataclass(frozen=True)
+class RouteResult:
+    """``route_command`` 的结果（task 5.3）。
+
+    执行成功 → ``result``（SandboxRunResult），``blocked=None``；prepare/run 返 ``SandboxBlocked``
+    → ``blocked`` 置位、``result=None``。``fell_back_to_local=True`` **仅** dev smoke 显式
+    ``allow_local_fallback=True`` 且确实切到 local tier 时——可审计，**绝不静默**（design #5 / L76）。
+    """
+    result: SandboxRunResult | None = None
+    blocked: SandboxBlocked | None = None
+    fell_back_to_local: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.blocked is None
+
+
+def select_adapter(*, container_sandbox_enabled: bool, prefer_container: bool = False,
+                   local_adapter=None, container_adapter=None):
+    """根据 flags + profile 选 sandbox adapter + tier（design #1：coordinator own sandbox）。
+
+    container_sandbox_enabled（feature flag）+ prefer_container（profile）皆真 → CONTAINER tier，
+    返 ``container_adapter``；否则 LOCAL_WORKTREE tier，返 ``local_adapter``。adapter 由调用方注入
+    （生产 coordinator 注入真实 LocalWorktreeSandbox / ContainerSandbox，测试注入桩）。"""
+    tier = resolve_tier(container_sandbox_enabled=container_sandbox_enabled,
+                        prefer_container=prefer_container)
+    if tier is AssuranceTier.CONTAINER:
+        return tier, container_adapter
+    return tier, local_adapter
+
+
+def _run_on_local(local_adapter, spec: SandboxSpec, command, requested_hosts,
+                  timeout) -> RouteResult:
+    """显式切 local tier 执行（dev smoke 仅）——标记 ``fell_back_to_local``，绝不静默（design #5）。"""
+    lh = local_adapter.prepare(spec)
+    if isinstance(lh, SandboxBlocked):
+        return RouteResult(result=None, blocked=lh, fell_back_to_local=True)
+    try:
+        out = local_adapter.run(lh, command, requested_hosts=requested_hosts, timeout=timeout)
+        return RouteResult(
+            result=out if isinstance(out, SandboxRunResult) else None,
+            blocked=out if isinstance(out, SandboxBlocked) else None,
+            fell_back_to_local=True,
+        )
+    finally:
+        local_adapter.teardown(lh)
+
+
+def route_command(*, adapter, spec: SandboxSpec, command,
+                  requested_hosts: tuple[str, ...] = (), timeout: float | None = None,
+                  allow_local_fallback: bool = False, local_adapter=None) -> RouteResult:
+    """经选定 adapter 路由 dev/test 命令（task 5.3）。prepare → run → teardown。
+
+    **禁止 container→local 静默 fallback**（design #5 / Migration Plan L5）：adapter（典型 container
+    tier）``prepare`` 返 ``SandboxBlocked``（egress 不可执行 / 策略安装失败 / 运行时不可用）时，默认
+    **不切 local**——返 ``RouteResult(blocked=...)``，生产路径调用方据此 abort 或记 ``sandbox_blocked``。
+    仅 ``allow_local_fallback=True``（dev smoke 显式）+ 提供 ``local_adapter`` 时才切 local tier 重试，
+    且 ``fell_back_to_local=True`` 可审计（非静默降级）。run 时 blocked（policy 违例）一律不 fallback。
+    """
+    handle = adapter.prepare(spec)
+    if isinstance(handle, SandboxBlocked):
+        if allow_local_fallback and local_adapter is not None:
+            return _run_on_local(local_adapter, spec, command, requested_hosts, timeout)
+        return RouteResult(result=None, blocked=handle, fell_back_to_local=False)
+    try:
+        out = adapter.run(handle, command, requested_hosts=requested_hosts, timeout=timeout)
+        if isinstance(out, SandboxBlocked):
+            # run 时 policy 违例（network/credential）——绝不 fallback（违例就是违例，design #5）
+            return RouteResult(result=None, blocked=out, fell_back_to_local=False)
+        return RouteResult(result=out, blocked=None, fell_back_to_local=False)
+    finally:
+        adapter.teardown(handle)
