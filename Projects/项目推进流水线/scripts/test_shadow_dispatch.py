@@ -115,3 +115,25 @@ def test_append_feedback_shadow_swallows_artifact_failure(tmp_path):
     run_daily._append_verify_feedback(str(prd), "反馈", 1, sj=sj, iter_id="iter_1", prd_id="prd_1",
                                       artifact_root=Path("/proc/cannot/store/here"))
     assert "反馈" in prd.read_text(encoding="utf-8")   # PRD 追加未被 artifact 失败拖垮
+
+
+# ─── task 2.5：dispatch_one 入口 preflight 阻断非法 flag 组合 ──────────────────
+def test_dispatch_one_preflight_blocks_invalid_flag_combo(tmp_path, monkeypatch):
+    """task 2.5：dispatch_one 入口 preflight——lifecycle_hooks 开但 journal_shadow 关（impossible partial
+    组合，design 决策#1）→ 阻断不投递（status=skip + 结构化 reason），**在 admission profile 门之前**
+    拦截，不起 dev loop（不触 git/gh/SDK）。"""
+    from types import SimpleNamespace
+    # Arrange — 违规 profile（hooks 开但 journal_shadow 默认关 → 依赖链违）+ 故意无 admission
+    # （证 preflight 先于 profile 门：未接入时会被 profile 门先 skip，reason 不含「loop flag 组合非法」）
+    prof = {"name": "p", "loop": {"lifecycle_hooks": True}}
+    entry = {"prd_path": "x.md"}
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)   # journal 路径指向 tmp_path（shadow 关→不 IO）
+
+    # Act
+    rec = run_daily.dispatch_one(entry, prof, "20260722", SimpleNamespace())
+
+    # Assert — preflight 阻断（先于 admission profile 门），结构化 reason 含违规详情
+    assert rec["status"] == "skip"
+    assert "loop flag 组合非法" in rec["skip_reason"]
+    assert "lifecycle_hooks requires journal_shadow" in rec["skip_reason"]
+

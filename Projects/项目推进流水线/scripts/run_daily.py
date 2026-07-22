@@ -45,9 +45,8 @@ from pathlib import Path
 
 from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（消解 ADR-0004 #4 shadow；无依赖模块，顶部 import 不触发 sdk 连带加载拖垮 cron）
 from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
-from feature_flags import resolve_flags   # OpenSpec add-durable-loop-runtime task 1.3：loop runtime 渐进 flag（纯 stdlib，cron 安全）
-import ids as loop_ids                     # task 3.1：稳定 ID 生成 run/prd/iteration（hashlib 纯 stdlib）
-from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写入器（纯 stdlib，cron 安全）
+from coordinator import build_coordinator, preflight  # task 2.1/2.5：runtime coordinator 边界 + flag 组合 preflight（design 决策#1；纯 stdlib，cron 安全）
+from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写入器（类型注解用；纯 stdlib，cron 安全）
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
 
 try:
@@ -1231,12 +1230,20 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                  "dev_cost": None, "dev_turns": None, "verify": None, "skip_reason": None,
                  "dev_test_cmd": None, "verify_verdict": None, "verify_round": None}   # verify 闭环字段
 
-    # ── task 3.2：shadow journal 旁路记录（journal_shadow flag 关→sj.emit 全 no-op，dispatch 决策零变化）
-    _run = loop_ids.run_id(stamp)
-    _prd = loop_ids.prd_id(entry.get("prd_path") or "")
-    _iter = loop_ids.iteration_id(_run, _prd, 0)   # 固定 seq=0：一个 PRD = 一个主 iteration，多轮 revise 是其内 REVISE→RUNNING 循环
-    _sj = ShadowJournal(STATE_DIR / "runs" / proj / f"{stamp}_{slug}.journal.jsonl",
-                        _run, _now_iso, enabled=resolve_flags(profile=prof).journal_shadow)
+    # ── task 2.1：coordinator 集中 own 运行时设施（design 决策#1；替代散建 _run/_prd/_iter/_sj）。
+    #    一次解析所有 loop flag + 建 IDs/journal/artifact_root；flag 全关→baseline no-op（dispatch 决策零变化）。
+    #    _run/_prd/_iter/_sj 局部别名保留，后续主体零改动；adapter（hooks/sandbox/telemetry）从 _coord.flags 挂载。
+    _coord = build_coordinator(stamp=stamp, prd_path=entry.get("prd_path") or "",
+                               proj=proj, slug=slug, state_dir=STATE_DIR, profile=prof,
+                               stamp_fn=_now_iso)
+    _run, _prd, _iter, _sj = (_coord.run_id, _coord.prd_id, _coord.iteration_id, _coord.journal)
+    # task 2.5：preflight 校验 loop flag 组合一致性（design 决策#1 防 impossible partial 组合）。
+    #   违规→阻断不投递（status=skip + 结构化 reason），在 admission profile 门**之前**拦截，不起 dev loop。
+    _pf = preflight(_coord.flags)
+    if not _pf.is_ok:
+        rec.update(status="skip",
+                   skip_reason="阻断-loop flag 组合非法: " + "; ".join(_pf.blocked.violations))
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
     _sj.emit("planned", _iter, _prd,
              payload={"base": base, "prd_path": entry.get("prd_path"), "project": proj})
     _sj.emit("running", _iter, _prd, payload={"round": 1})
