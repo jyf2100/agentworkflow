@@ -12,6 +12,9 @@ journal 是第二阶段的「崩溃恢复真源」（design 决策#1）。每次
             丢弃半行，继续归约前面已提交的事件；
           * **中部损坏 fail-closed**：已提交历史里夹坏行 = 磁盘错/写竞争污染 → ``JournalCorruptionError``，
             绝不静默跳过（否则状态机基于残缺事件归约出错误状态）。reducer 据此落 ``STATE_CORRUPT``。
+    task 3.6（schema-invalid 收紧）—— 末行若是**完整 JSON 但 schema 非法**（缺必填字段/类型错，非崩溃截断的
+        半行）→ 仍 fail-closed；只容忍**可证明不完整的截断尾写**，杜绝「完整但语义污染」被当截断静默丢弃。
+        实现：``_scan`` 分离 ``JSONDecodeError``（截断，末行容忍）与 schema 构造失败（complete-but-invalid，始终 fail-closed）。
 
 模块仅依赖 ``loop_state`` 数据模型 + 标准库（os/json/dataclasses/pathlib），不触 SDK——cron 隔离不变。
 """
@@ -85,9 +88,12 @@ def _scan(path: str | Path) -> tuple[list[JournalEvent], CorruptionReport]:
     """扫描 journal：逐行解析，返回 ``(events, report)``，**不 raise**。
 
     损坏策略（spec）：
-        * 行解析失败且该行是「最后一条非空行」→ 末尾截断，``tail_truncated=True``，丢弃该行；
-        * 行解析失败且非末尾 → 中部损坏，记入 ``corrupted_line_numbers``（1-based）；
-        * 解析成功 → 追加到 events。
+        * **JSON 词法解析失败**（半行/截断，崩溃只可能截断最后一条 append）且该行是「最后一条非空行」
+          → 末尾截断，``tail_truncated=True``，丢弃该行；
+        * **JSON 词法解析失败**且非末尾 → 中部损坏，记入 ``corrupted_line_numbers``（1-based）；
+        * **complete JSON 但 schema 非法**（缺必填字段/类型错，task 3.6）→ 始终 fail-closed，
+          记入 ``corrupted_line_numbers``（不论是否末行——完整但语义不合规是写污染，非崩溃截断）；
+        * 解析 + 校验成功 → 追加到 events。
     """
     target = Path(path)
     if not target.exists():
@@ -104,16 +110,24 @@ def _scan(path: str | Path) -> tuple[list[JournalEvent], CorruptionReport]:
     for i, line in enumerate(lines):
         if not line.strip():
             continue
+        # 第一步：JSON 词法解析。失败 = 半行/截断（provably incomplete trailing write，
+        # 崩溃只可能截断最后一条 append）。仅容忍末行的截断；中部截断仍 fail-closed。
         try:
             obj = json.loads(line)
-            filtered = {k: v for k, v in obj.items() if k in _KNOWN_FIELDS}
-            events.append(JournalEvent(**filtered))
-        except Exception:
+        except json.JSONDecodeError:
             # 末尾不完整（崩溃截断最后一条 append）→ 容忍；中部损坏 → fail-closed 记录
             if i == last_nonempty:
                 tail_truncated = True
             else:
                 corrupted.append(i + 1)   # 1-based
+            continue
+        # 第二步：schema 校验。complete JSON 但缺必填字段/类型错（task 3.6）→ 始终 fail-closed，
+        # 不论是否末行——「complete-but-schema-invalid」不是崩溃截断，是写污染/磁盘错，绝不静默丢弃。
+        try:
+            filtered = {k: v for k, v in obj.items() if k in _KNOWN_FIELDS}
+            events.append(JournalEvent(**filtered))
+        except Exception:
+            corrupted.append(i + 1)   # 1-based
 
     report = CorruptionReport(
         events_read=len(events),

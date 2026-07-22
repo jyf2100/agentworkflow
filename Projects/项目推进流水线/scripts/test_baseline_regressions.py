@@ -7,10 +7,11 @@
 test-artifact persistence、以及此前未映射的终态类。
 
 两类测试：
-  * **GREEN 锁定**：当前已正确的契约（green→published / red→revise、真正截断尾行容忍、unmapped
-    first-cut 不发事件、artifact 完整性 fail-closed）——Section 2-7 重构时若回归，立即红。
-  * **xfail(strict=True) 标注**：当前已是缺陷、由后续 task 修正的路径——修正后 xpass 触发 strict
-    失败，强制提醒把标记转成 GREEN 正式纳入保护（闭环，不让缺陷被遗忘）。
+  * **GREEN 锁定**：当前已正确的契约（green→published / red→revise、真正截断尾行容忍、
+    complete-schema-invalid 末行 fail-closed（task 3.6）、unmapped first-cut 不发事件、artifact 完整性
+    fail-closed）——Section 2-7 重构时若回归，立即红。
+  * **xfail(strict=True) 标注**（机制保留，task 3.6 落地后当前无在用项）：当前已是缺陷、由后续 task 修正的
+    路径——修正后 xpass 触发 strict 失败，强制提醒把标记转成 GREEN 正式纳入保护（闭环，不让缺陷被遗忘）。
 
 零 SDK（纯逻辑层）；AAA；跑：python3 -m pytest scripts/test_baseline_regressions.py -q
 """
@@ -72,11 +73,10 @@ def test_green_pr_maps_to_published_and_red_maps_to_revise(tmp_path):
 # ════════════════════════════════════════════════════════════════════════════
 # complete malformed journal tail
 # ════════════════════════════════════════════════════════════════════════════
-@pytest.mark.xfail(strict=True,
-                   reason="task 3.6: complete-but-schema-invalid 末行须 fail-closed，当前被误当截断容忍")
 def test_complete_schema_invalid_tail_must_fail_closed(tmp_path):
-    """spec verified-publication-integrity「Complete malformed journal tail」：末行是完整 JSON 但
-    schema 非法（缺必填字段）→ 应标记 corrupt（fail-closed），而非当截断容忍丢弃。"""
+    """spec verified-publication-integrity「Complete malformed journal tail」（task 3.6 已实现）：
+    末行是完整 JSON 但 schema 非法（缺必填字段）→ 应标记 corrupt（fail-closed），而非当截断容忍丢弃。
+    ``_scan`` 分离 ``JSONDecodeError``（截断，末行容忍）与 schema 构造失败（complete-but-invalid，始终 fail-closed）。"""
     # Arrange — 两行合法 + 末行 complete JSON 但缺 schema_version 等必填字段
     j = tmp_path / "bad.jsonl"
     j.write_text(_evt_line("e1") + "\n" + _evt_line("e2") + "\n"

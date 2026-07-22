@@ -19,7 +19,7 @@
 - [x] 3.3 Allocate a distinct deterministic iteration ID for every revise, resume, fork, and new-session attempt and record parent relationships.
 - [x] 3.4 Build each retry prompt from immutable PRD content plus verified journal artifacts and remaining acceptance criteria.
 - [x] 3.5 Emit and reduce all terminal classes, including planned smoke, stalled, orphan deletion, interrupted semantic revise, blocked evidence, and sandbox blocked.
-- [ ] 3.6 Make complete schema-invalid final journal records fail closed while continuing to tolerate only provably incomplete trailing writes.
+- [x] 3.6 Make complete schema-invalid final journal records fail closed while continuing to tolerate only provably incomplete trailing writes.
 
 ## 4. Publication and Evidence Integrity
 
