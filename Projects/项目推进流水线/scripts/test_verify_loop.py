@@ -333,6 +333,49 @@ def test_dispatch_red_then_green(tmp_path, monkeypatch):
     assert "审核反馈（verify 第1轮" in prd_text and "fix X at a.ts" in prd_text
 
 
+# ─── task 3.3：verify revise creates a new iteration（distinct + references prior + feedback）──
+def test_dispatch_revise_creates_distinct_iteration_referencing_prior(tmp_path, monkeypatch):
+    """task 3.3 + spec durable-runtime-integration「Iteration identity / Verify revise creates a new
+    iteration」：semantic verify 返回 revise → next attempt（round2）得**新 distinct deterministic
+    iteration ID**（``next_iteration(2)`` ≠ round1 ``next_iteration(1)``），其 ``agent_finished`` 事件
+    references the prior iteration（round1 iter）+ feedback artifact digest（round1 ``verifier_feedback``）。
+    planned/running（run 级 seq0）不混入 attempt iteration。"""
+    import journal as J
+    # Arrange — 同 revise→pass 闭环，但 journal_shadow 开（emit 落盘可观测 iteration）
+    _setup(tmp_path, monkeypatch); _admit(monkeypatch); repo = _repo(tmp_path)
+    branches = iter(["auto/r1", "auto/r2"])
+    monkeypatch.setattr(run_daily, "_run_dev_agent",
+                        lambda *a, **k: {"branch": next(branches), "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
+    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
+    monkeypatch.setattr(run_daily, "independent_verify",
+                        lambda *a, **k: {"pass": False, "test_rc": 1, "test_log": "L"})
+    monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
+    verdicts = iter([{"verdict": "revise", "feedback_section": "fix X at a.ts"}, {"verdict": "pass"}])
+    monkeypatch.setattr(run_daily, "run_persona", lambda *a, **k: (next(verdicts), {"cost": 0.0, "turns": 1}))
+    monkeypatch.setattr(run_daily, "reconcile_pr", lambda *a, **k: None)
+    prof = _prof(repo)
+    prof["loop"] = {"journal_shadow": True}      # 开 shadow → emit 落盘（baseline 关则 no-op，不可观测 iteration）
+
+    # Act
+    run_daily.dispatch_one(_entry(), prof, "20260718", _args())
+
+    # Assert — journal 落盘；round1/round2 agent_finished 用 distinct deterministic iteration
+    journals = list((tmp_path / "state").rglob("*.journal.jsonl"))
+    assert journals, "journal_shadow on → lifecycle 事件应落盘"
+    evs = J.read_events(journals[0])
+    agent_fin = [e for e in evs if e.event_type == "agent_finished"]
+    assert len(agent_fin) >= 2, "revise→增量重投应有两轮 agent_finished"
+    iter_r1, iter_r2 = agent_fin[0].iteration_id, agent_fin[1].iteration_id
+    assert iter_r1 != iter_r2, "task 3.3：每轮 distinct deterministic iteration（spec Iteration identity）"
+    # next attempt（round2）references prior iteration + feedback artifact（spec scenario）
+    assert agent_fin[1].payload.get("parent_iteration") == iter_r1, "next attempt 引用 prior iteration"
+    assert agent_fin[1].payload.get("parent_feedback_digest"), "next attempt 引用 feedback artifact digest"
+    # round1 feedback artifact digest 来自 round1 verifier_feedback 事件（一致性）
+    vf_r1 = [e for e in evs if e.event_type == "verifier_feedback" and e.payload.get("round") == 1]
+    assert vf_r1, "round1 revise → 应落 verifier_feedback artifact 事件"
+    assert agent_fin[1].payload["parent_feedback_digest"] == vf_r1[0].payload["digest"]
+
+
 def test_dispatch_red_used_up(tmp_path, monkeypatch):
     # Arrange：两轮全红
     _setup(tmp_path, monkeypatch)

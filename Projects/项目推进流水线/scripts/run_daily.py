@@ -1132,7 +1132,7 @@ def _dump_branch_diff(repo: str, base_ref: str, branch: str, out_path: Path) -> 
 
 def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int, *,
                             sj: ShadowJournal | None = None, iter_id: str = "", prd_id: str = "",
-                            artifact_root: Path | None = None, driven: bool = False) -> None:
+                            artifact_root: Path | None = None, driven: bool = False) -> str | None:
     """把 pa-verify 反馈节追加进 PRD 末尾（baseline）+ shadow/drift 阶段落 journal artifact（task 3.2/3.3）。
 
     反馈是施工指引（非需求变更），故不重过 pa-prd-critic 闸（docs/verify-commit-loop-design.md §3-④）。
@@ -1143,9 +1143,15 @@ def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int, *
     真源 + journal 事件）。verify 闭环下一轮读路径切 artifact 由 task 3.4 配合（retry prompt 读 artifact）；
     driven flag 真正 enable 在 task 7.5 cutover——3.2-3.4 完成前 driven 默认关，verify 闭环照旧读 PRD（不破）。
     driven 模式 artifact 写失败 → shadow 契约吞异常，反馈丢失（known，task 4.2 evidence-integrity fail closed 补）。
+
+    Returns:
+        feedback artifact digest（``sha256:<hex>``；shadow/drift store 成功时）；``None`` = 未 store
+        （baseline flag 关 / store 失败 / 无 feedback_section）。task 3.3 下轮 iteration 引用此 digest（spec
+        scenario「next attempt references ... feedback artifact」）。
     """
     section = (f"\n\n## ⚠️ 审核反馈（verify 第{round_n}轮·非需求变更，未重过 critic 闸）\n\n"
                + (feedback_section or "").strip() + "\n")
+    digest: str | None = None
     # shadow 双写：feedback → 内容寻址 artifact（不可变真源）+ journal 事件（payload-only，不改状态机）
     if sj is not None and getattr(sj, "enabled", False) and feedback_section and artifact_root is not None:
         try:
@@ -1153,12 +1159,14 @@ def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int, *
                                        kind="verifier_feedback", sensitivity="sanitized")
             sj.emit("verifier_feedback", iter_id, prd_id,
                     payload={"round": round_n, "digest": ref.digest, "path": ref.path, "size": ref.size})
+            digest = ref.digest
         except Exception:
             pass   # shadow 契约：观测层自身故障不得拖垮 verify 闭环（与 loop_runtime 契约#3 同源）
     if not driven:   # task 3.2：driven（journal_driven_dispatch）模式摘除 PRD 追加（spec「Immutable PRD source」
                      #   byte-for-byte unchanged）；baseline/shadow（driven 关）照旧追加——保 verify 闭环读 PRD 决策不变
         with open(prd_abs, "a", encoding="utf-8") as f:
             f.write(section)
+    return digest
 
 
 def _pa_verify_round(rec: dict, prof: dict, prd_abs: str, cur_base: str,
@@ -1322,7 +1330,11 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     #    同构模板：stage_critic revise loop（§4.3）。reconcile 顺位后移到「裁定后收尾」——不预先为中间红的分支补开 PR。
     #    执行器选源已固化（ADR-0006）：控制面 scripts/dev-agent.py 唯一，不再探测仓内 dev-agent.{py,mjs}。
     cur_base = base
+    _parent_iter: str | None = None       # task 3.3：prior iteration（revise→next attempt 引用，spec Iteration identity）
+    _parent_fb_digest: str | None = None  # task 3.3：prior feedback artifact digest（next attempt 引用）
     for round_n in range(1, VERIFY_MAX_ROUNDS + 1):
+        _iter = _coord.next_iteration(round_n)   # task 3.3：每轮 distinct deterministic iteration（seq=round_n；
+        #   planned/running 用 run 级 seq0，每 attempt 一个新 iteration；distinct 使 reducer/recovery 可按 attempt 切片）
         cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs)
         if cmd is None:
             rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
@@ -1354,9 +1366,14 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
             rec["stalled"] = bool(script_json.get("stalled"))   # SPEC #27：dev-agent 主动刹车（exit 12，非超时）
             rec["run_log"] = script_json.get("run_log")          # 监控 jsonl 路径（state/runs/...）
             rec["dev_test_cmd"] = script_json.get("test_cmd")
-            _sj.emit("agent_finished", _iter, _prd, payload={   # task 3.2：dev-agent 阶段结束（RUNNING→AGENT_FINISHED）
+            _af_payload = {   # task 3.2：dev-agent 阶段结束（RUNNING→AGENT_FINISHED）
                 "round": round_n, "branch": rec.get("branch"), "cost": rec.get("dev_cost"),
-                "turns": rec.get("dev_turns"), "stalled": rec.get("stalled")})
+                "turns": rec.get("dev_turns"), "stalled": rec.get("stalled")}
+            if _parent_iter is not None:   # task 3.3：next attempt references prior iteration + feedback artifact
+                #   （spec scenario「Verify revise creates a new iteration」；round≥2 由 revise 置位，round1 _parent_iter=None）
+                _af_payload["parent_iteration"] = _parent_iter
+                _af_payload["parent_feedback_digest"] = _parent_fb_digest
+            _sj.emit("agent_finished", _iter, _prd, payload=_af_payload)
         rec["dev_killed"] = script_json is None   # 无 stdout JSON → 大概率 kill/崩（与 stalled 互补：超时 vs 主动刹车）
 
         branch = rec.get("branch")
@@ -1409,10 +1426,12 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         if vinfo and vinfo.get("verdict") == "revise" and round_n < VERIFY_MAX_ROUNDS:
             # 判红（机会未用满）：保留分支做下次 base + 反馈追加进 PRD + 增量 --base=<上次分支> 重投
             log(f"  🔴 {slug}: verify 红（r{round_n}）→ 保留 {branch} 做下次 base，反馈进 PRD，增量重投 r{round_n + 1}")
-            _append_verify_feedback(prd_abs, vinfo.get("feedback_section", ""), round_n,
+            _fb_digest = _append_verify_feedback(prd_abs, vinfo.get("feedback_section", ""), round_n,
                                      sj=_sj, iter_id=_iter, prd_id=_prd,
                                      artifact_root=STATE_DIR / "artifacts" / _run,
                                      driven=_coord.flags.journal_driven_dispatch)   # task 3.2：driven→摘 PRD 追加
+            _parent_iter = _iter              # task 3.3：next attempt（round_n+1）引用 prior iteration
+            _parent_fb_digest = _fb_digest    # task 3.3：next attempt 引用 round_n feedback artifact digest
             cur_base = branch
             continue
         # 判红用满（round_n==VERIFY_MAX_ROUNDS）/ pa-verify 异常 / 无产出 → 对账降级 interrupted_pr（不 drop，半成品留 review）
