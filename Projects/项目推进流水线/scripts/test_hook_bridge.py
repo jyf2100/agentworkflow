@@ -24,13 +24,25 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 import hook_bridge  # noqa: E402
-from hook_adapter import HookOutcome  # noqa: E402
+from hook_adapter import HookAdapter, HookOutcome  # noqa: E402
 from hook_policy import PermissionDecision  # noqa: E402
+
+
+def _coord(*, lifecycle_hooks: bool, journal_path, artifact_root: str,
+           iteration_id: str = "iter_1") -> SimpleNamespace:
+    """duck-type Coordinator：build_dev_hooks 只读 flags/journal.path/artifact_root/iteration_id。"""
+    return SimpleNamespace(
+        flags=SimpleNamespace(lifecycle_hooks=lifecycle_hooks),
+        journal=SimpleNamespace(path=str(journal_path)),
+        artifact_root=artifact_root,
+        iteration_id=iteration_id,
+    )
 
 
 # ─── 测试替身：fake HookAdapter（记录调用 + 返回固定 outcome）──────────────────
@@ -289,3 +301,42 @@ def test_build_hook_matchers_covers_six_loop_lifecycle_events():
         assert len(ms) >= 1, f"{ev} 须至少一个 HookMatcher"
         # 每个 matcher 至少含一个 async hook callback
         assert any(asyncio.iscoroutinefunction(h) for m in ms for h in m.hooks)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Part 4：build_dev_hooks — dev-agent wiring（task 2.3b）：coordinator → (adapter, hooks)
+# ════════════════════════════════════════════════════════════════════════════
+def test_build_dev_hooks_baseline_returns_none_none(tmp_path):
+    """lifecycle_hooks 关 → (None, None)：dev-agent 不注册 SDK hooks（baseline 保留，design 决策#8）。"""
+    coord = _coord(lifecycle_hooks=False, journal_path=tmp_path / "x.journal.jsonl",
+                   artifact_root=str(tmp_path / "art"))
+    adapter, hooks = hook_bridge.build_dev_hooks(coord)
+    assert adapter is None
+    assert hooks is None
+
+
+def test_build_dev_hooks_lifecycle_on_builds_adapter_and_six_matchers(tmp_path):
+    """lifecycle_hooks 开 → (HookAdapter, dict[6 events])：adapter own hook journal + 复用 artifact_root。
+
+    design 决策#1「coordinator owns hooks」——adapter 从 coordinator 读 flags/artifact_root/iteration_id，
+    不各自 resolve；hooks dict 供 ``ClaudeAgentOptions.hooks`` 注册真实 SDK lifecycle。
+    """
+    coord = _coord(lifecycle_hooks=True, journal_path=tmp_path / "x.journal.jsonl",
+                   artifact_root=str(tmp_path / "art"), iteration_id="iter_1")
+    adapter, hooks = hook_bridge.build_dev_hooks(coord, stamp_fn=lambda: "T")
+    assert isinstance(adapter, HookAdapter)
+    assert adapter.artifact_root == str(tmp_path / "art")
+    assert set(hooks.keys()) == {
+        "PreToolUse", "PostToolUse", "Stop", "PreCompact", "SubagentStart", "SubagentStop"}
+
+
+def test_build_dev_hooks_hook_journal_is_sibling_of_iteration_journal(tmp_path):
+    """hook journal 路径 = iteration journal 同目录 ``.hooks.jsonl``（证据流与状态流分文件，
+    对齐 hook_events「独立 hook journal 不混进 loop_state iteration journal」）。"""
+    coord = _coord(lifecycle_hooks=True,
+                   journal_path=tmp_path / "runs" / "p" / "s.journal.jsonl",
+                   artifact_root=str(tmp_path / "art"), iteration_id="iter_1")
+    adapter, _hooks = hook_bridge.build_dev_hooks(coord, stamp_fn=lambda: "T")
+    assert adapter.journal.path.endswith(".hooks.jsonl")
+    assert "runs" in adapter.journal.path
+    assert adapter.journal.enabled is True

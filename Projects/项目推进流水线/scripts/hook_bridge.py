@@ -29,9 +29,11 @@ HookSpecificOutput，不含 Stop/PreCompact/SubagentStop**。本层用真实 SDK
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from hook_adapter import HookOutcome
+from hook_adapter import HookAdapter, HookOutcome
+from hook_events import HookJournal
 
 # 写类工具：PreToolUse ``write`` 判定（与 ``hook_adapter._WRITE_TOOLS`` 对齐——策略层不重复判写）。
 _WRITE_TOOLS: frozenset[str] = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
@@ -148,3 +150,31 @@ def build_hook_matchers(adapter: Any, *, iteration_id: str) -> dict[str, list]:
     from claude_agent_sdk import HookMatcher   # 延迟 import：保核心层 SDK-free（types.py:585）
     callback = make_hook_callback(adapter, iteration_id=iteration_id)
     return {event: [HookMatcher(hooks=[callback])] for event in LOOP_HOOK_EVENTS}
+
+
+def build_dev_hooks(coordinator: Any, *, stamp_fn: Callable[[], str] | None = None
+                    ) -> tuple[HookAdapter | None, dict[str, list] | None]:
+    """task 2.3b dev-agent wiring：从 coordinator 组装 ``(HookAdapter|None, hooks_dict|None)``。
+
+    dev-agent main() 调此函数把 coordinator 边界接到真实 SDK：``lifecycle_hooks`` 开 → 构造
+    ``HookAdapter``（own 独立 hook journal ``{iteration_journal}.hooks.jsonl`` + 复用 coordinator
+    ``artifact_root``）+ ``build_hook_matchers``（6 events，供 ``ClaudeAgentOptions.hooks`` 注册）；
+    关 → ``(None, None)``（baseline，dev-agent 不注册 SDK hooks，design 决策#8）。
+
+    design 决策#1「coordinator owns hooks」：adapter 从 coordinator 读 flags/artifact_root/iteration_id
+    （不再各自 ``resolve_flags``）。返回 adapter 供控制面持有跨整个 SDK session——HookAdapter 有状态
+    （TestEvidence / stop 续命计数 / subagent 归属表），跨 SDK 回调累积。
+
+    Args:
+        coordinator: build_coordinator 产出的 ``Coordinator``（duck-type：``.flags.lifecycle_hooks`` /
+            ``.journal.path`` / ``.artifact_root`` / ``.iteration_id``）。
+        stamp_fn: hook 事件时间戳函数（None → ``HookAdapter`` 默认）；dev-agent 可注入 UTC now。
+    """
+    if not coordinator.flags.lifecycle_hooks:
+        return None, None
+    hook_path = Path(coordinator.journal.path).with_suffix(".hooks.jsonl")
+    hook_journal = HookJournal(hook_path, enabled=True)
+    adapter = HookAdapter(journal=hook_journal, artifact_root=coordinator.artifact_root,
+                          stamp=stamp_fn)
+    hooks = build_hook_matchers(adapter, iteration_id=coordinator.iteration_id)
+    return adapter, hooks

@@ -61,6 +61,8 @@ from bash_allowlist import decide_bash   # ADR-0006 #7：Bash 命令放行判定
 from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # OpenSpec verified-dev-execution：结构化测试证据 + 发布硬门（无依赖模块，同上）
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
 from external_state import sanitize   # C2 脱敏：git()/gh() stderr 进 JSON error 前抹 token（无依赖模块，同上）
+from coordinator import build_coordinator   # task 2.3b：coordinator 边界（design 决策#1：一次解析 loop flag + own journal/artifacts/IDs）
+from hook_bridge import build_dev_hooks      # task 2.3b：lifecycle_hooks 开 → 注册真实 SDK lifecycle hooks（ClaudeAgentOptions.hooks）
 
 REPO_ROOT = Path.cwd()
 
@@ -362,7 +364,8 @@ async def main() -> int:
 
     base = args["base"]
     slug = dev_slugify(Path(args["prd"]).stem)
-    branch = f"{args['branch_prefix']}/{stamp()}-{slug}"
+    s = stamp()                      # task 2.3b：一次 stamp，coordinator/branch/run_log 复用（stamp() 含时分不可预测，多次调用会漂）
+    branch = f"{args['branch_prefix']}/{s}-{slug}"
 
     # 1. 建 feature 分支（dry-run 不切，改动留工作树）
     if not args["dry_run"]:
@@ -375,8 +378,15 @@ async def main() -> int:
     prompt = build_prompt(args, prd_text, None if args["dry_run"] else branch)
 
     # 3. SDK dev loop（acceptEdits + settingSources + 硬白名单 tools，对齐历史 mjs/py / SPEC §决策#23）
-    run_log = STATE_RUNS_DIR / f"{branch.replace('/', '-')}-{stamp()}.jsonl"
+    run_log = STATE_RUNS_DIR / f"{branch.replace('/', '-')}-{s}.jsonl"
     state = create_loop_state(run_log)
+    # task 2.3b：coordinator 边界（design 决策#1）——一次解析 loop flag + own journal/artifacts/IDs；
+    # lifecycle_hooks 开 → build_dev_hooks 注册真实 SDK lifecycle hooks（PreToolUse/Stop/...），
+    # 关 → sdk_hooks=None（baseline，dev-agent 行为零变化，design 决策#8）。
+    _coord = build_coordinator(stamp=s, prd_path=args["prd"], proj=REPO_ROOT.name,
+                               slug=slug, state_dir=str(REPO_ROOT / "state"),
+                               env=dict(os.environ))
+    _dev_adapter, sdk_hooks = build_dev_hooks(_coord)
     result_msg: ResultMessage | None = None
     try:
         options = ClaudeAgentOptions(
@@ -393,6 +403,7 @@ async def main() -> int:
             max_turns=150,
             max_budget_usd=MAX_BUDGET,               # 预算刹车（降级兜底，非硬保证——见上 follow-up）
             env=build_env_for_sdk(),                 # PATH 前置 runtime python + claude CLI
+            hooks=sdk_hooks,                          # task 2.3b：lifecycle_hooks 开→真实 SDK lifecycle hooks（None=baseline，design 决策#8）
         )
         # can_use_tool 回调要求 streaming 模式（SDK 0.2.x：_internal/client.py:103 见 prompt 为
         # str 即 raise「can_use_tool callback requires streaming mode」）。string prompt 经
