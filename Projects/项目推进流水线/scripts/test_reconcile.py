@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
+import artifact_store  # noqa: E402
 import journal as J  # noqa: E402
 import loop_runtime as RT  # noqa: E402
 import reconcile as RE  # noqa: E402
@@ -99,6 +100,24 @@ def test_reconcile_illegal_kind_is_unknown_fail_safe():
     assert report.external_known is False
 
 
+def test_reconcile_test_evidence_kind_classified_three_states():
+    """task 4.4：test evidence 幂等键纳入 reconcile 三态（confirmed=artifact 存在 / absent=缺失可重写 /
+    unknown=查不到→BLOCK）。publication/retry 前对账 test evidence——unknown 不当 fresh green evidence。"""
+    targets = [RE.SideEffectTarget("test", "sha256:abc")]
+    # confirmed
+    r1 = RE.reconcile_side_effects(iteration_id="iter_1", targets=targets,
+                                   resolver=FakeResolver({("test", "sha256:abc"): True}))
+    assert len(r1.confirmed) == 1 and r1.safe_to_retry
+    # absent（pending）
+    r2 = RE.reconcile_side_effects(iteration_id="iter_1", targets=targets,
+                                   resolver=FakeResolver({("test", "sha256:abc"): False}))
+    assert len(r2.pending) == 1 and r2.safe_to_retry
+    # unknown → 不 safe（BLOCK）
+    r3 = RE.reconcile_side_effects(iteration_id="iter_1", targets=targets,
+                                   resolver=FakeResolver({("test", "sha256:abc"): None}))
+    assert len(r3.unknown) == 1 and not r3.safe_to_retry
+
+
 def test_reconcile_idempotency_key_stable_across_replay():
     """同 (kind, iteration, target) → 同 key（exactly-once 比对键，跨重放稳定）。"""
     t = [RE.SideEffectTarget("pr", "owner/repo:auto/b")]
@@ -135,6 +154,21 @@ def test_local_git_resolver_branch_and_commit(tmp_path):
     assert r.check("push", "nonexistent") is False      # branch 不存在
     assert r.check("commit", "HEAD") is True            # commit 存在
     assert r.check("pr", "anything") is None            # pr 本地查不到（交 gh）
+
+
+def test_artifact_evidence_resolver_three_states(tmp_path):
+    """task 4.4：ArtifactEvidenceResolver.check('test', digest) 真实查 artifact_store——artifact 存在且
+    digest 匹配→confirmed(True)；缺失→absent(False)；digest 不匹配（篡改/损坏）→unknown(None, fail-safe)。
+    非 test kind→None（交其他 resolver）。publication/retry 前 reconcile green evidence 是否仍在。"""
+    root = tmp_path / "artifacts"
+    ref = artifact_store.store(root, "all tests passed", kind="test_output", sensitivity="internal")
+    res = RE.ArtifactEvidenceResolver(root)
+    assert res.check("test", ref.digest) is True            # 存在 + digest 匹配 → confirmed
+    assert res.check("test", "sha256:" + "0" * 64) is False  # 缺失 → absent（可重写）
+    # 篡改内容致 digest 不匹配 → unknown（损坏 fail-safe，既不当 confirmed 也不当 absent）
+    (root / artifact_store._bucketed_path(ref.digest)).write_text("TAMPERED", encoding="utf-8")
+    assert res.check("test", ref.digest) is None
+    assert res.check("commit", "x") is None                 # 非 test kind → None（不归本 resolver）
 
 
 def test_composite_resolver_first_non_none_wins():

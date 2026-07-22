@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+import artifact_store
 import ids
 import journal as J
 import loop_state as L
@@ -36,8 +37,9 @@ import retry_policy as RP
 from failure_analysis import FailureFingerprint
 from session_meta import ExceptionClass, SessionStore
 
-# ids.idempotency_id 允许的 kind（commit/push/pr），覆盖 task 5.5 的 branch/commit/PR/publication
-ALLOWED_KINDS: frozenset[str] = frozenset({"commit", "push", "pr"})
+# ids.idempotency_id 允许的 kind（commit/push/pr/test），覆盖 task 5.5 的 branch/commit/PR/publication
+# + task 4.4 的 test evidence（target=evidence digest，publication/retry 前 reconcile green evidence）
+ALLOWED_KINDS: frozenset[str] = frozenset({"commit", "push", "pr", "test"})
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,35 @@ class GhPrResolver:
             return len(data) > 0
         except Exception:
             return None
+
+
+class ArtifactEvidenceResolver:
+    """查 artifact_store 验证 test evidence artifact 仍在且 digest 匹配（task 4.4）。
+
+    check('test', digest)：按 content-addressed path 读回重算 digest 比对——confirmed(存在+匹配) /
+    absent(缺失，可重写) / None=unknown(篡改/损坏，fail-safe；非 test kind 亦返回 None 交其他 resolver)。
+    publication/retry 前 reconcile green evidence 是否仍在 + 完整（exactly-once fresh green evidence，
+    spec 4.4 test evidence idempotency keys）。"""
+
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def check(self, kind: str, target: str) -> bool | None:
+        if kind != "test":
+            return None   # 非 test kind 交其他 resolver
+        digest = target
+        if not isinstance(digest, str) or not digest.startswith("sha256:"):
+            return None   # 非法 target（非 digest 形式）→ unknown（fail-safe）
+        path = self.root / artifact_store._bucketed_path(digest)
+        if not path.is_file():
+            return False   # 缺失 → absent（safe to re-apply）
+        try:
+            content = path.read_bytes()
+        except OSError:
+            return None   # 读失败 → unknown
+        if artifact_store.compute_digest(content) == digest:
+            return True   # 存在 + digest 匹配 → confirmed
+        return None   # digest 不匹配（篡改/损坏）→ unknown（fail-safe，绝不当 confirmed/absent）
 
 
 class CompositeResolver:

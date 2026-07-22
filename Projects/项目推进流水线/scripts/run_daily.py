@@ -50,6 +50,7 @@ from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写
 import journal as J                        # task 3.4：driven retry 读 journal events → recovery context（纯 stdlib）
 import recovery_context as RC              # task 3.4：driven retry prompt 从 immutable PRD + journal artifacts（纯函数）
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
+import reconcile                           # task 4.4：ArtifactEvidenceResolver（publication 前 reconcile test evidence）
 
 try:
     import yaml
@@ -1213,7 +1214,8 @@ _SJ_TERMINAL_MAP: dict[str, str] = {
 }
 
 
-def _sj_terminal(sj: ShadowJournal, rec: dict, iteration_id: str, prd_id: str) -> None:
+def _sj_terminal(sj: ShadowJournal, rec: dict, iteration_id: str, prd_id: str,
+                 *, artifact_root=None) -> None:
     """dispatch 出口旁路 emit 终态事件（task 3.2）。
 
     flag 关→``sj.emit`` 内部 no-op（ShadowJournal 契约）；映射对齐 compat 保 parity。**旁路**：不改 rec、
@@ -1231,6 +1233,18 @@ def _sj_terminal(sj: ShadowJournal, rec: dict, iteration_id: str, prd_id: str) -
         mechanical_green = bool(verify.get("pass"))
         semantic_pass = rec.get("verify_verdict") == "pass"
         if mechanical_green and semantic_pass:
+            # task 4.4：publication 前 reconcile test evidence artifact（exactly-once fresh green evidence）。
+            # evidence_ref.digest 指向的 artifact 必须仍在 + digest 匹配；缺失/损坏 → 不当 published
+            # （spec 4.4 test evidence idempotency keys before publication；与 4.2 verify 时持久化互补，
+            #  防 verify→publication 窗口 crash/磁盘致 evidence 丢失）。
+            _ev_ref = verify.get("evidence_ref") or {}
+            _ev_digest = _ev_ref.get("digest") if isinstance(_ev_ref, dict) else None
+            if artifact_root and _ev_digest and \
+                    reconcile.ArtifactEvidenceResolver(artifact_root).check("test", _ev_digest) is not True:
+                sj.emit("blocked_evidence", iteration_id, prd_id,
+                        payload={"status": status, "pr_url": rec.get("pr_url"),
+                                 "reason": "publication evidence artifact not confirmed"})
+                return
             sj.emit("published", iteration_id, prd_id,
                     payload={"status": status, "pr_url": rec.get("pr_url")})
         else:
@@ -1497,7 +1511,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         log(f"  ⏸ {slug}: verify 终止（r{round_n}, verdict={rec['verify_verdict']}）→ 对账收尾（中断 PR 不 drop）")
         reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True); break
 
-    _sj_terminal(_sj, rec, _iter, _prd)   # task 3.2：所有 break 出口（verify绿pr_open / 终止interrupted_pr / 无branch fail）统一终态 emit
+    _sj_terminal(_sj, rec, _iter, _prd, artifact_root=STATE_DIR / "artifacts" / _run)   # task 3.2 + 4.4：统一终态 emit（publication 前 reconcile test evidence）
     return rec
 
 

@@ -28,7 +28,8 @@ _SEP = "\x1f"
 IDEMPOTENCY_COMMIT = "commit"
 IDEMPOTENCY_PUSH = "push"
 IDEMPOTENCY_PR = "pr"
-_IDEMPOTENCY_KINDS = frozenset({IDEMPOTENCY_COMMIT, IDEMPOTENCY_PUSH, IDEMPOTENCY_PR})
+IDEMPOTENCY_TEST = "test"   # task 4.4：test evidence 幂等键（target=evidence digest）
+_IDEMPOTENCY_KINDS = frozenset({IDEMPOTENCY_COMMIT, IDEMPOTENCY_PUSH, IDEMPOTENCY_PR, IDEMPOTENCY_TEST})
 
 
 def _digest(*parts) -> str:
@@ -61,11 +62,12 @@ def action_id(iteration: str, tool_use_id: str | None = None, seq: int | None = 
 
 
 def idempotency_id(kind: str, iteration: str, target: str) -> str:
-    """副作用幂等键：``kind``（commit/push/pr）+ ``iteration`` + ``target``（branch/repo）。
+    """副作用幂等键：``kind``（commit/push/pr/test）+ ``iteration`` + ``target``（branch/repo/evidence digest）。
 
     恢复重放时同 key → 该副作用已执行则跳过（exactly-once effective）。``kind`` 必须在允许列表
-    （commit/push/pr），防构造非法幂等键混入 reconcile 逻辑。
+    （commit/push/pr/test），防构造非法幂等键混入 reconcile 逻辑。``test`` kind 的 target 是 test
+    evidence artifact 的 digest（task 4.4：publication/retry 前 reconcile green evidence 是否仍在）。
     """
     if kind not in _IDEMPOTENCY_KINDS:
-        raise ValueError(f"非法 idempotency kind（允许 commit/push/pr）: {kind!r}")
+        raise ValueError(f"非法 idempotency kind（允许 commit/push/pr/test）: {kind!r}")
     return f"idem_{_digest(kind, iteration, target)}"

@@ -38,6 +38,31 @@ def test_sj_terminal_pr_open_green_emits_published(tmp_path):
     assert evs[0].payload["pr_url"] == "https://gh/o/r/pull/1"
 
 
+def test_sj_terminal_published_reconciles_evidence_artifact(tmp_path):
+    """task 4.4：publication 前 reconcile test evidence artifact（exactly-once fresh green evidence）。
+    dual gate 绿 + evidence artifact 存在&digest 匹配 → published；evidence 缺失/损坏 → emit
+    blocked_evidence，**绝不** published（spec 4.4 test evidence idempotency keys before publication）。"""
+    import artifact_store
+    root = tmp_path / "artifacts"
+    ref = artifact_store.store(root, "all tests passed", kind="test_output", sensitivity="internal")
+    # ① artifact 存在 + digest 匹配 → published
+    rec_ok = {"status": "pr_open", "pr_url": "https://gh/o/r/pull/1",
+              "verify": {"pass": True, "evidence_ref": {"digest": ref.digest}},
+              "verify_verdict": "pass"}
+    sj_ok = RT.ShadowJournal(tmp_path / "j_ok.jsonl", "run_1", _stamp, enabled=True)
+    run_daily._sj_terminal(sj_ok, rec_ok, "iter_1", "prd_1", artifact_root=root)
+    evs_ok = J.read_events(tmp_path / "j_ok.jsonl")
+    assert len(evs_ok) == 1 and evs_ok[0].event_type == "published"
+    # ② evidence digest 指向缺失 artifact → blocked_evidence（不当 published）
+    rec_bad = {"status": "pr_open", "pr_url": "https://gh/o/r/pull/2",
+               "verify": {"pass": True, "evidence_ref": {"digest": "sha256:" + "0" * 64}},
+               "verify_verdict": "pass"}
+    sj_bad = RT.ShadowJournal(tmp_path / "j_bad.jsonl", "run_1", _stamp, enabled=True)
+    run_daily._sj_terminal(sj_bad, rec_bad, "iter_1", "prd_1", artifact_root=root)
+    evs_bad = J.read_events(tmp_path / "j_bad.jsonl")
+    assert len(evs_bad) == 1 and evs_bad[0].event_type == "blocked_evidence"
+
+
 def test_sj_terminal_pr_open_red_emits_revise(tmp_path):
     """interrupted_pr + verify 未过 → revise（有 PR 但验证红，**非** published——对齐 compat 防假绿）。"""
     sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)

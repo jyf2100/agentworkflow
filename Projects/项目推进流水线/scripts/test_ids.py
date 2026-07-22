@@ -88,8 +88,19 @@ def test_idempotency_id_distinct_per_kind_and_target():
     assert len({a, b, c}) == 3
 
 
+def test_idempotency_id_supports_test_evidence_kind():
+    """task 4.4：test evidence 幂等键（target=evidence digest）——publication/retry 前 reconcile
+    test artifact 是否仍存在 + digest 匹配（exactly-once fresh green evidence，防重放/丢失）。"""
+    k = I.idempotency_id(I.IDEMPOTENCY_TEST, "iter_x", "sha256:abc")
+    assert k.startswith("idem_")
+    # 稳定（重放同 key → reconcile 跳过已确认 evidence）
+    assert k == I.idempotency_id(I.IDEMPOTENCY_TEST, "iter_x", "sha256:abc")
+    # 与 commit/push/pr 区分（不同 kind → 不同 key）
+    assert k != I.idempotency_id(I.IDEMPOTENCY_COMMIT, "iter_x", "sha256:abc")
+
+
 def test_idempotency_id_rejects_unknown_kind():
-    """kind 必须在允许列表（commit/push/pr）——防构造非法幂等键混入 reconcile 逻辑（边界校验）。"""
+    """kind 必须在允许列表（commit/push/pr/test）——防构造非法幂等键混入 reconcile 逻辑（边界校验）。"""
     with pytest.raises(ValueError):
         I.idempotency_id("malicious", "iter_x", "main")
 
