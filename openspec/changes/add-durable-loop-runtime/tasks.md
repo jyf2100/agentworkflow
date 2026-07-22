@@ -44,12 +44,12 @@
 
 ## 6. Execution Sandbox
 
-- [ ] 6.1 Define the `ExecutionSandbox` interface and implement the existing local-worktree behavior as an explicitly lower-assurance adapter.
-- [ ] 6.2 Implement a container adapter with non-root identity, writable worktree-only mount, read-only PRD/source mounts, temporary home, and CPU/memory/process limits.
-- [ ] 6.3 Add profile-driven network allowlists and tests proving undeclared destinations are blocked.
-- [ ] 6.4 Keep long-lived GitHub/SMTP/cloud credentials on the control-plane host and implement host-side verified publication.
-- [ ] 6.5 Make sandbox startup/policy failure produce `sandbox_blocked` without automatic fallback to local mode.
-- [ ] 6.6 Add Node and Python fixture repositories that run through both assurance tiers without real external services.
+- [x] 6.1 Define the `ExecutionSandbox` interface and implement the existing local-worktree behavior as an explicitly lower-assurance adapter.
+- [x] 6.2 Implement a container adapter with non-root identity, writable worktree-only mount, read-only PRD/source mounts, temporary home, and CPU/memory/process limits.
+- [x] 6.3 Add profile-driven network allowlists and tests proving undeclared destinations are blocked.
+- [x] 6.4 Keep long-lived GitHub/SMTP/cloud credentials on the control-plane host and implement host-side verified publication.
+- [x] 6.5 Make sandbox startup/policy failure produce `sandbox_blocked` without automatic fallback to local mode.
+- [x] 6.6 Add Node and Python fixture repositories that run through both assurance tiers without real external services.
 
 ## 7. OpenTelemetry and Operational Metrics
 
