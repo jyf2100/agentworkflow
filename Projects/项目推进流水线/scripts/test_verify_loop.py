@@ -320,8 +320,12 @@ def test_dispatch_red_then_green(tmp_path, monkeypatch):
     # spy：捕获每轮 --base（验证 r2 增量 base=上次 dev 分支）
     bases: list[str] = []
     real = run_daily._dev_cmd
-    monkeypatch.setattr(run_daily, "_dev_cmd",
-                        lambda prof, prd, base, src: (bases.append(base), real(prof, prd, base, src))[1])
+
+    def _spy(*a, **k):   # *a/**k 兼容 _dev_cmd 的 feedback_artifact keyword（task 3.4）
+        base = k.get("base") or (a[2] if len(a) > 2 else None)
+        bases.append(base)
+        return real(*a, **k)
+    monkeypatch.setattr(run_daily, "_dev_cmd", _spy)
 
     # Act
     rec = run_daily.dispatch_one(_entry(), _prof(repo), "20260718", _args())
@@ -374,6 +378,98 @@ def test_dispatch_revise_creates_distinct_iteration_referencing_prior(tmp_path, 
     vf_r1 = [e for e in evs if e.event_type == "verifier_feedback" and e.payload.get("round") == 1]
     assert vf_r1, "round1 revise → 应落 verifier_feedback artifact 事件"
     assert agent_fin[1].payload["parent_feedback_digest"] == vf_r1[0].payload["digest"]
+
+
+# ─── task 3.4：driven retry prompt 从 immutable PRD + journal feedback artifact 构造 ──
+def test_dispatch_driven_retry_injects_feedback_artifact(tmp_path, monkeypatch):
+    """task 3.4 + design.md:42「recovery context is generated from the immutable PRD plus referenced
+    artifacts」: driven（``journal_driven_dispatch``）模式 retry（round2）的 dev-agent 命令 inject
+    ``--feedback-artifact <path>``——path 来自 ``build_recovery_context`` 从 journal 抽的 last
+    ``verifier_feedback`` artifact（spec「remaining acceptance criteria + verified journal artifacts」）。
+    driven 摘除 PRD 追加（task 3.2）→ 反馈真源在 artifact，retry prompt 须从 artifact 读，不依赖 PRD 反馈节。
+    baseline（driven 关）retry 命令无 ``--feedback-artifact``（照旧读 PRD 反馈节）。"""
+    # Arrange — driven 开（preflight⇒shadow 开）+ revise→pass 闭环
+    _setup(tmp_path, monkeypatch); _admit(monkeypatch); repo = _repo(tmp_path)
+    branches = iter(["auto/r1", "auto/r2"])
+    monkeypatch.setattr(run_daily, "_run_dev_agent",
+                        lambda *a, **k: {"branch": next(branches), "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
+    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
+    monkeypatch.setattr(run_daily, "independent_verify",
+                        lambda *a, **k: {"pass": False, "test_rc": 1, "test_log": "L"})
+    monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
+    verdicts = iter([{"verdict": "revise", "feedback_section": "fix X at a.ts"}, {"verdict": "pass"}])
+    monkeypatch.setattr(run_daily, "run_persona", lambda *a, **k: (next(verdicts), {"cost": 0.0, "turns": 1}))
+    monkeypatch.setattr(run_daily, "reconcile_pr", lambda *a, **k: None)
+    prof = _prof(repo)
+    prof["loop"] = {"journal_shadow": True, "journal_driven_dispatch": True}
+    # spy _dev_cmd：捕获每轮命令（base=main 是 round1；base=auto/r1 是 round2 retry）
+    cmds: list[tuple[str, list[str]]] = []
+    real_cmd = run_daily._dev_cmd
+
+    def _spy(*a, **kw):
+        c = real_cmd(*a, **kw)
+        cmds.append((kw.get("base", a[2] if len(a) > 2 else "?"), list(c or [])))
+        return c
+    monkeypatch.setattr(run_daily, "_dev_cmd", _spy)
+
+    # Act
+    run_daily.dispatch_one(_entry(), prof, "20260718", _args())
+
+    # Assert — round2（retry，base=auto/r1）inject --feedback-artifact；round1（base=main）无
+    assert len(cmds) >= 2, "revise→重投应触发两轮 _dev_cmd"
+    r2_cmd = [c for base, c in cmds if base != "main"][0]
+    r1_cmd = [c for base, c in cmds if base == "main"][0]
+    assert "--feedback-artifact" in r2_cmd, "task 3.4：driven retry 从 feedback artifact 构 prompt"
+    # feedback artifact path 是 round1 verifier_feedback 的 artifact path（recovery context 从 journal 抽）
+    fa_idx = r2_cmd.index("--feedback-artifact") + 1
+    assert r2_cmd[fa_idx] and r2_cmd[fa_idx] != "--source"
+    assert "--feedback-artifact" not in r1_cmd, "baseline round1 无 feedback artifact（初始无反馈）"
+
+
+# ─── task 3.4：dev-agent 侧消费 --feedback-artifact（parse_args + build_prompt inject）──
+_DA = None
+
+
+def _dev_agent():
+    """lazy 加载 dev-agent.py（带连字符，importlib；SDK 可 import → exec_module 安全）。"""
+    global _DA
+    if _DA is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_dev_agent_under_test",
+                                                      Path(__file__).parent / "dev-agent.py")
+        _DA = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_DA)
+    return _DA
+
+
+def test_dev_agent_parse_args_feedback_artifact():
+    """task 3.4：dev-agent parse_args 解析 --feedback-artifact（driven retry 反馈源 path）。"""
+    da = _dev_agent()
+    args = da.parse_args(["--prd", "p.md", "--base", "main", "--feedback-artifact", "/art/fb.txt"])
+    assert args["feedback_artifact"] == "/art/fb.txt"
+    # baseline（无 --feedback-artifact）默认 None
+    assert da.parse_args(["--prd", "p.md"])["feedback_artifact"] is None
+
+
+def test_dev_agent_build_prompt_injects_feedback_artifact(tmp_path):
+    """task 3.4：build_prompt 在 args[feedback_artifact] 时 inject「上轮 verify 反馈」段（driven 模式
+    PRD 不可变 task 3.2 摘除追加 → 反馈真源在 artifact，prompt 须从此读，非 PRD 反馈节）。"""
+    da = _dev_agent()
+    fb = tmp_path / "fb.txt"
+    fb.write_text("修复 X：src/a.py:L10 token=ghp_xxx 须脱敏", encoding="utf-8")
+    args = {"prd": "p.md", "source": None, "base": "main", "dry_run": False,
+            "branch_prefix": "pa-dev", "feedback_artifact": str(fb), "help": False}
+    prompt = da.build_prompt(args, "# PRD\n实现 X\n\n## 验收标准\n- A", "auto/b")
+    assert "上轮 verify 反馈" in prompt and "src/a.py:L10" in prompt
+
+
+def test_dev_agent_build_prompt_baseline_no_feedback_block():
+    """baseline（feedback_artifact=None）build_prompt 不含反馈段（照旧读 PRD 反馈节，决策零变化）。"""
+    da = _dev_agent()
+    args = {"prd": "p.md", "source": None, "base": "main", "dry_run": False,
+            "branch_prefix": "pa-dev", "feedback_artifact": None, "help": False}
+    prompt = da.build_prompt(args, "# PRD", "auto/b")
+    assert "上轮 verify 反馈" not in prompt
 
 
 def test_dispatch_red_used_up(tmp_path, monkeypatch):

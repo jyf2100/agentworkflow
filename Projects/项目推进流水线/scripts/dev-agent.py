@@ -79,7 +79,7 @@ STATE_RUNS_DIR = REPO_ROOT / "state" / "runs"
 
 def parse_args(argv: list[str]) -> dict:
     out = {"prd": None, "source": None, "base": "main", "dry_run": False,
-           "branch_prefix": "pa-dev", "help": False}
+           "branch_prefix": "pa-dev", "feedback_artifact": None, "help": False}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -87,6 +87,7 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--source": out["source"] = argv[i + 1]; i += 1
         elif a == "--base": out["base"] = argv[i + 1]; i += 1
         elif a == "--branch-prefix": out["branch_prefix"] = argv[i + 1]; i += 1
+        elif a == "--feedback-artifact": out["feedback_artifact"] = argv[i + 1]; i += 1   # task 3.4：driven retry 反馈源
         elif a == "--dry-run": out["dry_run"] = True
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
@@ -294,6 +295,12 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     if args["source"]:
         src = read_text(args["source"]) or "(读不到 source)"
         source_block = f"\n\n## 触发信号（来自控制面 pa-radar）\n```\n{src}\n```"
+    # task 3.4：driven 模式 retry 反馈源——PRD 不可变（task 3.2 摘除追加），上轮 verify 反馈落 journal
+    # content-addressed artifact，经控制面 --feedback-artifact 传入；baseline（无此参）照旧读 PRD 反馈节。
+    feedback_block = ""
+    if args.get("feedback_artifact"):
+        fb = read_text(args["feedback_artifact"]) or "(读不到 feedback artifact)"
+        feedback_block = f"\n\n## ⚠️ 上轮 verify 反馈（journal artifact；driven 模式 PRD 不可变，按此落实后重做）\n```\n{fb}\n```"
     return "\n".join([
         head,
         prot,
@@ -301,6 +308,7 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
         "## 你的任务（PRD）",
         prd_text,
         source_block,
+        feedback_block,
         "",
         "## 仓特定守则（必读）",
         "本仓的目录结构 / 测试入口 / 受保护路径 / 环境名等仓特定知识，详见仓库根 `CLAUDE.md`",

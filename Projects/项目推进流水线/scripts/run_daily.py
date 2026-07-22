@@ -47,6 +47,8 @@ from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（
 from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
 from coordinator import build_coordinator, preflight  # task 2.1/2.5：runtime coordinator 边界 + flag 组合 preflight（design 决策#1；纯 stdlib，cron 安全）
 from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写入器（类型注解用；纯 stdlib，cron 安全）
+import journal as J                        # task 3.4：driven retry 读 journal events → recovery context（纯 stdlib）
+import recovery_context as RC              # task 3.4：driven retry prompt 从 immutable PRD + journal artifacts（纯函数）
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
 
 try:
@@ -1044,7 +1046,8 @@ def _run_capture(cmd: list[str], cwd: str, timeout: int, label: str,
 
 
 # ─── verify 闭环辅助（dev→独立验证→pa-verify，docs/verify-commit-loop-design.md §3/§5）──
-def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str) -> list[str] | None:
+def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
+             feedback_artifact: str | None = None) -> list[str] | None:
     """构造 dev-agent 触发命令（ADR-0006：控制面标准执行器为唯一源）。
 
     始终调用控制面 ``scripts/dev-agent.py``（DEV_AGENT_PY）——执行器贴目标仓跑（cwd=调用方传入的
@@ -1054,6 +1057,9 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str) -> list[str] | N
     （不报错），但其值不再分支：无论 vault 还是 repo，都走控制面执行器。
 
     --base 由 verify 闭环调用方按轮次传入（round1=默认分支；round≥2=上次 dev 分支，增量重投）。
+    --feedback-artifact（task 3.4）：driven（``journal_driven_dispatch``）模式 retry（round≥2）从 immutable
+        PRD + journal feedback artifact 构 prompt——传 round_n 的 ``verifier_feedback`` artifact path
+        （``build_recovery_context`` 从 journal 抽），dev-agent 读它 inject prompt（baseline 照旧读 PRD 反馈节）。
     控制面 dev-agent.py 缺失（DEV_AGENT_PY 不存在）→ None（dispatch_one 判 fail：控制面安装异常）。"""
     if not DEV_AGENT_PY.exists():
         return None
@@ -1061,6 +1067,8 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str) -> list[str] | N
            "--prd", prd_abs, "--branch-prefix", "auto", "--base", base]
     if src_abs:
         cmd += ["--source", src_abs]
+    if feedback_artifact:    # task 3.4：driven retry prompt 从 feedback artifact（PRD 不可变，反馈在 artifact）
+        cmd += ["--feedback-artifact", feedback_artifact]
     return cmd
 
 
@@ -1335,7 +1343,18 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     for round_n in range(1, VERIFY_MAX_ROUNDS + 1):
         _iter = _coord.next_iteration(round_n)   # task 3.3：每轮 distinct deterministic iteration（seq=round_n；
         #   planned/running 用 run 级 seq0，每 attempt 一个新 iteration；distinct 使 reducer/recovery 可按 attempt 切片）
-        cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs)
+        # task 3.4：driven retry prompt 从 immutable PRD + journal feedback artifact（recovery context 从
+        #   journal 抽 last verifier_feedback artifact path；baseline 照旧读 PRD 反馈节，不 inject）
+        _fb_artifact: str | None = None
+        if _coord.flags.journal_driven_dispatch and _parent_fb_digest is not None and prd_content is not None:
+            try:
+                _ctx = RC.build_recovery_context(
+                    iteration_id=_iter, prd_id=_prd, status_value="revise",
+                    prd_content=prd_content, events=J.read_events(_sj.path))
+                _fb_artifact = _ctx.last_verifier_feedback_path
+            except Exception:
+                _fb_artifact = None    # 容错：recovery 抽取失败 → 退回 baseline 读 PRD，不崩 verify 闭环
+        cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact)
         if cmd is None:
             rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
             _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
