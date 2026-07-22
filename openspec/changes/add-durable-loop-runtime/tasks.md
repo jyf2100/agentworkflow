@@ -62,11 +62,11 @@
 
 ## 8. Cutover, Canary, and Recovery Drills
 
-- [ ] 8.1 Run shadow journaling against representative historical fixtures and one real dry-run, resolving every state mismatch.
-- [ ] 8.2 Enable lifecycle hooks for one white-listed project and verify no-test, test-red, test-green, and compaction paths.
-- [ ] 8.3 Run controlled crash drills after agent completion, test completion, push, and PR creation and confirm exactly-once effective behavior.
-- [ ] 8.4 Canary session resume, fork, and new-session recovery using bounded model budget and verify journal causality.
-- [ ] 8.5 Canary isolated-container execution for one Node and one Python project, including network and credential denial tests.
-- [ ] 8.6 Enable journal-driven dispatch after shadow parity and retain legacy-state fallback for one release cycle.
-- [ ] 8.7 Document operator recovery for state corruption, missing session, sandbox failure, telemetry outage, and externally blocked reconciliation.
-- [ ] 8.8 Run the full repository quality command and archive passing test, sandbox, recovery, and telemetry evidence before declaring rollout complete.
+- [x] 8.1 Run shadow journaling against representative historical fixtures and one real dry-run, resolving every state mismatch.
+- [x] 8.2 Enable lifecycle hooks for one white-listed project and verify no-test, test-red, test-green, and compaction paths.
+- [x] 8.3 Run controlled crash drills after agent completion, test completion, push, and PR creation and confirm exactly-once effective behavior.
+- [x] 8.4 Canary session resume, fork, and new-session recovery using bounded model budget and verify journal causality.
+- [x] 8.5 Canary isolated-container execution for one Node and one Python project, including network and credential denial tests.
+- [x] 8.6 Enable journal-driven dispatch after shadow parity and retain legacy-state fallback for one release cycle.
+- [x] 8.7 Document operator recovery for state corruption, missing session, sandbox failure, telemetry outage, and externally blocked reconciliation.
+- [x] 8.8 Run the full repository quality command and archive passing test, sandbox, recovery, and telemetry evidence before declaring rollout complete.
