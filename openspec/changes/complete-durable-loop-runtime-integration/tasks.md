@@ -27,7 +27,7 @@
 - [x] 4.2 Prevent a test result from becoming fresh green evidence when its required artifact or journal event cannot be persisted and verified.
 - [x] 4.3 Add explicit evidence-integrity and journal-integrity blocked states to reports and retry policy inputs.
 - [x] 4.4 Reconcile commit, push, branch, PR, and test evidence idempotency keys before every resume, fork, new-session, or publication action.
-- [ ] 4.5 Add crash-injection integration tests around each journal-before-side-effect boundary and prove exactly-once effective behavior.
+- [x] 4.5 Add crash-injection integration tests around each journal-before-side-effect boundary and prove exactly-once effective behavior.
 
 ## 5. Enforced Sandbox and Credential Boundary
 

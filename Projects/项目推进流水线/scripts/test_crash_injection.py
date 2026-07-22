@@ -29,6 +29,9 @@ import journal as J  # noqa: E402
 import loop_runtime as RT  # noqa: E402
 import loop_state as L  # noqa: E402
 import ids  # noqa: E402
+import reconcile as RE  # noqa: E402  # task 4.5：crash injection × reconcile-before-retry 端到端集成
+import retry_policy as RP  # noqa: E402
+from session_meta import ResultSubtype, SessionMeta, SessionStore  # noqa: E402
 
 
 def _stamp() -> str:
@@ -152,3 +155,175 @@ def test_full_green_chain_recovers_to_published_after_simulated_restart(tmp_path
                      initial=L.initial_state("run_1", "prd_1", "iter_1", base="abc"))
     assert state.status is L.IterationStatus.PUBLISHED
     assert state.applied_event_ids                       # 6 条事件全部 dedup 累积
+
+
+# ─── task 4.5：journal-before-side-effect boundary × exactly-once 集成 ─────────
+# 迁移计划第 6 步：在 agent 完成 / 测试完成 / commit / push / PR 创建之后运行崩溃演练，重试之前对账。
+# 本节把 crash injection（journal reduce）与 reconcile-before-retry（recover_iteration）端到端集成：
+# crash 截断 journal 到每个副作用 boundary → 重启（无运行时内存）read+reduce → recover_iteration
+# reconcile 全部副作用 → 据 RecoveryPlan 驱动 reapply——confirmed 跳过（不重复）、pending 执行
+# （恰好一次）、unknown→BLOCK（绝不部分执行）。三态合起来 = exactly-once effective。
+
+
+class _FakeResolver:
+    """task 4.5 测试用 resolver：{(kind, target): True=confirmed / False=absent / None=unknown}。"""
+    def __init__(self, mapping):
+        self.m = dict(mapping)
+
+    def check(self, kind, target):
+        return self.m.get((kind, target))
+
+
+def _healthy_45() -> SessionMeta:
+    return SessionMeta(iteration_id="iter_1", session_id="s1", result_subtype=ResultSubtype.SUCCESS)
+
+
+def _crash_recover(tmp_path, boundary_seq, targets, resolver, *, session=None):
+    """crash 在 boundary（journal 截断到 boundary event）→ 重启 read+reduce+recover_iteration。
+
+    全新进程（无运行时内存）仅凭 journal + reconcile 决定每个副作用 confirmed(跳过)/absent(执行)/
+    unknown(阻塞)。模拟「journal-before-side-effect」边界崩溃后的 reconcile-before-retry 入口。"""
+    jf = _emit_seq(tmp_path / "j.jsonl", boundary_seq)
+    store = SessionStore(tmp_path / "sess")
+    if session is not None:
+        store.save(session)
+    return RE.recover_iteration(
+        journal_path=jf, run_id="run_1", prd_id="prd_1", iteration_id="iter_1", base="abc",
+        prd_content="# 目标\n\n## 验收标准\n- 条件\n", targets=targets, resolver=resolver,
+        session_store=store, budget=RP.BudgetState(limits=RP.BudgetLimits()))
+
+
+def _reapply_counts(plan, kinds):
+    """exactly-once 执行端：据 RecoveryPlan.reconciliation 在 pending 上计数（每个执行一次）。
+
+    confirmed 不在 pending（跳过，计数恒 0 = 不重复）；unknown 令 plan.decision=BLOCK，调用方
+    不应 reapply（见各测试的 BLOCK 守卫）。返回 {kind: 执行次数}——confirmed 恒 0、pending 恒 ≤1。"""
+    counts = {k: 0 for k in kinds}
+    for st in plan.reconciliation.pending:
+        if st.kind in counts:
+            counts[st.kind] += 1
+    return counts
+
+
+# dispatch 主路径 journal 边界（每条 event 之后的副作用边界，对齐 run_daily 的 sj.emit 顺序）
+_AGENT_DONE = ["planned", "running", "agent_finished"]            # agent 完成 boundary
+_VERIFY = ["planned", "running", "agent_finished", "verifying"]   # 测试完成 boundary（green evidence 已/未持久化）
+_PUBLISH_READY = ["planned", "running", "agent_finished",         # commit/push/PR boundary（publish_ready 已落盘）
+                  "verifying", "publish_ready"]
+
+
+# ── agent 完成 boundary：所有副作用未发生 → 全 pending → 重试各执行一次 ──
+def test_45_agent_done_boundary_all_pending_reapply_once(tmp_path):
+    """crash 在 agent 完成后（verify 前）：commit/push/pr 均未发生（absent）→ 全 pending →
+    重试时各执行恰好一次（exactly-once：pending 执行一次，无 confirmed 可跳过）。"""
+    targets = [RE.SideEffectTarget("commit", "abc123"),
+               RE.SideEffectTarget("push", "auto/b"),
+               RE.SideEffectTarget("pr", "owner/repo:auto/b")]
+    resolver = _FakeResolver({("commit", "abc123"): False, ("push", "auto/b"): False,
+                              ("pr", "owner/repo:auto/b"): False})
+    plan = _crash_recover(tmp_path, _AGENT_DONE, targets, resolver, session=_healthy_45())
+    assert plan.decision.mode is RP.RetryMode.RESUME           # 全明确（absent）→ 安全 retry
+    assert plan.reconciliation.confirmed == ()                 # 无 confirmed（都不跳过）
+    assert _reapply_counts(plan, ["commit", "push", "pr"]) == {"commit": 1, "push": 1, "pr": 1}
+
+
+# ── test evidence boundary（task 4.4 test 幂等键 × crash injection）──
+def test_45_test_evidence_confirmed_skips_reapply(tmp_path):
+    """crash 在 verify 后：green-test evidence artifact 仍在且 digest 匹配（confirmed）→
+    不重写证据（reapply test 计数 0 = exactly-once，不重复持久化）。"""
+    targets = [RE.SideEffectTarget("test", "sha256:abc")]
+    plan = _crash_recover(tmp_path, _VERIFY, targets,
+                          _FakeResolver({("test", "sha256:abc"): True}), session=_healthy_45())
+    assert plan.reconciliation.confirmed[0].kind == "test"
+    assert _reapply_counts(plan, ["test"]) == {"test": 0}      # confirmed → 跳过
+
+
+def test_45_test_evidence_absent_reapplies_once(tmp_path):
+    """crash 在 verify 后：evidence artifact 丢失（absent）→ 重写一次（reapply test 计数 1）。"""
+    targets = [RE.SideEffectTarget("test", "sha256:abc")]
+    plan = _crash_recover(tmp_path, _VERIFY, targets,
+                          _FakeResolver({("test", "sha256:abc"): False}), session=_healthy_45())
+    assert plan.reconciliation.pending[0].kind == "test"
+    assert _reapply_counts(plan, ["test"]) == {"test": 1}
+
+
+def test_45_test_evidence_tampered_blocks_no_reapply(tmp_path):
+    """crash 在 verify 后：evidence 被篡改（digest 不匹配→unknown）→ BLOCK + 不重写
+    （损坏证据既不当 confirmed 跳过、也不当 absent 重写，fail-safe 阻塞待运维）。"""
+    targets = [RE.SideEffectTarget("test", "sha256:abc")]
+    plan = _crash_recover(tmp_path, _VERIFY, targets,
+                          _FakeResolver({("test", "sha256:abc"): None}), session=_healthy_45())
+    assert plan.decision.mode is RP.RetryMode.BLOCK
+    assert plan.reconciliation.unknown[0].kind == "test"
+    assert not plan.decision.consumes_retry
+
+
+# ── commit boundary ──
+def test_45_commit_confirmed_skips_reapply(tmp_path):
+    """crash 在 commit 边界 + commit 已落（confirmed）→ 跳过（不重复 commit，exactly-once）。"""
+    targets = [RE.SideEffectTarget("commit", "abc123")]
+    plan = _crash_recover(tmp_path, _PUBLISH_READY, targets,
+                          _FakeResolver({("commit", "abc123"): True}), session=_healthy_45())
+    assert plan.reconciliation.confirmed[0].kind == "commit"
+    assert _reapply_counts(plan, ["commit"]) == {"commit": 0}
+
+
+def test_45_commit_unknown_blocks(tmp_path):
+    """crash 在 commit 边界 + commit 状态查不到（unknown）→ BLOCK（不盲目重 commit）。"""
+    targets = [RE.SideEffectTarget("commit", "abc123")]
+    plan = _crash_recover(tmp_path, _PUBLISH_READY, targets,
+                          _FakeResolver({("commit", "abc123"): None}), session=_healthy_45())
+    assert plan.decision.mode is RP.RetryMode.BLOCK
+    assert not plan.decision.consumes_retry
+
+
+# ── PR boundary ──
+def test_45_pr_confirmed_skips_reapply(tmp_path):
+    """crash 在 PR 边界（publish_ready）+ PR 已开（confirmed）→ 跳过（不重复开 PR，exactly-once）。"""
+    targets = [RE.SideEffectTarget("pr", "owner/repo:auto/b")]
+    plan = _crash_recover(tmp_path, _PUBLISH_READY, targets,
+                          _FakeResolver({("pr", "owner/repo:auto/b"): True}), session=_healthy_45())
+    assert plan.reconciliation.confirmed[0].kind == "pr"
+    assert _reapply_counts(plan, ["pr"]) == {"pr": 0}
+
+
+def test_45_pr_absent_reapplies_once(tmp_path):
+    """crash 在 PR 边界 + PR 未开（absent）→ 开一次（reapply pr 计数 1，恰好一次）。"""
+    targets = [RE.SideEffectTarget("pr", "owner/repo:auto/b")]
+    plan = _crash_recover(tmp_path, _PUBLISH_READY, targets,
+                          _FakeResolver({("pr", "owner/repo:auto/b"): False}), session=_healthy_45())
+    assert plan.reconciliation.pending[0].kind == "pr"
+    assert _reapply_counts(plan, ["pr"]) == {"pr": 1}
+
+
+# ── 汇总：mixed 多副作用 exactly-once effective ──
+def test_45_mixed_unknown_blocks_no_partial_reapply(tmp_path):
+    """crash 在 publish 前，三副作用 mixed：commit confirmed / push absent / pr unknown。
+    pr unknown → decision BLOCK → 调用方**不 reapply**（绝不部分执行——宁可整体阻塞也不只做
+    commit-skip+push 而漏 pr）。exactly-once effective 的 fail-safe 语义。"""
+    targets = [RE.SideEffectTarget("commit", "abc123"),
+               RE.SideEffectTarget("push", "auto/b"),
+               RE.SideEffectTarget("pr", "owner/repo:auto/b")]
+    resolver = _FakeResolver({("commit", "abc123"): True, ("push", "auto/b"): False,
+                              ("pr", "owner/repo:auto/b"): None})
+    plan = _crash_recover(tmp_path, _PUBLISH_READY, targets, resolver, session=_healthy_45())
+    assert plan.decision.mode is RP.RetryMode.BLOCK            # pr unknown → BLOCK
+    # BLOCK 守卫：调用方不 reapply（即便 push 在 pending，也不部分执行）
+    counts = (_reapply_counts(plan, ["commit", "push", "pr"])
+              if plan.decision.mode is not RP.RetryMode.BLOCK
+              else {"commit": 0, "push": 0, "pr": 0})
+    assert counts == {"commit": 0, "push": 0, "pr": 0}
+
+
+def test_45_mixed_all_known_confirmed_skip_pending_reapply_once(tmp_path):
+    """crash 在 publish 前，三副作用全明确：commit confirmed / push absent / pr absent。
+    RESUME → reapply：commit 跳过（计数 0）、push/pr 各执行一次（计数 1）。confirmed 跳过 +
+    pending 执行一次 = exactly-once effective（既不重复也不遗漏）。"""
+    targets = [RE.SideEffectTarget("commit", "abc123"),
+               RE.SideEffectTarget("push", "auto/b"),
+               RE.SideEffectTarget("pr", "owner/repo:auto/b")]
+    resolver = _FakeResolver({("commit", "abc123"): True, ("push", "auto/b"): False,
+                              ("pr", "owner/repo:auto/b"): False})
+    plan = _crash_recover(tmp_path, _PUBLISH_READY, targets, resolver, session=_healthy_45())
+    assert plan.decision.mode is RP.RetryMode.RESUME           # 全明确 → 安全 retry
+    assert _reapply_counts(plan, ["commit", "push", "pr"]) == {"commit": 0, "push": 1, "pr": 1}
