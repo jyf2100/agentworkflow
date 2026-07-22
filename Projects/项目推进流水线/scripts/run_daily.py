@@ -1132,14 +1132,17 @@ def _dump_branch_diff(repo: str, base_ref: str, branch: str, out_path: Path) -> 
 
 def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int, *,
                             sj: ShadowJournal | None = None, iter_id: str = "", prd_id: str = "",
-                            artifact_root: Path | None = None) -> None:
-    """把 pa-verify 反馈节追加进 PRD 末尾 + shadow 阶段额外落 journal artifact（task 3.3）。
+                            artifact_root: Path | None = None, driven: bool = False) -> None:
+    """把 pa-verify 反馈节追加进 PRD 末尾（baseline）+ shadow/drift 阶段落 journal artifact（task 3.2/3.3）。
 
     反馈是施工指引（非需求变更），故不重过 pa-prd-critic 闸（docs/verify-commit-loop-design.md §3-④）。
     **task 3.3 shadow 双写**：``journal_shadow`` flag 开（``sj.enabled``）时，feedback 额外写成 content-addressed
-    artifact（``verifier_feedback`` / ``sanitized``，密钥脱敏后算 digest）+ emit 事件；**PRD 追加照旧**——保
-    verify 闭环下一轮读反馈的决策不变（dev-agent 读 PRD）。PRD 追加的真正摘除 + 读路径切 journal 留 driven
-    阶段（task 8.6 enable journal-driven dispatch）——spec「Immutable PRD source」的完整落地需读路径配合。
+    artifact（``verifier_feedback`` / ``sanitized``，密钥脱敏后算 digest）+ emit 事件。
+    **task 3.2 driven 模式**：``driven``（``journal_driven_dispatch`` flag，dispatch_one 传入）开 → **摘除 PRD 追加**
+    （spec「Immutable new-run input」：original PRD byte-for-byte unchanged，feedback 只 content-addressed artifact
+    真源 + journal 事件）。verify 闭环下一轮读路径切 artifact 由 task 3.4 配合（retry prompt 读 artifact）；
+    driven flag 真正 enable 在 task 7.5 cutover——3.2-3.4 完成前 driven 默认关，verify 闭环照旧读 PRD（不破）。
+    driven 模式 artifact 写失败 → shadow 契约吞异常，反馈丢失（known，task 4.2 evidence-integrity fail closed 补）。
     """
     section = (f"\n\n## ⚠️ 审核反馈（verify 第{round_n}轮·非需求变更，未重过 critic 闸）\n\n"
                + (feedback_section or "").strip() + "\n")
@@ -1152,8 +1155,10 @@ def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int, *
                     payload={"round": round_n, "digest": ref.digest, "path": ref.path, "size": ref.size})
         except Exception:
             pass   # shadow 契约：观测层自身故障不得拖垮 verify 闭环（与 loop_runtime 契约#3 同源）
-    with open(prd_abs, "a", encoding="utf-8") as f:
-        f.write(section)
+    if not driven:   # task 3.2：driven（journal_driven_dispatch）模式摘除 PRD 追加（spec「Immutable PRD source」
+                     #   byte-for-byte unchanged）；baseline/shadow（driven 关）照旧追加——保 verify 闭环读 PRD 决策不变
+        with open(prd_abs, "a", encoding="utf-8") as f:
+            f.write(section)
 
 
 def _pa_verify_round(rec: dict, prof: dict, prd_abs: str, cur_base: str,
@@ -1406,7 +1411,8 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
             log(f"  🔴 {slug}: verify 红（r{round_n}）→ 保留 {branch} 做下次 base，反馈进 PRD，增量重投 r{round_n + 1}")
             _append_verify_feedback(prd_abs, vinfo.get("feedback_section", ""), round_n,
                                      sj=_sj, iter_id=_iter, prd_id=_prd,
-                                     artifact_root=STATE_DIR / "artifacts" / _run)
+                                     artifact_root=STATE_DIR / "artifacts" / _run,
+                                     driven=_coord.flags.journal_driven_dispatch)   # task 3.2：driven→摘 PRD 追加
             cur_base = branch
             continue
         # 判红用满（round_n==VERIFY_MAX_ROUNDS）/ pa-verify 异常 / 无产出 → 对账降级 interrupted_pr（不 drop，半成品留 review）

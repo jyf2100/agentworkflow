@@ -117,6 +117,42 @@ def test_append_feedback_shadow_swallows_artifact_failure(tmp_path):
     assert "反馈" in prd.read_text(encoding="utf-8")   # PRD 追加未被 artifact 失败拖垮
 
 
+# ─── task 3.2：driven 模式摘除 PRD 追加，feedback 只 sanitized content-addressed artifact ──
+def test_append_feedback_driven_stops_prd_append_keeps_artifact(tmp_path):
+    """task 3.2 + spec「Immutable new-run input」：``journal_driven_dispatch``（driven）开 → 不再追加 PRD
+    （original PRD byte-for-byte unchanged），feedback 只落 sanitized content-addressed artifact +
+    journal ``verifier_feedback`` event（引用 digest/path）。verify 闭环读路径切 artifact 由 task 3.4 配合，
+    driven flag 真正 enable 在 task 7.5 cutover（3.2-3.4 完成前 driven 不开 → verify 闭环不断）。"""
+    prd = tmp_path / "prd.md"
+    original = "# 原始 PRD\n\n不可变真源。"
+    prd.write_text(original, encoding="utf-8")
+    aroot = tmp_path / "artifacts"
+    sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
+    fb = "修复 X：token=ghp_secret12345 须脱敏\n定位 src/a.py:L10"
+    # Act
+    run_daily._append_verify_feedback(str(prd), fb, 1, sj=sj, iter_id="iter_1", prd_id="prd_1",
+                                      artifact_root=aroot, driven=True)
+    # Assert — PRD byte-for-byte 不变（spec SHALL）+ feedback 落 sanitized artifact + journal event
+    assert prd.read_text(encoding="utf-8") == original
+    evs = J.read_events(tmp_path / "j.jsonl")
+    assert len(evs) == 1 and evs[0].event_type == "verifier_feedback"
+    art = (aroot / evs[0].payload["path"]).read_text(encoding="utf-8")
+    assert "ghp_secret12345" not in art        # sanitized redact_secrets 抹密钥
+    assert "src/a.py:L10" in art               # 非密钥内容保留（审计/重放/3.4 retry prompt 读）
+
+
+def test_append_feedback_driven_swallows_artifact_failure_prd_still_unchanged(tmp_path):
+    """driven 模式 shadow 契约保留：artifact 写失败 → 吞异常不崩；PRD 仍 byte-for-byte 不变（driven 不追加）。
+    反馈丢失（既未 artifact 也未 PRD）是 known——task 4.2 加 evidence-integrity fail closed 补。"""
+    prd = tmp_path / "prd.md"
+    original = "# PRD"
+    prd.write_text(original, encoding="utf-8")
+    sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
+    run_daily._append_verify_feedback(str(prd), "反馈", 1, sj=sj, iter_id="iter_1", prd_id="prd_1",
+                                      artifact_root=Path("/proc/cannot/store/here"), driven=True)
+    assert prd.read_text(encoding="utf-8") == original    # driven：artifact 失败也不追加 PRD
+
+
 # ─── task 2.5：dispatch_one 入口 preflight 阻断非法 flag 组合 ──────────────────
 def test_dispatch_one_preflight_blocks_invalid_flag_combo(tmp_path, monkeypatch):
     """task 2.5：dispatch_one 入口 preflight——lifecycle_hooks 开但 journal_shadow 关（impossible partial
