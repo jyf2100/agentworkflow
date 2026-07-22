@@ -352,3 +352,60 @@ def test_directory_source_exclude_glob_filters_meta(tmp_path, monkeypatch):
     # 只剩正文 1 篇（meta 被 exclude_glob 排掉）
     assert out["per_source"] == {"wechat": 1}
     assert out["today_new_count"] == 1
+
+
+# ─── 取数窗口（window_days，ADR-0007 follow-up「往前追溯 N 天」）────────
+def test_discover_window_days_picks_rolling_window(tmp_path, monkeypatch):
+    # window_days=2：固定 today=20260721，窗口下沿=07-19；marker=00000000 也只取窗口内
+    monkeypatch.setattr(run_daily, "VAULT_ROOT", tmp_path)
+    import datetime as _dt   # datetime.date 不可 setattr today → 整体替换 run_daily.date 为带 today 的 stub
+    monkeypatch.setattr(run_daily, "date", SimpleNamespace(today=lambda: _dt.date(2026, 7, 21)))
+    root = tmp_path / "Knowledge/微信"
+    root.mkdir(parents=True)
+    for d in ("20260718", "20260719", "20260720", "20260721"):
+        (root / f"{d}_x.md").write_text("#", encoding="utf-8")
+    src = {"root": "Knowledge/微信", "content_glob": "**/[0-9]*.md", "window_days": 2}
+    out = run_daily.discover_today_new(src, "00000000", None)
+    # 07-19/20/21 在窗口内；07-18 早于 floor → 跳过（且无视 marker=00000000）
+    assert sorted(p.name for p in out) == ["20260719_x.md", "20260720_x.md", "20260721_x.md"]
+
+
+def test_discover_window_days_zero_is_waterline(tmp_path, monkeypatch):
+    # window_days 缺省/0 → 现状水位线（>marker，单调不回溯），向后兼容
+    monkeypatch.setattr(run_daily, "VAULT_ROOT", tmp_path)
+    root = tmp_path / "Knowledge/微信"
+    root.mkdir(parents=True)
+    for d in ("20260717", "20260718", "20260719"):
+        (root / f"{d}_x.md").write_text("#", encoding="utf-8")
+    src = {"root": "Knowledge/微信", "content_glob": "**/[0-9]*.md"}    # 无 window_days
+    out = run_daily.discover_today_new(src, "20260718", None)           # marker=20260718
+    assert sorted(p.name for p in out) == ["20260719_x.md"]             # 仅取 >20260718
+
+
+def test_stage_radar_dedup_skips_candidate_with_existing_prd(tmp_path, monkeypatch, capsys):
+    # 窗口回溯去重：candidate 的 source_path 已有 PRD → 过滤（防重复 PRD/critic）
+    sources = [{"name": "wechat", "kind": "directory", "root": "Knowledge/微信",
+                "content_glob": "**/[0-9]*.md", "target_projects": ["cc-web-control"],
+                "marker": "state/consumed_wechat"}]
+    profiles = {"cc-web-control": {"name": "cc-web-control", "match_surface": {}}}
+    state = _setup_radar(tmp_path, monkeypatch, sources, profiles)
+    _put("Knowledge/微信", "20260719_a.md", tmp_path)
+    # 手写一份已有 PRD，frontmatter source_path 指向同一 source（pa-prd 契约实证字段）
+    prd_dir = state / "prd" / "cc-web-control"
+    prd_dir.mkdir(parents=True)
+    (prd_dir / "20260720_old.md").write_text(
+        "---\nproject: cc-web-control\nsource_path: Knowledge/微信/20260719_a.md\n---\n# old\n",
+        encoding="utf-8")
+    SRC = "Knowledge/微信/20260719_a.md"
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda n, p, s, lbl: ({"candidates": [{"project": "cc-web-control",
+                                                                "source_path": SRC}],
+                                               "stats": {}}, {"cost": 0.0, "turns": 1}))
+    monkeypatch.setattr(run_daily, "fetch_dedup_list", lambda profs: {})
+
+    out = run_daily.stage_radar(
+        SimpleNamespace(force=False, dry_run=True, limit=None), sources, profiles, "20260721")
+
+    assert out["candidates"] == []                          # source_path 已有 PRD → 去重
+    captured = capsys.readouterr()
+    assert "去重" in captured.out or "去重" in captured.err  # 产出去重日志

@@ -40,11 +40,15 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（消解 ADR-0004 #4 shadow；无依赖模块，顶部 import 不触发 sdk 连带加载拖垮 cron）
 from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
+from feature_flags import resolve_flags   # OpenSpec add-durable-loop-runtime task 1.3：loop runtime 渐进 flag（纯 stdlib，cron 安全）
+import ids as loop_ids                     # task 3.1：稳定 ID 生成 run/prd/iteration（hashlib 纯 stdlib）
+from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写入器（纯 stdlib，cron 安全）
+import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
 
 try:
     import yaml
@@ -192,17 +196,61 @@ def discover_today_new(source: dict, marker_stamp: str, limit: int | None) -> li
         for pat in expand_braces(excl):
             for p in root.glob(pat):
                 seen.pop(p, None)
+    # 取数窗口：window_days>0 → [today-N, today] 滚动窗口（回溯，ADR-0007 follow-up，
+    #   防整理产品晚产出被水位线跳过）；缺省/0 → 现状水位线（>marker，单调不回溯）。
+    #   window 源幂等不靠 marker，靠 stage_radar 出口的 source_path 去重 + dispatch GitHub 去重。
+    window_days = int(source.get("window_days", 0) or 0)
+    floor = (date.today() - timedelta(days=window_days)).strftime("%Y%m%d") if window_days > 0 else None
     out = []
     for p in sorted(seen):
         m = re.match(r"(\d{8})", p.name)
         if not m:
             continue
-        if m.group(1) <= marker_stamp:   # 只取 > marker
+        fd = m.group(1)
+        if window_days > 0:
+            if fd < floor:               # 早于窗口下沿 → 太老，跳过（窗口内全取，不读 marker 下界）
+                continue
+        elif fd <= marker_stamp:         # 现状水位线：只取 > marker
             continue
         out.append(p)
     if limit:
         out = out[:limit]
     return out
+
+
+def _prd_frontmatter_source(path: Path) -> str:
+    """读一份 PRD 的 frontmatter source_path（内容指纹键）。无 frontmatter / 解析失败 → ""。"""
+    try:
+        txt = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    if not txt.startswith("---"):
+        return ""
+    parts = txt.split("---", 2)
+    if len(parts) < 3:
+        return ""
+    try:
+        return (yaml.safe_load(parts[1]) or {}).get("source_path") or ""
+    except Exception:
+        return ""
+
+
+def already_prd_sources(profiles: dict) -> set[str]:
+    """各项目 state/prd/<project>/*.md frontmatter source_path 集合。
+
+    窗口源回溯重取时的内容指纹去重键（ADR-0007 follow-up）：source_path 已产过 PRD
+    → 不再重喂下游，防重复 PRD 文件 + critic 重审。PRD frontmatter 契约已有 source_path
+    （pa-prd 实证），无需改契约。"""
+    done: set[str] = set()
+    for name in profiles:
+        d = STATE_DIR / "prd" / name
+        if not d.is_dir():
+            continue
+        for p in d.glob("*.md"):
+            sp = _prd_frontmatter_source(p)
+            if sp:
+                done.add(sp)
+    return done
 
 
 def fetch_dedup_list(profiles: dict) -> dict:
@@ -580,8 +628,9 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
         per_source_new[src["name"]] = today_new
         if today_new:
             per_source_newmax[src["name"]] = max(re.match(r"(\d{8})", p.name).group(1) for p in today_new)
+        wd = src.get("window_days", 0) or 0
         log(f"[radar] source={src['name']} kind={src.get('kind','directory')} "
-            f"marker={marker}｜今日新（>marker）={len(today_new)}")
+            f"marker={marker} window={'off' if not wd else wd}｜今日新={len(today_new)}")
         for p in today_new:
             log(f"        - {p.relative_to(VAULT_ROOT)}")
 
@@ -602,6 +651,7 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
 
     # 3) 按项目调 radar（只有「订阅到新文件」的项目才调——无订阅不调，比现状更省）
     dedup = fetch_dedup_list(profiles)
+    done_sources = already_prd_sources(profiles)   # 窗口源回溯去重：source_path 已产 PRD 的不再喂下游
     all_candidates: list[dict] = []
     per_project_stats: dict[str, dict] = {}
     for proj, src_files in proj_src_files.items():
@@ -614,6 +664,10 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
         for c in payload.get("candidates", []):
             c.setdefault("project", proj)
             c.setdefault("source", _source_of(c, src_files))   # 追溯来自哪个源（决定 #6）
+            sp = c.get("source_path")
+            if sp and sp in done_sources:                      # 已为该 source 产过 PRD → 去重，防重复 PRD/critic
+                log(f"[radar] ⏭ 去重：{sp} 已有 PRD，跳过 candidate")
+                continue
             all_candidates.append(c)
         per_project_stats[proj] = {**payload.get("stats", {}), "cost": meta["cost"], "turns": meta["turns"]}
         log(f"[radar] ✅ {proj}: candidates={len(payload.get('candidates', []))}｜"
@@ -1077,12 +1131,28 @@ def _dump_branch_diff(repo: str, base_ref: str, branch: str, out_path: Path) -> 
     out_path.write_text(out or "（diff 为空或获取失败）", encoding="utf-8")
 
 
-def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int) -> None:
-    """把 pa-verify 反馈节追加进 PRD 末尾（醒目独立节，标注「非需求变更、未重过 critic 闸」）。
+def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int, *,
+                            sj: ShadowJournal | None = None, iter_id: str = "", prd_id: str = "",
+                            artifact_root: Path | None = None) -> None:
+    """把 pa-verify 反馈节追加进 PRD 末尾 + shadow 阶段额外落 journal artifact（task 3.3）。
 
-    反馈是施工指引（非需求变更），故不重过 pa-prd-critic 闸（docs/verify-commit-loop-design.md §3-④）。"""
+    反馈是施工指引（非需求变更），故不重过 pa-prd-critic 闸（docs/verify-commit-loop-design.md §3-④）。
+    **task 3.3 shadow 双写**：``journal_shadow`` flag 开（``sj.enabled``）时，feedback 额外写成 content-addressed
+    artifact（``verifier_feedback`` / ``sanitized``，密钥脱敏后算 digest）+ emit 事件；**PRD 追加照旧**——保
+    verify 闭环下一轮读反馈的决策不变（dev-agent 读 PRD）。PRD 追加的真正摘除 + 读路径切 journal 留 driven
+    阶段（task 8.6 enable journal-driven dispatch）——spec「Immutable PRD source」的完整落地需读路径配合。
+    """
     section = (f"\n\n## ⚠️ 审核反馈（verify 第{round_n}轮·非需求变更，未重过 critic 闸）\n\n"
                + (feedback_section or "").strip() + "\n")
+    # shadow 双写：feedback → 内容寻址 artifact（不可变真源）+ journal 事件（payload-only，不改状态机）
+    if sj is not None and getattr(sj, "enabled", False) and feedback_section and artifact_root is not None:
+        try:
+            ref = artifact_store.store(artifact_root, feedback_section,
+                                       kind="verifier_feedback", sensitivity="sanitized")
+            sj.emit("verifier_feedback", iter_id, prd_id,
+                    payload={"round": round_n, "digest": ref.digest, "path": ref.path, "size": ref.size})
+        except Exception:
+            pass   # shadow 契约：观测层自身故障不得拖垮 verify 闭环（与 loop_runtime 契约#3 同源）
     with open(prd_abs, "a", encoding="utf-8") as f:
         f.write(section)
 
@@ -1098,8 +1168,52 @@ def _pa_verify_round(rec: dict, prof: dict, prd_abs: str, cur_base: str,
     return payload
 
 
+def _now_iso() -> str:
+    """当前 UTC ISO8601 时间戳（喂 ShadowJournal.stamp）。
+
+    独立成函数（非 inline ``datetime.now``）——便于测试 monkeypatch 固定时间，且 ShadowJournal 契约
+    要求 stamp 由调用方注入（loop_runtime 不触系统时间）。
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+# dispatch record status → journal 终态 event（task 3.2）。
+# 映射对齐 ``compat_readers.legacy_status`` 保 shadow parity（task 3.4）：pr_open/interrupted_pr 叠 verify.pass
+# （绿→published，红→revise）；blocked→external/test_blocked；fail→failed；skip→aborted。
+# 未映射 status（orphan_deleted/stalled/planned smoke）shadow first cut 暂不 emit 终态——占真 run 比例小，
+# 且不消耗 dev 资源；完整覆盖留 task 8.6 driven 阶段。
+_SJ_TERMINAL_MAP: dict[str, str] = {
+    "skip": "aborted",
+    "blocked_external_state": "external_blocked",
+    "blocked_test_gate": "test_blocked",
+    "fail": "failed",
+}
+
+
+def _sj_terminal(sj: ShadowJournal, rec: dict, iteration_id: str, prd_id: str) -> None:
+    """dispatch 出口旁路 emit 终态事件（task 3.2）。
+
+    flag 关→``sj.emit`` 内部 no-op（ShadowJournal 契约）；映射对齐 compat 保 parity。**旁路**：不改 rec、
+    不影响控制流（调用方在 ``return rec`` 前调，emit 返回值丢弃）。
+    """
+    status = rec.get("status")
+    if status in ("pr_open", "interrupted_pr"):
+        verify = rec.get("verify") or {}
+        sj.emit("published" if verify.get("pass") else "revise", iteration_id, prd_id,
+                payload={"status": status, "pr_url": rec.get("pr_url")})
+        return
+    event = _SJ_TERMINAL_MAP.get(status)
+    if event:
+        sj.emit(event, iteration_id, prd_id,
+                payload={"status": status, "skip_reason": rec.get("skip_reason")})
+
+
 def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
-    """单 PRD 全流程：准入→建 worktree→触发 dev-agent→对账→独立验证。返回记录 dict。"""
+    """单 PRD 全流程：准入→建 worktree→触发 dev-agent→对账→独立验证。返回记录 dict。
+
+    task 3.2：全程用 ``ShadowJournal`` 旁路写 journal 事件（``journal_shadow`` flag 关→全 no-op，dispatch
+    决策零变化，design 决策#8）。中间事件 inline emit；终态由 ``_sj_terminal`` 在各出口统一 emit。
+    """
     proj = prof.get("name", "?")
     repo = prof.get("repo", "")
     slug = Path(entry.get("prd_path", "")).stem or "unknown"
@@ -1117,41 +1231,51 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                  "dev_cost": None, "dev_turns": None, "verify": None, "skip_reason": None,
                  "dev_test_cmd": None, "verify_verdict": None, "verify_round": None}   # verify 闭环字段
 
+    # ── task 3.2：shadow journal 旁路记录（journal_shadow flag 关→sj.emit 全 no-op，dispatch 决策零变化）
+    _run = loop_ids.run_id(stamp)
+    _prd = loop_ids.prd_id(entry.get("prd_path") or "")
+    _iter = loop_ids.iteration_id(_run, _prd, 0)   # 固定 seq=0：一个 PRD = 一个主 iteration，多轮 revise 是其内 REVISE→RUNNING 循环
+    _sj = ShadowJournal(STATE_DIR / "runs" / proj / f"{stamp}_{slug}.journal.jsonl",
+                        _run, _now_iso, enabled=resolve_flags(profile=prof).journal_shadow)
+    _sj.emit("planned", _iter, _prd,
+             payload={"base": base, "prd_path": entry.get("prd_path"), "project": proj})
+    _sj.emit("running", _iter, _prd, payload={"round": 1})
+
     # ── 准入 1：profile 门
     if not (prof.get("admission") and prof.get("dev_agent_ready") and prof.get("type") == "code"):
         rec.update(status="skip", skip_reason="profile 不满足（admission/dev_agent_ready/type≠code）")
-        log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 2：branch protection 运行时实查（三态）
     if not owner_repo:
         rec.update(status="skip", skip_reason="跳过-无 remote（取不到 owner/repo）")
-        log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     prot = check_branch_protection(owner_repo, base)
     if prot.is_unknown:   # fail-safe：保护态不明 → 阻断，不起 dev loop（OpenSpec fail-safe-dispatch / tasks 4.3）
         rec.update(status="blocked_external_state", blocked_check="branch_protection",
                    skip_reason=f"阻断-分支保护态不明: {prot.reason}")
-        log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
     if prot.state is not ExtState.FOUND or not prot.value:   # NOT_FOUND（明确未保护）/ 兜底 → 拒投
         rec.update(status="skip", skip_reason=f"跳过-{prot.reason}")
-        log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 3：幂等前置闸（SPEC #30 ④ / ADR-0004 §4：投递前去重，已投递→skip 不起 dev loop，省 SDK 启动+$）
     idem = already_dispatched(owner_repo, repo, devslug)
     if idem.is_unknown:   # fail-safe：幂等态不明 → 阻断（旧版容忍可能重复投递）
         rec.update(status="blocked_external_state", blocked_check="idempotency",
                    skip_reason=f"阻断-幂等态不明: {idem.reason}")
-        log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
     if idem.state is ExtState.FOUND:   # 明确已投递 → skip
         rec.update(status="skip", skip_reason=f"跳过-{idem.reason}")
-        log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 4：在途 PR 限量（R1）
     inflight_res = count_inflight_prs(owner_repo)
     if inflight_res.is_unknown:   # fail-safe：在途数不明 → 阻断（旧版返 0 容忍可能超额投递）
         rec.update(status="blocked_external_state", blocked_check="inflight_count",
                    skip_reason=f"阻断-在途PR数不明: {inflight_res.reason}")
-        log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
     inflight = inflight_res.value
     if inflight >= int(prof.get("max_prs_in_flight", 2)):
         rec.update(status="skip", skip_reason=f"跳过-超额（在途 {inflight} ≥ {prof.get('max_prs_in_flight', 2)}）")
-        log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
 
     # ── 零成本 smoke：过准入但不触发 dev loop（不花钱、不开 PR）
     if getattr(args, "dispatch_skip_dev", False):
@@ -1172,7 +1296,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                      repo, 120, f"[{slug}:worktree]", log_file)
     except RuntimeError as e:
         rec.update(status="fail", skip_reason=f"建 worktree 失败: {e}")
-        log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
 
     # ── verify 闭环（docs/verify-commit-loop-design.md §3）：dev→独立验证→pa-verify 裁判；判红保留分支+反馈进 PRD+增量重投；判绿兜底开 PR
     #    同构模板：stage_critic revise loop（§4.3）。reconcile 顺位后移到「裁定后收尾」——不预先为中间红的分支补开 PR。
@@ -1182,7 +1306,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs)
         if cmd is None:
             rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
-            log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
+            _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
         script_json = _run_dev_agent(cmd, wt, slug, log_file)
         # 5.1 测试发布门拦截（dev-agent exit 14 → blocked_by_gate）——终态短路，不进 verify/reconcile、不开 PR。
         # dev-agent 已跑完 dev loop 但结构化测试证据不达发布门（test_not_run / test_failed / test_stale）：
@@ -1200,6 +1324,9 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                        dev_killed=False,
                        skip_reason=f"阻断-测试发布门: {script_json.get('gate_status')}")
             log(f"  🚫 {slug}: dev r{round_n} 测试发布门拦截（{rec['gate_status']}）→ 不验证/不开 PR，待运维 triage")
+            _sj.emit("agent_finished", _iter, _prd, payload={   # test_gate 在 agent_finished emit 前分流，补齐迁移前置
+                "round": round_n, "branch": rec.get("branch"), "gate_blocked": True})
+            _sj_terminal(_sj, rec, _iter, _prd)
             return rec
         if script_json:
             rec["dev_cost"] = script_json.get("cost"); rec["dev_turns"] = script_json.get("turns")
@@ -1207,6 +1334,9 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
             rec["stalled"] = bool(script_json.get("stalled"))   # SPEC #27：dev-agent 主动刹车（exit 12，非超时）
             rec["run_log"] = script_json.get("run_log")          # 监控 jsonl 路径（state/runs/...）
             rec["dev_test_cmd"] = script_json.get("test_cmd")
+            _sj.emit("agent_finished", _iter, _prd, payload={   # task 3.2：dev-agent 阶段结束（RUNNING→AGENT_FINISHED）
+                "round": round_n, "branch": rec.get("branch"), "cost": rec.get("dev_cost"),
+                "turns": rec.get("dev_turns"), "stalled": rec.get("stalled")})
         rec["dev_killed"] = script_json is None   # 无 stdout JSON → 大概率 kill/崩（与 stalled 互补：超时 vs 主动刹车）
 
         branch = rec.get("branch")
@@ -1224,6 +1354,10 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                                                test_cmd_hint=(script_json.get("test_cmd") if script_json else None))
         else:
             rec["verify"] = None              # 无新增 commit（如 round2 dev 未动）→ 无可验证
+        _vj = rec.get("verify") or {}
+        _sj.emit("test", _iter, _prd, payload={   # task 3.2：独立验证结果（payload-only，不改 status）
+            "round": round_n, "test_pass": _vj.get("pass"), "test_rc": _vj.get("test_rc"),
+            "has_commits": has_commits})
 
         # pa-verify 裁判（仅有产出可审时；无产出 → 终止不空转）
         vinfo: dict | None = None
@@ -1237,6 +1371,16 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                 vinfo = None
         rec["verify_verdict"] = vinfo.get("verdict") if vinfo else None
         rec["verify_round"] = round_n
+        # task 3.2：verify 闭环判决旁路 emit。verifying=状态迁移（AGENT_FINISHED→VERIFYING）；
+        # verifier=payload 观测（判决）；pass→publish_ready（VERIFYING→PUBLISH_READY）/ revise（VERIFYING→REVISE）。
+        _sj.emit("verifying", _iter, _prd, payload={"round": round_n})
+        if vinfo:
+            _sj.emit("verifier", _iter, _prd,
+                     payload={"round": round_n, "verdict": vinfo.get("verdict")})
+            if vinfo.get("verdict") == "pass":
+                _sj.emit("publish_ready", _iter, _prd, payload={"round": round_n})
+            elif vinfo.get("verdict") == "revise":
+                _sj.emit("revise", _iter, _prd, payload={"round": round_n})
 
         if vinfo and vinfo.get("verdict") == "pass":
             # 判绿：兜底开正常 PR 收尾（治 baostock 式 interrupted_pr；reconcile 查到 dev 自开 PR 则保持 pr_open）
@@ -1245,13 +1389,16 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         if vinfo and vinfo.get("verdict") == "revise" and round_n < VERIFY_MAX_ROUNDS:
             # 判红（机会未用满）：保留分支做下次 base + 反馈追加进 PRD + 增量 --base=<上次分支> 重投
             log(f"  🔴 {slug}: verify 红（r{round_n}）→ 保留 {branch} 做下次 base，反馈进 PRD，增量重投 r{round_n + 1}")
-            _append_verify_feedback(prd_abs, vinfo.get("feedback_section", ""), round_n)
+            _append_verify_feedback(prd_abs, vinfo.get("feedback_section", ""), round_n,
+                                     sj=_sj, iter_id=_iter, prd_id=_prd,
+                                     artifact_root=STATE_DIR / "artifacts" / _run)
             cur_base = branch
             continue
         # 判红用满（round_n==VERIFY_MAX_ROUNDS）/ pa-verify 异常 / 无产出 → 对账降级 interrupted_pr（不 drop，半成品留 review）
         log(f"  ⏸ {slug}: verify 终止（r{round_n}, verdict={rec['verify_verdict']}）→ 对账收尾（中断 PR 不 drop）")
         reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True); break
 
+    _sj_terminal(_sj, rec, _iter, _prd)   # task 3.2：所有 break 出口（verify绿pr_open / 终止interrupted_pr / 无branch fail）统一终态 emit
     return rec
 
 
