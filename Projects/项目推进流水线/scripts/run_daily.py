@@ -1201,7 +1201,7 @@ def _now_iso() -> str:
 # 映射对齐 ``compat_readers.legacy_status`` 保 shadow parity（task 3.4 / spec scenario 19）：pr_open/interrupted_pr
 # 叠 verify.pass（绿→published，红→revise）；blocked→external/test_blocked；fail→failed；skip→aborted；
 # stalled/orphan_deleted→同名终态（task 3.5：dev loop 主动刹车 / 无 commit 孤儿清理，独立 terminal class）。
-# 仍未映射：planned smoke（task 3.5 阶段 2 处理 running emit 位置）+ sandbox_blocked/blocked_evidence（task 4/5 引入）。
+# 仍未映射：planned smoke（task 3.5 阶段 2 处理 running emit 位置）+ sandbox_blocked（task 5 引入）。
 _SJ_TERMINAL_MAP: dict[str, str] = {
     "skip": "aborted",
     "blocked_external_state": "external_blocked",
@@ -1209,6 +1209,7 @@ _SJ_TERMINAL_MAP: dict[str, str] = {
     "fail": "failed",
     "stalled": "stalled",
     "orphan_deleted": "orphan_deleted",
+    "blocked_evidence": "blocked_evidence",   # task 4.2：green evidence artifact 持久化失败（不当 fresh green evidence）
 }
 
 
@@ -1431,9 +1432,28 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         else:
             rec["verify"] = None              # 无新增 commit（如 round2 dev 未动）→ 无可验证
         _vj = rec.get("verify") or {}
-        _sj.emit("test", _iter, _prd, payload={   # task 3.2：独立验证结果（payload-only，不改 status）
+        # task 4.2 evidence integrity：green test result（机械绿）必须持久化为 content-addressed artifact
+        # （valid digest），否则不当 fresh green evidence → blocked_evidence（spec verified-publication-integrity
+        # 「Test artifact write fails」：无法持久化/校验的 green result 不得成 complete fresh green evidence，
+        # 记 integrity-block reason）。fail-closed：store/读失败即降级，防下游 dual gate 误判 published。
+        if _vj.get("pass"):
+            try:
+                _green_out = Path(_vj["test_log"]).read_text(encoding="utf-8") if _vj.get("test_log") else ""
+                _ev = artifact_store.store(STATE_DIR / "artifacts" / _run, _green_out,
+                                           kind="test_output", sensitivity="internal")
+                _vj["evidence_ref"] = {"digest": _ev.digest, "path": _ev.path, "size": _ev.size}
+            except Exception as _ee:
+                rec["status"] = "blocked_evidence"
+                rec["skip_reason"] = f"green test evidence artifact 持久化失败（不当 fresh green evidence）: {_ee}"
+                rec["verify"] = {**_vj, "pass": False}   # fail-closed 降级（不当 green evidence，防下游误判）
+                log(f"  ⛔ {slug}: green evidence artifact 持久化失败 → blocked_evidence（不当 fresh green evidence）")
+                _sj.emit("test", _iter, _prd, payload={
+                    "round": round_n, "test_pass": True, "evidence_blocked": True, "reason": sanitize(str(_ee))})
+                _sj_terminal(_sj, rec, _iter, _prd)
+                break
+        _sj.emit("test", _iter, _prd, payload={   # task 3.2 + 4.2：独立验证结果 + green evidence artifact ref
             "round": round_n, "test_pass": _vj.get("pass"), "test_rc": _vj.get("test_rc"),
-            "has_commits": has_commits})
+            "has_commits": has_commits, "evidence_ref": _vj.get("evidence_ref")})
 
         # pa-verify 裁判（仅有产出可审时；无产出 → 终止不空转）
         vinfo: dict | None = None

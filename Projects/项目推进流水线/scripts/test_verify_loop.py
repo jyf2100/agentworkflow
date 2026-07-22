@@ -310,8 +310,10 @@ def test_dispatch_green_round1(tmp_path, monkeypatch):
     monkeypatch.setattr(run_daily, "_run_dev_agent",
                         lambda *a, **k: {"branch": "auto/r1", "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
     monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
+    _green_log = tmp_path / "green_test.out"   # task 4.2：green evidence 读 test_log 持久化为 artifact（须真实文件）
+    _green_log.write_text("all tests passed", encoding="utf-8")
     monkeypatch.setattr(run_daily, "independent_verify",
-                        lambda *a, **k: {"pass": True, "test_rc": 0, "test_log": "L"})
+                        lambda *a, **k: {"pass": True, "test_rc": 0, "test_log": str(_green_log)})
     monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
     monkeypatch.setattr(run_daily, "run_persona",
                         lambda *a, **k: ({"verdict": "pass"}, {"cost": 0.0, "turns": 1}))
@@ -325,6 +327,39 @@ def test_dispatch_green_round1(tmp_path, monkeypatch):
     assert rec["verify_round"] == 1
     assert recon_calls == [False]
     assert rec["status"] == "pr_open"
+
+
+def test_dispatch_green_evidence_artifact_failure_blocks_not_published(tmp_path, monkeypatch):
+    """task 4.2 evidence integrity：green test result（机械绿）但 evidence artifact 持久化失败
+    （artifact_store.store raise → 模拟磁盘满/IO 错）→ 不当 fresh green evidence → ``blocked_evidence``
+    终态（不 pr_open/published、不进 pa-verify、不 reconcile）。spec verified-publication-integrity
+    「Test artifact write fails」：无法持久化/校验的 green result 不得成 complete fresh green evidence，
+    记 integrity-block reason。"""
+    _setup(tmp_path, monkeypatch)
+    _admit(monkeypatch)
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(run_daily, "_run_dev_agent",
+                        lambda *a, **k: {"branch": "auto/r1", "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
+    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
+    _green_log = tmp_path / "green_evidence.out"   # 真实文件：read 成功，store 被 mock raise（精确测 store 失败）
+    _green_log.write_text("all tests passed", encoding="utf-8")
+    monkeypatch.setattr(run_daily, "independent_verify",
+                        lambda *a, **k: {"pass": True, "test_rc": 0, "test_log": str(_green_log)})
+    monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
+
+    def _boom(*a, **k):   # green evidence artifact 持久化失败（store raise → 模拟磁盘满/IO 错）
+        raise IOError("disk full")
+    monkeypatch.setattr(run_daily.artifact_store, "store", _boom)
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda *a, **k: ({"verdict": "pass"}, {"cost": 0.0, "turns": 1}))
+    recon_calls, fake_rec = _recon_recorder()
+    monkeypatch.setattr(run_daily, "reconcile_pr", fake_rec)
+    # Act
+    rec = run_daily.dispatch_one(_entry(), _prof(repo), "20260718", _args())
+    # Assert：不当 green evidence → blocked_evidence（不 pr_open/published、未 reconcile、未进 pa-verify）
+    assert rec["status"] == "blocked_evidence"
+    assert recon_calls == []
+    assert "evidence" in rec.get("skip_reason", "").lower()
 
 
 def test_dispatch_red_then_green(tmp_path, monkeypatch):

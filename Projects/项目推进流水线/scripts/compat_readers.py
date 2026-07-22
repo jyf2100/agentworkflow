@@ -38,6 +38,7 @@ _LEGACY_STATUS_MAP: dict[str, IterationStatus] = {
     "planned": IterationStatus.PLANNED,
     "stalled": IterationStatus.STALLED,                # task 3.5：dev loop 主动刹车终态
     "orphan_deleted": IterationStatus.ORPHAN_DELETED,  # task 3.5：无 commit 孤儿清理终态
+    "blocked_evidence": IterationStatus.BLOCKED_EVIDENCE,  # task 4.2：green evidence artifact 持久化失败终态
 }
 
 

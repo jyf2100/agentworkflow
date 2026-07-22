@@ -105,6 +105,12 @@ def test_legacy_status_orphan_deleted_is_orphan():
     assert C.legacy_status(_rec("orphan_deleted")) is S.ORPHAN_DELETED
 
 
+def test_legacy_status_blocked_evidence_is_blocked_evidence():
+    """task 4.2：blocked_evidence（green test evidence artifact 持久化失败，不当 fresh green evidence）
+    → BLOCKED_EVIDENCE 终态。独立 terminal class——shadow parity 须与 ``_sj_terminal`` + reducer 三端对齐。"""
+    assert C.legacy_status(_rec("blocked_evidence")) is S.BLOCKED_EVIDENCE
+
+
 def test_legacy_status_unknown_is_state_corrupt_fail_closed():
     """**fail-closed**：未知/无法识别的历史 status → STATE_CORRUPT。
 

@@ -24,7 +24,7 @@
 ## 4. Publication and Evidence Integrity
 
 - [x] 4.1 Change terminal publication logic to require independent green tests, `verify_verdict=pass`, and known reconciliation.
-- [ ] 4.2 Prevent a test result from becoming fresh green evidence when its required artifact or journal event cannot be persisted and verified.
+- [x] 4.2 Prevent a test result from becoming fresh green evidence when its required artifact or journal event cannot be persisted and verified.
 - [ ] 4.3 Add explicit evidence-integrity and journal-integrity blocked states to reports and retry policy inputs.
 - [ ] 4.4 Reconcile commit, push, branch, PR, and test evidence idempotency keys before every resume, fork, new-session, or publication action.
 - [ ] 4.5 Add crash-injection integration tests around each journal-before-side-effect boundary and prove exactly-once effective behavior.
