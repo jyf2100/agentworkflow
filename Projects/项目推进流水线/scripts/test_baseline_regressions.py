@@ -47,14 +47,11 @@ def _evt_line(event_id: str, event_type: str = "running", payload: dict | None =
 # tests-green / semantic-revise：_sj_terminal 核心终态映射锁定（防 Section 2-4 重构回归）
 # ════════════════════════════════════════════════════════════════════════════
 def test_green_pr_maps_to_published_and_red_maps_to_revise(tmp_path):
-    """机械测试绿 + pr_open → published；验证红 + interrupted_pr → revise（非 published，防假绿）。
-
-    注：当前 _sj_terminal 仅凭 ``verify.pass`` 判定（机械层）；task 4.1 将增强为同时要求语义
-    ``verify_verdict=pass``——此处锁定当前机械契约，4.1 落地后据此扩展。
-    """
+    """task 4.1 dual gate 已实现：绿 + pr_open + verify_verdict=pass → published；
+    验证红 + interrupted_pr（verify.pass=False）→ revise（非 published，防假绿）。"""
     # Arrange — green
     sj_green = RT.ShadowJournal(tmp_path / "g.jsonl", "run_1", _stamp, enabled=True)
-    green = {"status": "pr_open", "verify": {"pass": True}, "pr_url": "https://gh/p/1"}
+    green = {"status": "pr_open", "verify": {"pass": True}, "verify_verdict": "pass", "pr_url": "https://gh/p/1"}
     # Arrange — red
     sj_red = RT.ShadowJournal(tmp_path / "r.jsonl", "run_1", _stamp, enabled=True)
     red = {"status": "interrupted_pr", "verify": {"pass": False}, "pr_url": "https://gh/p/2"}

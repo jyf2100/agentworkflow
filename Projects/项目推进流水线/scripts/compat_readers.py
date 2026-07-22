@@ -5,10 +5,12 @@ parity 比对**（task 3.4）必须能读「无 journal 的历史 dispatch 记�
 shadow 比对缺基准。本读取器把第一阶段 ``dispatch_<stamp>.json`` 的 records 翻译成等价 ``IterationState``
 （loop 终态模型），让新旧两套真源可机械比对。
 
-映射规则（``legacy_status``）—— 历史 dispatch ``status`` + ``verify.pass`` → ``IterationStatus``：
-    * ``pr_open``/``interrupted_pr`` + verify.pass → ``PUBLISHED``（已交付）；
-    * ``pr_open``/``interrupted_pr`` + verify 未过 → ``REVISE``（有 PR 但验证红，**非** PUBLISHED——
-      与状态机一致：交付物存在 ≠ 验证通过，保留这层语义防 shadow 比对假绿）；
+映射规则（``legacy_status``）—— 历史 dispatch ``status`` + ``verify.pass`` + ``verify_verdict`` → ``IterationStatus``：
+    * ``pr_open``/``interrupted_pr`` + verify.pass + verify_verdict=='pass' → ``PUBLISHED``（双绿已交付）；
+    * ``pr_open``/``interrupted_pr`` + verify.pass 但 verify_verdict 非 pass → ``REVISE``（机械绿但语义红，
+      task 4.1 dual gate——防假绿，与 ``_sj_terminal`` 对齐保 shadow parity）；
+    * ``pr_open``/``interrupted_pr`` + verify 未过 → ``REVISE``（有 PR 但验证红）；
+      **兼容**：历史 record 无 ``verify_verdict`` 字段 → fallback 仅看 ``verify.pass``（迁移前旧契约）；
     * ``blocked_external_state`` → ``EXTERNAL_BLOCKED``；``blocked_test_gate`` → ``TEST_BLOCKED``；
     * ``fail`` → ``FAILED``；``skip`` → ``ABORTED``；``planned`` → ``PLANNED``；
     * **未知 status → ``STATE_CORRUPT``**（fail-closed：不认识的历史态保守标记，绝不假装成功）。
@@ -42,8 +44,10 @@ _LEGACY_STATUS_MAP: dict[str, IterationStatus] = {
 def legacy_status(record: dict) -> IterationStatus:
     """把一条历史 dispatch record 映射到 ``IterationStatus``。
 
-    规则见模块 docstring。关键：``pr_open``/``interrupted_pr`` 的「已交付」判定 **必须** 叠加
-    ``verify.pass=True``——只有 PR 不够（验证红的 PR 是 REVISE，不是 PUBLISHED）。
+    规则见模块 docstring。关键：``pr_open``/``interrupted_pr`` 的「已交付」判定 **必须** 双绿佐证
+    （task 4.1 dual gate）——``verify.pass=True``（独立机械绿）+ ``verify_verdict=='pass'``（语义绿）。
+    只有 PR 不够（验证红的 PR 是 REVISE）；机械绿但语义红亦是 REVISE（防假绿，与 ``_sj_terminal`` 对齐保 parity）。
+    **兼容**：历史 record 无 ``verify_verdict`` 字段（迁移前旧格式）→ fallback 仅看 ``verify.pass``。
     未知/缺失 status → ``STATE_CORRUPT``（fail-closed，绝不假装成功）。
     """
     raw = record.get("status")
@@ -51,10 +55,14 @@ def legacy_status(record: dict) -> IterationStatus:
     if mapped is None:
         return IterationStatus.STATE_CORRUPT
 
-    # 已交付态需 verify.pass 佐证：有 PR 但验证红 → REVISE（打回重做）
+    # 已交付态需双绿佐证（task 4.1 dual gate）：verify.pass（机械绿）+ verify_verdict=='pass'（语义绿）。
+    # 历史 record 无 verify_verdict → fallback 仅 verify.pass（兼容迁移前旧契约）。
     if mapped is IterationStatus.PUBLISHED:
         verify = record.get("verify") or {}
         if not verify.get("pass"):
+            return IterationStatus.REVISE
+        verdict = record.get("verify_verdict")
+        if verdict is not None and verdict != "pass":
             return IterationStatus.REVISE
     return mapped
 

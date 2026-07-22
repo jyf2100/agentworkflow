@@ -28,9 +28,10 @@ def _stamp() -> str:
 
 # ─── 3.2：_sj_terminal 终态映射（对齐 compat_readers.legacy_status 保 parity）────────
 def test_sj_terminal_pr_open_green_emits_published(tmp_path):
-    """pr_open + verify.pass → published（交付终态，payload 带 pr_url）。"""
+    """pr_open + verify.pass + verify_verdict='pass'（双绿，task 4.1 dual gate）→ published（交付终态）。"""
     sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
-    rec = {"status": "pr_open", "verify": {"pass": True}, "pr_url": "https://gh/o/r/pull/1"}
+    rec = {"status": "pr_open", "verify": {"pass": True}, "verify_verdict": "pass",
+           "pr_url": "https://gh/o/r/pull/1"}
     run_daily._sj_terminal(sj, rec, "iter_1", "prd_1")
     evs = J.read_events(tmp_path / "j.jsonl")
     assert len(evs) == 1 and evs[0].event_type == "published"
@@ -41,6 +42,28 @@ def test_sj_terminal_pr_open_red_emits_revise(tmp_path):
     """interrupted_pr + verify 未过 → revise（有 PR 但验证红，**非** published——对齐 compat 防假绿）。"""
     sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
     rec = {"status": "interrupted_pr", "verify": {"pass": False}, "pr_url": "https://gh/o/r/pull/2"}
+    run_daily._sj_terminal(sj, rec, "iter_1", "prd_1")
+    evs = J.read_events(tmp_path / "j.jsonl")
+    assert evs[0].event_type == "revise"
+
+
+def test_sj_terminal_interrupted_pr_mechanical_green_semantic_red_emits_revise(tmp_path):
+    """task 4.1 dual publication gate：interrupted_pr + verify.pass=True（独立测试机械绿）但
+    verify_verdict='revise'（pa-verify 语义红）→ emit ``revise``，**绝不** published。spec「Tests green
+    but semantic review red」：机械绿非充分证据，须 semantic pass + 对账 known 才 published（防假绿）。"""
+    sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
+    rec = {"status": "interrupted_pr", "verify": {"pass": True}, "verify_verdict": "revise",
+           "pr_url": "https://gh/o/r/pull/3"}
+    run_daily._sj_terminal(sj, rec, "iter_1", "prd_1")
+    evs = J.read_events(tmp_path / "j.jsonl")
+    assert evs[0].event_type == "revise"
+
+
+def test_sj_terminal_mechanical_green_missing_semantic_verdict_emits_revise(tmp_path):
+    """task 4.1：verify_verdict 缺失（pa-verify 异常/未跑）+ 机械绿 → ``revise``（fail-closed：语义判决
+    不明不当 published，design 决策#3「never a green substitute for unknown semantic verdict」）。"""
+    sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
+    rec = {"status": "pr_open", "verify": {"pass": True}}   # 无 verify_verdict
     run_daily._sj_terminal(sj, rec, "iter_1", "prd_1")
     evs = J.read_events(tmp_path / "j.jsonl")
     assert evs[0].event_type == "revise"

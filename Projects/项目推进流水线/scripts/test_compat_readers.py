@@ -6,9 +6,11 @@
 必须能读「无 journal 的历史 dispatch 记录」——否则迁移无法验证 parity、回退无据。本读取器把第一阶段
 ``dispatch_<stamp>.json`` 的 records 翻译成等价 ``IterationState``（loop 终态模型），让新旧两套真源可机械比对。
 
-    ``legacy_status(record)`` —— 历史 dispatch record 的 ``status`` + ``verify.pass`` → ``IterationStatus``：
-        * pr_open/interrupted_pr + verify.pass → PUBLISHED（已交付）；
+    ``legacy_status(record)`` —— 历史 dispatch record 的 ``status`` + ``verify.pass`` + ``verify_verdict`` → ``IterationStatus``：
+        * pr_open/interrupted_pr + verify.pass + verify_verdict=='pass' → PUBLISHED（双绿已交付）；
+        * pr_open/interrupted_pr + verify.pass 但 verify_verdict 非 pass → REVISE（机械绿但语义红，task 4.1 dual gate）；
         * pr_open/interrupted_pr + verify 未过 → REVISE（有 PR 但验证红，打回重做态）；
+          兼容：无 verify_verdict 字段 → fallback 仅 verify.pass（迁移前旧契约）；
         * blocked_external_state → EXTERNAL_BLOCKED；blocked_test_gate → TEST_BLOCKED；
         * fail → FAILED；skip → ABORTED；planned → PLANNED；
         * **未知 status → STATE_CORRUPT**（fail-closed：不认识的历史态保守标记，绝不假装成功）。
@@ -110,6 +112,21 @@ def test_legacy_status_unknown_is_state_corrupt_fail_closed():
     （spec fail-safe 精神 + design 决策#2「SDK 成功≠已发布」的延伸：不认识 ≠ 成功）。"""
     assert C.legacy_status(_rec("some_new_future_status")) is S.STATE_CORRUPT
     assert C.legacy_status({}) is S.STATE_CORRUPT   # 完全无 status 字段
+
+
+def test_legacy_status_dual_gate_semantic_red_demotes_to_revise():
+    """task 4.1 dual gate parity 对端：pr_open/interrupted_pr + verify.pass=True（机械绿）但
+    verify_verdict='revise'（pa-verify 语义红）→ REVISE。与 ``_sj_terminal`` dual gate 对齐——否则
+    shadow parity 断裂（dispatch 端 PUBLISHED、journal 端 REVISE）。spec「Tests green but semantic review red」。"""
+    assert C.legacy_status(_rec("interrupted_pr", verify_pass=True, verify_verdict="revise")) is S.REVISE
+    assert C.legacy_status(_rec("pr_open", verify_pass=True, verify_verdict="revise")) is S.REVISE
+
+
+def test_legacy_status_missing_verdict_falls_back_to_mechanical_pass():
+    """task 4.1 兼容：历史 record 无 verify_verdict 字段（迁移前旧格式）→ fallback 仅看 verify.pass。
+    pr_open + pass（无 verdict）→ PUBLISHED——保历史 records 读取不因 dual gate 升级而破坏。"""
+    assert C.legacy_status(_rec("pr_open", verify_pass=True)) is S.PUBLISHED
+    assert C.legacy_status(_rec("interrupted_pr", verify_pass=True)) is S.PUBLISHED
 
 
 # ════════════════════════════════════════════════════════════════════════

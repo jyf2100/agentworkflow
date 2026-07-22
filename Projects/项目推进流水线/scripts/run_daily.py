@@ -1221,8 +1221,21 @@ def _sj_terminal(sj: ShadowJournal, rec: dict, iteration_id: str, prd_id: str) -
     status = rec.get("status")
     if status in ("pr_open", "interrupted_pr"):
         verify = rec.get("verify") or {}
-        sj.emit("published" if verify.get("pass") else "revise", iteration_id, prd_id,
-                payload={"status": status, "pr_url": rec.get("pr_url")})
+        # task 4.1 dual publication gate（spec verified-publication-integrity）：published 当且仅当
+        #   ① 机械绿（independent verify.pass）
+        #   ② 语义 pass（verify_verdict=='pass'）
+        #   ③ 对账 known（status ∈ {pr_open, interrupted_pr} 蕴含 reconcile 成功对账；external unknown
+        #      已落 blocked_external_state 走下方 map，不进此分支）
+        # 机械绿但语义红/异常/缺失 → revise，绝不假绿 published（design 决策#3「never a green substitute」）。
+        mechanical_green = bool(verify.get("pass"))
+        semantic_pass = rec.get("verify_verdict") == "pass"
+        if mechanical_green and semantic_pass:
+            sj.emit("published", iteration_id, prd_id,
+                    payload={"status": status, "pr_url": rec.get("pr_url")})
+        else:
+            sj.emit("revise", iteration_id, prd_id,
+                    payload={"status": status, "pr_url": rec.get("pr_url"),
+                             "verify_verdict": rec.get("verify_verdict")})
         return
     event = _SJ_TERMINAL_MAP.get(status)
     if event:
