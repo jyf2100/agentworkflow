@@ -74,6 +74,63 @@ def _normalize_host(host: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# task 5.1 egress enforcement adapter（design 决策#5：可执行出口策略 or sandbox_blocked）
+# ════════════════════════════════════════════════════════════════════════════
+class EgressEnforcement(Protocol):
+    """可执行出口强制 adapter（design 决策#5 + task 5.1）。
+
+    container adapter 必须调用 enforceable egress policy（configured network namespace /
+    proxy / equivalent deployment policy）或返回 sandbox_blocked——**docker label 只是审计
+    元数据，控制边界观察到的请求是证据但不足以 claim 对任意 Bash 命令的网络强制**（design #5）。
+    task 5.1：claim higher assurance 前 preflight ``enforceable()``，不可执行 → sandbox_blocked。
+    """
+    def enforceable(self) -> bool: ...     # preflight：egress 策略是否真的可执行（已部署/可达）
+    def describe(self) -> str: ...          # 强制机制描述（审计：label / proxy / network namespace）
+
+
+class LabelOnlyEgress:
+    """只有 docker ``--label``（无真实强制）→ enforceable=False（design #5：label 是 audit only）。
+
+    代表「意图记录」层：``--label pa.network_allowlist=...`` 声明 allowlist 但不强制。claim higher
+    assurance 前必须 preflight 到一个 enforceable egress（``DockerNetworkEgress`` / 部署的 proxy /
+    network namespace 策略），否则 ContainerSandbox 进 sandbox_blocked。
+    """
+    def enforceable(self) -> bool:
+        return False
+
+    def describe(self) -> str:
+        return "label-only (docker --label pa.network_allowlist; audit metadata, not enforcement)"
+
+
+class DockerNetworkEgress:
+    """真实 preflight egress adapter：``docker network inspect <name>`` 验证命名 egress 网络已部署。
+
+    design #5「configured network namespace / equivalent deployment policy」的可执行边界——比 label
+    强的真实证据：命名网络存在 = 部署侧确实配了 egress 边界（自定义网络 + iptables/proxy 规则由部署
+    侧落实）。``enforceable()`` 查网络存在（returncode 0）；无 docker / 网络缺失 / 超时 → False →
+    ContainerSandbox sandbox_blocked（绝不以 label 充当 enforcement）。真实 subprocess 仅在
+    ``enforceable()`` 运行时调用；模块导入零 docker 依赖（cron 隔离友好）。
+    """
+    def __init__(self, network: str = "pa-egress", runtime: str = "docker", timeout: float = 10):
+        self.network = network
+        self.runtime = runtime
+        self.timeout = timeout
+
+    def enforceable(self) -> bool:
+        if shutil.which(self.runtime) is None:
+            return False
+        try:
+            r = subprocess.run([self.runtime, "network", "inspect", self.network],
+                               capture_output=True, timeout=self.timeout)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def describe(self) -> str:
+        return f"docker named network '{self.network}' (inspected at preflight)"
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # task 6.2 ContainerRunner Protocol（注入式，解耦真实 docker）
 # ════════════════════════════════════════════════════════════════════════════
 class ContainerRunner(Protocol):
@@ -201,10 +258,11 @@ class ContainerSandbox:
     tier = AssuranceTier.CONTAINER
 
     def __init__(self, runner: ContainerRunner, *, image: str = "pa-sandbox:latest",
-                 run_as_user: str = "1000:1000"):
+                 run_as_user: str = "1000:1000", egress: EgressEnforcement | None = None):
         self.runner = runner
         self.image = image
         self.run_as_user = run_as_user
+        self.egress = egress
         self._prepared: dict[str, _PreparedContainer] = {}
 
     def assurance_level(self) -> str:
@@ -217,13 +275,22 @@ class ContainerSandbox:
                 reason=f"container runtime unavailable ({type(self.runner).__name__})",
                 tier=self.tier, policy_violation=False,
             )
-        # 2. worktree 必须存在且唯一可写
+        # 2. task 5.1 egress enforcement preflight（claim higher assurance 前验可执行性，design #5）
+        #    label / 无 adapter 不足以 claim network enforcement → sandbox_blocked（policy_violation）
+        if self.egress is None or not self.egress.enforceable():
+            desc = self.egress.describe() if self.egress is not None else "no egress adapter"
+            return SandboxBlocked(
+                reason=(f"egress policy not enforceable ({desc}); higher assurance requires an "
+                        f"enforceable egress boundary—a label is audit metadata only (design #5)"),
+                tier=self.tier, policy_violation=True,
+            )
+        # 3. worktree 必须存在且唯一可写
         wt = Path(spec.worktree_dir)
         if not wt.is_dir():
             return SandboxBlocked(reason=f"worktree not found: {spec.worktree_dir}",
                                   tier=self.tier, policy_violation=False)
         ro = tuple(d for d in spec.prd_source_dirs if Path(d).is_dir())
-        # 3. network policy（task 6.3）
+        # 4. network policy（task 6.3）
         policy = NetworkPolicy(allowlist=tuple(spec.network_allowlist), strict=True)
         viol = policy.violations(spec.requested_hosts)
         if viol:
@@ -231,7 +298,7 @@ class ContainerSandbox:
                 reason=f"undeclared network destinations blocked: {list(viol)}",
                 tier=self.tier, policy_violation=True,
             )
-        # 4. create container（runner 抛 → blocked）
+        # 5. create container（runner 抛 → blocked）
         try:
             cid = self.runner.create(
                 image=self.image,

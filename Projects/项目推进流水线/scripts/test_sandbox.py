@@ -58,6 +58,19 @@ class FakeContainerRunner:
         self.removed.append(container_id)
 
 
+class StaticEgress:
+    """task 5.1 测试用 egress enforcement adapter：``enforceable`` 固定 bool（模拟已部署/未部署）。"""
+    def __init__(self, enforceable: bool, desc: str = "static"):
+        self._ok = enforceable
+        self._desc = desc
+
+    def enforceable(self) -> bool:
+        return self._ok
+
+    def describe(self) -> str:
+        return self._desc
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 6.1 LocalWorktreeSandbox（lower assurance）
 # ════════════════════════════════════════════════════════════════════════════
@@ -188,7 +201,7 @@ def test_container_prepare_mounts_and_limits(tmp_path):
     wt = tmp_path / "wt"; wt.mkdir()
     prd = tmp_path / "prd"; prd.mkdir()
     runner = FakeContainerRunner()
-    c = CS.ContainerSandbox(runner, image="pa:test")
+    c = CS.ContainerSandbox(runner, image="pa:test", egress=StaticEgress(True))
     handle = c.prepare(SB.SandboxSpec(
         worktree_dir=str(wt), prd_source_dirs=(str(prd),),
         cpu_limit="2.0", memory_limit="1g", process_limit=256,
@@ -208,7 +221,7 @@ def test_container_prepare_mounts_and_limits(tmp_path):
 def test_container_prepare_network_violation_policy_blocked(tmp_path):
     """6.3 核心：requested_hosts 有未声明目标 → policy_violation blocked（fail-closed）。"""
     wt = tmp_path / "wt"; wt.mkdir()
-    c = CS.ContainerSandbox(FakeContainerRunner())
+    c = CS.ContainerSandbox(FakeContainerRunner(), egress=StaticEgress(True))
     result = c.prepare(SB.SandboxSpec(
         worktree_dir=str(wt),
         network_allowlist=("pypi.org",),
@@ -221,7 +234,7 @@ def test_container_prepare_network_violation_policy_blocked(tmp_path):
 
 def test_container_prepare_create_failure_blocked(tmp_path):
     wt = tmp_path / "wt"; wt.mkdir()
-    c = CS.ContainerSandbox(FakeContainerRunner(create_raises=True))
+    c = CS.ContainerSandbox(FakeContainerRunner(create_raises=True), egress=StaticEgress(True))
     result = c.prepare(SB.SandboxSpec(worktree_dir=str(wt)))
     assert isinstance(result, SB.SandboxBlocked)
 
@@ -229,7 +242,7 @@ def test_container_prepare_create_failure_blocked(tmp_path):
 def test_container_run_executes_and_enforces_network(tmp_path):
     wt = tmp_path / "wt"; wt.mkdir()
     runner = FakeContainerRunner(exec_result=(0, "ok", ""))
-    c = CS.ContainerSandbox(runner)
+    c = CS.ContainerSandbox(runner, egress=StaticEgress(True))
     handle = c.prepare(SB.SandboxSpec(worktree_dir=str(wt), network_allowlist=("pypi.org",)))
     # requested_hosts 全在 allowlist → 放行 exec
     out = c.run(handle, ["pytest", "-q"], requested_hosts=("pypi.org",))
@@ -243,10 +256,74 @@ def test_container_run_executes_and_enforces_network(tmp_path):
 def test_container_teardown_removes(tmp_path):
     wt = tmp_path / "wt"; wt.mkdir()
     runner = FakeContainerRunner()
-    c = CS.ContainerSandbox(runner)
+    c = CS.ContainerSandbox(runner, egress=StaticEgress(True))
     handle = c.prepare(SB.SandboxSpec(worktree_dir=str(wt)))
     c.teardown(handle)
     assert runner.removed == [handle.runtime_id]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 5 task 5.1：egress enforcement adapter + preflight（design 决策#5）
+# container adapter 必须调用 enforceable egress policy 或 sandbox_blocked——label 只是审计
+# 元数据，不足以 claim network enforcement。claim higher assurance 前 preflight enforceable()。
+# ════════════════════════════════════════════════════════════════════════════
+def test_container_prepare_preflights_egress_enforceability(tmp_path):
+    """5.1 核心（design #5）：egress 不可执行（label-only / 无真实强制）→ claim higher 前 preflight
+    拦截 → SandboxBlocked（policy_violation），绝不以 label 充当 enforcement。"""
+    wt = tmp_path / "wt"; wt.mkdir()
+    c = CS.ContainerSandbox(FakeContainerRunner(),
+                             egress=StaticEgress(False, "label-only audit metadata"))
+    result = c.prepare(SB.SandboxSpec(worktree_dir=str(wt)))
+    assert isinstance(result, SB.SandboxBlocked)
+    assert result.policy_violation is True
+    assert "egress" in result.reason.lower()
+
+
+def test_container_prepare_no_egress_adapter_blocked(tmp_path):
+    """未注入 egress adapter（egress=None）→ 不能 claim higher assurance（默认 fail-closed，design #5）。"""
+    wt = tmp_path / "wt"; wt.mkdir()
+    c = CS.ContainerSandbox(FakeContainerRunner())          # egress=None
+    result = c.prepare(SB.SandboxSpec(worktree_dir=str(wt)))
+    assert isinstance(result, SB.SandboxBlocked)
+    assert "egress" in result.reason.lower()
+
+
+def test_container_prepare_enforceable_egress_proceeds_to_higher(tmp_path):
+    """egress 可执行（真实强制已部署，preflight 过）→ 正常 prepare，claim higher assurance。"""
+    wt = tmp_path / "wt"; wt.mkdir()
+    runner = FakeContainerRunner()
+    c = CS.ContainerSandbox(runner, egress=StaticEgress(True, "pa-egress network inspected"))
+    handle = c.prepare(SB.SandboxSpec(worktree_dir=str(wt)))
+    assert isinstance(handle, SB.SandboxHandle)
+    assert handle.limits["assurance"] == "higher"
+
+
+def test_label_only_egress_is_not_enforceable():
+    """LabelOnlyEgress（docker --label 元数据）enforceable=False——label 不构成 enforcement（design #5）。"""
+    e = CS.LabelOnlyEgress()
+    assert e.enforceable() is False
+    assert "label" in e.describe().lower()
+
+
+def test_docker_network_egress_preflights_inspect(monkeypatch):
+    """DockerNetworkEgress.enforceable() 真实 preflight：docker network inspect <name> 返回 0=已部署
+    （enforceable）；网络缺失/无 docker → False（不 claim）。导入零 docker 依赖（仅运行时 subprocess）。"""
+    e = CS.DockerNetworkEgress(network="pa-egress")
+
+    class _R:
+        returncode = 0
+    # 有 docker + network 存在 → enforceable
+    monkeypatch.setattr(CS.shutil, "which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr(CS.subprocess, "run", lambda *a, **k: _R())
+    assert e.enforceable() is True
+    # network 缺失（inspect 非 0）→ 不 enforceable
+    class _R2:
+        returncode = 1
+    monkeypatch.setattr(CS.subprocess, "run", lambda *a, **k: _R2())
+    assert e.enforceable() is False
+    # 无 docker → 不 enforceable
+    monkeypatch.setattr(CS.shutil, "which", lambda _: None)
+    assert e.enforceable() is False
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -338,7 +415,7 @@ def test_python_fixture_runs_container_tier(tmp_path):
     repo.mkdir()
     _make_python_fixture(repo)
     runner = FakeContainerRunner(exec_result=(0, "PY_OK", ""))
-    c = CS.ContainerSandbox(runner)
+    c = CS.ContainerSandbox(runner, egress=StaticEgress(True))
     handle = c.prepare(SB.SandboxSpec(worktree_dir=str(repo), network_allowlist=()))
     assert isinstance(handle, SB.SandboxHandle)
     out = c.run(handle, ["python3", "test_calc.py"])
@@ -364,7 +441,7 @@ def test_node_fixture_runs_container_tier(tmp_path):
     repo.mkdir()
     _make_node_fixture(repo)
     runner = FakeContainerRunner(exec_result=(0, "NODE_OK", ""))
-    c = CS.ContainerSandbox(runner)
+    c = CS.ContainerSandbox(runner, egress=StaticEgress(True))
     handle = c.prepare(SB.SandboxSpec(worktree_dir=str(repo), network_allowlist=()))
     out = c.run(handle, ["node", "test_calc.js"])
     assert out.exit_code == 0 and "NODE_OK" in out.stdout
@@ -377,7 +454,7 @@ def test_both_tiers_no_real_external_services(tmp_path):
     _make_python_fixture(repo)
     # container tier：空 allowlist + 无 requested_hosts → 不 block（fixture 本就不联网）
     runner = FakeContainerRunner(exec_result=(0, "", ""))
-    c = CS.ContainerSandbox(runner)
+    c = CS.ContainerSandbox(runner, egress=StaticEgress(True))
     handle = c.prepare(SB.SandboxSpec(worktree_dir=str(repo), network_allowlist=()))
     assert isinstance(handle, SB.SandboxHandle)
     out = c.run(handle, ["python3", "test_calc.py"], requested_hosts=())

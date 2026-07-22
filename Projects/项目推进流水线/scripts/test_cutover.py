@@ -74,6 +74,20 @@ class FakeContainerRunner:
         pass
 
 
+class _StaticEgress:
+    """task 5.1 egress enforcement 桩：``enforceable`` 固定 bool（让 prepare 过 egress preflight）。"""
+    __test__ = False
+
+    def __init__(self, enforceable: bool = True):
+        self._ok = enforceable
+
+    def enforceable(self) -> bool:
+        return self._ok
+
+    def describe(self) -> str:
+        return "static test egress"
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 8.1 shadow parity + dry-run
 # ════════════════════════════════════════════════════════════════════════════
@@ -241,7 +255,7 @@ def test_sandbox_python_local_tier_runs_clean(tmp_path):
 def test_sandbox_container_network_violation_denied(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    c = CS.ContainerSandbox(FakeContainerRunner(exec_result=(0, "", "")))
+    c = CS.ContainerSandbox(FakeContainerRunner(exec_result=(0, "", "")), egress=_StaticEgress(True))
     handle = c.prepare(SB.SandboxSpec(worktree_dir=str(repo), network_allowlist=("pypi.org",)))
     assert isinstance(handle, SB.SandboxHandle)
     # requested_hosts 含未声明的 evil.com → policy block
