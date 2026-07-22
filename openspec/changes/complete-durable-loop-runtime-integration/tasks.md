@@ -9,7 +9,7 @@
 - [x] 2.1 Implement a coordinator that resolves all loop flags once and owns journal, artifacts, IDs, retry, hooks, sandbox, telemetry, and reconciliation for one dispatch.
 - [x] 2.2 Integrate the coordinator into `run_daily.dispatch_one()` without changing first-phase admission and fail-safe external-state gates when durable flags are disabled.
 - [x] 2.3 Integrate the coordinator into `dev-agent.py` and register real Claude Agent SDK lifecycle hooks with the pinned SDK API.
-- [ ] 2.4 Add subprocess-level integration tests proving each feature flag changes the real dispatch/SDK path rather than only a helper or drill function.
+- [x] 2.4 Add subprocess-level integration tests proving each feature flag changes the real dispatch/SDK path rather than only a helper or drill function.
 - [x] 2.5 Reject invalid partial feature combinations during preflight and record a structured blocked reason.
 
 ## 3. Immutable Iterations and Journal Authority
