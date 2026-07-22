@@ -49,14 +49,23 @@ class IterationStatus(str, Enum):
     PUBLISHED = "published"               # 唯一成功交付终态
     ABORTED = "aborted"                   # 主动放弃终态
     FAILED = "failed"                     # 重试耗尽/预算用尽终态
+    STALLED = "stalled"                   # task 3.5：dev loop 主动刹车终态（连续 N 轮无写类进展 exit 12）
+    ORPHAN_DELETED = "orphan_deleted"     # task 3.5：无 commit 孤儿分支清理终态（dev 跑过但无产出）
+    BLOCKED_EVIDENCE = "blocked_evidence"  # task 3.5 前向（task 4.2/4.3）：证据无法持久化/校验终态
+    SANDBOX_BLOCKED = "sandbox_blocked"    # task 3.5 前向（task 5.2）：沙箱策略安装/校验失败终态
     STATE_CORRUPT = "state_corrupt"       # journal 损坏保守终态（需运维）
 
 
-# 终态集合：已交付/已废弃/已失败/已损坏——无任何出向迁移，不可复活。
+# 终态集合：已交付/已废弃/已失败/已停滞/已清理孤儿/已损坏——无任何出向迁移，不可复活。
+# task 3.5：stalled/orphan_deleted 是 dispatch 旁路放弃终态（spec scenario 19 terminal class）。
 TERMINAL_STATUSES: frozenset[IterationStatus] = frozenset({
     IterationStatus.PUBLISHED,
     IterationStatus.ABORTED,
     IterationStatus.FAILED,
+    IterationStatus.STALLED,
+    IterationStatus.ORPHAN_DELETED,
+    IterationStatus.BLOCKED_EVIDENCE,
+    IterationStatus.SANDBOX_BLOCKED,
     IterationStatus.STATE_CORRUPT,
 })
 
@@ -65,18 +74,25 @@ TERMINAL_STATUSES: frozenset[IterationStatus] = frozenset({
 _TRANSITIONS: dict[IterationStatus, frozenset[IterationStatus]] = {
     IterationStatus.PLANNED: frozenset({
         IterationStatus.RUNNING,
-        IterationStatus.ABORTED,   # planning 阶段放弃（dispatch_skip_dev：profile 不满足/dev 被跳过，agent 未跑即弃）
+        IterationStatus.ABORTED,          # planning 阶段放弃（profile 不满足/dev 被跳过，agent 未跑即弃）
+        IterationStatus.EXTERNAL_BLOCKED, # task 3.5：admission 阶段三态 fail-safe 阻断（分支保护/幂等/inflight UNKNOWN）
+        IterationStatus.SANDBOX_BLOCKED,  # task 3.5 前向（task 5.2）：沙箱策略安装/校验失败
     }),
     IterationStatus.RUNNING: frozenset({
         IterationStatus.AGENT_FINISHED,
         IterationStatus.FAILED,
         IterationStatus.EXTERNAL_BLOCKED,
         IterationStatus.ABORTED,
+        IterationStatus.STALLED,           # task 3.5：dev 主动刹车无产出 → 放弃终态
+        IterationStatus.ORPHAN_DELETED,    # task 3.5：无 commit 孤儿清理
+        IterationStatus.SANDBOX_BLOCKED,   # task 3.5 前向（task 5.2）：沙箱运行时阻断
     }),
     IterationStatus.AGENT_FINISHED: frozenset({
         IterationStatus.TEST_BLOCKED,
         IterationStatus.VERIFYING,
         IterationStatus.FAILED,
+        IterationStatus.STALLED,           # task 3.5：agent 跑完但无 commit → 放弃
+        IterationStatus.ORPHAN_DELETED,    # task 3.5：无产出孤儿清理
     }),
     IterationStatus.TEST_BLOCKED: frozenset({
         IterationStatus.RUNNING,      # retry：补/修测试后重投
@@ -88,8 +104,14 @@ _TRANSITIONS: dict[IterationStatus, frozenset[IterationStatus]] = {
         IterationStatus.REVISE,
         IterationStatus.EXTERNAL_BLOCKED,
         IterationStatus.FAILED,
+        IterationStatus.STALLED,           # task 3.5：verify 闭环中连续无进展 → 放弃
+        IterationStatus.BLOCKED_EVIDENCE,  # task 3.5 前向（task 4.2/4.3）：证据无法持久化/校验
     }),
-    IterationStatus.REVISE: frozenset({IterationStatus.RUNNING}),
+    IterationStatus.REVISE: frozenset({
+        IterationStatus.RUNNING,           # 增量重投（反馈进 PRD/artifact，next iteration）
+        IterationStatus.STALLED,           # task 3.5：连续 revise 无写类进展 → 重试耗尽放弃
+        IterationStatus.ORPHAN_DELETED,    # task 3.5：revise 后无 commit 孤儿清理
+    }),
     IterationStatus.EXTERNAL_BLOCKED: frozenset({
         IterationStatus.RUNNING,      # reconciled（远程态变可决断）→ 重投
         IterationStatus.ABORTED,
@@ -99,11 +121,16 @@ _TRANSITIONS: dict[IterationStatus, frozenset[IterationStatus]] = {
         IterationStatus.PUBLISHED,
         IterationStatus.EXTERNAL_BLOCKED,   # reconcile_pr 见 UNKNOWN → 阻断不创 PR
         IterationStatus.FAILED,
+        IterationStatus.BLOCKED_EVIDENCE,   # task 3.5 前向（task 4.4）：发布前证据 reconcile 无法持久化/校验
     }),
     # 终态：空集（无出向迁移）
     IterationStatus.PUBLISHED: frozenset(),
     IterationStatus.ABORTED: frozenset(),
     IterationStatus.FAILED: frozenset(),
+    IterationStatus.STALLED: frozenset(),
+    IterationStatus.ORPHAN_DELETED: frozenset(),
+    IterationStatus.BLOCKED_EVIDENCE: frozenset(),
+    IterationStatus.SANDBOX_BLOCKED: frozenset(),
     IterationStatus.STATE_CORRUPT: frozenset(),
 }
 
@@ -305,6 +332,10 @@ _EVENT_STATUS_MAP: dict[str, IterationStatus] = {
     "published": IterationStatus.PUBLISHED,
     "aborted": IterationStatus.ABORTED,
     "failed": IterationStatus.FAILED,
+    "stalled": IterationStatus.STALLED,                  # task 3.5：dev loop 主动刹车终态
+    "orphan_deleted": IterationStatus.ORPHAN_DELETED,    # task 3.5：无 commit 孤儿清理终态
+    "blocked_evidence": IterationStatus.BLOCKED_EVIDENCE,  # task 3.5 前向（task 4.2/4.3）
+    "sandbox_blocked": IterationStatus.SANDBOX_BLOCKED,    # task 3.5 前向（task 5.2）
     "state_corrupt": IterationStatus.STATE_CORRUPT,
 }
 

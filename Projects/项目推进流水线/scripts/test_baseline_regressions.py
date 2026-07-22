@@ -110,10 +110,14 @@ def test_truncated_incomplete_tail_remains_tolerated(tmp_path):
 # ════════════════════════════════════════════════════════════════════════════
 # every previously unmapped terminal state（first-cut 不发 journal 终态事件）
 # ════════════════════════════════════════════════════════════════════════════
-@pytest.mark.parametrize("status", ["stalled", "planned", "pr_closed", "pr_merged", "orphan_deleted"])
+@pytest.mark.parametrize("status", ["planned", "pr_closed", "pr_merged", "sandbox_blocked"])
 def test_unmapped_terminal_emits_no_journal_event(tmp_path, status):
-    """stalled/planned/pr_<other>/orphan_deleted 当前是有意 first-cut 未映射——不发 journal 终态事件。
-    锁定当前契约；task 3.5「emit and reduce all terminal classes」落地后这些预期会变更。"""
+    """planned/pr_<other>/sandbox_blocked 当前**不经 ``_sj_terminal`` emit** 终态事件：
+      - planned：parity 靠 dispatch_one 不 emit running（task 3.5 移动 running emit 到 skip-dev 之后），
+        reduce [planned] 落 PLANNED == legacy planned；``_sj_terminal`` 不额外 emit（planned 已由 dispatch entry emit）。
+      - pr_closed/pr_merged：reconcile 罕见态，暂未映射（留驱动阶段）。
+      - sandbox_blocked：task 5.2 才引入的 status，前向占位暂不 emit。
+    task 3.5 已让 stalled/orphan_deleted 经 ``_sj_terminal`` emit（见 test_shadow_dispatch），故移出此列表。"""
     # Arrange
     sj = RT.ShadowJournal(tmp_path / "u.jsonl", "run_1", _stamp, enabled=True)
 

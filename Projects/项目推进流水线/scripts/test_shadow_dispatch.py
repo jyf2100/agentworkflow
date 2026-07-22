@@ -62,10 +62,29 @@ def test_sj_terminal_blocked_and_fail_statuses(tmp_path):
 
 
 def test_sj_terminal_unmapped_status_emits_nothing(tmp_path):
-    """orphan_deleted/stalled 等 first-cut 未映射 status → 不 emit（shadow gap，留 driven 阶段 task 8.6）。"""
+    """sandbox_blocked/blocked_evidence 等 task 4/5 才引入的 status → 暂不 emit（前向占位，留各自 task）。
+    task 3.5 已覆盖 stalled/orphan_deleted emit（见下），故用真正未引入的 status 验证 no-op 契约。"""
+    sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
+    run_daily._sj_terminal(sj, {"status": "sandbox_blocked"}, "iter_1", "prd_1")
+    assert not (tmp_path / "j.jsonl").exists()   # 未 emit → 文件未创建
+
+
+def test_sj_terminal_stalled_emits_stalled_event(tmp_path):
+    """task 3.5：stalled（dev loop 主动刹车无 commit，连续 N 轮无写类进展）→ emit ``stalled`` 终态事件。
+    spec terminal class（scenario 19）：与 compat ``legacy_status`` + reducer STALLED 三端对齐保 parity。"""
+    sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
+    run_daily._sj_terminal(sj, {"status": "stalled"}, "iter_1", "prd_1")
+    evs = J.read_events(tmp_path / "j.jsonl")
+    assert len(evs) == 1 and evs[0].event_type == "stalled"
+
+
+def test_sj_terminal_orphan_deleted_emits_orphan_event(tmp_path):
+    """task 3.5：orphan_deleted（dev 无 commit 孤儿分支清理）→ emit ``orphan_deleted`` 终态事件。
+    spec terminal class（scenario 19）：与 compat ``legacy_status`` + reducer ORPHAN_DELETED 三端对齐保 parity。"""
     sj = RT.ShadowJournal(tmp_path / "j.jsonl", "run_1", _stamp, enabled=True)
     run_daily._sj_terminal(sj, {"status": "orphan_deleted"}, "iter_1", "prd_1")
-    assert not (tmp_path / "j.jsonl").exists()   # 未 emit → 文件未创建
+    evs = J.read_events(tmp_path / "j.jsonl")
+    assert len(evs) == 1 and evs[0].event_type == "orphan_deleted"
 
 
 def test_sj_terminal_noop_when_flag_off(tmp_path):

@@ -1197,16 +1197,18 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# dispatch record status → journal 终态 event（task 3.2）。
-# 映射对齐 ``compat_readers.legacy_status`` 保 shadow parity（task 3.4）：pr_open/interrupted_pr 叠 verify.pass
-# （绿→published，红→revise）；blocked→external/test_blocked；fail→failed；skip→aborted。
-# 未映射 status（orphan_deleted/stalled/planned smoke）shadow first cut 暂不 emit 终态——占真 run 比例小，
-# 且不消耗 dev 资源；完整覆盖留 task 8.6 driven 阶段。
+# dispatch record status → journal 终态 event（task 3.2 + 3.5）。
+# 映射对齐 ``compat_readers.legacy_status`` 保 shadow parity（task 3.4 / spec scenario 19）：pr_open/interrupted_pr
+# 叠 verify.pass（绿→published，红→revise）；blocked→external/test_blocked；fail→failed；skip→aborted；
+# stalled/orphan_deleted→同名终态（task 3.5：dev loop 主动刹车 / 无 commit 孤儿清理，独立 terminal class）。
+# 仍未映射：planned smoke（task 3.5 阶段 2 处理 running emit 位置）+ sandbox_blocked/blocked_evidence（task 4/5 引入）。
 _SJ_TERMINAL_MAP: dict[str, str] = {
     "skip": "aborted",
     "blocked_external_state": "external_blocked",
     "blocked_test_gate": "test_blocked",
     "fail": "failed",
+    "stalled": "stalled",
+    "orphan_deleted": "orphan_deleted",
 }
 
 
@@ -1275,7 +1277,9 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     if _coord.prd_digest is not None:    # task 3.1：PRD 可读→initial event 锚定内容版本（不可读省略）
         _planned_payload["prd_digest"] = _coord.prd_digest
     _sj.emit("planned", _iter, _prd, payload=_planned_payload)
-    _sj.emit("running", _iter, _prd, payload={"round": 1})
+    # task 3.5：running emit 推迟到「确认投递 dev loop」后（见下方 skip-dev 检查之后）——admission 阶段终态
+    #   与 skip-dev smoke 均未投递，不应 RUNNING；否则 planned smoke reduce RUNNING ≠ legacy PLANNED
+    #   （spec scenario 19 terminal-class parity 断裂）。admission 终态从 PLANNED 迁移（含 EXTERNAL_BLOCKED）。
 
     # ── 准入 1：profile 门
     if not (prof.get("admission") and prof.get("dev_agent_ready") and prof.get("type") == "code"):
@@ -1319,6 +1323,9 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                    skip_reason=f"--dispatch-skip-dev smoke（已过准入，in-flight {inflight}，未触发 dev loop）")
         log(f"  📋 {slug}: 将投递（已过准入，in-flight {inflight}）— skip-dev 未触发")
         return rec
+
+    # task 3.5：确认投递 dev loop → emit running（round 1）。上方 skip-dev smoke 已 return，不触此处 → 不 RUNNING。
+    _sj.emit("running", _iter, _prd, payload={"round": 1})
 
     # ── 投递：detached worktree on main → 触发控制面 dev-agent.py（ADR-0006 vault-only 执行器）
     if not log_file.exists():

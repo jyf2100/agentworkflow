@@ -40,6 +40,10 @@ _CHAINS = {
     "blocked_external_state":    ["planned", "running", "external_blocked"],
     "blocked_test_gate":         ["planned", "running", "agent_finished", "test_blocked"],
     "skip":                      ["planned", "aborted"],
+    "planned":                   ["planned"],   # task 3.5：skip-dev smoke（过准入未投递，无 running→reduce PLANNED）
+    # task 3.5：dispatch 旁路终态类（stalled/orphan_deleted）——dev loop 主动刹车 / 无 commit 孤儿清理
+    "stalled":                   ["planned", "running", "agent_finished", "verifying", "revise", "stalled"],
+    "orphan_deleted":            ["planned", "running", "orphan_deleted"],
 }
 
 
@@ -98,6 +102,9 @@ def test_shadow_parity_each_status_individually(tmp_path):
         ("blocked_external_state", None, L.IterationStatus.EXTERNAL_BLOCKED),
         ("blocked_test_gate", None, L.IterationStatus.TEST_BLOCKED),
         ("skip", None, L.IterationStatus.ABORTED),
+        ("planned", None, L.IterationStatus.PLANNED),
+        ("stalled", None, L.IterationStatus.STALLED),
+        ("orphan_deleted", None, L.IterationStatus.ORPHAN_DELETED),
     ]
     for idx, (status, verify, expected) in enumerate(cases):
         record = {"project": "x", "slug": "s", "status": status}

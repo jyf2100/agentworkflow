@@ -170,12 +170,14 @@ def test_iteration_state_fields_and_frozen():
 
 
 def test_iteration_status_enum_complete():
-    """IterationStatus 覆盖 design 决策#2 的 11 个迭代态 + state_corrupt（损坏终态）。
+    """IterationStatus 覆盖 design 决策#2 的 11 个迭代态 + state_corrupt（损坏终态）+ stalled/orphan_deleted。
 
-    ``state_corrupt`` 是 journal 中部损坏时 reducer 落定的保守终态（spec「fail closed on malformed middle」）。"""
+    ``state_corrupt`` 是 journal 中部损坏时 reducer 落定的保守终态（spec「fail closed on malformed middle」）。
+    task 3.5：``stalled``/``orphan_deleted`` 是 dispatch 旁路放弃终态（spec scenario 19 terminal class）。"""
     expected = {"planned", "running", "agent_finished", "test_blocked", "verifying",
                 "revise", "external_blocked", "publish_ready", "published",
-                "aborted", "failed", "state_corrupt"}
+                "aborted", "failed", "stalled", "orphan_deleted",
+                "blocked_evidence", "sandbox_blocked", "state_corrupt"}
     actual = {s.value for s in L.IterationStatus}
     assert actual == expected, f"IterationStatus 枚举值集合不符: 缺 {expected - actual}, 多 {actual - expected}"
 
@@ -245,9 +247,14 @@ def test_validate_transition_rejects_terminal_outgoing():
 
 
 def test_is_terminal():
-    """is_terminal 锁定 4 个终态；运行中状态（planned/running/verifying 等）非终态。"""
+    """is_terminal 锁定终态集合；运行中状态（planned/running/verifying 等）非终态。
+
+    task 3.5：stalled/orphan_deleted 是 dispatch 旁路放弃终态（与 published/aborted/failed/state_corrupt
+    并列），无出向迁移不可复活。"""
     for s in [L.IterationStatus.PUBLISHED, L.IterationStatus.ABORTED,
-              L.IterationStatus.FAILED, L.IterationStatus.STATE_CORRUPT]:
+              L.IterationStatus.FAILED, L.IterationStatus.STATE_CORRUPT,
+              L.IterationStatus.STALLED, L.IterationStatus.ORPHAN_DELETED,
+              L.IterationStatus.BLOCKED_EVIDENCE, L.IterationStatus.SANDBOX_BLOCKED]:
         assert L.is_terminal(s) is True, f"{s} 应为终态"
     for s in [L.IterationStatus.PLANNED, L.IterationStatus.RUNNING,
               L.IterationStatus.VERIFYING, L.IterationStatus.PUBLISH_READY]:
@@ -274,6 +281,51 @@ def test_reduce_legal_pipeline_reaches_published():
     assert state.status is L.IterationStatus.PUBLISHED
     assert L.is_terminal(state.status)
     assert {e.event_id for e in events} <= state.applied_event_ids
+
+
+def test_reduce_stalled_chain_reaches_stalled_terminal():
+    """task 3.5：dev loop 主动刹车（验证红后连续 N 轮无写类进展 exit 12）→
+    [planned,running,agent_finished,verifying,revise,stalled] reduce 到 STALLED 终态。
+
+    spec terminal class（scenario 19）：REVISE→STALLED 是合法「重试耗尽放弃」迁移——dev 反复 revise
+    无进展后 reconcile 删分支，iteration 落定 STALLED（独立桶，非 FAILED）。"""
+    events = [
+        _ev("planned", "e0"), _ev("running", "e1"), _ev("agent_finished", "e2"),
+        _ev("verifying", "e3"), _ev("revise", "e4"), _ev("stalled", "e5"),
+    ]
+    state = L.reduce(events, initial=_initial())
+    assert state.status is L.IterationStatus.STALLED
+    assert L.is_terminal(state.status)
+
+
+def test_reduce_orphan_deleted_chain_reaches_orphan_terminal():
+    """task 3.5：dev 跑过但无 commit 产出 → [planned,running,orphan_deleted] reduce 到 ORPHAN_DELETED 终态。
+
+    spec terminal class（scenario 19）：RUNNING→ORPHAN_DELETED 是合法「无产出孤儿清理」迁移——
+    reconcile 删孤儿分支，iteration 落定 ORPHAN_DELETED（独立桶，非 ABORTED）。"""
+    events = [_ev("planned", "e0"), _ev("running", "e1"), _ev("orphan_deleted", "e2")]
+    state = L.reduce(events, initial=_initial())
+    assert state.status is L.IterationStatus.ORPHAN_DELETED
+    assert L.is_terminal(state.status)
+
+
+def test_reduce_blocked_evidence_chain_reaches_terminal():
+    """task 3.5 前向（dispatch status 由 task 4.2/4.3 引入）：verify 时证据无法持久化/校验 →
+    BLOCKED_EVIDENCE 终态。reducer 前向认识此 terminal class，task 4.2 引入 dispatch emit 时 reduce 即就绪。"""
+    events = [_ev("planned", "e0"), _ev("running", "e1"), _ev("agent_finished", "e2"),
+              _ev("verifying", "e3"), _ev("blocked_evidence", "e4")]
+    state = L.reduce(events, initial=_initial())
+    assert state.status is L.IterationStatus.BLOCKED_EVIDENCE
+    assert L.is_terminal(state.status)
+
+
+def test_reduce_sandbox_blocked_chain_reaches_terminal():
+    """task 3.5 前向（dispatch status 由 task 5.2 引入）：沙箱策略安装/校验失败 → SANDBOX_BLOCKED 终态。
+    reducer 前向认识此 terminal class，task 5.2 引入 dispatch emit 时 reduce 即就绪。"""
+    events = [_ev("planned", "e0"), _ev("sandbox_blocked", "e1")]
+    state = L.reduce(events, initial=_initial())
+    assert state.status is L.IterationStatus.SANDBOX_BLOCKED
+    assert L.is_terminal(state.status)
 
 
 def test_reduce_rejects_duplicate_event_id():

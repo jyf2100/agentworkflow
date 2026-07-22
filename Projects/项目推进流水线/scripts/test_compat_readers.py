@@ -87,6 +87,22 @@ def test_legacy_status_planned_is_planned():
     assert C.legacy_status(_rec("planned")) is S.PLANNED
 
 
+def test_legacy_status_stalled_is_stalled():
+    """task 3.5：stalled（dev loop 主动刹车，验证红后连续 N 轮无写类进展）→ STALLED 终态。
+
+    独立 terminal class（spec scenario 19「Real shadow parity」列示）——区别于 FAILED（异常），
+    stalled 是「主动放弃，分支已清理」的语义，shadow parity 须作独立桶匹配。"""
+    assert C.legacy_status(_rec("stalled")) is S.STALLED
+
+
+def test_legacy_status_orphan_deleted_is_orphan():
+    """task 3.5：orphan_deleted（无 commit 孤儿分支清理）→ ORPHAN_DELETED 终态。
+
+    独立 terminal class（spec scenario 19）——区别于 ABORTED（准入跳过），orphan 是「dev 跑过但
+    无产出、孤儿分支已删」的语义，shadow parity 须作独立桶匹配。"""
+    assert C.legacy_status(_rec("orphan_deleted")) is S.ORPHAN_DELETED
+
+
 def test_legacy_status_unknown_is_state_corrupt_fail_closed():
     """**fail-closed**：未知/无法识别的历史 status → STATE_CORRUPT。
 

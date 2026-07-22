@@ -275,6 +275,33 @@ def test_reconcile_preserves_on_commit_lookup_unknown(monkeypatch):
 
 
 # ─── dispatch_one 闭环循环（mock 驱动）──────────────────────────────
+# ─── task 3.5：planned smoke（--dispatch-skip-dev）parity——不 emit running，reduce 落 PLANNED ──
+def test_dispatch_skip_dev_smoke_emits_planned_no_running(tmp_path, monkeypatch):
+    """task 3.5 + spec scenario 19：--dispatch-skip-dev 零成本 smoke（过准入但不触发 dev loop）→
+    journal 只 emit ``planned``（**不** emit running——dev loop 未起跑），reduce 落定 PLANNED == legacy planned。
+
+    planned smoke 是 spec terminal class：它「已过准入、未投递」，IterationStatus 必须 PLANNED（非 RUNNING）。
+    running event 表示「开始投递 dev loop」——smoke 不投递，故不应 emit；否则 reducer 归约 RUNNING，
+    与 compat ``legacy_status(planned)=PLANNED`` 断裂 → shadow parity 失败（scenario 19）。"""
+    _setup(tmp_path, monkeypatch)
+    _admit(monkeypatch)
+    repo = _repo(tmp_path)
+    prof = _prof(repo)
+    prof["loop"] = {"journal_shadow": True}   # journal 真写（捕获 planned/running emit）
+    args = SimpleNamespace(force=False, dispatch_skip_dev=True, dispatch_limit=None, max_concurrent=1)
+    # Act
+    rec = run_daily.dispatch_one(_entry(), prof, "20260718", args)
+    # Assert — smoke 终态 planned + journal 无 running（reduce→PLANNED = legacy planned）
+    assert rec["status"] == "planned"
+    import journal as J
+    journals = list((tmp_path / "state").rglob("*.journal.jsonl"))
+    assert journals, "journal_shadow on → planned event 应落盘"
+    evs = J.read_events(journals[0])
+    types = [e.event_type for e in evs]
+    assert "planned" in types
+    assert "running" not in types, f"skip-dev smoke 不应 emit running（dev loop 未起跑）: {types}"
+
+
 def test_dispatch_green_round1(tmp_path, monkeypatch):
     # Arrange：dev r1 出分支+测试绿+pa-verify 判绿
     _setup(tmp_path, monkeypatch)
