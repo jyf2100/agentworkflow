@@ -489,7 +489,47 @@ def real_sdk_canary(workdir: Path) -> dict:
 
     result_msg = asyncio.run(_run())
 
-    # 我们的 callback 写的 hook journal（HookAdapter → HookJournal）
+    # r2 P1-1：subagent 场景——第二次真实 query 尝试触发 SubagentStart/Stop（Task 工具 + agents）。
+    # proxy glm-5.2 headless 是否支持 Task/agents/SubagentStart hook 不确定 → try，未达成诚实 blocked。
+    subagent_query_error: dict = {"msg": None}
+    sub_result_msg = None
+
+    async def _run_subagent():
+        agents = None
+        try:
+            agent_def_cls = getattr(CAS, "AgentDefinition", None)
+            if agent_def_cls is not None:
+                agents = {"pa-verify": agent_def_cls(
+                    description="verify diff", prompt="Read README.md then stop.", tools=["Read"])}
+        except Exception:
+            agents = None
+        sub_options = CAS.ClaudeAgentOptions(
+            cwd=str(workdir),
+            permission_mode="bypassPermissions",
+            tools=["Read", "Bash", "Task"],
+            max_turns=4,
+            hooks=sdk_hooks,
+            agents=agents,
+        )
+        sub_prompt = ("Use the Task tool to delegate a sub-agent named 'pa-verify' to read README.md, "
+                      "then stop and reply: SUBAGENT DONE")
+        res = None
+        try:
+            async for msg in CAS.query(prompt=sub_prompt, options=sub_options):
+                if isinstance(msg, getattr(CAS, "HookEventMessage", ())):
+                    hen = getattr(msg, "hook_event_name", None)
+                    if hen is None and hasattr(msg, "model_dump"):
+                        hen = msg.model_dump().get("hook_event_name")
+                    sdk_hook_names.append(hen)
+                if isinstance(msg, CAS.ResultMessage):
+                    res = msg
+        except Exception as e:
+            subagent_query_error["msg"] = str(e)[:200]
+        return res
+
+    sub_result_msg = asyncio.run(_run_subagent())
+
+    # 我们的 callback 写的 hook journal（HookAdapter → HookJournal；base + subagent query 累积）
     hook_path = Path(coord.journal.path).with_suffix(".hooks.jsonl")
     our_events: list[dict] = []
     if hook_path.exists():
@@ -503,6 +543,38 @@ def real_sdk_canary(workdir: Path) -> dict:
     lifecycle = {"PreToolUse", "PostToolUse", "Stop", "PreCompact", "SubagentStart", "SubagentStop"}
     our_types = sorted({e.get("hook_event_name") or e.get("event_type") for e in our_events})
     sdk_types = sorted({h for h in sdk_hook_names if h})
+    real_triggered = set(our_types) & lifecycle
+
+    # r2 P1-1：per-scenario 真实触发矩阵（spec 7 path + test_red 基线）。每场景映射其核心 lifecycle event；
+    # base/subagent 真实 query 触发 → real_proven；不可单次 headless query 触发（PreCompact 需逼近上下文
+    # 上限）→ 诚实 blocked，不伪造 pass。adapter gate 业务逻辑（on_stop/on_pre_compact/on_subagent_start）
+    # 由 run_sdk_hook_canary fixture 覆盖，本矩阵只证明「真实 SDK 是否触发对应 lifecycle callback」。
+    scenario_events = {
+        "no_test": "Stop",            # 无 evidence gate → Stop deny
+        "test_red": "PostToolUse",    # Bash pytest exit1 + Stop deny
+        "stale_test": "PostToolUse",  # 绿后候选写 mark_stale + Stop deny
+        "test_green": "PostToolUse",  # Bash pytest exit0 + Stop allow
+        "semantic_revise": "Stop",    # dual-gate inner 绿 outer 语义红（逻辑判定，event=Stop）
+        "compaction": "PreCompact",   # auto-compact + snapshot 持久化
+        "subagent": "SubagentStart",  # SubagentStart 记归属 + publication DENY
+        "hook_failure": "PreCompact", # snapshot_writer 抛异常 → fail-closed block
+    }
+    per_scenario: dict[str, dict] = {}
+    for sc, ev in scenario_events.items():
+        if ev in real_triggered:
+            per_scenario[sc] = {"expected_event": ev, "real_proven": True,
+                                "source": "subagent query" if ev in {"SubagentStart", "SubagentStop"} else "base query"}
+        else:
+            reason = {
+                "PreCompact": "PreCompact 需逼近上下文上限触发 auto-compact，单次 headless query 不触发；"
+                              "adapter on_pre_compact 逻辑由 run_sdk_hook_canary fixture 覆盖",
+                "SubagentStart": "subagent query 未触发 SubagentStart（proxy/Task 工具支持不确定）；"
+                                 "adapter on_subagent_start 逻辑由 run_sdk_hook_canary fixture 覆盖",
+            }.get(ev, f"{ev} 未在真实 query 中触发")
+            per_scenario[sc] = {"expected_event": ev, "real_proven": False, "blocked_reason": reason}
+    proven_scenarios = sorted(sc for sc, v in per_scenario.items() if v["real_proven"])
+    blocked_scenarios = sorted(sc for sc, v in per_scenario.items() if not v["real_proven"])
+
     return {
         "drill": "7.2 real SDK hook canary",
         "real_sdk_query": True,
@@ -511,14 +583,20 @@ def real_sdk_canary(workdir: Path) -> dict:
         "num_turns": getattr(result_msg, "num_turns", None),
         "cost_usd": getattr(result_msg, "total_cost_usd", None),
         "query_error": query_error["msg"],
+        "subagent_result_received": sub_result_msg is not None,
+        "subagent_query_error": subagent_query_error["msg"],
         "hooks_registered": list(sdk_hooks.keys()) if sdk_hooks else [],
         "callback_invocations": callback_invocations,
         "callback_errors": callback_errors,
         "sdk_lifecycle_event_types_seen": sdk_types,
         "our_callback_hook_events_count": len(our_events),
         "our_callback_hook_types": our_types,
-        "lifecycle_hooks_triggered_by_callback": sorted(set(our_types) & lifecycle),
-        "lifecycle_callback_proven": len(set(our_types) & lifecycle) > 0,
+        "lifecycle_hooks_triggered_by_callback": sorted(real_triggered),
+        "lifecycle_callback_proven": len(real_triggered) > 0,
+        "per_scenario_real_triggers": per_scenario,
+        "proven_scenarios": proven_scenarios,
+        "blocked_scenarios": blocked_scenarios,
+        "real_triggered_event_types": sorted(real_triggered),
         "our_hook_journal_path": str(hook_path),
     }
 
