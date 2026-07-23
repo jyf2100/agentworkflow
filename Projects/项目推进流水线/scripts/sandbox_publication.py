@@ -33,15 +33,16 @@ class CredentialPolicy(str, Enum):
     MINIMAL_INJECT = "minimal_inject"
 
 
-# publication 种类（对齐 ids.idempotency_id 的 commit/push/pr + 扩展 smtp/cloud）
+# publication 种类（对齐 ids.idempotency_id 的 commit/push/pr + 扩展 smtp/cloud/model）
 PUB_GIT_PUSH = "git_push"
 PUB_PR_CREATE = "pr_create"
 PUB_SMTP_SEND = "smtp_send"
 PUB_CLOUD_DEPLOY = "cloud_deploy"
+PUB_MODEL_DEPLOY = "model_deploy"        # task 5.4：模型发布（registry/hub 推送，长期凭据留 host）
 
-# 需要宿主长期凭据的 publication kind（sandbox 内不得直接执行）
+# 需要宿主长期凭据的 publication kind（sandbox 内不得直接执行）——task 5.4 含 model publication
 HOST_CREDENTIAL_KINDS: frozenset[str] = frozenset({
-    PUB_GIT_PUSH, PUB_PR_CREATE, PUB_SMTP_SEND, PUB_CLOUD_DEPLOY,
+    PUB_GIT_PUSH, PUB_PR_CREATE, PUB_SMTP_SEND, PUB_CLOUD_DEPLOY, PUB_MODEL_DEPLOY,
 })
 
 
@@ -124,3 +125,61 @@ def sandbox_credential_allowed(*, policy: CredentialPolicy,
     if kind in HOST_CREDENTIAL_KINDS:
         return False   # 长期凭据无论何种 policy 都不进 sandbox（design L76 硬约束）
     return policy is CredentialPolicy.MINIMAL_INJECT
+
+
+# ─── task 5.4：长期凭据留 host + prove absent from sandbox env & artifacts ───────────────────
+class CredentialLeakError(Exception):
+    """task 5.4 prove-absent 断言失败：长期凭据泄漏到 sandbox env / artifact 文本。
+
+    fail-loud：绝不静默放过泄漏（spec「prove they are absent」——absent 不成立即报错阻断）。
+    """
+
+
+# 长期凭据 env var 名（GitHub/SMTP/cloud/model 四域，task 5.4 留 host 的目标）。
+# sandbox env 准备时经 ``sanitize_sandbox_env`` 全部移除——sandbox 零长期凭据（prove absent 的基础）。
+CREDENTIAL_ENV_VARS: frozenset[str] = frozenset({
+    # GitHub PAT / Actions
+    "GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_API_TOKEN",
+    # SMTP / 邮件
+    "SMTP_PASSWORD", "SMTP_PASS", "MAIL_PASSWORD",
+    # cloud（AWS/Azure/GCP 长期 secret）
+    "AWS_SECRET_ACCESS_KEY", "AZURE_CLIENT_SECRET", "AZURE_TENANT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS", "GCP_SERVICE_ACCOUNT_KEY",
+    # model publication（registry/hub 推送长期凭据）
+    "MODEL_API_KEY", "MODEL_REGISTRY_TOKEN", "HF_TOKEN",
+})
+
+
+def sanitize_sandbox_env(env: dict) -> tuple[dict, tuple[str, ...]]:
+    """从 sandbox env 移除长期凭据 env var（task 5.4：长期凭据留 host，sandbox 零长期凭据）。
+
+    Args:
+        env: 拟注入 sandbox 的 env dict（含宿主 env 的拷贝）。
+    Returns:
+        ``(sanitized_env, removed)``：净化 env（无 CREDENTIAL_ENV_VARS）+ 被移除 var 名元组（审计）。
+        长期凭据留控制面 host，sandbox 内 agent 无法 env 读到长期凭据。
+    """
+    removed = tuple(sorted(k for k in env if k in CREDENTIAL_ENV_VARS))
+    sanitized = {k: v for k, v in env.items() if k not in CREDENTIAL_ENV_VARS}
+    return sanitized, removed
+
+
+def assert_credentials_absent(*, env: dict | None = None,
+                              text: str | None = None) -> None:
+    """prove：断言 sandbox env / artifact 文本**不含**长期凭据（task 5.4「prove they are absent」）。
+
+    两个维度独立检查，含任一即抛 ``CredentialLeakError``（fail-loud）：
+      * ``env``：检查无 CREDENTIAL_ENV_VARS 名（长期凭据 env var 不得注入 sandbox）；
+      * ``text``：复用 ``artifact_store.redact_secrets`` 判定——消毒后文本与原文相同 = 无凭据值模式
+        （artifact 落盘前消毒，prove absent from artifacts）。
+    """
+    if env is not None:
+        leaked = sorted(k for k in env if k in CREDENTIAL_ENV_VARS)
+        if leaked:
+            raise CredentialLeakError(
+                f"long-lived credential env var present in sandbox environment: {leaked}")
+    if text is not None:
+        from artifact_store import redact_secrets   # 延迟 import 避免循环
+        if redact_secrets(text) != text:
+            raise CredentialLeakError(
+                "credential value pattern present in text (artifact not sanitized)")
