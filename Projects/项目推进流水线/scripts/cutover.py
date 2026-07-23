@@ -300,6 +300,9 @@ class SdkHookCanaryEvidence:
     stop_gates: dict[str, str]       # scenario → gate
     paths_covered: tuple[str, ...]   # spec 7 path（kebab）
     summary: str
+    real_query_proven: bool = True   # r2 P0-5：真实 SDK query 是否证明 lifecycle callback 真实触发
+                                     # （run_sdk_hook_canary fixture 默认 True；real_cutover_suite 从 real_sdk_canary
+                                     # 真实 query 结果填 → sdk_canary 通过需 adapter gate AND 真实 query proven）
 
 
 # canary 跑序（spec 7 path 对应 scenario + test_red 基线，按 GATE 严重度递减便于归档阅读）
@@ -818,7 +821,9 @@ def _shadow_parity_outcome(ev: "ShadowParityEvidence") -> DrillOutcome:
 
 
 def _sdk_canary_outcome(ev: "SdkHookCanaryEvidence") -> DrillOutcome:
-    return DrillOutcome("sdk_canary", _lifecycle_canary_passed(ev), ev.summary)
+    # r2 P0-5：sdk_canary 通过 = adapter gate spec 7 场景符合预期 AND 真实 SDK query 证明 lifecycle callback 触发
+    passed = _lifecycle_canary_passed(ev) and ev.real_query_proven
+    return DrillOutcome("sdk_canary", passed, ev.summary)
 
 
 def _crash_outcome(ev: "CrashReconciliationEvidence") -> DrillOutcome:

@@ -580,6 +580,8 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
     allowlist = real_allowlist_rollout(workdir, gh_repo=gh_repo)   # 真实 dispatch parity + 三重 gate
     crash = real_crash_restart_drill(workdir, gh_repo=gh_repo)     # 真实 crash/restart + ls-remote 对账
     docker = real_docker_canary(workdir)                           # 真实 Docker 容器隔离（凭据/egress/resource）
+    sdk_real = real_sdk_canary(workdir)                            # r2 P0-5：真实 SDK query（证明 lifecycle callback 真实触发，非 fixture）
+    sdk_gate = CT.run_sdk_hook_canary()                            # adapter gate 业务逻辑判 spec 7 场景（on_stop/evaluate_gate 真实代码路径，非 fixture 假数据）
 
     parity_passed = bool(allowlist.get("parity_passed"))
     crash_ok = bool(crash.get("exactly_once") and crash.get("safe_to_retry"))
@@ -621,8 +623,16 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
                 mismatches=() if parity_passed else ("dispatch/journal terminal mismatch",)),
             dry_run_terminal=allowlist.get("gate_all_pass_dispatch_journal_terminal_state", "planned"),
             dry_run_run_id="real_dispatch_skip_dev"),
-        # sdk_canary：真实 gate 策略（spec 7 path，run_lifecycle_drill 真实 gate 逻辑）；real_sdk_canary 机制证据见 7.2
-        sdk_canary=lambda: CT.run_sdk_hook_canary(),
+        # sdk_canary：r2 P0-5——真实 SDK query（real_sdk_canary 调真实 claude_agent_sdk.query 证明 lifecycle
+        # callback 真实触发）+ adapter gate 业务逻辑（run_sdk_hook_canary 的 on_stop/evaluate_gate 真实代码
+        # 路径判 spec 7 场景，非 fixture 假数据）。real_query_proven 从真实 query 填 → sdk_canary 通过需
+        # adapter gate AND 真实 query proven。P1-1 每场景真实触发对应 lifecycle event 见 real_sdk_canary 7 场景扩展。
+        sdk_canary=lambda _r=sdk_real, _g=sdk_gate: CT.SdkHookCanaryEvidence(
+            scenarios=_g.scenarios, stop_gates=_g.stop_gates, paths_covered=_g.paths_covered,
+            summary=(f"[real SDK query proven={_r.get('lifecycle_callback_proven')}, "
+                     f"types={_r.get('our_callback_hook_types')}, err={_r.get('query_error')}] "
+                     f"+ [adapter-gate 7 scenarios: {_g.summary}]"),
+            real_query_proven=bool(_r.get("lifecycle_callback_proven"))),
         # crash_reconciliation：真实 crash/restart + ls-remote 对账 → 真实 CrashDrillResult（非 results=()）
         crash_reconciliation=lambda _r=_crash_result: CT.CrashReconciliationEvidence(
             results=(_r,), boundaries_run=("publish_ready",),
