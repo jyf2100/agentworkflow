@@ -543,8 +543,19 @@ def real_allowlist_rollout(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
     import journal as J
     import loop_runtime as RT
 
+    import yaml
+    import feature_flags as FF
     project_id = gh_repo
-    allowlist = [project_id]
+    # r2 P1-3：写真实 canary profile（loop 段：单项目开 journal_shadow + journal_driven_dispatch）+
+    # 真实读回（load_profiles 语义：yaml → dict）→ allowlist 从真实 profile name（非字面量 [project_id]）+
+    # resolve_flags 真实解析 profile.loop（flag 链 profile.loop → LoopFlags，非 env 硬编码）。
+    canary_profile_path = workdir / "canary-rollout.profile.yaml"
+    canary_profile = {"name": project_id,
+                      "loop": {"journal_shadow": True, "journal_driven_dispatch": True}}
+    canary_profile_path.write_text(yaml.safe_dump(canary_profile), encoding="utf-8")
+    loaded_profile = yaml.safe_load(canary_profile_path.read_text(encoding="utf-8"))
+    allowlist = [loaded_profile["name"]]
+    profile_flags = FF.resolve_flags(env={}, profile=loaded_profile)
 
     # 1) 真实 shadow parity 证据：复用 7.1 真实 dispatch（journal on/off 决策不变 → parity_passed=True）
     parity = real_dispatch_skip_dev(workdir, gh_repo=gh_repo)
@@ -571,12 +582,12 @@ def real_allowlist_rollout(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
 
     # 4) 三重 gate 全过 → driven（reducer 用真实多事件 journal 驱动到 aborted）
     driven = CT.resolve_dispatch_source(
-        journal_driven_flag=True, project_id=project_id, allowlist=allowlist,
+        journal_driven_flag=profile_flags.journal_driven_dispatch, project_id=project_id, allowlist=allowlist,
         parity_passed=parity_passed, journal_events=reducer_events)
 
     # 附加：三重 gate 全过但 reducer 用真实 dispatch 单事件 journal（planned）——证明真实 dispatch journal 也能进 gate
     driven_dispatch_journal = CT.resolve_dispatch_source(
-        journal_driven_flag=True, project_id=project_id, allowlist=allowlist,
+        journal_driven_flag=profile_flags.journal_driven_dispatch, project_id=project_id, allowlist=allowlist,
         parity_passed=parity_passed, journal_events=real_dispatch_events)
 
     # 5) legacy fallback 3 场景（真实 reason，gate 任一维度不过 → _legacy_fallback）
@@ -591,11 +602,30 @@ def real_allowlist_rollout(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
         allowlist=allowlist, parity_passed=parity_passed,
         journal_events=reducer_events, legacy_records=legacy_records)
 
+    # r2 P1-3：保存一个发布周期的 legacy fallback 记录（真实归档到磁盘，非 in-memory 字面量）
+    legacy_cycle_record = {
+        "cycle": "legacy fallback publication record",
+        "project_id": project_id,
+        "flag_off_fallback": {"driven_by": fb_flag_off.driven_by,
+                              "terminal_state": fb_flag_off.terminal_state,
+                              "reason": fb_flag_off.fallback_reason},
+        "parity_fail_fallback": {"driven_by": fb_parity_fail.driven_by,
+                                 "reason": fb_parity_fail.fallback_reason},
+        "non_allowlist_fallback": {"driven_by": fb_non_allowlist.driven_by,
+                                   "reason": fb_non_allowlist.fallback_reason},
+    }
+    legacy_record_path = workdir / "legacy_fallback_cycle.json"
+    legacy_record_path.write_text(json.dumps(legacy_cycle_record, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
     return {
         "drill": "7.5 real single-project allowlist rollout",
         "project_id": project_id,
         "allowlist": allowlist,
-        "journal_driven_flag": True,    # gate 第一维：profile 开 flag（rollout 单项目）
+        "canary_profile_path": str(canary_profile_path),
+        "profile_loop_resolved": {"journal_shadow": profile_flags.journal_shadow,
+                                  "journal_driven_dispatch": profile_flags.journal_driven_dispatch},
+        "legacy_fallback_cycle_record": str(legacy_record_path),
+        "journal_driven_flag": profile_flags.journal_driven_dispatch,    # gate 第一维：真实 profile.loop（非硬编码 True）
         "parity_passed": parity_passed,
         "parity_evidence_source": "real_dispatch_skip_dev (7.1) journal on/off decision unchanged + reached planned",
         "real_dispatch_journal_events": len(real_dispatch_events),
