@@ -589,6 +589,43 @@ def test_cutover_suite_summary_formats_flags():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Section 7 task 7.6：完整 cutover 套件运行器 + 归档不可变通过证据
+# spec（runtime-cutover-evidence「Quality command passes」）：archive immutable passing evidence
+# before marking the change complete。design 决策#6（archive immutable passing evidence）。
+# ════════════════════════════════════════════════════════════════════════════
+def test_cutover_suite_passes_and_archives_when_all_green(tmp_path):
+    """7 维度全绿 → overall_passed=True + 归档 summary digest（archive immutable evidence）。"""
+    suite = CT.run_cutover_suite(
+        shadow_parity_matched=True, lifecycle_all_pass=True, crash_all_exactly_once=True,
+        recovery_all_intact=True, sandbox_all_clean=True, dispatch_cutover_ok=True,
+        quality_gate_passed=True, artifact_root=str(tmp_path / "suite"))
+    assert suite.overall_passed is True
+    assert suite.archive_digest is not None          # summary 已归档为内容寻址 artifact
+
+
+def test_cutover_suite_fails_without_archive_when_any_dimension_red(tmp_path):
+    """任一维度 red（sandbox）→ overall_passed=False 且不归档（绝不伪装绿归档）。"""
+    suite = CT.run_cutover_suite(
+        shadow_parity_matched=True, lifecycle_all_pass=True, crash_all_exactly_once=True,
+        recovery_all_intact=True, sandbox_all_clean=False, dispatch_cutover_ok=True,
+        quality_gate_passed=True, artifact_root=str(tmp_path / "suite"))
+    assert suite.overall_passed is False
+    assert suite.archive_digest is None              # red 套件不归档
+
+
+def test_cutover_suite_archive_is_content_addressed_and_verifiable(tmp_path):
+    """归档 digest 内容寻址可复现：同 summary → 同 digest（artifact_store 内容寻址语义）。"""
+    root = str(tmp_path / "suite")
+    kwargs = dict(shadow_parity_matched=True, lifecycle_all_pass=True,
+                  crash_all_exactly_once=True, recovery_all_intact=True,
+                  sandbox_all_clean=True, dispatch_cutover_ok=True,
+                  quality_gate_passed=True, artifact_root=root)
+    a = CT.run_cutover_suite(**kwargs)
+    b = CT.run_cutover_suite(**kwargs)
+    assert a.archive_digest == b.archive_digest      # 内容寻址：同 summary → 同 digest
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Section 7 task 7.1：historical fixtures shadow parity + 一个真实 no-write dispatch
 # spec：「Run shadow parity against historical fixtures and one real no-write dispatch,
 # resolving every terminal mismatch.」

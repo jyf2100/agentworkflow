@@ -21,7 +21,7 @@ drill 一律返不可变结果 dataclass（``*_DrillResult``），便于测试�
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -704,6 +704,7 @@ class CutoverSuiteResult:
     dispatch_cutover_ok: bool
     quality_gate_passed: bool
     overall_passed: bool
+    archive_digest: str | None = None       # task 7.6：suite 通过时归档 summary 的内容寻址 digest（None=未归档/red）
 
     @property
     def summary(self) -> str:
@@ -714,3 +715,31 @@ class CutoverSuiteResult:
             f"quality={self.quality_gate_passed}",
         ]
         return "cutover suite: " + ("PASS" if self.overall_passed else "FAIL") + " (" + ", ".join(flags) + ")"
+
+
+def run_cutover_suite(*, shadow_parity_matched, lifecycle_all_pass, crash_all_exactly_once,
+                      recovery_all_intact, sandbox_all_clean, dispatch_cutover_ok,
+                      quality_gate_passed, artifact_root) -> CutoverSuiteResult:
+    """task 7.6：完整 cutover 套件运行器——7 维度全绿才 overall_passed；通过则归档不可变 summary 证据。
+
+    spec（runtime-cutover-evidence「Quality command passes」+ design 决策#6 archive immutable passing
+    evidence）：marking the change complete 前跑完整 quality/sandbox/recovery/canary 套件，全绿且证据
+    归档。任一维度 red → ``overall_passed=False`` 且**不归档**（绝不把 red 套件伪装成绿归档）。
+
+    单一职责：调用方从各 drill Result（run_shadow_parity_evidence / run_sdk_hook_canary /
+    run_crash_reconciliation_evidence / run_recovery_drill / run_sandbox_drill /
+    run_dispatch_cutover_drill / run_quality_gate）提取 pass bool 传入——本函数只汇总 + 归档，
+    不重跑 drill 逻辑。归档用 ``artifact_store`` 内容寻址（同 summary → 同 digest，可复现验证）。
+    """
+    flags = (shadow_parity_matched, lifecycle_all_pass, crash_all_exactly_once,
+             recovery_all_intact, sandbox_all_clean, dispatch_cutover_ok, quality_gate_passed)
+    suite = CutoverSuiteResult(
+        shadow_parity_matched=shadow_parity_matched, lifecycle_all_pass=lifecycle_all_pass,
+        crash_all_exactly_once=crash_all_exactly_once, recovery_all_intact=recovery_all_intact,
+        sandbox_all_clean=sandbox_all_clean, dispatch_cutover_ok=dispatch_cutover_ok,
+        quality_gate_passed=quality_gate_passed, overall_passed=all(flags))
+    if not suite.overall_passed:
+        return suite                                # red 套件不归档（绝不伪装绿归档）
+    ref = artifact_store.store(artifact_root, suite.summary, kind="cutover_suite",
+                               sensitivity="internal")
+    return replace(suite, archive_digest=ref.digest)

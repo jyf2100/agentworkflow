@@ -153,6 +153,7 @@ class ArtifactKind(str, Enum):
     VERIFIER_FEEDBACK = "verifier_feedback"
     RECOVERY_SNAPSHOT = "recovery_snapshot"
     TRANSCRIPT = "transcript"
+    CUTOVER_SUITE = "cutover_suite"        # task 7.6：完整 cutover 套件通过 summary 归档（immutable passing evidence）
 
 
 class AssuranceTier(str, Enum):
