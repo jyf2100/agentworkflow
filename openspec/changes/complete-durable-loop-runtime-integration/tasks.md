@@ -41,7 +41,7 @@
 
 - [x] 6.1 Create a root trace per PRD run and propagate trace context through iteration, SDK session, tool, test, verify, reconcile, and publish operations.
 - [x] 6.2 Connect OTLP export and degradation journaling to the production coordinator with bounded timeouts and metadata-only attributes.
-- [ ] 6.3 Extend reports with journal authority, trace ID, assurance tier, recovery mode, semantic verdict, evidence integrity, compaction count, and observability degradation.
+- [x] 6.3 Extend reports with journal authority, trace ID, assurance tier, recovery mode, semantic verdict, evidence integrity, compaction count, and observability degradation.
 - [ ] 6.4 Add production-path tests for OTLP outage, secret rejection, recovery span links, and report redaction.
 
 ## 7. Real Cutover and Recovery Drills

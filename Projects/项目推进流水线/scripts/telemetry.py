@@ -236,6 +236,9 @@ def extend_report(report: dict, *, trace_id: str | None = None, span_id: str | N
                   assurance_tier: str | None = None, recovery_mode: str | None = None,
                   compaction_count: int | None = None,
                   observability_degraded: bool | None = None,
+                  journal_authority: str | None = None,
+                  semantic_verdict: str | None = None,
+                  evidence_integrity: str | None = None,
                   metrics: MetricSnapshot | None = None) -> dict:
     """扩展 dispatch report 加可观测元数据（task 7.6）。
 
@@ -256,6 +259,12 @@ def extend_report(report: dict, *, trace_id: str | None = None, span_id: str | N
         ext["compaction_count"] = int(compaction_count)
     if observability_degraded is not None:
         ext["observability_degraded"] = bool(observability_degraded)
+    if journal_authority is not None:
+        ext["journal_authority"] = journal_authority          # task 6.3：driven/shadow/legacy（decision#2）
+    if semantic_verdict is not None:
+        ext["semantic_verdict"] = semantic_verdict            # task 6.3：verify 语义判定（与 mechanical test 分开，decision#3）
+    if evidence_integrity is not None:
+        ext["evidence_integrity"] = evidence_integrity        # task 6.3：ok/blocked_evidence/state_corrupt（不伪装绿）
     if metrics is not None:
         ext["metrics"] = {
             "success_rate": round(metrics.success_rate, 4),

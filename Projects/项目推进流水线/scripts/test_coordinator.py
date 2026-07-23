@@ -445,3 +445,73 @@ def test_coordinator_degradation_does_not_crash_when_journal_disabled(tmp_path):
     assert coord.telemetry_sink.degraded is True
     assert not Path(coord.journal.path).exists()          # journal 关 → 文件不建
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.3：coordinator own report 元数据（build_report + 派生 property）
+# spec task 6.3：「Extend reports with journal authority, trace ID, assurance tier, recovery mode,
+# semantic verdict, evidence integrity, compaction count, and observability degradation.」
+# design 决策#1：coordinator 是元数据唯一来源（trace/flags/sink.degraded）→ own build_report；
+# 运行时业务态（semantic_verdict/evidence_integrity/recovery_mode/compaction_count）由调用方传。
+# extend_report 补 journal_authority/semantic_verdict/evidence_integrity（见 test_telemetry）。
+# ════════════════════════════════════════════════════════════════════════════
+def test_coordinator_assurance_tier_from_container_flag(tmp_path):
+    """6.3：container_sandbox 开 → assurance_tier='container'；关 → 'local'（configured intent，coord 从 flags 派生）。"""
+    c_on = _build(tmp_path, profile={"loop": {"container_sandbox": True}})
+    c_off = _build(tmp_path)
+    assert c_on.assurance_tier == "container"
+    assert c_off.assurance_tier == "local"
+
+
+def test_coordinator_journal_authority_from_flags(tmp_path):
+    """6.3：journal authority 从 flags 派生（decision#2 cutover 阶段）：
+    driven→'driven'；shadow→'shadow'；baseline→'legacy'。"""
+    c_driven = _build(tmp_path, profile={"loop": {"journal_driven_dispatch": True, "journal_shadow": True}})
+    c_shadow = _build(tmp_path, profile={"loop": {"journal_shadow": True}})
+    c_base = _build(tmp_path)
+    assert c_driven.journal_authority == "driven"
+    assert c_shadow.journal_authority == "shadow"
+    assert c_base.journal_authority == "legacy"
+
+
+def test_coordinator_build_report_includes_coord_owned_metadata(tmp_path):
+    """6.3：build_report 把 coord own 的元数据（trace_id/span_id/tier/journal_authority/degraded）写进 observability。"""
+    coord = _build(tmp_path, profile={"loop": {"journal_shadow": True}})
+    out = coord.build_report({"run_id": "r1", "status": "published"})
+    obs = out["observability"]
+    assert obs["trace_id"] == coord.trace.trace_id
+    assert obs["root_span_id"] == coord.trace.span_id
+    assert obs["assurance_tier"] == coord.assurance_tier
+    assert obs["journal_authority"] == coord.journal_authority
+    assert obs["observability_degraded"] is False
+
+
+def test_coordinator_build_report_passes_runtime_fields(tmp_path):
+    """6.3：调用方传运行时业务态（semantic_verdict/evidence_integrity/recovery_mode/compaction_count）。"""
+    coord = _build(tmp_path)
+    out = coord.build_report(
+        {"run_id": "r1"}, semantic_verdict="pass", evidence_integrity="ok",
+        recovery_mode="resume", compaction_count=3)
+    obs = out["observability"]
+    assert obs["semantic_verdict"] == "pass"
+    assert obs["evidence_integrity"] == "ok"
+    assert obs["recovery_mode"] == "resume"
+    assert obs["compaction_count"] == 3
+
+
+def test_coordinator_build_report_degradation_reflected(tmp_path):
+    """6.3：telemetry backend 不可用 → build_report observability_degraded=True（coord own sink.degraded）。"""
+    exp = _FakeExporter(fail=True)
+    coord = _telem(tmp_path, exporter=exp, journal=True)
+    coord.emit_telemetry_span("test")
+    coord.flush_telemetry()
+    out = coord.build_report({"run_id": "r1"})
+    assert out["observability"]["observability_degraded"] is True
+
+
+def test_coordinator_build_report_does_not_mutate_base(tmp_path):
+    """6.3：build_report 不改 base report（不可变；extend_report 拷贝）。"""
+    coord = _build(tmp_path)
+    base = {"run_id": "r1"}
+    coord.build_report(base)
+    assert "observability" not in base
+

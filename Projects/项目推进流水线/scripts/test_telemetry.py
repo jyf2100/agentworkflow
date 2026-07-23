@@ -429,3 +429,30 @@ def test_extend_report_degraded_flag_reflects_sink():
     sink.flush()
     out = TEL.extend_report({}, trace_id="t" * 32, observability_degraded=sink.degraded)
     assert out["observability"]["observability_degraded"] is True
+
+
+# ─── task 6.3：extend_report 补 journal authority / semantic verdict / evidence integrity ───
+def test_extend_report_adds_authority_verdict_integrity():
+    """6.3：extend_report 补 journal_authority / semantic_verdict / evidence_integrity（metadata-only 枚举）。
+
+    decision#2（journal authority: driven/shadow/legacy）+ #3（semantic verdict 与 mechanical test 分开）+
+    evidence integrity（blocked_evidence/state_corrupt → 报告显式标，不伪装绿）。
+    """
+    out = TEL.extend_report(
+        {"run_id": "r1", "status": "published"},
+        trace_id="t" * 32,
+        journal_authority="driven", semantic_verdict="pass", evidence_integrity="ok",
+    )
+    obs = out["observability"]
+    assert obs["journal_authority"] == "driven"
+    assert obs["semantic_verdict"] == "pass"
+    assert obs["evidence_integrity"] == "ok"
+
+
+def test_extend_report_new_fields_optional_absent_when_omitted():
+    """6.3：新字段未传 → observability 不含（None-optional 语义，不污染 baseline 报告）。"""
+    out = TEL.extend_report({"run_id": "r1"}, trace_id="t" * 32)
+    obs = out["observability"]
+    assert "journal_authority" not in obs
+    assert "semantic_verdict" not in obs
+    assert "evidence_integrity" not in obs

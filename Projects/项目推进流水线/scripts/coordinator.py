@@ -75,6 +75,26 @@ class Coordinator:
             self.flags.container_sandbox, self.flags.telemetry_export,
         ))
 
+    @property
+    def assurance_tier(self) -> str:
+        """task 6.3：configured assurance tier（``flags.container_sandbox`` → 'container' else 'local'）。
+
+        report 元数据用 configured intent（实际 used tier 经 sandbox preflight，task 5.1）；coordinator 从
+        flags 派生 configured 值（design 决策#1：coord 是元数据唯一来源）。
+        """
+        return "container" if self.flags.container_sandbox else "local"
+
+    @property
+    def journal_authority(self) -> str:
+        """task 6.3：journal 权威阶段（decision#2 cutover）：
+        ``journal_driven_dispatch`` → 'driven'；``journal_shadow`` → 'shadow'；baseline → 'legacy'。
+        """
+        if self.flags.journal_driven_dispatch:
+            return "driven"
+        if self.flags.journal_shadow:
+            return "shadow"
+        return "legacy"
+
     def emit(self, event_type: str, payload: dict | None = None) -> str | None:
         """委托 journal emit lifecycle 事件（shadow 语义：flag 关 no-op，不改决策；返回值不得驱动控制流）。
 
@@ -134,6 +154,30 @@ class Coordinator:
         被观测的 dispatch（design L82 + shadow 契约#3）。失败时 span 保留待下次重试。
         """
         return self.telemetry_sink.flush()
+
+    def build_report(self, base_report, *, semantic_verdict: str | None = None,
+                     evidence_integrity: str | None = None,
+                     recovery_mode: str | None = None,
+                     compaction_count: int | None = None) -> dict:
+        """task 6.3：扩展报告加可观测元数据（design 决策#1：coordinator own report 元数据源头）。
+
+        coord own 的元数据（``trace_id``/``span_id``/``assurance_tier``/``journal_authority``/
+        ``observability_degraded``）直接从 coord 读——coordinator 是这些元数据的唯一来源；运行时业务态
+        （``semantic_verdict``/``evidence_integrity``/``recovery_mode``/``compaction_count``）由调用方传。
+        全部 metadata-only（经 ``extend_report``，绝不泄敏感）。
+        """
+        return TE.extend_report(
+            base_report,
+            trace_id=self.trace.trace_id,
+            span_id=self.trace.span_id,
+            assurance_tier=self.assurance_tier,
+            recovery_mode=recovery_mode,
+            compaction_count=compaction_count,
+            observability_degraded=self.telemetry_sink.degraded,
+            journal_authority=self.journal_authority,
+            semantic_verdict=semantic_verdict,
+            evidence_integrity=evidence_integrity,
+        )
 
 
 # task 6.1：coordinator root trace 的子 operation（``run`` 是 root，7 子 operation 来自 telemetry.SPAN_NAMES）
