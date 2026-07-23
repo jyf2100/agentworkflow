@@ -24,6 +24,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 
 import artifact_store
 import compat_readers as CR
@@ -743,3 +744,175 @@ def run_cutover_suite(*, shadow_parity_matched, lifecycle_all_pass, crash_all_ex
     ref = artifact_store.store(artifact_root, suite.summary, kind="cutover_suite",
                                sensitivity="internal")
     return replace(suite, archive_digest=ref.digest)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# task 7.6（评审 P0-2 修正）：完整 cutover 套件**运行器**——自行编排执行各子 drill + 归档 manifest
+# ════════════════════════════════════════════════════════════════════════════
+# 评审 P0-2：旧 run_cutover_suite 接收 7 个布尔值做 all()，是聚合器非运行器。本节新增
+# run_full_cutover_suite——runner **调用每个子 drill 的执行入口**（注入 bundle），从各 Result 提取
+# pass + detail，构建不可变 manifest，全绿才归档带 digest 的 manifest（design#1 runner 编排真实
+# drill + #6 archive immutable evidence）。drill 注入保持可测（fake bundle 验证编排/归档逻辑）+ 生产
+# 可注入真实 drill（真实跑各子项，见 real_cutover_drills）。
+
+# lifecycle canary 每场景的预期 gate（lifecycle pass = 全场景 gate 符合预期，非"全 allow"——
+# no_test/test_red/stale_test 应 deny 阻断，test_green allow，revise/compaction/subagent/hook-failure 各符预期）
+_EXPECTED_LIFECYCLE_GATES: dict[str, str] = {
+    "no_test": EV.GATE_NOT_RUN,
+    "test_red": EV.GATE_FAILED,
+    "stale_test": EV.GATE_STALE,
+    "test_green": EV.GATE_PUBLISH,
+    "semantic_revise": "semantic_revise",
+    "compaction": "snapshot_persisted",
+    "subagent": "publication_blocked",
+    "hook_failure": "fail_closed",
+}
+
+
+@dataclass(frozen=True)
+class DrillOutcome:
+    """一项 drill 的运行结果摘要（manifest 元素）。``passed`` ⇔ 该维度验收通过；``detail`` 给归档可读证据。"""
+    name: str
+    passed: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class CutoverManifest:
+    """task 7.6：完整 cutover 套件**编排运行**后的不可变通过证据 manifest。
+
+    runner 自行执行各子 drill（非接收外部布尔值），逐项记 ``(name, passed, detail)``。``overall_passed``
+    ⇔ 全项 passed；全绿归档 manifest 内容寻址 digest（design#6）；任一 red → 不归档（绝不伪装绿归档）。
+    """
+    outcomes: tuple[DrillOutcome, ...]
+    overall_passed: bool
+    archive_digest: str | None = None
+
+    @property
+    def summary(self) -> str:
+        parts = [f"{o.name}={'PASS' if o.passed else 'FAIL'}" for o in self.outcomes]
+        head = "PASS" if self.overall_passed else "FAIL"
+        return f"cutover manifest: {head} (" + ", ".join(parts) + ")"
+
+
+def _lifecycle_canary_passed(ev: "SdkHookCanaryEvidence") -> bool:
+    """lifecycle pass = 每场景 gate 符合 ``_EXPECTED_LIFECYCLE_GATES``（非"全 allow"）。"""
+    return all(ev.stop_gates.get(sc) == exp for sc, exp in _EXPECTED_LIFECYCLE_GATES.items())
+
+
+# 各 drill Result → DrillOutcome 提取器（runner 编排执行各 drill 后调用，从真实 Result 提取 pass+detail）
+def _shadow_parity_outcome(ev: "ShadowParityEvidence") -> DrillOutcome:
+    return DrillOutcome("shadow_parity", ev.parity.matched,
+                        f"matched={ev.parity.matched}; mismatches={len(ev.parity.mismatches)}")
+
+
+def _sdk_canary_outcome(ev: "SdkHookCanaryEvidence") -> DrillOutcome:
+    return DrillOutcome("sdk_canary", _lifecycle_canary_passed(ev), ev.summary)
+
+
+def _crash_outcome(ev: "CrashReconciliationEvidence") -> DrillOutcome:
+    return DrillOutcome("crash_reconciliation", ev.all_exactly_once, ev.summary)
+
+
+def _recovery_outcome(results: "tuple[RecoveryDrillResult, ...]") -> DrillOutcome:
+    intact = bool(results) and all(r.causality_intact for r in results)
+    detail = " | ".join(f"{r.mode}={r.decision_mode}/causal={r.causality_intact}" for r in results)
+    return DrillOutcome("recovery", intact, detail or "no recovery results")
+
+
+def _sandbox_outcome(results: "tuple[SandboxDrillResult, ...]") -> DrillOutcome:
+    # clean = 每个 canary：长期凭据始终拒（host-side verified）**且**（正常退出 exit0 或因 network
+    # 违例被 policy block）。exit0=fixture 正常跑，network_denied=违例正确阻断（两者皆 clean）。
+    clean = bool(results) and all(r.credential_denied and (r.exit_code == 0 or r.network_denied)
+                                  for r in results)
+    detail = " | ".join(
+        f"{r.language}/{r.tier}=exit{r.exit_code}/net_denied={r.network_denied}" for r in results)
+    return DrillOutcome("sandbox", clean, detail or "no sandbox results")
+
+
+def _dispatch_outcome(r: "DispatchCutoverResult") -> DrillOutcome:
+    # dispatch ok = reducer 给出合法终态（journal 驱动或 legacy fallback 均可，design#8 一个 release
+    # cycle 允许 fallback）；仅 state_corrupt（无历史/reducer 全失败）算 red。
+    ok = r.driven_by in ("journal", "legacy_fallback") and \
+        r.terminal_state != L.IterationStatus.STATE_CORRUPT.value
+    return DrillOutcome("dispatch_cutover", ok, f"driven_by={r.driven_by}; terminal={r.terminal_state}")
+
+
+def _quality_outcome(r: "QualityGateResult") -> DrillOutcome:
+    return DrillOutcome("quality_gate", r.passed, r.detail)
+
+
+@dataclass(frozen=True)
+class CutoverDrillBundle:
+    """task 7.6：各子 drill 的执行入口注入（runner 编排**调用执行**，非接收 bool）。
+
+    每字段是无参 callable，返回对应 drill 的 Result/evidence。测试注入确定性 fake callable（验证
+    编排/汇总/归档/red-不归档），生产注入真实 drill callable（真实跑 shadow parity / SDK canary /
+    crash reconciliation / recovery / sandbox / dispatch cutover / quality gate，见 ``real_cutover_drills``）。
+    design 决策#1（runner 编排真实 drill，非 disconnected helper 聚合布尔值——评审 P0-2）。
+    """
+    shadow_parity: Callable[[], "ShadowParityEvidence"]
+    sdk_canary: Callable[[], "SdkHookCanaryEvidence"]
+    crash_reconciliation: Callable[[], "CrashReconciliationEvidence"]
+    recovery: Callable[[], "tuple[RecoveryDrillResult, ...]"]
+    sandbox: Callable[[], "tuple[SandboxDrillResult, ...]"]
+    dispatch_cutover: Callable[[], "DispatchCutoverResult"]
+    quality_gate: Callable[[], "QualityGateResult"]
+
+
+def run_full_cutover_suite(*, drills: CutoverDrillBundle,
+                           artifact_root: str) -> CutoverManifest:
+    """task 7.6：完整 cutover 套件**运行器**——自行编排执行各子 drill + 归档不可变通过证据 manifest。
+
+    评审 P0-2 修正：旧 ``run_cutover_suite`` 接收外部布尔值做 ``all()``，不执行任何 drill。本函数**调用
+    ``drills`` bundle 里每个子 drill 的执行入口**（真实跑该 drill）→ 从 Result 提取 pass + detail → 构建
+    ``CutoverManifest`` → 全绿才归档内容寻址 manifest digest（design#1 runner 编排真实 drill + #6 archive
+    immutable passing evidence）。任一维度 red → ``overall_passed=False`` 且**不归档**（绝不伪装绿归档）。
+
+    drill 注入（design 决策#1）：bundle 每项是 callable，测试注入 fake（确定性验证编排/归档），生产注入
+    真实 drill（真实跑各子项，见 ``real_cutover_drills``）。runner 只编排执行 + 汇总归档，不重写 drill 逻辑。
+
+    Args:
+        drills: ``CutoverDrillBundle``——7 个子 drill 的执行入口（runner 依次调用执行）。
+        artifact_root: 归档 manifest 的内容寻址 artifact store 根。
+    """
+    outcomes = (
+        _shadow_parity_outcome(drills.shadow_parity()),
+        _sdk_canary_outcome(drills.sdk_canary()),
+        _crash_outcome(drills.crash_reconciliation()),
+        _recovery_outcome(drills.recovery()),
+        _sandbox_outcome(drills.sandbox()),
+        _dispatch_outcome(drills.dispatch_cutover()),
+        _quality_outcome(drills.quality_gate()),
+    )
+    manifest = CutoverManifest(outcomes=outcomes, overall_passed=all(o.passed for o in outcomes))
+    if not manifest.overall_passed:
+        return manifest                        # red 套件不归档（绝不伪装绿归档）
+    # kind 复用 ``cutover_suite``（ArtifactKind 分类）；manifest 内容自带 ``cutover manifest:`` 前缀，
+    # 内容寻址 digest 区分具体归档（design#6 archive immutable evidence）。
+    ref = artifact_store.store(artifact_root, manifest.summary, kind="cutover_suite",
+                               sensitivity="internal")
+    return replace(manifest, archive_digest=ref.digest)
+
+
+def real_cutover_drills(*, state_dir, stamp_fn, resolver, sandbox_runs,
+                        dispatch_events, dispatch_legacy, test_counts,
+                        evidence_items, artifact_root) -> CutoverDrillBundle:
+    """生产用 bundle：用 cutover 自身各 ``run_*`` drill 构造真实执行入口（runner 编排真实跑各子项）。
+
+    环境相关输入（真实 sandbox/handle/fixture、dispatch journal events、test counts）由调用方提供——
+    sandbox 真实执行需真实 worktree/container，调用方先跑 ``run_sandbox_drill`` 收集 ``SandboxDrillResult``
+    传入 ``sandbox_runs``；其余 drill 由 bundle 内 callable 直接调真实 ``run_*`` 函数执行。runner 调用
+    bundle 时这些 callable 才真实执行（design#1 production wiring，非 disconnected helper）。
+    """
+    return CutoverDrillBundle(
+        shadow_parity=lambda: run_shadow_parity_evidence(state_dir=state_dir, stamp_fn=stamp_fn),
+        sdk_canary=lambda: run_sdk_hook_canary(stamp_fn=stamp_fn),
+        crash_reconciliation=lambda: run_crash_reconciliation_evidence(resolver=resolver),
+        recovery=lambda: tuple(run_recovery_drill(m) for m in RECOVERY_MODES),
+        sandbox=lambda: tuple(sandbox_runs),
+        dispatch_cutover=lambda: run_dispatch_cutover_drill(
+            journal_driven=True, journal_events=dispatch_events, legacy_records=dispatch_legacy),
+        quality_gate=lambda: run_quality_gate(
+            test_counts=test_counts, evidence_items=evidence_items, artifact_root=artifact_root),
+    )

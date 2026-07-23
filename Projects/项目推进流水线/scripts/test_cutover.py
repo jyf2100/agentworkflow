@@ -660,3 +660,104 @@ def test_run_shadow_parity_evidence_no_write_dry_run_published(tmp_path):
     ev = CT.run_shadow_parity_evidence(
         state_dir=tmp_path, stamp_fn=lambda: "2026-07-23T00:00:00Z")
     assert ev.dry_run_terminal == "published"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# task 7.6（评审 P0-2 修正）：run_full_cutover_suite 编排运行器——自行执行各子 drill + 归档 manifest
+# 评审 P0-2：旧 run_cutover_suite 接收外部布尔值做 all()（聚合器非运行器）。新 runner 调用每个 drill
+# 执行入口（注入 bundle）真实执行，从 Result 提取 pass+detail，构建 CutoverManifest，全绿归档 digest。
+# ════════════════════════════════════════════════════════════════════════════
+def _green_bundle():
+    """全绿 fake bundle（callable 返回全绿 fake Result）+ 真实 sdk_canary/recovery（确定性绿）。"""
+    return CT.CutoverDrillBundle(
+        shadow_parity=lambda: CT.ShadowParityEvidence(
+            parity=CT.ShadowParityReport(dispatch_counts={}, journal_counts={}, matched=True),
+            dry_run_terminal="published", dry_run_run_id="r"),
+        sdk_canary=lambda: CT.run_sdk_hook_canary(),   # 真实 canary：全场景 gate 符合预期 → pass
+        crash_reconciliation=lambda: CT.CrashReconciliationEvidence(
+            results=(), boundaries_run=(), all_exactly_once=True, summary="all exactly-once"),
+        recovery=lambda: (CT.run_recovery_drill("resume"), CT.run_recovery_drill("fork"),
+                          CT.run_recovery_drill("new_session")),
+        sandbox=lambda: (CT.SandboxDrillResult("python", "local_worktree", 0, False, True),),
+        dispatch_cutover=lambda: CT.DispatchCutoverResult("journal", "published", ""),
+        quality_gate=lambda: CT.QualityGateResult(
+            tests_total=10, tests_failed=0, passed=True, evidence_digests=("d",), detail="10/10 pass"),
+    )
+
+
+def test_run_full_cutover_suite_green_archives_manifest(tmp_path):
+    """runner 自行执行各 drill → 全绿 → overall_passed + 归档 manifest digest（archive immutable evidence）。"""
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "suite"))
+    assert m.overall_passed is True
+    assert m.archive_digest is not None               # manifest 已归档为内容寻址 artifact
+    names = {o.name for o in m.outcomes}
+    assert names == {"shadow_parity", "sdk_canary", "crash_reconciliation", "recovery",
+                     "sandbox", "dispatch_cutover", "quality_gate"}
+    assert all(o.passed for o in m.outcomes)
+
+
+def test_run_full_cutover_suite_red_does_not_archive(tmp_path):
+    """任一 drill red（sandbox fixture exit1 且未 net_denied → 不 clean）→ overall red 且不归档（绝不伪装绿归档）。"""
+    green = _green_bundle()
+    bundle = CT.CutoverDrillBundle(
+        shadow_parity=green.shadow_parity, sdk_canary=green.sdk_canary,
+        crash_reconciliation=green.crash_reconciliation, recovery=green.recovery,
+        sandbox=lambda: (CT.SandboxDrillResult("python", "local_worktree", 1, False, True),),
+        dispatch_cutover=green.dispatch_cutover, quality_gate=green.quality_gate)
+    m = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(tmp_path / "suite"))
+    assert m.overall_passed is False
+    assert m.archive_digest is None                   # red 套件不归档
+    assert any(o.name == "sandbox" and not o.passed for o in m.outcomes)
+
+
+def test_run_full_cutover_suite_invokes_every_drill(tmp_path):
+    """评审 P0-2 核心：runner **调用**每个 drill 执行入口（编排执行），而非接收外部布尔值。
+    用带计数副作用的 callable 证明 7 个 drill 都被真实调用一次。"""
+    calls = []
+
+    def wrap(name, result):
+        def _f():
+            calls.append(name)
+            return result
+        return _f
+    green = _green_bundle()
+    bundle = CT.CutoverDrillBundle(
+        shadow_parity=wrap("shadow_parity", green.shadow_parity()),
+        sdk_canary=wrap("sdk_canary", green.sdk_canary()),
+        crash_reconciliation=wrap("crash_reconciliation", green.crash_reconciliation()),
+        recovery=wrap("recovery", green.recovery()),
+        sandbox=wrap("sandbox", green.sandbox()),
+        dispatch_cutover=wrap("dispatch_cutover", green.dispatch_cutover()),
+        quality_gate=wrap("quality_gate", green.quality_gate()),
+    )
+    m = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(tmp_path / "suite"))
+    assert len(calls) == 7                            # 每个 drill 都被真实调用一次
+    assert set(calls) == {"shadow_parity", "sdk_canary", "crash_reconciliation", "recovery",
+                          "sandbox", "dispatch_cutover", "quality_gate"}
+    assert m.overall_passed is True
+
+
+def test_real_cutover_drills_orchestrates_real_drills(tmp_path):
+    """real_cutover_drills 用真实 run_* drill 构造 bundle → runner 编排真实执行（集成证据）。"""
+    sandbox_green = CT.SandboxDrillResult("python", "local_worktree", 0, False, True)
+    events = [_ev("running", eid="e1"), _ev("aborted", eid="e2")]   # running→aborted 合法迁移
+    bundle = CT.real_cutover_drills(
+        state_dir=tmp_path, stamp_fn=lambda: "2026-07-23T00:00:00Z",
+        resolver=FakeResolver(True),
+        sandbox_runs=(sandbox_green,),
+        dispatch_events=events, dispatch_legacy=None,
+        test_counts={"passed": 5, "failed": 0},
+        evidence_items=[("test_output", "ok")],
+        artifact_root=str(tmp_path / "q"))
+    m = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(tmp_path / "q"))
+    assert m.overall_passed is True
+    assert m.archive_digest is not None
+    assert {o.name for o in m.outcomes} == {"shadow_parity", "sdk_canary", "crash_reconciliation",
+                                            "recovery", "sandbox", "dispatch_cutover", "quality_gate"}
+
+
+def test_run_full_cutover_suite_archive_is_content_addressed(tmp_path):
+    """归档 digest 内容寻址可复现：同 manifest summary → 同 digest（artifact_store 内容寻址语义）。"""
+    a = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "a"))
+    b = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "b"))
+    assert a.archive_digest == b.archive_digest

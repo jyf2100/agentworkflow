@@ -462,6 +462,49 @@ def test_coordinator_assurance_tier_from_container_flag(tmp_path):
     assert c_off.assurance_tier == "local"
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Section 2 task 2.1：coordinator own retry/session/reconciliation（design 决策#1；评审 P0-1）
+# 评审 P0-1：coordinator 曾只 own flags/IDs/journal/artifact/trace/telemetry，未持有 retry/session/
+# reconcile——recover_iteration / publication 前对账无法从 coordinator 单点派生。build_coordinator 现构造
+# retry_budget/session_store（session_aware_retry 开）+ 持有注入 resolver；baseline 关 → None（零变化）。
+# ════════════════════════════════════════════════════════════════════════════
+def test_coordinator_owns_retry_session_resolver_when_session_aware(tmp_path):
+    """2.1：session_aware_retry 开（+ journal_shadow 依赖）→ coord 持有 retry_budget（BudgetState）/
+    session_store（SessionStore）/ 注入 resolver（design 决策#1：集中 own 所有运行时关注点）。"""
+    sentinel = object()
+    coord = CO.build_coordinator(
+        stamp=_STAMP, prd_path="p.md", proj="proj", slug="x", state_dir=tmp_path,
+        profile={"loop": {"journal_shadow": True, "session_aware_retry": True}},
+        env={}, stamp_fn=lambda: "T", resolver=sentinel)
+    assert coord.retry_budget is not None             # BudgetState 构造（session_aware_retry 开）
+    assert coord.session_store is not None            # SessionStore 构造（resume/fork/new-session 真源）
+    assert coord.resolver is sentinel                 # 持有注入 resolver（opaque，coordinator 只 own 不调）
+    assert coord.flags.session_aware_retry is True
+
+
+def test_coordinator_retry_session_absent_resolver_none_in_baseline(tmp_path):
+    """2.1：flags 全关（baseline）→ retry_budget/session_store None（零变化）；resolver 不注入 → None。"""
+    coord = CO.build_coordinator(
+        stamp=_STAMP, prd_path="p.md", proj="proj", slug="x", state_dir=tmp_path,
+        env={}, stamp_fn=lambda: "T")                 # 不传 resolver
+    assert coord.retry_budget is None
+    assert coord.session_store is None
+    assert coord.resolver is None
+    assert coord.is_baseline                          # baseline 保留（flag 全关）
+
+
+def test_coordinator_holds_resolver_even_in_baseline_when_injected(tmp_path):
+    """2.1：resolver 是被动 KeyResolver，baseline 注入亦持有无害（publication/retry 前对账才查）。
+    design「coordinator 是 reconcile 唯一 resolve 点」——持有不等于触发，dispatch baseline 决策零变化。"""
+    sentinel = object()
+    coord = CO.build_coordinator(
+        stamp=_STAMP, prd_path="p.md", proj="proj", slug="x", state_dir=tmp_path,
+        env={}, stamp_fn=lambda: "T", resolver=sentinel)
+    assert coord.resolver is sentinel
+    assert coord.retry_budget is None                 # baseline 仍不构造 retry/session（只有 resolver 被持有）
+    assert coord.session_store is None
+
+
 def test_coordinator_journal_authority_from_flags(tmp_path):
     """6.3：journal authority 从 flags 派生（decision#2 cutover 阶段）：
     driven→'driven'；shadow→'shadow'；baseline→'legacy'。"""

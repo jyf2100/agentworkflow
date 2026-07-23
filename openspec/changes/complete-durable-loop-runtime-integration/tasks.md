@@ -6,7 +6,7 @@
 
 ## 2. Production Runtime Coordinator
 
-- [x] 2.1 Implement a coordinator that resolves all loop flags once and owns journal, artifacts, IDs, retry, hooks, sandbox, telemetry, and reconciliation for one dispatch.
+- [ ] 2.1 Implement a coordinator that resolves all loop flags once and owns journal, artifacts, IDs, retry, hooks, sandbox, telemetry, and reconciliation for one dispatch.
 - [x] 2.2 Integrate the coordinator into `run_daily.dispatch_one()` without changing first-phase admission and fail-safe external-state gates when durable flags are disabled.
 - [x] 2.3 Integrate the coordinator into `dev-agent.py` and register real Claude Agent SDK lifecycle hooks with the pinned SDK API.
 - [x] 2.4 Add subprocess-level integration tests proving each feature flag changes the real dispatch/SDK path rather than only a helper or drill function.
@@ -16,7 +16,7 @@
 
 - [x] 3.1 Capture the immutable PRD content digest at dispatch entry and include it in `prd_id` and the initial journal event.
 - [x] 3.2 Stop appending verifier feedback to PRDs for new runs; store feedback as sanitized content-addressed artifacts.
-- [x] 3.3 Allocate a distinct deterministic iteration ID for every revise, resume, fork, and new-session attempt and record parent relationships.
+- [ ] 3.3 Allocate a distinct deterministic iteration ID for every revise, resume, fork, and new-session attempt and record parent relationships.
 - [x] 3.4 Build each retry prompt from immutable PRD content plus verified journal artifacts and remaining acceptance criteria.
 - [x] 3.5 Emit and reduce all terminal classes, including planned smoke, stalled, orphan deletion, interrupted semantic revise, blocked evidence, and sandbox blocked.
 - [x] 3.6 Make complete schema-invalid final journal records fail closed while continuing to tolerate only provably incomplete trailing writes.
@@ -26,7 +26,7 @@
 - [x] 4.1 Change terminal publication logic to require independent green tests, `verify_verdict=pass`, and known reconciliation.
 - [x] 4.2 Prevent a test result from becoming fresh green evidence when its required artifact or journal event cannot be persisted and verified.
 - [x] 4.3 Add explicit evidence-integrity and journal-integrity blocked states to reports and retry policy inputs.
-- [x] 4.4 Reconcile commit, push, branch, PR, and test evidence idempotency keys before every resume, fork, new-session, or publication action.
+- [ ] 4.4 Reconcile commit, push, branch, PR, and test evidence idempotency keys before every resume, fork, new-session, or publication action.
 - [x] 4.5 Add crash-injection integration tests around each journal-before-side-effect boundary and prove exactly-once effective behavior.
 
 ## 5. Enforced Sandbox and Credential Boundary
@@ -35,7 +35,7 @@
 - [x] 5.2 Replace label-only domain intent with enforceable egress policy, and return `sandbox_blocked` when policy installation or verification fails.
 - [x] 5.3 Route real dev and independent-test commands through the selected sandbox adapter and forbid silent fallback from container to local.
 - [x] 5.4 Keep GitHub, SMTP, cloud, and model publication credentials host-side and prove they are absent from sandbox environment and artifacts.
-- [x] 5.5 Add real Node and Python fixture canaries covering allowed network, denied network, denied credential access, resource limits, and unavailable runtime behavior.
+- [ ] 5.5 Add real Node and Python fixture canaries covering allowed network, denied network, denied credential access, resource limits, and unavailable runtime behavior.
 
 ## 6. Telemetry and Reporting Integration
 
@@ -46,9 +46,17 @@
 
 ## 7. Real Cutover and Recovery Drills
 
-- [x] 7.1 Run shadow parity against historical fixtures and one real no-write dispatch, resolving every terminal mismatch.
-- [x] 7.2 Run a real SDK hook canary for no-test, stale-test, green-test, semantic-revise, compaction, subagent, and hook-failure paths.
-- [x] 7.3 Run crash drills after agent completion, test completion, commit, push, and PR creation, and archive reconciliation evidence.
+- [ ] 7.1 Run shadow parity against historical fixtures and one real no-write dispatch, resolving every terminal mismatch.
+- [ ] 7.2 Run a real SDK hook canary for no-test, stale-test, green-test, semantic-revise, compaction, subagent, and hook-failure paths.
+- [ ] 7.3 Run crash drills after agent completion, test completion, commit, push, and PR creation, and archive reconciliation evidence.
 - [x] 7.4 Implement the runbook's journal-corruption recovery command and test every documented command end to end.
-- [x] 7.5 Enable journal-driven dispatch for one allowlisted project only after parity passes; retain and test legacy read fallback for one release cycle.
-- [x] 7.6 Run the complete quality, sandbox, recovery, telemetry, and canary suite and archive immutable passing evidence before marking the change complete.
+- [ ] 7.5 Enable journal-driven dispatch for one allowlisted project only after parity passes; retain and test legacy read fallback for one release cycle.
+- [ ] 7.6 Run the complete quality, sandbox, recovery, telemetry, and canary suite and archive immutable passing evidence before marking the change complete.
+
+<!-- Review 2026-07-23 (Request Changes):
+     依据 docs/reviews/complete-durable-loop-runtime-integration-tasks-review-2026-07-23.md，
+     以下 9 个任务从 [x] 恢复为 [ ]，因其仅有 helper / fake adapter / 单元测试，
+     缺乏真实执行证据（真实 SDK session、真实 Docker/Podman canary、真实 dispatch、
+     真实 allowlisted project rollout、真实 crash-restart-remote reconciliation、
+     真实 cutover suite 归档）：2.1, 3.3, 4.4, 5.5, 7.1, 7.2, 7.3, 7.5, 7.6。
+     重新勾选前须补齐评审第 5 节 Required Acceptance Evidence；结论 Request Changes，暂不允许 archive。 -->

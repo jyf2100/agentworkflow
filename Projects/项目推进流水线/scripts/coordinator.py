@@ -37,6 +37,8 @@ import trace_context as TC
 from artifact_store import compute_digest
 from feature_flags import LoopFlags, resolve_flags
 from loop_runtime import ShadowJournal
+import retry_policy as RP            # task 2.1：coordinator own retry budget（session_aware_retry 开才构造）
+from session_meta import SessionStore  # task 2.1：coordinator own SDK session 真源（resume/fork/new-session 决策消费）
 
 
 def _real_stamp() -> str:
@@ -65,6 +67,15 @@ class Coordinator:
     trace: TC.TraceContext               # task 6.1：root trace（per PRD run，trace_id 由 run_id 派生，metadata-only）
     telemetry_sink: OTLP.TelemetrySink   # task 6.2：OTLP export + degradation journaling（enabled 从 telemetry_export flag）
     prd_digest: str | None = None        # task 3.1：dispatch entry PRD 内容 digest（``sha256:<hex>``；None=未捕获）
+    # task 2.1：own retry·session·reconciliation（design 决策#1：coordinator 集中 own 所有运行时关注点，
+    #   production code 不再 disconnected helper 式各自 resolve）。评审 P0-1：曾散建、coordinator 未持有
+    #   retry/session/reconcile，导致 recover_iteration / publication 前对账无法从 coordinator 单点派生。
+    #   ``session_aware_retry`` 开 → 构造 budget/session_store（resume/fork/new-session 决策消费）；
+    #   关 → None（baseline 零变化，dispatch 决策不受影响）。``resolver`` 始终注入持有（被动对象，持有无害；
+    #   publication/retry 前对账才查），满足 design「coordinator 是 reconcile 唯一 resolve 点」。
+    retry_budget: RP.BudgetState | None = None     # retry 预算（sdk_retries_used 计数 + limits；session_aware_retry 开构造）
+    session_store: SessionStore | None = None      # SDK session 真源（resume/fork/new-session 决策 + dev-agent 持久化消费）
+    resolver: object | None = None                 # reconcile KeyResolver（publication/retry 前对账 commit/push/pr/test 幂等键）
 
     @property
     def is_baseline(self) -> bool:
@@ -232,7 +243,8 @@ def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
                       stamp_fn: Callable[[], str] | None = None,
                       prd_content: str | None = None,
                       telemetry_exporter=None,
-                      otlp_timeout: float = 5.0) -> Coordinator:
+                      otlp_timeout: float = 5.0,
+                      resolver: object | None = None) -> Coordinator:
     """dispatch/dev-agent 入口：一次解析 flag + 建 IDs/journal/artifact_root，返回 ``Coordinator``。
 
     替代 ``dispatch_one`` 散建的 ``_run``/``_prd``/``_iter``/``_sj``。所有 adapter 从返回的
@@ -264,9 +276,20 @@ def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
     telemetry_sink = _build_telemetry_sink(          # task 6.2：OTLP export + degradation journaling
         flags=flags, journal=journal, iteration_id=iteration, prd_id=prd,
         env=env, telemetry_exporter=telemetry_exporter, otlp_timeout=otlp_timeout)
+    # task 2.1：session_aware_retry 开 → own session_store + retry_budget（design 决策#1；评审 P0-1 曾散建、
+    #   coordinator 未持有 retry/session/reconcile，致 recover_iteration / publication 前对账无法单点派生）。
+    #   关 → None（baseline 零变化）。resolver 始终注入持有（被动 KeyResolver，持有无害；publication/retry
+    #   前对账才查 commit/push/pr/test 幂等键）。
+    if flags.session_aware_retry:
+        session_store = SessionStore(Path(state_dir) / "sessions")
+        retry_budget = RP.BudgetState(limits=RP.BudgetLimits())
+    else:
+        session_store = None
+        retry_budget = None
     return Coordinator(flags=flags, run_id=run, prd_id=prd, iteration_id=iteration,
                        journal=journal, artifact_root=artifact_root, trace=trace,
-                       telemetry_sink=telemetry_sink, prd_digest=prd_digest)
+                       telemetry_sink=telemetry_sink, prd_digest=prd_digest,
+                       retry_budget=retry_budget, session_store=session_store, resolver=resolver)
 
 
 # ─── task 2.5：preflight 校验 loop flag 组合一致性（design 决策#1 防 impossible partial 组合）──

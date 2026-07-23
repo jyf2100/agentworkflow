@@ -4,7 +4,7 @@
 
 覆盖：
     - reconcile 谓词三态（confirmed/absent/unknown）+ 非法 kind fail-safe + idempotency key 稳定；
-    - LocalGitResolver 真实 subprocess git（commit/branch）+ pr 返回 None；
+    - LocalGitResolver 真实 subprocess git（commit + 远端 push ls-remote）+ pr 返回 None；
     - CompositeResolver 首 non-None 胜出；
     - recover_iteration 端到端（reconcile→policy→RecoveryPlan）：PR 前 crash 对账 pending、
       unknown→BLOCK、session 缺失→NEW_SESSION、预算耗尽→STOP、中部损坏→corruption 传播。
@@ -141,19 +141,47 @@ def _git_init(repo):
     subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
 
 
-def test_local_git_resolver_branch_and_commit(tmp_path):
+def test_local_git_resolver_commit_and_pr_local(tmp_path):
+    """commit 查本地对象库（cat-file）；pr 本地查不到→None（交 GhPrResolver）。"""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git_init(repo)
     (repo / "f.txt").write_text("x", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    r = RE.LocalGitResolver(repo)
+    assert r.check("commit", "HEAD") is True            # commit 存在
+    assert r.check("commit", "deadbeef") is False       # commit 不存在
+    assert r.check("pr", "anything") is None            # pr 本地查不到（交 gh）
+
+
+def test_local_git_resolver_push_uses_remote_truth(tmp_path):
+    """P1-3：push resolver 查远端真源（ls-remote）——本地 branch 存在 ≠ 远端已 push。
+
+    本地 bare repo 作 remote（origin）：feature 分支只在本地时远端无此 ref→absent(False)；
+    push 到远端后→confirmed(True)；无 remote 的纯本地 repo→ls-remote 失败→unknown(None) fail-safe。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    bare = tmp_path / "remote.git"
+    _git_init(repo)
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    (repo / "f.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
     subprocess.run(["git", "branch", "feature"], cwd=repo, check=True)
     r = RE.LocalGitResolver(repo)
-    assert r.check("push", "feature") is True          # branch 存在
-    assert r.check("push", "nonexistent") is False      # branch 不存在
-    assert r.check("commit", "HEAD") is True            # commit 存在
-    assert r.check("pr", "anything") is None            # pr 本地查不到（交 gh）
+    assert r.check("push", "feature") is False          # 只在本地、未 push → 远端无 → absent
+    assert r.check("push", "nonexistent") is False      # 远端同样无 → absent
+    subprocess.run(["git", "push", "-q", "origin", "feature"], cwd=repo, check=True)
+    assert r.check("push", "feature") is True           # push 后远端有 → confirmed
+    # 无 remote 的纯本地 repo → ls-remote 失败 → unknown（fail-safe，绝不盲目重放 push）
+    noremote = tmp_path / "noremote"
+    noremote.mkdir()
+    _git_init(noremote)
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "i"], cwd=noremote, check=True)
+    subprocess.run(["git", "branch", "x"], cwd=noremote, check=True)
+    assert RE.LocalGitResolver(noremote).check("push", "x") is None
 
 
 def test_artifact_evidence_resolver_three_states(tmp_path):

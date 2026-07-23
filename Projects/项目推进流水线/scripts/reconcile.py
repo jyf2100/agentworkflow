@@ -10,7 +10,7 @@ spec L10-12 契约：进程崩溃重启后，reducer 重建最后合法状态，
 1. **reconcile 谓词**（``reconcile_side_effects``）：对每个副作用 (kind, target) 算 idempotency
    key，通过注入的 ``KeyResolver`` 查实际状态（三态：confirmed 存在 / absent 不存在 / unknown
    查不到）。全明确 → ``safe_to_retry``；有 unknown → ``external_known=False``（RetryPolicy BLOCK）。
-2. **KeyResolver**：注入接口（Protocol）。``LocalGitResolver``（subprocess git，查 commit/branch，
+2. **KeyResolver**：注入接口（Protocol）。``LocalGitResolver``（subprocess git，查 commit + 远端 push ``ls-remote``，
    真实可跑）+ ``GhPrResolver``（gh CLI 查 PR，真实可跑，gh 缺失时容错→unknown）+ ``CompositeResolver``
    组合。测试用 ``FakeResolver``。
 3. **recovery driver**（``recover_iteration``）：read journal → reduce → 查 session → reconcile →
@@ -127,13 +127,16 @@ def reconcile_side_effects(*, iteration_id: str, targets,
 
 # ─── 真实 KeyResolver 实现（真正能跑）──────────────────────────────────────
 class LocalGitResolver:
-    """subprocess git 查 commit/branch（本地，真实可跑）。
+    """subprocess git 查 commit（本地 ``cat-file``）/ push（远端 ``ls-remote`` 真源），真实可跑。
 
-    assurance 较低（design 决策#6：local adapter 标 lower assurance）——查不到远端 push/PR。
-    ``pr`` kind 返回 None（需 ``GhPrResolver``）。git 命令失败 → None（fail-safe）。"""
+    assurance（design 决策#6）：commit 查本地对象库（高保真）；**push 查远端 ref（``ls-remote``）**——
+    本地 branch 存在 ≠ 远端已 push（评审 P1-3：曾误用 ``show-ref`` 把本地分支当作远端 push 已发生，
+    crash drill 据此可能盲目重放 push）。``pr`` kind 返回 None（需 ``GhPrResolver``）。
+    git 命令失败/无 remote → None（fail-safe unknown，绝不把"查不到远端"当"未 push"而盲目重放）。"""
 
-    def __init__(self, repo_dir: str | Path = "."):
+    def __init__(self, repo_dir: str | Path = ".", remote: str = "origin"):
         self.repo_dir = str(repo_dir)
+        self.remote = remote
 
     def check(self, kind: str, target: str) -> bool | None:
         try:
@@ -142,10 +145,16 @@ class LocalGitResolver:
                                    capture_output=True, timeout=10)
                 return r.returncode == 0
             if kind == "push":
-                # 本地 branch ref 存在性（lower-assurance 近似；真实远端 push 需 ls-remote）
-                r = subprocess.run(["git", "show-ref", "--verify", f"refs/heads/{target}"],
-                                   cwd=self.repo_dir, capture_output=True, timeout=10)
-                return r.returncode == 0
+                # 远端真源查询（git ls-remote <remote> refs/heads/<target>），三态：
+                #   成功 + 有匹配行 → confirmed（远端已有此 branch = push 已发生，retry 跳过）
+                #   成功 + 无匹配行 → absent（远端无此 branch = 未 push，可安全 push）
+                #   失败/无 remote/超时 → unknown（fail-safe BLOCK，绝不盲目重放 push，评审 P1-3）
+                r = subprocess.run(
+                    ["git", "ls-remote", self.remote, f"refs/heads/{target}"],
+                    cwd=self.repo_dir, capture_output=True, timeout=15, text=True)
+                if r.returncode != 0:
+                    return None
+                return bool(r.stdout.strip())
             # pr 本地查不到 → None（交 GhPrResolver）
             return None
         except Exception:

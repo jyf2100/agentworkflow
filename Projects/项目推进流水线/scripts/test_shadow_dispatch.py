@@ -286,3 +286,26 @@ def test_dispatch_one_planned_omits_digest_when_prd_unreadable(tmp_path, monkeyp
     assert planned
     assert "prd_digest" not in planned[0].payload
 
+
+# ─── task 4.4：publication 前对账目标构造（_publication_targets，coordinator.owned resolver 消费）──
+def test_publication_targets_covers_push_pr_and_test_evidence():
+    """4.4：_publication_targets 产 push（远端分支）/ pr（``owner:branch``）/ test（green evidence digest）。
+    publication 前对账这三类关键副作用幂等键（commit 已在 verify 阶段 ``_has_commits`` 查 GitHub 视角）。
+    这些 target 喂 ``reconcile.reconcile_side_effects`` + coord.owned resolver 算 confirmed/pending/unknown 三态。"""
+    rec = {"branch": "auto/feat"}
+    vj = {"evidence_ref": {"digest": "sha256:abc"}}
+    targets = run_daily._publication_targets("owner/repo", rec, vj)
+    by_kind = {t.kind: t.target for t in targets}
+    assert by_kind["push"] == "auto/feat"                 # 远端分支
+    assert by_kind["pr"] == "owner/repo:auto/feat"        # owner:branch
+    assert by_kind["test"] == "sha256:abc"                # green evidence digest
+
+
+def test_publication_targets_handles_missing_fields():
+    """4.4：无 branch → 无 push/pr；无 evidence_ref → 无 test；owner_repo 空 → pr target=branch（无前缀）。"""
+    assert run_daily._publication_targets("o/r", {}, {}) == []      # 无 branch 无 evidence → 空
+    only_branch = run_daily._publication_targets("o/r", {"branch": "b"}, {})
+    assert {t.kind for t in only_branch} == {"push", "pr"}          # 有 branch 无 evidence → push/pr
+    no_owner = run_daily._publication_targets("", {"branch": "b"}, {})
+    assert next(t for t in no_owner if t.kind == "pr").target == "b"   # owner_repo 空 → pr target=branch
+

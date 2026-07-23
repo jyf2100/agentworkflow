@@ -1292,7 +1292,8 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
         prd_content = None
     _coord = build_coordinator(stamp=stamp, prd_path=entry.get("prd_path") or "",
                                proj=proj, slug=slug, state_dir=STATE_DIR, profile=prof,
-                               stamp_fn=_now_iso, prd_content=prd_content)
+                               stamp_fn=_now_iso, prd_content=prd_content,
+                               resolver=reconcile.default_resolver(repo, owner_repo))   # task 2.1：coord own reconcile resolver（4.4 publication 前对账消费）
     _run, _prd, _iter, _sj = (_coord.run_id, _coord.prd_id, _coord.iteration_id, _coord.journal)
     # task 2.5：preflight 校验 loop flag 组合一致性（design 决策#1 防 impossible partial 组合）。
     #   违规→阻断不投递（status=skip + 结构化 reason），在 admission profile 门**之前**拦截，不起 dev loop。
@@ -1493,6 +1494,31 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                 _sj.emit("revise", _iter, _prd, payload={"round": round_n})
 
         if vinfo and vinfo.get("verdict") == "pass":
+            # task 4.4：publication 前结构化 reconcile（idempotency keys + KeyResolver 三态）——
+            #   session_aware_retry 开 → 用 coord.owned resolver 对账 push/pr/test 幂等键，ReconciliationReport
+            #   记入 rec + journal（exactly-once 结构化证据；unknown → fail-safe 阻断，不盲目 publish）。
+            #   baseline（flag 关）→ 跳过（reconcile_pr 仍做真实 GitHub 对账，dispatch 决策零变化）。
+            if _coord.flags.session_aware_retry and _coord.resolver is not None:
+                _pub_report = reconcile.reconcile_side_effects(
+                    iteration_id=_iter, targets=_publication_targets(owner_repo, rec, _vj),
+                    resolver=_coord.resolver)
+                rec["publication_reconciliation"] = {
+                    "confirmed": tuple(t.kind for t in _pub_report.confirmed),
+                    "pending": tuple(t.kind for t in _pub_report.pending),
+                    "unknown": tuple(t.kind for t in _pub_report.unknown),
+                    "safe_to_publish": _pub_report.safe_to_retry,
+                }
+                _sj.emit("reconcile", _iter, _prd, payload={
+                    "round": round_n, "phase": "publication",
+                    "confirmed": list(t.kind for t in _pub_report.confirmed),
+                    "pending": list(t.kind for t in _pub_report.pending),
+                    "unknown": list(t.kind for t in _pub_report.unknown),
+                    "safe_to_publish": _pub_report.safe_to_retry})
+                if not _pub_report.safe_to_retry:
+                    log(f"  ⛔ {slug}: publication reconcile 有 unknown 副作用 → fail-safe 阻断（不盲目 publish）")
+                    rec.update(status="blocked_external_state", blocked_check="publication_reconcile",
+                               skip_reason="阻断-publication reconcile 有 unknown 副作用（不盲目 publish）")
+                    break   # 不进 reconcile_pr；for 外 _sj_terminal 统一收尾
             # 判绿：兜底开正常 PR 收尾（治 baostock 式 interrupted_pr；reconcile 查到 dev 自开 PR 则保持 pr_open）
             log(f"  ✅ {slug}: verify 绿（r{round_n}）→ 兜底开 PR 收尾")
             reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=False); break
@@ -1513,6 +1539,24 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
 
     _sj_terminal(_sj, rec, _iter, _prd, artifact_root=STATE_DIR / "artifacts" / _run)   # task 3.2 + 4.4：统一终态 emit（publication 前 reconcile test evidence）
     return rec
+
+
+def _publication_targets(owner_repo: str, rec: dict, vj: dict) -> list:
+    """task 4.4：publication 前对账的副作用目标（push 远端分支 / pr ``owner:branch`` / test green evidence digest）。
+
+    commit 由 ``_has_commits`` 在 verify 阶段已查（GitHub 视角）；此处对账 publication 关键副作用幂等键，
+    交 ``reconcile.reconcile_side_effects`` + coord.owned resolver 算 confirmed/pending/unknown 三态。
+    """
+    targets = []
+    branch = rec.get("branch")
+    if branch:
+        targets.append(reconcile.SideEffectTarget("push", branch))
+        targets.append(reconcile.SideEffectTarget("pr",
+                     f"{owner_repo}:{branch}" if owner_repo else branch))
+    ev = vj.get("evidence_ref") if vj else None
+    if isinstance(ev, dict) and ev.get("digest"):
+        targets.append(reconcile.SideEffectTarget("test", ev["digest"]))
+    return targets
 
 
 def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
