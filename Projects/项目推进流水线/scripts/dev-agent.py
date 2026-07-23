@@ -79,7 +79,9 @@ STATE_RUNS_DIR = REPO_ROOT / "state" / "runs"
 
 def parse_args(argv: list[str]) -> dict:
     out = {"prd": None, "source": None, "base": "main", "dry_run": False,
-           "branch_prefix": "pa-dev", "feedback_artifact": None, "help": False}
+           "branch_prefix": "pa-dev", "feedback_artifact": None, "help": False,
+           # task 3.3：session-aware retry 接入生产执行路径（resume/fork/new-session 分配 distinct iteration）
+           "iteration_seq": 0, "resume_session": None, "fork_session": False}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -88,6 +90,9 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--base": out["base"] = argv[i + 1]; i += 1
         elif a == "--branch-prefix": out["branch_prefix"] = argv[i + 1]; i += 1
         elif a == "--feedback-artifact": out["feedback_artifact"] = argv[i + 1]; i += 1   # task 3.4：driven retry 反馈源
+        elif a == "--iteration-seq": out["iteration_seq"] = int(argv[i + 1]); i += 1     # task 3.3：revise/resume/fork/new-session 衍生 iteration
+        elif a == "--resume-session": out["resume_session"] = argv[i + 1]; i += 1        # task 3.3：retry 同 session resume（SDK ResultMessage.session_id）
+        elif a == "--fork-session": out["fork_session"] = True                           # task 3.3：fork 新 session（context 污染/compaction）
         elif a == "--dry-run": out["dry_run"] = True
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
@@ -412,6 +417,12 @@ async def main() -> int:
             max_budget_usd=MAX_BUDGET,               # 预算刹车（降级兜底，非硬保证——见上 follow-up）
             env=build_env_for_sdk(),                 # PATH 前置 runtime python + claude CLI
             hooks=sdk_hooks,                          # task 2.3b：lifecycle_hooks 开→真实 SDK lifecycle hooks（None=baseline，design 决策#8）
+            # task 3.3：session-aware retry 接入生产执行路径
+            #   retry 同 session → resume=<session_id>（SDK ResultMessage.session_id，transient/agent 中断续传）；
+            #   context 污染/compaction → fork_session=True（new_session 从 parent session 派生）；
+            #   均无 → 新 session（seq=0 baseline）。design 决策#3：transient+session 可用→resume；context 污染→new_session。
+            resume=args["resume_session"],
+            fork_session=args["fork_session"] or None,
         )
         # can_use_tool 回调要求 streaming 模式（SDK 0.2.x：_internal/client.py:103 见 prompt 为
         # str 即 raise「can_use_tool callback requires streaming mode」）。string prompt 经
@@ -420,6 +431,19 @@ async def main() -> int:
         result_msg = await process_dev_loop(query(prompt=prompt_stream(prompt), options=options), state)
     except Exception as e:
         sys.stderr.write(f"✗ SDK dev loop 异常: {e}\n"); return 11
+
+    # task 3.3：持久化 SDK session_id 到 coordinator SessionStore（resume/fork/new-session 决策消费）。
+    # retry（seq>0）→ next_iteration(seq) 衍生 distinct iteration（revise/resume/fork/new-session 各自 iteration）；
+    # seq=0 → build_coordinator 初始 iteration。session_id 缺失 → RetryPolicy fallback new_session（design risk#91）。
+    _iter_for_session = (_coord.next_iteration(args["iteration_seq"])
+                         if args["iteration_seq"] > 0 else _coord.iteration_id)
+    if result_msg and getattr(_coord, "session_store", None):
+        from session_meta import SessionMeta, ResultSubtype
+        _subtype = ResultSubtype.ERROR if getattr(result_msg, "is_error", False) else ResultSubtype.SUCCESS
+        _coord.session_store.save(SessionMeta(
+            iteration_id=_iter_for_session,
+            session_id=getattr(result_msg, "session_id", None),
+            result_subtype=_subtype))
 
     cost = getattr(result_msg, "total_cost_usd", None) if result_msg else None
     turns = getattr(result_msg, "num_turns", None) if result_msg else state["turn"]
