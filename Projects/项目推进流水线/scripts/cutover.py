@@ -31,8 +31,10 @@ import evidence as EV
 import hook_adapter as HA
 import hook_events as HE
 import hook_policy as HP
+import journal as J
 import loop_runtime as LR
 import loop_state as L
+import recovery_context
 import reconcile as RC
 import retry_policy as RP
 import sandbox as SB
@@ -422,6 +424,76 @@ def run_crash_reconciliation_evidence(*, resolver: RC.KeyResolver,
     return CrashReconciliationEvidence(
         results=results, boundaries_run=boundaries_run,
         all_exactly_once=all_exactly_once, summary=summary)
+
+
+# ─── task 7.4：operator journal-corruption recovery command（runbook 引用，design#1 production 命令 + #6 archive）──
+@dataclass(frozen=True)
+class JournalRecoveryResult:
+    """task 7.4：operator recovery 命令结果（spec scenario「Documented recovery command」）。
+
+    两种 action（spec：verifiable recovery 或 explicit manual-block）：
+    * ``recovered``：journal 可读（末尾截断容忍/正常）→ ``terminal_status`` = reduce 重建终态；
+      ``prd_content`` 提供时附 ``recovery_context``（完整恢复），否则仅终态。
+    * ``manual_block``：journal 中部损坏（fail-closed）→ ``report.is_fail_closed``，绝不自动修复，
+      给运维 ``corrupted_line_numbers`` 定位（备份后重建/丢弃受污染 iteration）。
+    design 决策#6：frozen dataclass（不可变归档）。
+    """
+    journal_path: str
+    action: str                          # "recovered" / "manual_block"
+    report: J.CorruptionReport
+    terminal_status: str | None          # recovered → reduce 终态；manual_block → None
+    recovery_context: "recovery_context.RecoveryContext | None"
+    detail: str
+
+
+def run_journal_recovery(*, journal_path, prd_content: str | None = None,
+                         iteration_id: str = "iter_recover", prd_id: str = "prd_recover",
+                         stamp_fn=None) -> JournalRecoveryResult:
+    """task 7.4：operator recovery command——损坏 journal → verifiable recovery 或 explicit manual-block。
+
+    spec scenario「Documented recovery command」：operator follows the runbook for a corrupt journal →
+    every referenced command produces a verifiable recovery or explicit manual-block result。
+
+    production wiring（design 决策#1）：把 ``validate_journal``/``reduce``/``build_recovery_context`` 从
+    disconnected helper 连成可重复的 operator recovery 命令（``recovery_cli.py`` 薄 CLI 包装）。
+
+    决策树：
+        * ``validate_journal`` → ``CorruptionReport``；
+        * ``report.is_fail_closed``（committed history 内中部损坏）→ ``manual_block``（fail-closed，
+          绝不静默跳过坏行归约——否则状态机基于残缺事件得错误状态，design 决策#1）；
+        * 否则（末尾截断容忍 / 正常）→ ``read_events`` → ``reduce`` 重建终态；``prd_content`` 提供 →
+          ``build_recovery_context``（verifiable 完整恢复），缺则仅终态（detail 注 PRD 缺失）。
+
+    Args:
+        journal_path: journal JSONL 路径（损坏真源）。
+        prd_content: PRD 文本（可选；提供 → 完整 RecoveryContext，缺 → 仅终态）。
+        iteration_id/prd_id: recovery_context 归属（prd_content 提供时用）。
+    """
+    report = J.validate_journal(journal_path)
+    if report.is_fail_closed:
+        return JournalRecoveryResult(
+            journal_path=str(journal_path), action="manual_block", report=report,
+            terminal_status=None, recovery_context=None,
+            detail=(f"journal 中部损坏（fail-closed）：行 {list(report.corrupted_line_numbers)}；"
+                    "不自动修复——运维介入（备份后重建或丢弃受污染 iteration）"))
+    events = J.read_events(journal_path)            # 末尾截断容忍
+    if not events:
+        return JournalRecoveryResult(
+            journal_path=str(journal_path), action="recovered", report=report,
+            terminal_status=None, recovery_context=None,
+            detail="空 journal（首次 dispatch 或全截断）——无状态可恢复")
+    state = L.reduce(events)
+    rc: "recovery_context.RecoveryContext | None" = None
+    if prd_content is not None:
+        rc = recovery_context.build_recovery_context(
+            iteration_id=iteration_id, prd_id=prd_id,
+            status_value=state.status.value, prd_content=prd_content, events=events)
+    detail = (f"recovered → terminal={state.status.value}；"
+              + ("PRD 提供 → 完整 RecoveryContext" if rc is not None
+                 else "PRD 缺失 → 仅终态（无 RecoveryContext）"))
+    return JournalRecoveryResult(
+        journal_path=str(journal_path), action="recovered", report=report,
+        terminal_status=state.status.value, recovery_context=rc, detail=detail)
 
 
 # ════════════════════════════════════════════════════════════════════════════

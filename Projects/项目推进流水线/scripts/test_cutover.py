@@ -294,6 +294,77 @@ def test_run_crash_reconciliation_evidence_archives_immutable():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 7.4 journal-corruption recovery command（runbook 命令 + e2e，design #1/#6）
+# ════════════════════════════════════════════════════════════════════════════
+import json as _json  # noqa: E402
+import subprocess  # noqa: E402
+import journal as _J  # noqa: E402
+
+
+def _revo_ev(eid, etype="running", **payload):
+    """造最小合法 JournalEvent（7.4 recovery fixture）。"""
+    return L.JournalEvent(
+        schema_version=L.JOURNAL_SCHEMA_VERSION, event_id=eid,
+        timestamp="2026-07-22T00:00:00Z", iteration_id="i", run_id="r",
+        prd_id="p", event_type=etype, payload=payload)
+
+
+def test_recovery_corrupt_journal_manual_blocks(tmp_path):
+    """中部损坏 → explicit manual-block（不自动修复，给运维 corrupted_line_numbers）。"""
+    p = tmp_path / "bad.jsonl"
+    _J.append_event(p, _revo_ev("e1", "planned"))
+    p.write_text(p.read_text() + "{CORRUPT\n")        # 中部坏行
+    _J.append_event(p, _revo_ev("e2", "running"))     # append → 坏行变中部
+    r = CT.run_journal_recovery(journal_path=p)
+    assert r.action == "manual_block"
+    assert r.report.is_fail_closed
+
+
+def test_recovery_tail_truncated_recovers(tmp_path):
+    """末尾截断容忍 → verifiable recovery（reduce 重建终态）。"""
+    p = tmp_path / "trunc.jsonl"
+    _J.append_event(p, _revo_ev("e1", "planned"))
+    _J.append_event(p, _revo_ev("e2", "running"))
+    p.write_text(p.read_text() + '{"schema_version":')   # 半行截断尾
+    r = CT.run_journal_recovery(journal_path=p)
+    assert r.action == "recovered"
+    assert r.terminal_status is not None
+
+
+def test_recovery_clean_with_prd_recovers_context(tmp_path):
+    """正常 journal + PRD → recovered + RecoveryContext（verifiable 完整恢复）。"""
+    p = tmp_path / "clean.jsonl"
+    _J.append_event(p, _revo_ev("e1", "planned"))
+    _J.append_event(p, _revo_ev("e2", "running"))
+    r = CT.run_journal_recovery(journal_path=p, prd_content="# 标题\n\n## 验收\n- [ ] a\n")
+    assert r.action == "recovered"
+    assert r.recovery_context is not None
+
+
+def test_recovery_cli_executable_manual_block_e2e(tmp_path):
+    """recovery_cli.py 是 runbook 引用的可执行命令：损坏 → exit 2 + JSON manual_block。"""
+    p = tmp_path / "bad.jsonl"
+    _J.append_event(p, _revo_ev("e1", "planned"))
+    p.write_text(p.read_text() + "{CORRUPT\n")
+    _J.append_event(p, _revo_ev("e2", "running"))
+    cli = Path(__file__).parent / "recovery_cli.py"
+    proc = subprocess.run([sys.executable, str(cli), str(p)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 2                       # manual_block exit code
+    data = _json.loads(proc.stdout)
+    assert data["action"] == "manual_block"
+
+
+def test_runbook_references_existing_commands():
+    """spec：runbook 引用的每个命令存在于仓库（every referenced command exists）。"""
+    runbook = Path(__file__).parent.parent / "RUNBOOK.md"
+    assert runbook.exists()
+    text = runbook.read_text(encoding="utf-8")
+    assert "recovery_cli.py" in text
+    assert (Path(__file__).parent / "recovery_cli.py").exists()
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 8.4 recovery canary（resume/fork/new_session + bounded budget + 因果）
 # ════════════════════════════════════════════════════════════════════════════
 def test_recovery_resume_decision():

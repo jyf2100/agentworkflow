@@ -49,6 +49,6 @@
 - [x] 7.1 Run shadow parity against historical fixtures and one real no-write dispatch, resolving every terminal mismatch.
 - [x] 7.2 Run a real SDK hook canary for no-test, stale-test, green-test, semantic-revise, compaction, subagent, and hook-failure paths.
 - [x] 7.3 Run crash drills after agent completion, test completion, commit, push, and PR creation, and archive reconciliation evidence.
-- [ ] 7.4 Implement the runbook's journal-corruption recovery command and test every documented command end to end.
+- [x] 7.4 Implement the runbook's journal-corruption recovery command and test every documented command end to end.
 - [ ] 7.5 Enable journal-driven dispatch for one allowlisted project only after parity passes; retain and test legacy read fallback for one release cycle.
 - [ ] 7.6 Run the complete quality, sandbox, recovery, telemetry, and canary suite and archive immutable passing evidence before marking the change complete.
