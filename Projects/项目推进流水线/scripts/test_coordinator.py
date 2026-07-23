@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import coordinator as CO  # noqa: E402
 import ids as loop_ids  # noqa: E402
 import journal as J  # noqa: E402
+import trace_context as TC  # noqa: E402
 from feature_flags import LoopFlags  # noqa: E402
 from loop_runtime import ShadowJournal  # noqa: E402
 
@@ -247,4 +248,58 @@ def test_prd_digest_differs_when_prd_content_changes(tmp_path):
                               state_dir=tmp_path, env={}, stamp_fn=lambda: "T", prd_content="v2")
     assert c1.prd_digest != c2.prd_digest
     assert c1.prd_id != c2.prd_id
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.1：coordinator own root trace + propagation through operations
+# design 决策#1：telemetry 从 coord 派生，非 disconnected helper。trace_context 已实现 generic
+# root + child；6.1 把它连到 coordinator——per PRD run 建 root trace + 为子 operations 派生子 span。
+# ════════════════════════════════════════════════════════════════════════════
+def test_coordinator_owns_root_trace_per_run(tmp_path):
+    """6.1：build_coordinator → coord.trace 是 root TraceContext（trace_id 由 run_id 派生，无 parent）。"""
+    coord = _build(tmp_path)
+    assert coord.trace.parent_span_id is None
+    assert coord.trace.trace_id == TC.new_trace_id(coord.run_id)
+
+
+def test_coordinator_root_trace_stable_for_same_run(tmp_path):
+    """6.1：同 run → 同 root trace（确定性，跨进程/重放稳定，design 决策#1 稳定 ID）。"""
+    c1 = _build(tmp_path)
+    c2 = _build(tmp_path)
+    assert c1.trace.trace_id == c2.trace.trace_id
+
+
+def test_coordinator_child_span_propagates_trace(tmp_path):
+    """6.1：child_span 派生子 span——trace_id 不变 + parent 指向 root span（propagation）。"""
+    coord = _build(tmp_path)
+    child = coord.child_span("test")
+    assert child.trace_id == coord.trace.trace_id
+    assert child.parent_span_id == coord.trace.span_id
+    assert child.span_id != coord.trace.span_id
+
+
+def test_coordinator_child_span_covers_seven_operations(tmp_path):
+    """6.1：7 子 operation（iteration/sdk_session/tool/test/verify/reconcile/publish）都能派生 child span。"""
+    coord = _build(tmp_path)
+    for op in ("iteration", "sdk_session", "tool", "test", "verify", "reconcile", "publish"):
+        child = coord.child_span(op)
+        assert child.trace_id == coord.trace.trace_id
+        assert child.parent_span_id == coord.trace.span_id
+
+
+def test_coordinator_child_span_rejects_run_and_unknown(tmp_path):
+    """6.1：run 是 root（不作为 child）+ 未知 operation → ValueError。"""
+    coord = _build(tmp_path)
+    with pytest.raises(ValueError):
+        coord.child_span("run")
+    with pytest.raises(ValueError):
+        coord.child_span("bogus")
+
+
+def test_coordinator_trace_present_in_baseline(tmp_path):
+    """6.1：baseline（telemetry flag 关）coord.trace 仍建（metadata-only，无 export 副作用，不依赖 flag）。"""
+    coord = _build(tmp_path)
+    assert coord.is_baseline
+    assert coord.trace is not None
+    assert coord.trace.parent_span_id is None
 

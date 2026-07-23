@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Callable
 
 import ids as loop_ids
+import telemetry as TE
+import trace_context as TC
 from artifact_store import compute_digest
 from feature_flags import LoopFlags, resolve_flags
 from loop_runtime import ShadowJournal
@@ -58,6 +60,7 @@ class Coordinator:
     iteration_id: str               # 初始 iteration（seq=0）；next_iteration(seq) 衍生后续
     journal: ShadowJournal
     artifact_root: str
+    trace: TC.TraceContext               # task 6.1：root trace（per PRD run，trace_id 由 run_id 派生，metadata-only）
     prd_digest: str | None = None        # task 3.1：dispatch entry PRD 内容 digest（``sha256:<hex>``；None=未捕获）
 
     @property
@@ -84,6 +87,25 @@ class Coordinator:
         每次 verify revise/recovery 用新 seq 调此方法得新 iteration，引用 parent run/prd。
         """
         return loop_ids.iteration_id(self.run_id, self.prd_id, seq)
+
+    def child_span(self, operation: str, seq: int = 0) -> TC.TraceContext:
+        """task 6.1：派生 operation 子 span context（propagation through operations）。
+
+        design 决策#1：telemetry 从 coordinator 派生，非 disconnected helper。``operation`` ∈ 子 span 名
+        （iteration/sdk_session/tool/test/verify/reconcile/publish）；``run`` 是 root（不作为 child）；
+        非法 → ValueError。trace_id 不变（同 run 同 trace），parent_span_id 指向 root span。
+
+        生产 dispatch/dev-agent 各 operation（iteration/SDK session/tool/test/verify/reconcile/publish）
+        调此方法得子 span context，记录 telemetry（task 6.2 export 经 TelemetrySink）。
+        """
+        if operation not in _CHILD_SPAN_OPS:
+            raise ValueError(
+                f"illegal child span operation (allowed: {sorted(_CHILD_SPAN_OPS)}): {operation!r}")
+        return self.trace.child(operation, seq)
+
+
+# task 6.1：coordinator root trace 的子 operation（``run`` 是 root，7 子 operation 来自 telemetry.SPAN_NAMES）
+_CHILD_SPAN_OPS: frozenset[str] = TE.SPAN_NAMES - {TE.SPAN_RUN}
 
 
 def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
@@ -117,8 +139,10 @@ def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
     journal = ShadowJournal(journal_path, run, stamp_fn or _real_stamp,
                             enabled=flags.journal_shadow)
     artifact_root = str(Path(state_dir) / "artifacts" / run)
+    trace = TC.trace_context_for_run(run)            # task 6.1：per-PRD-run root trace（metadata-only）
     return Coordinator(flags=flags, run_id=run, prd_id=prd, iteration_id=iteration,
-                       journal=journal, artifact_root=artifact_root, prd_digest=prd_digest)
+                       journal=journal, artifact_root=artifact_root, trace=trace,
+                       prd_digest=prd_digest)
 
 
 # ─── task 2.5：preflight 校验 loop flag 组合一致性（design 决策#1 防 impossible partial 组合）──
