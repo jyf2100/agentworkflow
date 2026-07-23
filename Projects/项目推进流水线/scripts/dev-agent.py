@@ -81,7 +81,10 @@ def parse_args(argv: list[str]) -> dict:
     out = {"prd": None, "source": None, "base": "main", "dry_run": False,
            "branch_prefix": "pa-dev", "feedback_artifact": None, "help": False,
            # task 3.3：session-aware retry 接入生产执行路径（resume/fork/new-session 分配 distinct iteration）
-           "iteration_seq": 0, "resume_session": None, "fork_session": False}
+           "iteration_seq": 0, "resume_session": None, "fork_session": False,
+           # task 3.3 P0-3：state_dir 由控制面 run_daily 注入（=STATE_DIR）→ dev-agent session_store 与
+           #   控制面 coordinator 同一 SessionStore（retry 读 dev-agent 持久化的 session_id）；缺省=worktree/state
+           "state_dir": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -93,6 +96,7 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--iteration-seq": out["iteration_seq"] = int(argv[i + 1]); i += 1     # task 3.3：revise/resume/fork/new-session 衍生 iteration
         elif a == "--resume-session": out["resume_session"] = argv[i + 1]; i += 1        # task 3.3：retry 同 session resume（SDK ResultMessage.session_id）
         elif a == "--fork-session": out["fork_session"] = True                           # task 3.3：fork 新 session（context 污染/compaction）
+        elif a == "--state-dir": out["state_dir"] = argv[i + 1]; i += 1                  # task 3.3 P0-3：控制面注入 state_dir（SessionStore 统一）
         elif a == "--dry-run": out["dry_run"] = True
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
@@ -396,8 +400,11 @@ async def main() -> int:
     # task 2.3b：coordinator 边界（design 决策#1）——一次解析 loop flag + own journal/artifacts/IDs；
     # lifecycle_hooks 开 → build_dev_hooks 注册真实 SDK lifecycle hooks（PreToolUse/Stop/...），
     # 关 → sdk_hooks=None（baseline，dev-agent 行为零变化，design 决策#8）。
+    # task 3.3 P0-3：state_dir 优先用控制面注入（=run_daily STATE_DIR）→ dev-agent session_store 与控制面
+    #   coordinator 同一 SessionStore（retry 读到 dev-agent 持久化的 SDK session_id）；缺省=worktree/state（baseline）
+    _state_dir = args["state_dir"] or str(REPO_ROOT / "state")
     _coord = build_coordinator(stamp=s, prd_path=args["prd"], proj=REPO_ROOT.name,
-                               slug=slug, state_dir=str(REPO_ROOT / "state"),
+                               slug=slug, state_dir=_state_dir,
                                env=dict(os.environ))
     _dev_adapter, sdk_hooks = build_dev_hooks(_coord)
     result_msg: ResultMessage | None = None

@@ -51,6 +51,7 @@ import journal as J                        # task 3.4：driven retry 读 journal
 import recovery_context as RC              # task 3.4：driven retry prompt 从 immutable PRD + journal artifacts（纯函数）
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
 import reconcile                           # task 4.4：ArtifactEvidenceResolver（publication 前 reconcile test evidence）
+import retry_policy as RP                  # task 3.3 P0-3：run_daily 驱动 retry（decide/recover_iteration/budget/session 参数生成）
 
 try:
     import yaml
@@ -1048,7 +1049,9 @@ def _run_capture(cmd: list[str], cwd: str, timeout: int, label: str,
 
 # ─── verify 闭环辅助（dev→独立验证→pa-verify，docs/verify-commit-loop-design.md §3/§5）──
 def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
-             feedback_artifact: str | None = None) -> list[str] | None:
+             feedback_artifact: str | None = None, *,
+             state_dir: str | None = None, iteration_seq: int = 0,
+             resume_session: str | None = None, fork_session: bool = False) -> list[str] | None:
     """构造 dev-agent 触发命令（ADR-0006：控制面标准执行器为唯一源）。
 
     始终调用控制面 ``scripts/dev-agent.py``（DEV_AGENT_PY）——执行器贴目标仓跑（cwd=调用方传入的
@@ -1070,6 +1073,16 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
         cmd += ["--source", src_abs]
     if feedback_artifact:    # task 3.4：driven retry prompt 从 feedback artifact（PRD 不可变，反馈在 artifact）
         cmd += ["--feedback-artifact", feedback_artifact]
+    # task 3.3 P0-3：session-aware retry 参数（run_daily 据 RetryPolicy.decide 生成 → dev-agent 透传 SDK）。
+    #   state_dir=控制面 STATE_DIR → dev-agent session_store 与控制面同一（retry 读 dev-agent 持久化 session_id）。
+    if state_dir:
+        cmd += ["--state-dir", state_dir]
+    if iteration_seq > 0:          # seq=0 baseline（新 session）；seq>0 retry 衍生 distinct iteration
+        cmd += ["--iteration-seq", str(iteration_seq)]
+    if resume_session:
+        cmd += ["--resume-session", resume_session]
+    if fork_session:
+        cmd += ["--fork-session"]
     return cmd
 
 
@@ -1375,6 +1388,9 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     #    执行器选源已固化（ADR-0006）：控制面 scripts/dev-agent.py 唯一，不再探测仓内 dev-agent.{py,mjs}。
     cur_base = base
     _parent_iter: str | None = None       # task 3.3：prior iteration（revise→next attempt 引用，spec Iteration identity）
+    # task 3.3 P0-3：session-aware retry 参数（revise→RetryPolicy.decide 生成；baseline flag 关=保持 None/False）
+    cur_resume_session: str | None = None
+    cur_fork_session = False
     _parent_fb_digest: str | None = None  # task 3.3：prior feedback artifact digest（next attempt 引用）
     for round_n in range(1, VERIFY_MAX_ROUNDS + 1):
         _iter = _coord.next_iteration(round_n)   # task 3.3：每轮 distinct deterministic iteration（seq=round_n；
@@ -1390,7 +1406,12 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                 _fb_artifact = _ctx.last_verifier_feedback_path
             except Exception:
                 _fb_artifact = None    # 容错：recovery 抽取失败 → 退回 baseline 读 PRD，不崩 verify 闭环
-        cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact)
+        if _coord.flags.session_aware_retry:   # task 3.3 P0-3：retry 模式注入 state_dir+session 参数（baseline flag 关→原 cmd 零变化）
+            cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
+                           state_dir=str(STATE_DIR), iteration_seq=round_n,
+                           resume_session=cur_resume_session, fork_session=cur_fork_session)
+        else:
+            cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact)
         if cmd is None:
             rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
             _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
@@ -1532,6 +1553,42 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
             _parent_iter = _iter              # task 3.3：next attempt（round_n+1）引用 prior iteration
             _parent_fb_digest = _fb_digest    # task 3.3：next attempt 引用 round_n feedback artifact digest
             cur_base = branch
+            # task 3.3 P0-3：session-aware retry 闭环——run_daily 驱动 RetryPolicy（recover_iteration 内
+            #   reconcile 副作用 + decide）→ 据 mode 生成 dev-agent session 参数 + emit journal 决策事件 +
+            #   消耗 retry 预算。baseline（flag 关）→ 跳过，走原增量 --base 重投（dispatch 决策零变化）。
+            if _coord.flags.session_aware_retry and _coord.resolver is not None \
+                    and getattr(_coord, "session_store", None) and getattr(_coord, "retry_budget", None):
+                _rplan = reconcile.recover_iteration(
+                    journal_path=_sj.path, run_id=_run, prd_id=_prd, iteration_id=_iter,
+                    base=cur_base, prd_content=prd_abs.read_text(encoding="utf-8"),
+                    targets=_publication_targets(owner_repo, rec, _vj),
+                    resolver=_coord.resolver, session_store=_coord.session_store,
+                    budget=_coord.retry_budget,
+                    verifier_signal=RP.VerifierSignal.LOCAL_FEEDBACK)   # revise=局部反馈，history 可信
+                _rmode = _rplan.decision.mode
+                _sj.emit("retry_decided", _iter, _prd, payload={
+                    "round": round_n, "next_round": round_n + 1, "mode": _rmode.value,
+                    "reason": _rplan.decision.reason, "consumes_retry": _rplan.decision.consumes_retry,
+                    "external_known": _rplan.reconciliation.external_known,
+                    "iteration_status": _rplan.iteration_status})
+                if _rmode in (RP.RetryMode.BLOCK, RP.RetryMode.STOP):
+                    log(f"  ⛔ {slug}: retry {_rmode.value}（{_rplan.decision.reason}）→ 不重试")
+                    rec.update(status="retry_blocked" if _rmode is RP.RetryMode.BLOCK else "retry_budget_exhausted",
+                               skip_reason=f"阻断-retry {_rmode.value}: {_rplan.decision.reason}")
+                    break
+                # 据 mode 设下一轮 session 参数（dev-agent 透传 SDK：resume/fork/new-session）
+                if _rmode is RP.RetryMode.RESUME:
+                    _sess = _coord.session_store.load(_iter)
+                    cur_resume_session = getattr(_sess, "session_id", None) if _sess else None
+                    cur_fork_session = False
+                elif _rmode is RP.RetryMode.FORK:
+                    cur_resume_session = None
+                    cur_fork_session = True
+                else:   # NEW_SESSION
+                    cur_resume_session = None
+                    cur_fork_session = False
+                if _rplan.decision.consumes_retry:
+                    _coord.retry_budget.consume(RP.BudgetDimension.SDK_RETRY)
             continue
         # 判红用满（round_n==VERIFY_MAX_ROUNDS）/ pa-verify 异常 / 无产出 → 对账降级 interrupted_pr（不 drop，半成品留 review）
         log(f"  ⏸ {slug}: verify 终止（r{round_n}, verdict={rec['verify_verdict']}）→ 对账收尾（中断 PR 不 drop）")
