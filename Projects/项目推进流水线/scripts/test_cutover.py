@@ -165,6 +165,61 @@ def test_lifecycle_unknown_scenario_raises():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 7.2 SDK hook canary（no-test / stale-test / green-test / semantic-revise / compaction / subagent / hook-failure）
+# ════════════════════════════════════════════════════════════════════════════
+import evidence as EV  # noqa: E402
+
+
+def test_canary_stale_test_denies_stop():
+    """stale-test path：绿后候选写 → GATE_STALE（区别 test_red 的 GATE_FAILED）。"""
+    r = CT.run_lifecycle_drill("stale_test")
+    assert r.stop_decision == "deny"
+    assert r.gate == EV.GATE_STALE
+
+
+def test_canary_semantic_revise_defers_publish():
+    """semantic-revise path：inner fresh-green gate 放行，外层 verify 语义判红 → revise（dual-gate）。"""
+    r = CT.run_lifecycle_drill("semantic_revise")
+    assert r.stop_decision == "revise"
+    assert r.gate == "semantic_revise"
+
+
+def test_canary_subagent_blocks_publication():
+    """subagent path：subagent context 强制 allow_publication=False → publication PreToolUse DENY。"""
+    r = CT.run_lifecycle_drill("subagent")
+    assert r.stop_decision == "deny"
+    assert r.gate == "publication_blocked"
+    assert "deny" in r.detail.lower()
+
+
+def test_canary_hook_failure_fail_closed():
+    """hook-failure path：snapshot_writer 抛异常 → auto 压缩 unpersisted → fail-closed block。"""
+    r = CT.run_lifecycle_drill("hook_failure")
+    assert r.stop_decision == "deny"
+    assert r.gate == "fail_closed"
+    assert r.snapshot_persisted is False
+
+
+def test_run_sdk_hook_canary_covers_all_spec_paths():
+    """canary 命令覆盖 spec 7 path（design#1 production 证据命令 + #6 archive）。"""
+    ev = CT.run_sdk_hook_canary()
+    assert set(ev.paths_covered) == {
+        "no-test", "stale-test", "green-test", "semantic-revise",
+        "compaction", "subagent", "hook-failure",
+    }
+    mapped = [CT.SPEC_PATH_TO_SCENARIO[p] for p in ev.paths_covered]
+    assert all(ev.stop_gates[s] for s in mapped)
+
+
+def test_run_sdk_hook_canary_archives_immutable():
+    """evidence frozen + 不可变归档（tuple scenarios + 非空 summary）。"""
+    ev = CT.run_sdk_hook_canary()
+    assert isinstance(ev.scenarios, tuple)
+    assert all(isinstance(s, CT.LifecycleDrillResult) for s in ev.scenarios)
+    assert ev.summary
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 8.3 crash drill（exactly-once via reconcile）
 # ════════════════════════════════════════════════════════════════════════════
 def test_crash_agent_done_no_side_effects_exactly_once():

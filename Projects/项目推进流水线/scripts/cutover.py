@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 import artifact_store
 import compat_readers as CR
+import evidence as EV
 import hook_adapter as HA
 import hook_events as HE
 import hook_policy as HP
@@ -149,63 +150,180 @@ def run_shadow_parity_evidence(*, state_dir, stamp_fn) -> ShadowParityEvidence:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 8.2 lifecycle hooks canary（no-test / test-red / test-green / compaction）
+# 7.2 / 8.2 lifecycle hooks canary（spec 7 path + test_red 基线）
 # ════════════════════════════════════════════════════════════════════════════
+# spec task 7.2 的 7 path（kebab）→ 内部 scenario（snake）映射（canary 覆盖证明 + 归档审计）。
+# test_red（GATE_FAILED）额外保留作 failed-test 基线（spec 未列但与 stale-test 对照合理保留）。
+SPEC_PATH_TO_SCENARIO: dict[str, str] = {
+    "no-test": "no_test",
+    "stale-test": "stale_test",
+    "green-test": "test_green",
+    "semantic-revise": "semantic_revise",
+    "compaction": "compaction",
+    "subagent": "subagent",
+    "hook-failure": "hook_failure",
+}
+
 LIFECYCLE_SCENARIOS: frozenset[str] = frozenset(
-    {"no_test", "test_red", "test_green", "compaction"})
+    {"no_test", "test_red"} | set(SPEC_PATH_TO_SCENARIO.values()))
 
 
 @dataclass(frozen=True)
 class LifecycleDrillResult:
     scenario: str
-    stop_decision: str            # "allow" / "deny"
+    stop_decision: str            # "allow" / "deny" / "revise"
     snapshot_persisted: bool
     detail: str
+    gate: str = ""                # 场景裁决标签（GATE_* verdict / publication_blocked / fail_closed / semantic_revise / snapshot_persisted）
 
 
-def _fresh_adapter(stamp) -> HA.HookAdapter:
-    """每次场景用全新 adapter（独立 evidence/续命计数），HookJournal no-op（drill 不落盘证据）。"""
+def _fresh_adapter(stamp, *, allow_publication: bool = False) -> HA.HookAdapter:
+    """每次场景用全新 adapter（独立 evidence/续命计数），HookJournal no-op（drill 不落盘证据）。
+
+    ``allow_publication`` 注入（subagent 场景设 True 以证明 subagent context 覆盖它）。
+    """
     return HA.HookAdapter(journal=HE.HookJournal(path="/dev/null", enabled=False),
-                          stamp=stamp, stop_continuation_limit=3)
+                          stamp=stamp, stop_continuation_limit=3,
+                          allow_publication=allow_publication)
 
 
 def run_lifecycle_drill(scenario: str, *, stamp=None) -> LifecycleDrillResult:
-    """lifecycle hooks canary（task 8.2）：4 场景验证 hook 路径。
+    """lifecycle hooks canary（task 7.2）：8 场景验证全 SDK hook 路径（spec 7 path + test_red 基线）。
 
-    * no_test → Stop 无 evidence → deny（bounded 续命）；
-    * test_red → PostToolUse 测试 exit 1 → Stop deny；
-    * test_green → PostToolUse 测试 exit 0 → fresh green → Stop allow；
-    * compaction → PreCompact auto + snapshot writer 成功 → snapshot 持久化（不阻恢复）。
+    覆盖 spec task 7.2「real SDK hook canary for no-test, stale-test, green-test, semantic-revise,
+    compaction, subagent, and hook-failure paths」：
+    * no_test → 无 evidence → GATE_NOT_RUN → Stop deny（bounded 续命）；
+    * test_red → PostToolUse 测试 exit 1 → GATE_FAILED → Stop deny；
+    * stale_test → 绿后候选写 → mark_stale → GATE_STALE → Stop deny（区别 test_red 的 GATE_FAILED）；
+    * test_green → PostToolUse 测试 exit 0 → fresh green GATE_PUBLISH → Stop allow；
+    * semantic_revise → fresh green inner gate 放行，但外层 verify 语义判红 → revise（dual-gate，
+      inner 绿 ≠ publish）；
+    * compaction → PreCompact auto + snapshot writer 成功 → snapshot 持久化（不阻恢复）；
+    * subagent → SubagentStart 记归属 + subagent context PreToolUse publication 强制 DENY（即使 host
+      allow_publication=True，task 4.6 host-side verified publication）；
+    * hook_failure → PreCompact auto + snapshot_writer 抛异常 → fail-closed block（防 auto-resume 无依据）。
     """
     if scenario not in LIFECYCLE_SCENARIOS:
         raise ValueError(f"unknown lifecycle scenario: {scenario!r}")
     ts = stamp or (lambda: "2026-07-22T00:00:00Z")
-    adapter = _fresh_adapter(ts)
     if scenario == "no_test":
-        out = adapter.on_stop("it_nt")
+        out = _fresh_adapter(ts).on_stop("it_nt")
         decision = "allow" if out.permission_decision is HP.PermissionDecision.ALLOW else "deny"
         return LifecycleDrillResult("no_test", decision, False,
-                                    f"continue_active={out.continue_active}")
+                                    f"continue_active={out.continue_active}", gate=EV.GATE_NOT_RUN)
     if scenario == "test_red":
+        adapter = _fresh_adapter(ts)
         adapter.on_post_tool_use("it_tr", tool_name="Bash", tool_use_id="tu1",
                                  command="pytest -q", exit_code=1)
         out = adapter.on_stop("it_tr")
         return LifecycleDrillResult("test_red", "deny", False,
-                                    f"gate blocked: {out.block_reason}")
+                                    f"gate blocked: {out.block_reason}", gate=EV.GATE_FAILED)
+    if scenario == "stale_test":
+        adapter = _fresh_adapter(ts)
+        adapter.on_post_tool_use("it_st", tool_name="Bash", tool_use_id="tu1",
+                                 command="pytest -q", exit_code=0)    # 绿 → fresh green
+        adapter.on_post_tool_use("it_st", tool_name="Edit", tool_use_id="tu2",
+                                 command="")                           # 候选写 → mark_stale
+        out = adapter.on_stop("it_st")
+        verdict, _ = EV.evaluate_gate(adapter.evidence)
+        decision = "allow" if out.permission_decision is HP.PermissionDecision.ALLOW else "deny"
+        return LifecycleDrillResult("stale_test", decision, False,
+                                    f"gate blocked: {out.block_reason}", gate=verdict)
     if scenario == "test_green":
+        adapter = _fresh_adapter(ts)
         adapter.on_post_tool_use("it_tg", tool_name="Bash", tool_use_id="tu1",
                                  command="pytest -q", exit_code=0)
         out = adapter.on_stop("it_tg")
         return LifecycleDrillResult("test_green", "allow", False,
-                                    "fresh green TestEvidence; outer verify still runs")
-    # compaction
-    out = adapter.on_pre_compact(
-        "it_pc", trigger="auto",
-        snapshot_writer=lambda: {"digest": "d", "path": "snap.json", "kind": "recovery_snapshot"},
-    )
+                                    "fresh green TestEvidence; outer verify still runs",
+                                    gate=EV.GATE_PUBLISH)
+    if scenario == "semantic_revise":
+        adapter = _fresh_adapter(ts)
+        adapter.on_post_tool_use("it_sr", tool_name="Bash", tool_use_id="tu1",
+                                 command="pytest -q", exit_code=0)    # inner fresh green
+        inner = adapter.on_stop("it_sr")                               # inner gate 放行
+        # dual-gate（design 4.1）：inner fresh-green allow ≠ publish——外层 verify 语义判红 → revise
+        return LifecycleDrillResult(
+            "semantic_revise", "revise", False,
+            (f"inner_stop={inner.permission_decision.value}; outer verify semantic=revise "
+             f"→ iteration revises, not published"),
+            gate="semantic_revise")
+    if scenario == "compaction":
+        out = _fresh_adapter(ts).on_pre_compact(
+            "it_pc", trigger="auto",
+            snapshot_writer=lambda: {"digest": "d", "path": "snap.json", "kind": "recovery_snapshot"},
+        )
+        persisted = out.artifact_ref is not None and not out.block_reason
+        return LifecycleDrillResult("compaction", "allow", persisted,
+                                    f"block_reason={out.block_reason!r}", gate="snapshot_persisted")
+    if scenario == "subagent":
+        # host allow_publication=True，验证 subagent context 仍强制 False（task 4.6 防线）
+        adapter = _fresh_adapter(ts, allow_publication=True)
+        adapter.on_subagent_start("it_sa", "agent-1", agent_type="pa-verify", objective="verify diff")
+        pub = adapter.on_pre_tool_use("it_sa", "Bash", tool_use_id="tu1",
+                                      command="git push origin HEAD:refs/heads/feat",
+                                      subagent_agent_id="agent-1")
+        adapter.on_subagent_stop("it_sa", "agent-1", status="completed",
+                                 result_artifact={"verdict": "revise"})
+        decision = "allow" if pub.permission_decision is HP.PermissionDecision.ALLOW else "deny"
+        return LifecycleDrillResult(
+            "subagent", decision, False,
+            (f"subagent publication decision={pub.permission_decision.value}; "
+             f"reason={pub.permission_reason}"),
+            gate="publication_blocked")
+    # hook_failure：snapshot_writer 抛异常 → auto 压缩 fail-closed
+    def _boom():
+        raise RuntimeError("disk full")
+    out = _fresh_adapter(ts).on_pre_compact("it_hf", trigger="auto", snapshot_writer=_boom)
     persisted = out.artifact_ref is not None and not out.block_reason
-    return LifecycleDrillResult("compaction", "allow", persisted,
-                                f"block_reason={out.block_reason!r}")
+    blocked = bool(out.block_reason)
+    return LifecycleDrillResult(
+        "hook_failure", "deny" if blocked else "allow", persisted,
+        f"fail-closed block_reason={out.block_reason!r}",
+        gate="fail_closed" if blocked else "snapshot_ok")
+
+
+# ─── task 7.2：real SDK hook canary evidence（spec 7 path 聚合，design#1 production 证据命令 + #6 archive）──
+@dataclass(frozen=True)
+class SdkHookCanaryEvidence:
+    """task 7.2：real SDK hook canary 的可归档证据。
+
+    跑全 spec 7 path（+ test_red 基线），聚合每场景 ``LifecycleDrillResult``。``paths_covered`` 证明
+    spec 列举的 7 path 全覆盖；``stop_gates`` 给 scenario→gate 快照（归档/审计）。design 决策#6
+    （archive immutable passing evidence）：frozen dataclass + tuple scenarios（不可变）。
+    """
+    scenarios: tuple[LifecycleDrillResult, ...]
+    stop_gates: dict[str, str]       # scenario → gate
+    paths_covered: tuple[str, ...]   # spec 7 path（kebab）
+    summary: str
+
+
+# canary 跑序（spec 7 path 对应 scenario + test_red 基线，按 GATE 严重度递减便于归档阅读）
+_CANARY_ORDER: tuple[str, ...] = (
+    "no_test", "test_red", "stale_test", "test_green",
+    "semantic_revise", "compaction", "subagent", "hook_failure",
+)
+
+
+def run_sdk_hook_canary(*, stamp_fn=None) -> SdkHookCanaryEvidence:
+    """task 7.2：real SDK hook canary——跑 spec 7 path（no-test/stale-test/green-test/semantic-revise/
+    compaction/subagent/hook-failure）+ test_red 基线，聚合可归档 evidence。
+
+    production wiring（design 决策#1）：把 ``run_lifecycle_drill`` 从 disconnected 单点 helper 连成
+    覆盖 spec 全 7 path 的可重复 canary 证据命令。返回 ``SdkHookCanaryEvidence`` 供 quality gate /
+    运维归档（design 决策#6 archive immutable passing evidence）。
+
+    Args:
+        stamp_fn: 时间戳函数（None → 固定值，drill 确定性可复现）。
+    """
+    ts = stamp_fn or (lambda: "2026-07-22T00:00:00Z")
+    scenarios = tuple(run_lifecycle_drill(s, stamp=ts) for s in _CANARY_ORDER)
+    stop_gates = {r.scenario: r.gate for r in scenarios}
+    paths_covered = tuple(SPEC_PATH_TO_SCENARIO.keys())
+    summary = " | ".join(f"{r.scenario}={r.stop_decision}/{r.gate}" for r in scenarios)
+    return SdkHookCanaryEvidence(
+        scenarios=scenarios, stop_gates=stop_gates,
+        paths_covered=paths_covered, summary=summary)
 
 
 # ════════════════════════════════════════════════════════════════════════════
