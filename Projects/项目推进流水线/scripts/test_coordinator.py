@@ -515,3 +515,84 @@ def test_coordinator_build_report_does_not_mutate_base(tmp_path):
     coord.build_report(base)
     assert "observability" not in base
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.4：production-path tests
+# spec task 6.4：「Add production-path tests for OTLP outage, secret rejection,
+# recovery span links, and report redaction.」
+# OTLP outage 的 flush+degradation+journal 生产路径已在 task 6.2 覆盖
+# （test_coordinator_degradation_journaled / _does_not_crash_when_journal_disabled）；
+# 本节补 6.2/6.3 未覆盖的生产路径 wiring：endpoint 配置解析、recovery span links、report 端到端 redaction。
+# ════════════════════════════════════════════════════════════════════════════
+def test_coordinator_otlp_endpoint_configures_http_exporter(tmp_path):
+    """6.4 OTLP 生产配置路径：PA_OTLP_ENDPOINT + telemetry_export → sink.exporter 是 HttpOtlpExporter
+    （bounded ``timeout``，design L82「bounded timeouts」）。非 DI——真实生产 env 解析。"""
+    import otlp_export as OTLP
+    coord = CO.build_coordinator(
+        stamp=_STAMP, prd_path="prd/proj/x.md", proj="proj", slug="x",
+        state_dir=tmp_path, profile={"loop": {"telemetry_export": True}},
+        env={"PA_OTLP_ENDPOINT": "http://collector:4318"}, stamp_fn=lambda: "T",
+        otlp_timeout=3.0)
+    assert isinstance(coord.telemetry_sink.exporter, OTLP.HttpOtlpExporter)
+    assert coord.telemetry_sink.exporter.endpoint == "http://collector:4318"
+    assert coord.telemetry_sink.exporter.timeout == 3.0            # bounded
+
+
+def test_coordinator_no_endpoint_when_flag_on_is_safe_noop(tmp_path):
+    """6.4 OTLP outage 安全降级：telemetry 开但 PA_OTLP_ENDPOINT 未配 → exporter None（flush no-op，
+    不记 degradation；otlp_export L152「无 exporter 配置 = no-op」）。dispatch 不受影响。"""
+    coord = CO.build_coordinator(
+        stamp=_STAMP, prd_path="prd/proj/x.md", proj="proj", slug="x",
+        state_dir=tmp_path, profile={"loop": {"telemetry_export": True}},
+        env={}, stamp_fn=lambda: "T")
+    assert coord.telemetry_sink.exporter is None
+    res = coord.flush_telemetry()
+    assert res.exported_spans == 0
+    assert res.degraded is False
+
+
+def test_coordinator_emit_telemetry_span_carries_recovery_links(tmp_path):
+    """6.4 recovery span links：emit_telemetry_span(links=(prev_span,)) → export 的 span.links 反映
+    resume/fork 因果（design L80 trace context + span links 表达 continuation）。"""
+    exp = _FakeExporter()
+    coord = _telem(tmp_path, exporter=exp)
+    prev_span_id = "abc123def456abc1"          # resume 接续的 parent iteration span_id（16 hex）
+    coord.emit_telemetry_span("iteration", links=(prev_span_id,))
+    coord.flush_telemetry()
+    span = exp.exported[0][0][0]
+    assert prev_span_id in span.links          # 因果传播（resume/fork link 指回 parent span）
+
+
+def test_coordinator_report_observability_redacted_end_to_end(tmp_path):
+    """6.4 report redaction 端到端：build_report 全 observability 字段经 json 无 secret/prompt/credential。
+
+    coord own 的 trace_id（hash）/tier/authority 是枚举，调用方传 semantic_verdict/evidence_integrity
+    为 trusted 枚举——report 可观测段绝不泄敏感（production-path redaction，design L80/L94）。
+    """
+    import json
+    coord = _build(tmp_path, profile={"loop": {"journal_shadow": True, "container_sandbox": True}})
+    out = coord.build_report(
+        {"run_id": "r1"}, semantic_verdict="pass", evidence_integrity="ok",
+        recovery_mode="fork", compaction_count=1)
+    blob = json.dumps(out["observability"]).lower()
+    for needle in ("prompt", "secret", "credential", "cookie", "authorization", "ghp_", "bearer"):
+        assert needle not in blob
+
+
+def test_coordinator_emit_span_secret_value_rejected_in_production_path(tmp_path):
+    """6.4 secret rejection 生产路径：emit_telemetry_span 白名单 key + secret value → export payload 抹
+    （metadata-only 经 make_span sanitize，design L80 绝不记 secret）。"""
+    import json
+    import otlp_export as OTLP
+    exp = _FakeExporter()
+    coord = _telem(tmp_path, exporter=exp)
+    coord.emit_telemetry_span("tool", attributes={
+        "tool_use_id": "tu_1",                         # 白名单
+        "error_class": "Auth Bearer ghp_LEAKED_xyz",   # 白名单 key + secret value → 抹
+    })
+    coord.flush_telemetry()
+    span = exp.exported[0][0][0]
+    payload_blob = json.dumps(OTLP._span_payload(span)).lower()
+    assert "ghp_leaked_xyz" not in payload_blob        # secret value 抹
+    assert "tu_1" in payload_blob                       # 元数据保留
+
