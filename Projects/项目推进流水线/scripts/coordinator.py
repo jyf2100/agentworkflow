@@ -24,12 +24,14 @@ DI（design 决策#6）：``stamp_fn``/``env``/``profile`` 注入，单测确定
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 import ids as loop_ids
+import otlp_export as OTLP
 import telemetry as TE
 import trace_context as TC
 from artifact_store import compute_digest
@@ -61,6 +63,7 @@ class Coordinator:
     journal: ShadowJournal
     artifact_root: str
     trace: TC.TraceContext               # task 6.1：root trace（per PRD run，trace_id 由 run_id 派生，metadata-only）
+    telemetry_sink: OTLP.TelemetrySink   # task 6.2：OTLP export + degradation journaling（enabled 从 telemetry_export flag）
     prd_digest: str | None = None        # task 3.1：dispatch entry PRD 内容 digest（``sha256:<hex>``；None=未捕获）
 
     @property
@@ -103,15 +106,89 @@ class Coordinator:
                 f"illegal child span operation (allowed: {sorted(_CHILD_SPAN_OPS)}): {operation!r}")
         return self.trace.child(operation, seq)
 
+    def emit_telemetry_span(self, operation: str, *, seq: int = 0,
+                            attributes=None, start_ms: int = 0, end_ms: int = 0,
+                            status: str = "ok", links: tuple[str, ...] = ()) -> None:
+        """task 6.2：派生 child span → emit 到 sink（metadata-only attributes）。
+
+        design 决策#1：telemetry 从 coord 发，非 disconnected helper。``operation`` 经 ``child_span`` 派生
+        （propagation：trace_id 不变，parent 指向 root span）；attributes 经 ``make_span`` 内
+        ``sanitize_attributes`` 仅留 metadata（allowlist key + secret value 抹，design L80 绝不记
+        prompt/source/secret）。flag 关 → ``sink.emit_span`` no-op。
+
+        生产 dispatch/dev-agent 各 operation 完成后调此方法记录 span；``seq`` 区分同 operation 多次
+        （多次 test → 不同 span_id）。
+        """
+        child = self.child_span(operation, seq=seq)     # propagation（非法 operation → ValueError）
+        span = TE.make_span(
+            operation, trace_id=child.trace_id, span_id=child.span_id,
+            parent_span_id=child.parent_span_id, links=links,
+            start_ms=start_ms, end_ms=end_ms, status=status, attributes=attributes)
+        self.telemetry_sink.emit_span(span)
+
+    def flush_telemetry(self) -> OTLP.ExportResult:
+        """task 6.2：flush 收集的 span/metric 到 OTLP backend（bounded timeout 由 exporter 持有）。
+
+        flag 关 → no-op（``ExportResult()``）；backend 不可用/超时 → ``degraded=True``（callback 落 journal
+        ``telemetry_degraded`` event，design L82 可见），**绝不抛**——telemetry 是观测层，outage 不得拖垮
+        被观测的 dispatch（design L82 + shadow 契约#3）。失败时 span 保留待下次重试。
+        """
+        return self.telemetry_sink.flush()
+
 
 # task 6.1：coordinator root trace 的子 operation（``run`` 是 root，7 子 operation 来自 telemetry.SPAN_NAMES）
 _CHILD_SPAN_OPS: frozenset[str] = TE.SPAN_NAMES - {TE.SPAN_RUN}
 
 
+# ─── task 6.2：telemetry sink 构造（coordinator own；enabled 从 flags.telemetry_export）──────────
+def _make_degradation_callback(journal: ShadowJournal, iteration_id: str, prd_id: str):
+    """造 degradation callback：telemetry backend 不可用时落 ``telemetry_degraded`` lifecycle event。
+
+    design L82「记录一次可见的 degradation event」——callback 经 ``journal.emit`` 落盘（journal enabled 时）；
+    journal disabled 时 emit no-op，可见性兜底由 ``sink.degraded`` 给 report（task 6.3）。``error`` 截断
+    200 字防长 stack/敏感泄漏。
+    """
+    def _cb(rec: OTLP.DegradationRecord) -> None:
+        journal.emit("telemetry_degraded", iteration_id, prd_id, payload={
+            "reason": rec.reason,
+            "at_flush": rec.at_flush,
+            "error": (rec.error or "")[:200],
+        })
+    return _cb
+
+
+def _build_telemetry_sink(*, flags: LoopFlags, journal: ShadowJournal, iteration_id: str,
+                          prd_id: str, env: dict | None, telemetry_exporter,
+                          otlp_timeout: float) -> OTLP.TelemetrySink:
+    """建 coordinator own 的 ``TelemetrySink``（design 决策#1：telemetry 从 coord 派生）。
+
+    exporter 解析（DI 优先）：
+      * ``telemetry_exporter`` 注入（测试 ``FakeExporter``）→ 直接用；
+      * flag 开但无注入 → ``PA_OTLP_ENDPOINT`` 配则 ``HttpOtlpExporter(endpoint, timeout)``（bounded
+        timeout），未配则 ``None``（sink enabled 但无 exporter = flush no-op，otlp_export L152）；
+      * flag 关 → ``None``（sink disabled = 全 no-op，design 决策#8 渐进启用）。
+    degradation callback 始终接（flag 关时 sink 不 flush，callback 不触发）。
+    """
+    enabled = flags.telemetry_export
+    if telemetry_exporter is not None:
+        exporter = telemetry_exporter
+    elif enabled:
+        env_dict = env if env is not None else os.environ
+        endpoint = env_dict.get("PA_OTLP_ENDPOINT")
+        exporter = OTLP.HttpOtlpExporter(endpoint, timeout=otlp_timeout) if endpoint else None
+    else:
+        exporter = None
+    return OTLP.TelemetrySink(
+        exporter, enabled=enabled,
+        degradation_callback=_make_degradation_callback(journal, iteration_id, prd_id))
+
+
 def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
                       state_dir, profile: dict | None = None, env: dict | None = None,
                       stamp_fn: Callable[[], str] | None = None,
-                      prd_content: str | None = None) -> Coordinator:
+                      prd_content: str | None = None,
+                      telemetry_exporter=None,
+                      otlp_timeout: float = 5.0) -> Coordinator:
     """dispatch/dev-agent 入口：一次解析 flag + 建 IDs/journal/artifact_root，返回 ``Coordinator``。
 
     替代 ``dispatch_one`` 散建的 ``_run``/``_prd``/``_iter``/``_sj``。所有 adapter 从返回的
@@ -140,9 +217,12 @@ def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
                             enabled=flags.journal_shadow)
     artifact_root = str(Path(state_dir) / "artifacts" / run)
     trace = TC.trace_context_for_run(run)            # task 6.1：per-PRD-run root trace（metadata-only）
+    telemetry_sink = _build_telemetry_sink(          # task 6.2：OTLP export + degradation journaling
+        flags=flags, journal=journal, iteration_id=iteration, prd_id=prd,
+        env=env, telemetry_exporter=telemetry_exporter, otlp_timeout=otlp_timeout)
     return Coordinator(flags=flags, run_id=run, prd_id=prd, iteration_id=iteration,
                        journal=journal, artifact_root=artifact_root, trace=trace,
-                       prd_digest=prd_digest)
+                       telemetry_sink=telemetry_sink, prd_digest=prd_digest)
 
 
 # ─── task 2.5：preflight 校验 loop flag 组合一致性（design 决策#1 防 impossible partial 组合）──

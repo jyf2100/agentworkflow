@@ -303,3 +303,145 @@ def test_coordinator_trace_present_in_baseline(tmp_path):
     assert coord.trace is not None
     assert coord.trace.parent_span_id is None
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.2：connect OTLP export + degradation journaling to coordinator
+# design 决策#1：coordinator own telemetry sink（从 flags.telemetry_export 读 enabled，非 disconnected
+# helper）。bounded timeout（HttpOtlpExporter.timeout）+ metadata-only（make_span 内 sanitize_attributes）+
+# backend 不可用 → 落 journal 'telemetry_degraded' event（design L82 可见，不拖垮 dispatch）。
+# TelemetrySink/exporter/degradation 语义已在 test_telemetry 覆盖；此处只验 coordinator wiring。
+# ════════════════════════════════════════════════════════════════════════════
+class _FakeExporter:
+    """6.2 测试桩 OTLP exporter（可控 fail，记录 export 调用，同 test_telemetry.FakeExporter 形态）。"""
+    __test__ = False
+
+    def __init__(self, *, fail=False):
+        self._fail = fail
+        self.exported: list = []
+
+    def available(self):
+        return not self._fail
+
+    def export(self, spans, metrics):   # noqa: ARG002
+        import otlp_export as OTLP
+        self.exported.append((list(spans), metrics))
+        if self._fail:
+            return OTLP.ExportResult(degraded=True, error="backend down (test)")
+        return OTLP.ExportResult(exported_spans=len(spans), exported_metrics=1)
+
+
+def _telem(tmp_path, *, exporter=None, journal=False):
+    """造 telemetry_export 开的 coordinator（DI exporter；可选 journal_shadow 同开）。"""
+    prof = {"loop": {"telemetry_export": True}}
+    if journal:
+        prof["loop"]["journal_shadow"] = True
+    return CO.build_coordinator(
+        stamp=_STAMP, prd_path="prd/proj/x.md", proj="proj", slug="x",
+        state_dir=tmp_path, profile=prof, env={},
+        stamp_fn=lambda: "2026-07-22T00:00:00Z",
+        telemetry_exporter=exporter,
+    )
+
+
+def test_coordinator_owns_telemetry_sink_enabled_when_flag_on(tmp_path):
+    """6.2：telemetry_export flag 开 → coord.telemetry_sink 是 TelemetrySink，enabled=True（coord own）。"""
+    import otlp_export as OTLP
+    coord = _telem(tmp_path, exporter=_FakeExporter())
+    assert isinstance(coord.telemetry_sink, OTLP.TelemetrySink)
+    assert coord.telemetry_sink.enabled is True
+
+
+def test_coordinator_telemetry_sink_disabled_in_baseline(tmp_path):
+    """6.2：baseline（telemetry_export 关）→ sink.enabled=False，flush no-op（flag off → no-op，design 决策#8）。"""
+    coord = _build(tmp_path)
+    assert coord.is_baseline
+    assert coord.telemetry_sink.enabled is False
+    res = coord.flush_telemetry()
+    assert res.exported_spans == 0
+    assert res.degraded is False
+
+
+def test_coordinator_emit_telemetry_span_is_metadata_only(tmp_path):
+    """6.2：emit_telemetry_span 的 attributes 经 sanitize——非白名单 key（prompt/source）丢、白名单 key 的
+    secret value 抹（metadata-only，design L80 绝不记 prompt/source/secret）。"""
+    exp = _FakeExporter()
+    coord = _telem(tmp_path, exporter=exp)
+    coord.emit_telemetry_span(
+        "test", attributes={
+            "status": "ok",                         # 白名单
+            "input_tokens": 100,                    # 白名单（数值）
+            "prompt": "leak me",                    # 非白名单 → 整个 field 丢
+            "source": "def f(): ...",               # 非白名单 → 丢
+            "error_class": "Bearer ghp_leaked123",  # 白名单 key + secret value → value 抹
+        })
+    res = coord.flush_telemetry()
+    assert res.exported_spans == 1
+    span = exp.exported[0][0][0]
+    assert "prompt" not in span.attributes                # 非白名单丢
+    assert "source" not in span.attributes
+    assert span.attributes["status"] == "ok"
+    assert span.attributes["input_tokens"] == 100
+    assert "ghp_leaked123" not in span.attributes["error_class"]   # secret value 抹
+    assert span.attributes["error_class"] != "Bearer ghp_leaked123"
+
+
+def test_coordinator_emit_telemetry_span_rejects_run_and_unknown(tmp_path):
+    """6.2：emit_telemetry_span('run')/未知 operation → ValueError（run 是 root，6.1 已立 propagation 边界）。"""
+    coord = _telem(tmp_path, exporter=_FakeExporter())
+    with pytest.raises(ValueError):
+        coord.emit_telemetry_span("run")
+    with pytest.raises(ValueError):
+        coord.emit_telemetry_span("bogus")
+
+
+def test_coordinator_emit_telemetry_span_propagates_trace(tmp_path):
+    """6.2：emit 的 span trace_id == coord root trace，parent 指向 root span（propagation，6.1 延续）。"""
+    exp = _FakeExporter()
+    coord = _telem(tmp_path, exporter=exp)
+    coord.emit_telemetry_span("verify")
+    coord.flush_telemetry()
+    span = exp.exported[0][0][0]
+    assert span.trace_id == coord.trace.trace_id
+    assert span.parent_span_id == coord.trace.span_id
+
+
+def test_coordinator_flush_exports_collected_spans_with_bounded_exporter(tmp_path):
+    """6.2：emit 多 span → flush 经 DI exporter export（bounded timeout 由 exporter 持有；coord 只 connect）。"""
+    exp = _FakeExporter()
+    coord = _telem(tmp_path, exporter=exp)
+    coord.emit_telemetry_span("iteration")
+    coord.emit_telemetry_span("test", attributes={"status": "ok"})
+    res = coord.flush_telemetry()
+    assert res.exported_spans == 2
+    assert len(exp.exported) == 1                         # 一次 flush 一次 export
+    assert {s.name for s in exp.exported[0][0]} == {"iteration", "test"}
+
+
+def test_coordinator_degradation_journaled_on_backend_unavailable(tmp_path):
+    """6.2：backend 不可用 → flush 返 degraded（不抛）+ 落 journal 'telemetry_degraded' event（design L82 可见）。
+
+    telemetry outage 不拖垮 dispatch，但记一次可见事件（journal enabled 时落盘 + sink.degraded 给 report 6.3）。
+    """
+    exp = _FakeExporter(fail=True)
+    coord = _telem(tmp_path, exporter=exp, journal=True)
+    coord.emit_telemetry_span("test")
+    res = coord.flush_telemetry()                         # 不抛
+    assert res.degraded is True
+    events = J.read_events(coord.journal.path)
+    assert any(e.event_type == "telemetry_degraded" for e in events)
+    assert coord.telemetry_sink.degraded is True
+
+
+def test_coordinator_degradation_does_not_crash_when_journal_disabled(tmp_path):
+    """6.2：telemetry 开但 journal 关 → backend 不可用时 flush 仍不抛（callback 落 disabled journal = no-op）。
+
+    baseline 保留：telemetry_export 不强依赖 journal_shadow（preflight 无此依赖链）；可见性经 sink.degraded
+    给 report 6.3，journal event 是 bonus。"""
+    exp = _FakeExporter(fail=True)
+    coord = _telem(tmp_path, exporter=exp, journal=False)
+    coord.emit_telemetry_span("test")
+    res = coord.flush_telemetry()                         # 不抛
+    assert res.degraded is True
+    assert coord.telemetry_sink.degraded is True
+    assert not Path(coord.journal.path).exists()          # journal 关 → 文件不建
+
