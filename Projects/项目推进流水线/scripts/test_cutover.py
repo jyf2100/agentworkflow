@@ -479,6 +479,58 @@ def test_dispatch_cutover_empty_legacy_corrupt_state():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 7.5 dispatch 三重 gate（flag + parity + allowlist）→ driven；否则 legacy fallback
+# spec（durable-runtime）：switch to journal-reduced decisions ONLY after real parity
+# evidence passes。design 决策#8：cutover 前置 parity；单项目 rollout（allowlist）。
+# ════════════════════════════════════════════════════════════════════════════
+def test_dispatch_gated_journal_when_flag_parity_allowlist_all_pass():
+    """三重 gate 全过 → driven（journal reducer 驱动 dispatch）。"""
+    events = [_ev("running", eid="e1"), _ev("aborted", eid="e2")]
+    r = CT.resolve_dispatch_source(
+        journal_driven_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True, journal_events=events)
+    assert r.driven_by == "journal"
+    assert r.terminal_state == "aborted"
+
+
+def test_dispatch_legacy_when_parity_not_passed():
+    """parity 未过 → 即使 flag 开 + 白名单，仍 legacy（design 决策#8 cutover 前置）。"""
+    events = [_ev("running")]
+    r = CT.resolve_dispatch_source(
+        journal_driven_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=False, journal_events=events)
+    assert r.driven_by == "legacy_fallback"
+    assert "parity" in r.fallback_reason.lower()
+
+
+def test_dispatch_legacy_when_project_not_allowlisted():
+    """非白名单项目 → 即使 flag 开 + parity 过，仍 legacy（单项目 rollout）。"""
+    events = [_ev("running")]
+    r = CT.resolve_dispatch_source(
+        journal_driven_flag=True, project_id="proj-beta",
+        allowlist=("proj-alpha",), parity_passed=True, journal_events=events)
+    assert r.driven_by == "legacy_fallback"
+    assert "allowlist" in r.fallback_reason.lower()
+
+
+def test_dispatch_legacy_when_gate_flag_off():
+    """flag 关 → legacy（allowlist/parity 不查）。"""
+    r = CT.resolve_dispatch_source(
+        journal_driven_flag=False, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True)
+    assert r.driven_by == "legacy_fallback"
+
+
+def test_dispatch_legacy_fallback_when_reducer_fails_under_full_gate():
+    """三重 gate 过但 reducer 失败 → 一个 release cycle 内 legacy 仍可用。"""
+    r = CT.resolve_dispatch_source(
+        journal_driven_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True,
+        journal_events=["not-an-event"], legacy_records=[{"status": "fail"}])
+    assert r.driven_by == "legacy_fallback"
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 8.8 quality gate + evidence archive
 # ════════════════════════════════════════════════════════════════════════════
 def test_quality_gate_passes_when_green_and_evidence_archived(tmp_path):

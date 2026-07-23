@@ -628,6 +628,34 @@ def _legacy_fallback(legacy_records, reason) -> DispatchCutoverResult:
     return DispatchCutoverResult("legacy_fallback", terminal, reason)
 
 
+def resolve_dispatch_source(*, journal_driven_flag, project_id, allowlist,
+                            parity_passed, journal_events=None,
+                            legacy_records=None) -> DispatchCutoverResult:
+    """task 7.5：dispatch 三重 gate——flag + parity + allowlist 全过才 journal-driven；否则 legacy fallback。
+
+    spec（durable-runtime Requirement "shadow mode → journal authority"）：new runs switch to
+    journal-reduced decisions **only after real parity evidence passes**；tasks 7.5 单项目 rollout
+    （allowlist）。gate 任一不过 → ``legacy_fallback``（reason 指明未开闸维度），**保留并测试 legacy
+    读取回退一个 release cycle**（design 决策#8；reducer 失败亦 fallback）。
+
+    三重 gate 全过后复用 ``run_dispatch_cutover_drill`` 的 reducer 驱动 + reducer-fail fallback——
+    把 gate 判定与 reducer 执行解耦，gate 不重写 reducer 逻辑。
+    """
+    allow = set(allowlist or ())
+    if not journal_driven_flag:
+        return _legacy_fallback(
+            legacy_records, "journal_driven_dispatch flag off (single-project rollout gate)")
+    if not parity_passed:
+        return _legacy_fallback(
+            legacy_records, "shadow parity not passed (design 决策#8 cutover 前置)")
+    if project_id not in allow:
+        return _legacy_fallback(
+            legacy_records, f"project {project_id!r} not in dispatch allowlist (single-project rollout)")
+    # 三重 gate 通过 → journal reducer 驱动；reducer 失败仍 legacy fallback（一个 release cycle）
+    return run_dispatch_cutover_drill(
+        journal_driven=True, journal_events=journal_events, legacy_records=legacy_records)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 8.8 full repository quality gate + archive passing evidence
 # ════════════════════════════════════════════════════════════════════════════
