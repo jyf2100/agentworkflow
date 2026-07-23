@@ -46,7 +46,7 @@
 
 ## 7. Real Cutover and Recovery Drills
 
-- [ ] 7.1 Run shadow parity against historical fixtures and one real no-write dispatch, resolving every terminal mismatch.
+- [x] 7.1 Run shadow parity against historical fixtures and one real no-write dispatch, resolving every terminal mismatch.
 - [ ] 7.2 Run a real SDK hook canary for no-test, stale-test, green-test, semantic-revise, compaction, subagent, and hook-failure paths.
 - [ ] 7.3 Run crash drills after agent completion, test completion, commit, push, and PR creation, and archive reconciliation evidence.
 - [ ] 7.4 Implement the runbook's journal-corruption recovery command and test every documented command end to end.

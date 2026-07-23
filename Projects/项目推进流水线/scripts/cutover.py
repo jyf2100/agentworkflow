@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import artifact_store
@@ -100,6 +101,51 @@ def _read_journal_events(path):
         return J.read_events(path)
     except Exception:
         return []
+
+
+# ─── task 7.1：historical fixtures shadow parity + 一个真实 no-write dispatch（production evidence）──
+@dataclass(frozen=True)
+class ShadowParityEvidence:
+    """task 7.1：historical fixtures parity + 一个真实 no-write dispatch dry-run 的可归档证据。
+
+    design 决策#2（parity 比对全 terminal state）+ #6（archive passing evidence）。``parity.matched``
+    ⇔ historical fixtures 的 dispatch 终态分布 == journal-reducer 终态分布（mismatch 已解决基线）。
+    """
+    parity: "ShadowParityReport"
+    dry_run_terminal: str          # no-write dry-run 重建终态（published 路径）
+    dry_run_run_id: str
+
+
+def run_shadow_parity_evidence(*, state_dir, stamp_fn) -> ShadowParityEvidence:
+    """task 7.1：historical fixtures shadow parity + 一个真实 no-write dispatch dry-run（design#2/#6）。
+
+    historical fixtures（``cutover_fixtures``，覆盖全 terminal class）经真实 ``ShadowJournal`` 写等价链、
+    读回 reduce，与 ``summarize_terminal`` 比对——parity matched（mismatch 已解决的基线，design 7.1
+    「resolving every terminal mismatch」）。再跑一个真实 no-write dispatch dry-run（``run_shadow_dry_run``，
+    纯 journal 旁路写 + reducer 重建，不创建 PR/commit）。返回结构化 evidence 供 quality gate / 运维归档。
+
+    production wiring（design 决策#1）：把 ``run_shadow_parity_drill``/``run_shadow_dry_run`` 从
+    disconnected helper 连成可重复运行的 evidence 命令。
+    """
+    import cutover_fixtures as FX
+    state = Path(state_dir)
+    # historical parity：真实 ShadowJournal 写等价链（模拟 shadow 接入旁路记录），读回 reduce 比对
+    parity_path = state / "parity_shadow.journal.jsonl"
+    sj = LR.ShadowJournal(path=parity_path, run_id="run_parity", stamp=stamp_fn, enabled=True)
+    for i, rec in enumerate(FX.HISTORICAL_DISPATCH_RECORDS):
+        for et in FX.chain_for(rec):
+            sj.emit(et, iteration_id=f"iter_{i}", prd_id=f"prd_{i}", payload={"base": "main"})
+    parity = run_shadow_parity_drill(FX.HISTORICAL_DISPATCH_RECORDS,
+                                     _read_journal_events(parity_path))
+    # 一个真实 no-write dispatch dry-run（published 路径，纯 journal 旁路写 + reducer 重建）
+    dry_state = run_shadow_dry_run(
+        journal_path=state / "dry_run.journal.jsonl", run_id="run_dry",
+        stamp=stamp_fn, flow=FX.NO_WRITE_DRY_RUN_FLOW)
+    return ShadowParityEvidence(
+        parity=parity,
+        dry_run_terminal=dry_state.status.value,
+        dry_run_run_id="run_dry",
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════

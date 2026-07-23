@@ -369,3 +369,40 @@ def test_cutover_suite_summary_formats_flags():
         quality_gate_passed=True, overall_passed=True,
     )
     assert "PASS" in suite.summary and "parity=True" in suite.summary
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 7 task 7.1：historical fixtures shadow parity + 一个真实 no-write dispatch
+# spec：「Run shadow parity against historical fixtures and one real no-write dispatch,
+# resolving every terminal mismatch.」
+# design 决策#2（parity 比对全 terminal state）+ #1（production wiring，非 disconnected helper）
+# + #6（archive evidence）。run_shadow_parity_drill/dry_run 逻辑层已在 8.1 覆盖；7.1 补 production
+# historical fixtures（覆盖全 terminal class，parity matched 基线）+ 串成可归档 evidence 的命令。
+# ════════════════════════════════════════════════════════════════════════════
+def test_historical_fixtures_cover_all_terminal_classes():
+    """7.1：historical fixtures 覆盖 decision#2 parity 比对范围的全 terminal class：
+    published/revise/failed/blocked_external/blocked_test/stalled/orphan/planned。"""
+    import compat_readers as CR
+    import cutover_fixtures as FX
+    statuses = {CR.legacy_status(r) for r in FX.HISTORICAL_DISPATCH_RECORDS}
+    for expected in (L.IterationStatus.PUBLISHED, L.IterationStatus.REVISE,
+                     L.IterationStatus.FAILED, L.IterationStatus.EXTERNAL_BLOCKED,
+                     L.IterationStatus.TEST_BLOCKED, L.IterationStatus.STALLED,
+                     L.IterationStatus.ORPHAN_DELETED, L.IterationStatus.PLANNED):
+        assert expected in statuses, f"historical fixtures 缺 terminal class {expected}"
+
+
+def test_run_shadow_parity_evidence_historical_matched(tmp_path):
+    """7.1：run_shadow_parity_evidence → historical fixtures parity matched（mismatch 已解决，design 7.1）。"""
+    ev = CT.run_shadow_parity_evidence(
+        state_dir=tmp_path, stamp_fn=lambda: "2026-07-23T00:00:00Z")
+    assert ev.parity.matched is True
+    assert ev.parity.mismatches == ()
+
+
+def test_run_shadow_parity_evidence_no_write_dry_run_published(tmp_path):
+    """7.1：一个真实 no-write dispatch——dry-run 经真实 ShadowJournal 旁路写 + reducer 重建 published
+    终态（不创建 PR/commit，纯 journal 路径，design#2 one real dry-run）。"""
+    ev = CT.run_shadow_parity_evidence(
+        state_dir=tmp_path, stamp_fn=lambda: "2026-07-23T00:00:00Z")
+    assert ev.dry_run_terminal == "published"
