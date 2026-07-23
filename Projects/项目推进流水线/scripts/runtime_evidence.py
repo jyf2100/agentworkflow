@@ -30,7 +30,7 @@ import artifact_store  # noqa: E402
 import reconcile as RE  # noqa: E402
 import retry_policy as RP  # noqa: E402
 import loop_runtime as RT  # noqa: E402
-from session_meta import SessionMeta, SessionStore, ResultSubtype  # noqa: E402
+from session_meta import SessionStore  # noqa: E402   # SessionMeta/ResultSubtype 仅 _crash_child 子进程局部 import
 
 
 def _stamp() -> str:
@@ -51,21 +51,20 @@ def _git(args, cwd):
 # unknown fail-safe），push 用远端真源（ls-remote，非本地 show-ref）。exactly-once ⇔ 无 unknown。
 # ════════════════════════════════════════════════════════════════════════════
 def real_crash_restart_drill(workdir: Path, gh_repo: str = "jyf2100/agentworkflow") -> dict:
-    """7.3 真实 crash/restart drill。
+    """7.3 真实子进程 crash/restart drill（r2 P1-2：5 边界逐项 SIGKILL/restart）。
 
-    步骤（全真实，非 fake adapter）：
-      1. 建真实 git repo + 本地 bare remote（origin）；
-      2. 真实 commit + 建 feat-branch + push 到 remote（远端真有此 ref）；
-      3. 写 journal 模拟跑到 ``publish_ready`` 后进程崩溃（state 落盘，副作用未完成）；
-      4. **restart** → ``recover_iteration`` 用 ``LocalGitResolver``（commit cat-file / push ls-remote
-         远端真源）+ ``GhPrResolver``（真实 gh CLI）对账；
-      5. 验证 exactly-once：commit=confirmed（跳过重 commit）、push=confirmed（跳过重 push，
-         ls-remote 证远端已有）、pr=absent（待开），三态全明确 → safe_to_retry。
+    每边界起**真实子进程**（``_crash_child`` 经 ``python -c``）：先持久化 session state（``SessionStore.save``）
+    再 emit boundary event 到 journal（emit ⇔ state 已落盘 = durable boundary 达成）→ 阻塞 → 父进程
+    ``SIGKILL`` 模拟进程崩溃 → **restart entrypoint** 重新载入落盘 journal + ``SessionStore.load`` →
+    ``recover_iteration`` 对账（commit cat-file / push ls-remote 远端真源 / pr gh CLI）。
+    5 边界（agent_done/test_done/commit/push/pr_create）逐项验证 exactly-once + safe_to_retry + 真实子进程被 kill。
 
-    评审 P1-3：曾用 ``show-ref`` 把本地分支当远端 push 已发生 → 本 drill 用 ``ls-remote`` 远端真源，
-    真实证明 push reconcile 查远端（push 后 confirmed；删 remote ref 后 absent）。
+    评审 P1-2：旧版同进程写 journal 后直接调 recover_iteration（无真实 crash/restart，未验证 restart
+    entrypoint 真实载入落盘 state）。现版真实 subprocess kill/restart。
     """
     import shutil
+    import signal
+    import time
     repo = workdir / "crash_repo"
     bare = workdir / "crash_remote.git"
     for _p in (repo, bare):                 # 持久化 workdir 重跑清理残留（避免 mkdir/init 复用半成品）
@@ -84,51 +83,124 @@ def real_crash_restart_drill(workdir: Path, gh_repo: str = "jyf2100/agentworkflo
     _git(["branch", "feat-branch"], repo)
     _git(["push", "-q", "origin", "feat-branch"], repo)            # 真实 push：远端 origin 有 feat-branch
 
-    # journal：模拟跑到 publish_ready 后崩溃（state 已落盘，publication 副作用未发生）
-    jf = workdir / "crash.journal.jsonl"
-    sj = RT.ShadowJournal(jf, "run_crash", _stamp, enabled=True)
-    for et in ("planned", "running", "agent_finished", "verifying", "publish_ready"):
-        sj.emit(et, "iter_crash", "prd_crash", payload={"base": "main"})
-
-    # restart → recover_iteration 真实对账（commit/push git 真源；pr gh 真源）
-    store = SessionStore(workdir / "sess")
-    store.save(SessionMeta(iteration_id="iter_crash", session_id="s_crash",
-                           result_subtype=ResultSubtype.SUCCESS))
+    scripts_dir = str(Path(__file__).resolve().parent)
+    py = sys.executable
+    resolver = RE.CompositeResolver([RE.LocalGitResolver(repo), RE.GhPrResolver(default_repo=gh_repo)])
     targets = [
         RE.SideEffectTarget("commit", sha),                              # 真实 commit sha（cat-file 真源）
         RE.SideEffectTarget("push", "feat-branch"),                      # 真实 push（ls-remote 远端真源）
         RE.SideEffectTarget("pr", f"{gh_repo}:feat-branch-absent-canary"),  # 真实 gh（absent：canary 分支无 PR）
     ]
-    plan = RE.recover_iteration(
-        journal_path=jf, run_id="run_crash", prd_id="prd_crash", iteration_id="iter_crash",
-        base="main", prd_content="# 目标\n\n## 验收标准\n- 条件\n", targets=targets,
-        resolver=RE.CompositeResolver([RE.LocalGitResolver(repo), RE.GhPrResolver(default_repo=gh_repo)]),
-        session_store=store, budget=RP.BudgetState(limits=RP.BudgetLimits()))
+    boundaries = ["agent_done", "test_done", "commit", "push", "pr_create"]
+    per_boundary = []
+    for b in boundaries:
+        jf = workdir / f"crash_{b}.journal.jsonl"
+        state_dir = workdir / f"sess_{b}"
+        if jf.exists():
+            jf.unlink()
+        if state_dir.exists():
+            shutil.rmtree(state_dir)
+        # 真实子进程：持久化 session + emit boundary event + 阻塞（等 SIGKILL 模拟崩溃）
+        child = (
+            f"import sys; sys.path.insert(0, {scripts_dir!r}); "
+            f"from runtime_evidence import _crash_child; "
+            f"_crash_child({b!r}, {str(jf)!r}, {str(state_dir)!r})"
+        )
+        proc = subprocess.Popen([py, "-c", child])
+        # 轮询 journal：见 boundary event ⇔ 子进程已持久化 session 并抵达 boundary（durable boundary 达成）
+        seen = False
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            if jf.exists():
+                try:
+                    evs = [json.loads(l) for l in jf.read_text(encoding="utf-8").splitlines() if l.strip()]
+                except (json.JSONDecodeError, OSError):
+                    evs = []
+                if any(e.get("event_type") == b for e in evs):
+                    seen = True
+                    break
+            if proc.poll() is not None:       # 子进程异常早退（非 kill）
+                break
+            time.sleep(0.2)
+        # SIGKILL 模拟崩溃（state 已落盘）
+        killed = False
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGKILL)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            killed = True
+        # restart entrypoint：重新载入落盘 journal + SessionStore.load → recover_iteration 对账
+        store = SessionStore(state_dir)
+        sess_persisted = store.load("iter_crash") is not None
+        plan = RE.recover_iteration(
+            journal_path=jf, run_id="run_crash", prd_id="prd_crash", iteration_id="iter_crash",
+            base="main", prd_content="# 目标\n\n## 验收标准\n- 条件\n",
+            targets=targets, resolver=resolver, session_store=store,
+            budget=RP.BudgetState(limits=RP.BudgetLimits()))
+        by_kind = {s.kind: s.state for s in plan.reconciliation.statuses}
+        per_boundary.append({
+            "boundary": b,
+            "subprocess_killed_by_sigkill": killed,
+            "boundary_event_emitted_before_kill": seen,
+            "session_state_persisted_and_reloaded": sess_persisted,
+            "commit_state": by_kind.get("commit"),
+            "push_state": by_kind.get("push"),
+            "pr_state": by_kind.get("pr"),
+            "external_known": plan.reconciliation.external_known,
+            "safe_to_retry": plan.reconciliation.safe_to_retry,
+            "decision_mode": plan.decision.mode.value,
+        })
 
-    by_kind = {s.kind: s.state for s in plan.reconciliation.statuses}
-
-    # 对照：删 remote ref 后 push 应转 absent（证 ls-remote 查远端，非本地 show-ref）
+    # 对照：删 remote ref 后 push 应转 absent（证 ls-remote 查远端真源，非本地 show-ref）
     _git(["push", "-q", "origin", "--delete", "feat-branch"], repo)
+    ctrl_jf = workdir / "crash_control.journal.jsonl"
+    sj_ctrl = RT.ShadowJournal(ctrl_jf, "run_crash", _stamp, enabled=True)
+    for et in ("planned", "running", "publish_ready"):
+        sj_ctrl.emit(et, "iter_crash", "prd_crash", payload={"base": "main"})
     plan_after_drop = RE.reconcile_side_effects(
         iteration_id="iter_crash",
         targets=[RE.SideEffectTarget("push", "feat-branch")],
         resolver=RE.LocalGitResolver(repo))
 
+    all_killed = all(pb["subprocess_killed_by_sigkill"] for pb in per_boundary)
+    all_external_known = all(pb["external_known"] for pb in per_boundary)
+    all_safe = all(pb["safe_to_retry"] for pb in per_boundary)
+    bm = {pb["boundary"]: pb for pb in per_boundary}
     return {
-        "drill": "7.3 real crash/restart + remote ls-remote reconciliation",
-        "crash_boundary": "publish_ready (state persisted, side-effects pending) → restart → reconcile",
+        "drill": "7.3 real subprocess crash/restart (5 boundaries) + remote ls-remote reconciliation",
+        "crash_boundaries": boundaries,
+        "crash_method": "subprocess SIGKILL after boundary event emit (durable boundary: state persisted → process killed → restart reloads)",
+        "per_boundary": per_boundary,
         "boundaries_real_source": {
-            "commit": {"state": by_kind.get("commit"), "source": "git cat-file (local object store)"},
-            "push": {"state": by_kind.get("push"), "source": "git ls-remote origin (REMOTE truth, not show-ref)"},
-            "pr": {"state": by_kind.get("pr"), "source": f"gh pr list --head (real gh CLI on {gh_repo})"},
+            "commit": {"state": bm["commit"]["commit_state"], "source": "git cat-file (local object store)"},
+            "push": {"state": bm["push"]["push_state"], "source": "git ls-remote origin (REMOTE truth, not show-ref)"},
+            "pr": {"state": bm["pr_create"]["pr_state"], "source": f"gh pr list --head (real gh CLI on {gh_repo})"},
         },
-        "exactly_once": plan.reconciliation.external_known,     # 无 unknown ⇔ 每副作用状态明确
-        "safe_to_retry": plan.reconciliation.safe_to_retry,
-        "decision_mode": plan.decision.mode.value,              # RESUME（session 健康 + external known）
-        "iteration_status": plan.iteration_status,
+        "all_subprocesses_killed": all_killed,
+        "exactly_once": all_external_known,     # 5 边界全无 unknown ⇔ 每副作用状态明确
+        "safe_to_retry": all_safe,
         "push_after_remote_ref_deleted": plan_after_drop.pending[0].state if plan_after_drop.pending else "confirmed",
         "push_resolver_is_remote_truth": plan_after_drop.pending[0].state == "absent",  # 删远端 ref→absent 证查远端
     }
+
+
+def _crash_child(boundary: str, jf_str: str, state_dir_str: str) -> None:
+    """子进程（被 real_crash_restart_drill 经 ``python -c`` 起的真实子进程）：模拟 dev loop 抵达
+    durable boundary——**先持久化 session state**（``SessionStore.save``）再 emit boundary event 到
+    journal（emit ⇔ state 已落盘），然后阻塞 ``sleep`` 等父进程 ``SIGKILL``（模拟进程崩溃）。
+
+    父进程见 boundary event 即知 session 已持久化 → SIGKILL → restart entrypoint 重新载入落盘 state。
+    """
+    import time
+    from session_meta import SessionMeta, ResultSubtype   # 顶部仅 SessionStore；Meta/Subtype 局部 import
+    store = SessionStore(Path(state_dir_str))             # 顶部 SessionStore（子进程 import runtime_evidence 已载入）
+    store.save(SessionMeta(iteration_id="iter_crash", session_id="s_crash",
+                           result_subtype=ResultSubtype.SUCCESS))   # 先持久化（durable boundary）
+    sj = RT.ShadowJournal(Path(jf_str), "run_crash", _stamp, enabled=True)   # 顶部 RT（loop_runtime）
+    sj.emit(boundary, "iter_crash", "prd_crash", payload={"base": "main"})   # emit ⇔ state 已落盘
+    time.sleep(60)   # 阻塞等 SIGKILL（模拟崩溃前一刻）
 
 
 # ════════════════════════════════════════════════════════════════════════════
