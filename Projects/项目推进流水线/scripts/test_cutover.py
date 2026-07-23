@@ -255,6 +255,45 @@ def test_crash_unknown_boundary_raises():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 7.3 crash reconciliation evidence（commit 边界 + 全边界归档，design #1/#6）
+# ════════════════════════════════════════════════════════════════════════════
+def test_crash_commit_confirmed_skips_on_retry():
+    """commit 边界（spec 7.3 新增）：commit 副作用已发生 → confirmed 跳过（exactly-once）。"""
+    r = CT.run_crash_drill("commit", resolver=FakeResolver(True))
+    assert r.boundary == "commit"
+    assert r.confirmed == 1
+    assert r.exactly_once is True
+
+
+def test_crash_commit_absent_reapplies_once():
+    """commit 边界：commit 未发生 → pending 重新执行一次。"""
+    r = CT.run_crash_drill("commit", resolver=FakeResolver(False))
+    assert r.pending == 1
+    assert r.exactly_once is True
+
+
+def test_run_crash_reconciliation_evidence_all_boundaries():
+    """归档命令覆盖 spec 全 5 边界（agent/test/commit/push/PR），全 confirmed → all exactly-once。"""
+    ev = CT.run_crash_reconciliation_evidence(resolver=FakeResolver(True))
+    assert set(ev.boundaries_run) == {"agent_done", "test_done", "commit", "push", "pr_create"}
+    assert ev.all_exactly_once is True
+
+
+def test_run_crash_reconciliation_evidence_unknown_breaks_exactly_once():
+    """任一边界 unknown → all_exactly_once=False（fail-safe，design risk）。"""
+    ev = CT.run_crash_reconciliation_evidence(resolver=FakeResolver(None))
+    assert ev.all_exactly_once is False
+
+
+def test_run_crash_reconciliation_evidence_archives_immutable():
+    """evidence frozen + 不可变归档（tuple results + 非空 summary）。"""
+    ev = CT.run_crash_reconciliation_evidence(resolver=FakeResolver(True))
+    assert isinstance(ev.results, tuple)
+    assert all(isinstance(r, CT.CrashDrillResult) for r in ev.results)
+    assert ev.summary
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 8.4 recovery canary（resume/fork/new_session + bounded budget + 因果）
 # ════════════════════════════════════════════════════════════════════════════
 def test_recovery_resume_decision():

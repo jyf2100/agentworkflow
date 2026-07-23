@@ -327,10 +327,11 @@ def run_sdk_hook_canary(*, stamp_fn=None) -> SdkHookCanaryEvidence:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 8.3 controlled crash drill（agent/test/push/PR 后）确认 exactly-once
+# 7.3 / 8.3 controlled crash drill（agent/test/commit/push/PR 后）确认 exactly-once
 # ════════════════════════════════════════════════════════════════════════════
+# spec task 7.3 的 5 边界（side-effect 发生点），崩溃后 reconcile 判定每个副作用是否已发生。
 CRASH_BOUNDARIES: frozenset[str] = frozenset(
-    {"agent_done", "test_done", "push", "pr_create"})
+    {"agent_done", "test_done", "commit", "push", "pr_create"})
 
 
 @dataclass(frozen=True)
@@ -343,10 +344,12 @@ class CrashDrillResult:
     external_known: bool
 
 
-# 各边界注入崩溃后待 reconcile 的副作用目标（agent_done/test_done 无外部副作用；push/pr 有）。
+# 各边界注入崩溃后待 reconcile 的副作用目标（agent_done/test_done 无外部副作用；commit/push/pr 有）。
+# SideEffectTarget.kind 对齐 ids.idempotency_id 允许列表（commit/push/pr）；target 语义随 kind。
 _BOUNDARY_TARGETS = {
     "agent_done": (),
     "test_done": (),
+    "commit": (RC.SideEffectTarget("commit", "feat-branch"),),
     "push": (RC.SideEffectTarget("push", "feat-branch"),),
     "pr_create": (RC.SideEffectTarget("pr", "owner/repo:feat-branch"),),
 }
@@ -370,6 +373,55 @@ def run_crash_drill(boundary: str, *, resolver: RC.KeyResolver,
         unknown=len(report.unknown), exactly_once=report.external_known,
         external_known=report.external_known,
     )
+
+
+# ─── task 7.3：crash reconciliation evidence（全 5 边界 exactly-once 归档，design#1 production 证据命令 + #6 archive）──
+@dataclass(frozen=True)
+class CrashReconciliationEvidence:
+    """task 7.3：crash reconciliation 的可归档证据。
+
+    跑 spec 全 5 边界（agent/test/commit/push/PR），聚合每边界 ``CrashDrillResult``。
+    ``all_exactly_once`` ⇔ 每边界 reconcile 无 unknown（崩溃后副作用状态全明确，retry 安全决策）。
+    design 决策#6（archive immutable passing evidence）：frozen dataclass + tuple results。
+    """
+    results: tuple[CrashDrillResult, ...]
+    boundaries_run: tuple[str, ...]
+    all_exactly_once: bool
+    summary: str
+
+
+# 跑序（spec 7.3 边界顺序：side-effect 发生时点）
+_CRASH_BOUNDARY_ORDER: tuple[str, ...] = (
+    "agent_done", "test_done", "commit", "push", "pr_create",
+)
+
+
+def run_crash_reconciliation_evidence(*, resolver: RC.KeyResolver,
+                                      iteration_id: str = "iter_crash") -> CrashReconciliationEvidence:
+    """task 7.3：crash reconciliation evidence——跑 spec 全 5 边界（agent/test/commit/push/PR），
+    聚合每边界 reconcile 结果为可归档证据。
+
+    production wiring（design 决策#1）：把 ``run_crash_drill`` 从 disconnected 单点 helper 连成覆盖
+    spec 全 5 边界的可重复 reconciliation 证据命令。``all_exactly_once`` 汇总每边界 exactly_once——
+    任一边界 unknown（reconcile 查不到）→ False（fail-safe，design risk#90 不盲目重放）。返回
+    ``CrashReconciliationEvidence`` 供 quality gate / 运维归档（design 决策#6 archive）。
+
+    Args:
+        resolver: KeyResolver（reconcile 查副作用状态；生产 LocalGitResolver，测试 FakeResolver）。
+        iteration_id: reconcile 幂等键输入（同 iteration 同 target → 同 key，跨崩溃稳定）。
+    """
+    results = tuple(
+        run_crash_drill(b, resolver=resolver, iteration_id=iteration_id)
+        for b in _CRASH_BOUNDARY_ORDER
+    )
+    boundaries_run = tuple(r.boundary for r in results)
+    all_exactly_once = all(r.exactly_once for r in results)
+    summary = " | ".join(
+        f"{r.boundary}=confirmed={r.confirmed}/pending={r.pending}/unknown={r.unknown}"
+        for r in results)
+    return CrashReconciliationEvidence(
+        results=results, boundaries_run=boundaries_run,
+        all_exactly_once=all_exactly_once, summary=summary)
 
 
 # ════════════════════════════════════════════════════════════════════════════
