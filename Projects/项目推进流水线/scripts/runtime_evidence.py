@@ -142,7 +142,11 @@ def _docker_run(image, cmd, *, network=None, mem_limit=None, env_sanitize=True, 
     if mem_limit:
         args += ["--memory", mem_limit]
     if env_sanitize:
-        args += ["-e", "GH_TOKEN", "-e", "GITHUB_TOKEN", "-e", "ANTHROPIC_API_KEY"]  # 剥离主机凭据
+        # P0-2 凭据隔离：docker run 默认不继承宿主环境；不传任何 -e <凭据> → 禁止凭据在容器内 absent。
+        #   旧实现 `-e GH_TOKEN` 是把宿主同名变量"复制"进容器（非清除），正是凭据泄漏（r2 P0-2）。
+        #   注意：`-e VAR=` 空值会让变量存在但为空，容器内 cred_check 用 `k in os.environ` 判定会误报"存在"，
+        #   故不采用空覆盖；凭据隔离由容器内 cred_check（GH/GITHUB/ANTHROPIC/AWS 全 absent）实证。
+        pass   # 不附加凭据环境变量；docker 默认 env 仅 PATH/HOME/HOSTNAME
     args += [image] + cmd
     r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     return {"exit": r.returncode, "stdout": r.stdout.strip()[:500], "stderr": r.stderr.strip()[:300]}
@@ -232,7 +236,8 @@ def real_dispatch_skip_dev(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
       * shadow parity：journal 开/关 **决策不变**（rec 终态一致），journal 仅旁路。
 
     dispatch_skip_dev 零写入（不开 PR、不触发 dev loop、不 commit/push），只真实 gh 查询准入态。
-    main 需临时保护以过 branch protection 门（保护期零 push 副作用）；finally 恢复（移除保护）。
+    P0-1 非破坏：GET 原 protection 态——原有保护则不碰（零修改），原无保护则临时加过 admission 门、
+    finally 删除恢复无保护；恢复失败 raise 阻断。绝不删除/覆盖仓库原有保护规则。
     """
     import run_daily as RD   # 延迟 import（dispatch_one 依赖模块级 STATE_DIR/VAULT_ROOT/dev_slugify）
     from types import SimpleNamespace
@@ -255,11 +260,19 @@ def real_dispatch_skip_dev(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
     prd_abs.write_text("# Skip-dev parity canary\n\n## 验收标准\n- 条件\n", encoding="utf-8")
     entry = {"prd_path": prd_rel, "source_path": ""}
 
-    # 临时保护 main（过 branch protection 门；dispatch_skip_dev 零 push，保护期无副作用）
-    _prot = json.dumps({"required_status_checks": None, "enforce_admins": False,
-                        "required_pull_request_reviews": None, "restrictions": None})
-    subprocess.run(["gh", "api", "-X", "PUT", f"repos/{gh_repo}/branches/main/protection", "--input", "-"],
-                   input=_prot, capture_output=True, text=True, timeout=60)
+    # P0-1 非破坏 branch protection：先 GET 原态。原有保护→不碰（admission 门已过，零修改）；
+    #   原无保护→临时 PUT 过 admission protection 门（dispatch_skip_dev 零 push 零 PR，临时弱保护无副作用）。
+    #   finally 仅删本次临时加的（恢复无保护），绝不删原有保护；恢复失败 raise 非零退出阻断。
+    get_r = subprocess.run(["gh", "api", f"repos/{gh_repo}/branches/main/protection"],
+                           capture_output=True, text=True, timeout=60)
+    originally_protected = get_r.returncode == 0   # 200=原有保护；404=原无保护
+    temp_protection_added = False
+    if not originally_protected:
+        _prot = json.dumps({"required_status_checks": None, "enforce_admins": False,
+                            "required_pull_request_reviews": None, "restrictions": None})
+        subprocess.run(["gh", "api", "-X", "PUT", f"repos/{gh_repo}/branches/main/protection", "--input", "-"],
+                       input=_prot, capture_output=True, text=True, timeout=60)
+        temp_protection_added = True
 
     results: dict = {"drill": "7.1 real dispatch-skip-dev shadow parity", "repo": gh_repo, "runs": {}}
     try:
@@ -288,8 +301,9 @@ def real_dispatch_skip_dev(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
                 "journal_path": str(jf),
             }
     finally:
-        subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{gh_repo}/branches/main/protection"],
-                       capture_output=True, text=True, timeout=60)
+        if temp_protection_added:   # 仅删本次临时加的（原无保护→恢复无保护）；原有保护绝不删
+            subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{gh_repo}/branches/main/protection"],
+                           capture_output=True, text=True, timeout=60)
         try:
             prd_abs.unlink()
         except OSError:
@@ -306,7 +320,19 @@ def real_dispatch_skip_dev(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
         "covered_coordinator": True,                              # build_coordinator 真实解析 flag+建 IDs/journal
         "not_manual_event_flow": True,                            # 未用 NO_WRITE_DRY_RUN_FLOW；真实 dispatch_one()
     }
-    results["protection_restored"] = True
+    # 恢复验证（r2 P0-1）：临时加的→GET 应 404（恢复无保护）；原有保护→未修改。失败 raise 非零退出阻断
+    if temp_protection_added:
+        verify_r = subprocess.run(["gh", "api", f"repos/{gh_repo}/branches/main/protection"],
+                                  capture_output=True, text=True, timeout=60)
+        restored = verify_r.returncode != 0   # 原 404 → DELETE 后仍应 404
+        results["protection_restored"] = restored
+        if not restored:
+            raise RuntimeError(
+                f"branch protection 恢复失败（r2 P0-1）：临时保护未删除，需人工检查 "
+                f"{gh_repo}/branches/main/protection")
+    else:
+        results["protection_restored"] = True   # 原有保护，全程未修改
+    results["originally_protected"] = originally_protected
     return results
 
 
@@ -565,6 +591,18 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
     sandbox_clean = cred_denied and net_denied                  # sandbox 核心语义：凭据拒 + 网络违例 block
     dispatch_ok = bool(allowlist.get("triple_gate_proven"))
 
+    # r2 P0-5：crash/quality 从真实子 drill 结果映射（非 results=()/硬编码 test_counts）
+    _brs = crash.get("boundaries_real_source", {})
+    _crash_result = CT.CrashDrillResult(
+        boundary="publish_ready",
+        confirmed=sum(1 for k in ("commit", "push") if _brs.get(k, {}).get("state") == "confirmed"),
+        pending=sum(1 for k in ("commit", "push", "pr")
+                    if _brs.get(k, {}).get("state") in ("pending", "absent")),
+        unknown=0 if crash_ok else 1, exactly_once=crash_ok, external_known=crash_ok)
+    _qdims = {"shadow_parity": parity_passed, "crash_reconciliation": crash_ok,
+              "sandbox": sandbox_clean, "dispatch_cutover": dispatch_ok}
+    _qpassed = sum(_qdims.values())
+
     # quality_gate 的 evidence_items：真实 drill JSON blob（run_quality_gate 归档 content）
     evidence_items = [
         ("test_output", json.dumps(allowlist, ensure_ascii=False, sort_keys=True)),
@@ -585,11 +623,11 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
             dry_run_run_id="real_dispatch_skip_dev"),
         # sdk_canary：真实 gate 策略（spec 7 path，run_lifecycle_drill 真实 gate 逻辑）；real_sdk_canary 机制证据见 7.2
         sdk_canary=lambda: CT.run_sdk_hook_canary(),
-        # crash_reconciliation：真实 crash/restart + ls-remote 对账映射
-        crash_reconciliation=lambda: CT.CrashReconciliationEvidence(
-            results=(), boundaries_run=("commit", "push", "pr"),
+        # crash_reconciliation：真实 crash/restart + ls-remote 对账 → 真实 CrashDrillResult（非 results=()）
+        crash_reconciliation=lambda _r=_crash_result: CT.CrashReconciliationEvidence(
+            results=(_r,), boundaries_run=("publish_ready",),
             all_exactly_once=crash_ok,
-            summary=(f"commit/push/pr via real git cat-file+ls-remote+gh; "
+            summary=(f"real crash/restart publish_ready→restart→reconcile: {_brs}; "
                      f"remote_truth={crash.get('push_resolver_is_remote_truth')}")),
         # recovery：真实 run_recovery_drill（resume/fork/new_session 3 mode）
         recovery=lambda: tuple(CT.run_recovery_drill(m) for m in ("resume", "fork", "new_session")),
@@ -601,9 +639,9 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
             driven_by=allowlist.get("gate_all_pass_driven_by", "journal"),
             terminal_state=allowlist.get("gate_all_pass_terminal_state", "aborted"),
             fallback_reason=""),
-        # quality_gate：真实 evidence_items（drill JSON 归档）+ 套件验证 test_counts
-        quality_gate=lambda: CT.run_quality_gate(
-            test_counts={"passed": 3, "failed": 0},   # 3 真实 runtime drill 全绿
+        # quality_gate：test_counts 从真实子维度 pass 计数（非硬编码；任一维度红→failed>0→passed=False 级联）
+        quality_gate=lambda _p=_qpassed: CT.run_quality_gate(
+            test_counts={"passed": _p, "failed": len(_qdims) - _p},
             evidence_items=evidence_items, artifact_root=str(artifact_root)),
     )
 
@@ -622,7 +660,9 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
         "overall_passed": manifest.overall_passed,
         "archive_digest": manifest.archive_digest,
         "manifest_summary": manifest.summary,
-        "outcomes": [{"name": o.name, "passed": o.passed, "detail": o.detail} for o in manifest.outcomes],
+        "sub_evidence_refs": manifest.sub_evidence_refs,   # r2 P0-5：passing manifest 引用全部子 evidence digest
+        "outcomes": [{"name": o.name, "passed": o.passed, "detail": o.detail,
+                      "evidence_digests": o.evidence_digests} for o in manifest.outcomes],
         "not_manual_event_flow": True,   # run_full_cutover_suite 编排真实 drill bundle callable
     }
 
@@ -782,6 +822,43 @@ def real_session_lifecycle(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
     }
 
 
+def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
+    """每个 drill 的 pass predicate（r2 P0-4：定义每 drill pass predicate；失败给出原因）。
+
+    Returns:
+        ``(passed, fail_reason)``——passed=True 时 fail_reason 为 None。
+    """
+    try:
+        if key == "3.3_session_lifecycle":
+            ok = bool(res.get("overall_proven"))
+            return ok, None if ok else f"overall_proven={res.get('overall_proven')}"
+        if key == "7.3_crash_restart":
+            ok = bool(res.get("exactly_once") and res.get("safe_to_retry"))
+            return ok, None if ok else (
+                f"exactly_once={res.get('exactly_once')} safe_to_retry={res.get('safe_to_retry')}")
+        if key == "5.5_docker_canary":
+            ok = bool(res.get("summary", {}).get("all_pass"))
+            return ok, None if ok else f"summary.all_pass={res.get('summary', {}).get('all_pass')}"
+        if key == "7.1_dispatch_skip_dev":
+            p = res.get("parity", {})
+            ok = bool(p.get("decision_unchanged") and p.get("reached_skip_dev_planned"))
+            return ok, None if ok else (
+                f"parity decision_unchanged={p.get('decision_unchanged')} "
+                f"reached_planned={p.get('reached_skip_dev_planned')}")
+        if key == "7.2_sdk_canary":
+            ok = bool(res.get("lifecycle_callback_proven"))
+            return ok, None if ok else f"lifecycle_callback_proven={res.get('lifecycle_callback_proven')}"
+        if key == "7.5_allowlist_rollout":
+            ok = bool(res.get("triple_gate_proven"))
+            return ok, None if ok else f"triple_gate_proven={res.get('triple_gate_proven')}"
+        if key == "7.6_cutover_suite":
+            ok = bool(res.get("overall_passed"))
+            return ok, None if ok else f"overall_passed={res.get('overall_passed')}"
+    except Exception as e:
+        return False, f"predicate error: {type(e).__name__}: {e}"
+    return False, "unknown drill key"
+
+
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser(description="review §5 真实 runtime 执行证据收集器")
@@ -795,28 +872,45 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     artifact_root = (Path(args.artifact_root) if args.artifact_root else workdir / "artifacts").resolve()
 
+    drill_specs = [
+        ("3.3", "3.3_session_lifecycle", lambda: real_session_lifecycle(workdir)),
+        ("7.3", "7.3_crash_restart", lambda: real_crash_restart_drill(workdir)),
+        ("5.5", "5.5_docker_canary", lambda: real_docker_canary(workdir)),
+        ("7.1", "7.1_dispatch_skip_dev", lambda: real_dispatch_skip_dev(workdir)),
+        ("7.2", "7.2_sdk_canary", lambda: real_sdk_canary(workdir)),
+        ("7.5", "7.5_allowlist_rollout", lambda: real_allowlist_rollout(workdir)),
+        ("7.6", "7.6_cutover_suite",
+         lambda: real_cutover_suite(workdir, artifact_root=artifact_root / "cutover")),
+    ]
+
     evidence = {"collected_at": _stamp(), "host": os.uname().nodename, "drills": {}}
-    if args.drill in ("3.3", "all"):
-        evidence["drills"]["3.3_session_lifecycle"] = real_session_lifecycle(workdir)
-    if args.drill in ("7.3", "all"):
-        evidence["drills"]["7.3_crash_restart"] = real_crash_restart_drill(workdir)
-    if args.drill in ("5.5", "all"):
-        evidence["drills"]["5.5_docker_canary"] = real_docker_canary(workdir)
-    if args.drill in ("7.1", "all"):
-        evidence["drills"]["7.1_dispatch_skip_dev"] = real_dispatch_skip_dev(workdir)
-    if args.drill in ("7.2", "all"):
-        evidence["drills"]["7.2_sdk_canary"] = real_sdk_canary(workdir)
-    if args.drill in ("7.5", "all"):
-        evidence["drills"]["7.5_allowlist_rollout"] = real_allowlist_rollout(workdir)
-    if args.drill in ("7.6", "all"):
-        evidence["drills"]["7.6_cutover_suite"] = real_cutover_suite(
-            workdir, artifact_root=artifact_root / "cutover")
+    failed_drills: list[dict] = []
+    for drill_id, key, fn in drill_specs:
+        if args.drill != "all" and args.drill != drill_id:
+            continue
+        try:
+            res = fn()
+        except Exception as e:   # drill 抛异常（如 P0-1 protection 恢复失败 raise）→ 标记 failed，不崩 main
+            res = {"drill": key, "error": f"{type(e).__name__}: {e}"}
+            failed_drills.append({"key": key, "reason": f"exception: {type(e).__name__}: {str(e)[:200]}"})
+            evidence["drills"][key] = res
+            continue
+        evidence["drills"][key] = res
+        ok, reason = _drill_predicate(key, res)
+        if not ok:
+            failed_drills.append({"key": key, "reason": reason})
+
+    overall_ok = len(failed_drills) == 0
+    evidence["failed"] = not overall_ok
+    evidence["failed_drills"] = failed_drills
 
     blob = json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True)
     print(blob)
     ref = artifact_store.store(artifact_root, blob, kind="test_output", sensitivity="internal")
-    print(f"\n📦 ARCHIVED evidence: digest={ref.digest} path={ref.path} size={ref.size}")
-    return 0
+    tag = ("✅ ARCHIVED PASSING evidence manifest" if overall_ok
+           else "⛔ ARCHIVED FAILED evidence（非 passing manifest，含失败 drill）")
+    print(f"\n{tag}: digest={ref.digest} path={ref.path} size={ref.size} failed_drills={len(failed_drills)}")
+    return 0 if overall_ok else 1
 
 
 if __name__ == "__main__":

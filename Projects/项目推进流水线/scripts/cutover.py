@@ -20,8 +20,9 @@ drill 一律返不可变结果 dataclass（``*_DrillResult``），便于测试�
 """
 from __future__ import annotations
 
+import json
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -771,10 +772,16 @@ _EXPECTED_LIFECYCLE_GATES: dict[str, str] = {
 
 @dataclass(frozen=True)
 class DrillOutcome:
-    """一项 drill 的运行结果摘要（manifest 元素）。``passed`` ⇔ 该维度验收通过；``detail`` 给归档可读证据。"""
+    """一项 drill 的运行结果摘要（manifest 元素）。``passed`` ⇔ 该维度验收通过；``detail`` 给归档可读证据。
+
+    r2 P0-5：``evidence_digests`` 持该子 drill evidence 的内容寻址 digest（runner 归档每个子 drill
+    evidence 后填入），manifest ``sub_evidence_refs`` 聚合全部子 digest——passing manifest 引用所有子
+    evidence，可逐项 ``artifact_store.load`` 校验。
+    """
     name: str
     passed: bool
     detail: str
+    evidence_digests: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -783,10 +790,14 @@ class CutoverManifest:
 
     runner 自行执行各子 drill（非接收外部布尔值），逐项记 ``(name, passed, detail)``。``overall_passed``
     ⇔ 全项 passed；全绿归档 manifest 内容寻址 digest（design#6）；任一 red → 不归档（绝不伪装绿归档）。
+
+    r2 P0-5：``sub_evidence_refs`` 聚合每子 drill evidence 的 digest（runner 归档每子 evidence 后收集），
+    passing manifest 引用全部子 evidence digest（非只存 summary 字符串），满足 §6.8。
     """
     outcomes: tuple[DrillOutcome, ...]
     overall_passed: bool
     archive_digest: str | None = None
+    sub_evidence_refs: tuple[str, ...] = ()
 
     @property
     def summary(self) -> str:
@@ -860,6 +871,27 @@ class CutoverDrillBundle:
     quality_gate: Callable[[], "QualityGateResult"]
 
 
+def _archive_sub_evidence(artifact_root: str, name: str, ev) -> tuple[str, ...]:
+    """归档单个子 drill evidence 到内容寻址 store，返回 digest tuple（r2 P0-5：manifest 引用子 evidence）。
+
+    序列化 robust：dataclass→``asdict``、tuple→list 递归、其余 ``default=str`` 兜底。归档失败返回 ``()``
+    （不阻断 manifest，但 outcome.evidence_digests 为空 → 审计可见该子 evidence 未归档）。
+    """
+    def _jsonable(o):
+        if isinstance(o, tuple):
+            return [_jsonable(x) for x in o]
+        if is_dataclass(o) and not isinstance(o, type):
+            return asdict(o)
+        return o
+    try:
+        blob = json.dumps({"drill": name, "evidence": _jsonable(ev)},
+                          ensure_ascii=False, sort_keys=True, default=str)
+        ref = artifact_store.store(artifact_root, blob, kind="test_output", sensitivity="internal")
+        return (ref.digest,)
+    except Exception:
+        return ()
+
+
 def run_full_cutover_suite(*, drills: CutoverDrillBundle,
                            artifact_root: str) -> CutoverManifest:
     """task 7.6：完整 cutover 套件**运行器**——自行编排执行各子 drill + 归档不可变通过证据 manifest。
@@ -869,6 +901,9 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
     ``CutoverManifest`` → 全绿才归档内容寻址 manifest digest（design#1 runner 编排真实 drill + #6 archive
     immutable passing evidence）。任一维度 red → ``overall_passed=False`` 且**不归档**（绝不伪装绿归档）。
 
+    r2 P0-5：runner 归档每个子 drill evidence（``_archive_sub_evidence``），outcome 带 ``evidence_digests``，
+    manifest ``sub_evidence_refs`` 聚合全部子 digest——passing manifest 引用所有子 evidence（非只存 summary）。
+
     drill 注入（design 决策#1）：bundle 每项是 callable，测试注入 fake（确定性验证编排/归档），生产注入
     真实 drill（真实跑各子项，见 ``real_cutover_drills``）。runner 只编排执行 + 汇总归档，不重写 drill 逻辑。
 
@@ -876,16 +911,23 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
         drills: ``CutoverDrillBundle``——7 个子 drill 的执行入口（runner 依次调用执行）。
         artifact_root: 归档 manifest 的内容寻址 artifact store 根。
     """
+    def _exec(execute: Callable, extractor: Callable, archive_name: str) -> DrillOutcome:
+        ev = execute()                            # 调 bundle callable，真实执行该子 drill
+        digests = _archive_sub_evidence(artifact_root, archive_name, ev)
+        return replace(extractor(ev), evidence_digests=digests)
+
     outcomes = (
-        _shadow_parity_outcome(drills.shadow_parity()),
-        _sdk_canary_outcome(drills.sdk_canary()),
-        _crash_outcome(drills.crash_reconciliation()),
-        _recovery_outcome(drills.recovery()),
-        _sandbox_outcome(drills.sandbox()),
-        _dispatch_outcome(drills.dispatch_cutover()),
-        _quality_outcome(drills.quality_gate()),
+        _exec(drills.shadow_parity, _shadow_parity_outcome, "shadow_parity"),
+        _exec(drills.sdk_canary, _sdk_canary_outcome, "sdk_canary"),
+        _exec(drills.crash_reconciliation, _crash_outcome, "crash_reconciliation"),
+        _exec(drills.recovery, _recovery_outcome, "recovery"),
+        _exec(drills.sandbox, _sandbox_outcome, "sandbox"),
+        _exec(drills.dispatch_cutover, _dispatch_outcome, "dispatch_cutover"),
+        _exec(drills.quality_gate, _quality_outcome, "quality_gate"),
     )
-    manifest = CutoverManifest(outcomes=outcomes, overall_passed=all(o.passed for o in outcomes))
+    sub_refs = tuple(d for o in outcomes for d in o.evidence_digests)
+    manifest = CutoverManifest(outcomes=outcomes, overall_passed=all(o.passed for o in outcomes),
+                               sub_evidence_refs=sub_refs)
     if not manifest.overall_passed:
         return manifest                        # red 套件不归档（绝不伪装绿归档）
     # kind 复用 ``cutover_suite``（ArtifactKind 分类）；manifest 内容自带 ``cutover manifest:`` 前缀，
