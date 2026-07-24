@@ -545,10 +545,16 @@ def real_sdk_canary(workdir: Path) -> dict:
     sdk_types = sorted({h for h in sdk_hook_names if h})
     real_triggered = set(our_types) & lifecycle
 
-    # r2 P1-1：per-scenario 真实触发矩阵（spec 7 path + test_red 基线）。每场景映射其核心 lifecycle event；
-    # base/subagent 真实 query 触发 → real_proven；不可单次 headless query 触发（PreCompact 需逼近上下文
-    # 上限）→ 诚实 blocked，不伪造 pass。adapter gate 业务逻辑（on_stop/on_pre_compact/on_subagent_start）
-    # 由 run_sdk_hook_canary fixture 覆盖，本矩阵只证明「真实 SDK 是否触发对应 lifecycle callback」。
+    # r3 P0-1：per-scenario 逐场景校验矩阵（非任意 callback 假绿）。每场景两个独立证据维度：
+    #   (1) sdk_callback_real_proven：base/subagent 真实 query 是否触发该场景的 lifecycle callback；
+    #   (2) adapter_gate_outcome：adapter 业务逻辑（on_stop/on_post_tool_use/on_pre_compact/
+    #       on_subagent_start 真实代码路径，run_sdk_hook_canary fixture）产生的 gate 判定。
+    # PreCompact 场景（compaction/hook_failure）：SDK callback 需逼近上下文上限，单次 headless query 不可靠
+    # 触发（实测 max_turns=12 + 30KB×3 读 + budget $2 仍不触发）→ sdk_callback 诚实 blocked；其 gate outcome
+    # （snapshot_persisted/fail_closed）由 adapter on_pre_compact 真实代码路径覆盖（独立证据，非假绿）。
+    import cutover as CT
+    adapter_evidence = CT.run_sdk_hook_canary()
+    adapter_gates = dict(adapter_evidence.stop_gates)   # scenario → gate（adapter on_* 真实代码路径）
     scenario_events = {
         "no_test": "Stop",            # 无 evidence gate → Stop deny
         "test_red": "PostToolUse",    # Bash pytest exit1 + Stop deny
@@ -561,19 +567,26 @@ def real_sdk_canary(workdir: Path) -> dict:
     }
     per_scenario: dict[str, dict] = {}
     for sc, ev in scenario_events.items():
-        if ev in real_triggered:
-            per_scenario[sc] = {"expected_event": ev, "real_proven": True,
-                                "source": "subagent query" if ev in {"SubagentStart", "SubagentStop"} else "base query"}
+        sdk_cb = ev in real_triggered
+        entry: dict = {
+            "expected_event": ev,
+            "real_proven": sdk_cb,                                # 向后兼容（= sdk_callback_real_proven）
+            "sdk_callback_real_proven": sdk_cb,                   # 维度1：真实 SDK query 触发 callback
+            "adapter_gate_outcome": adapter_gates.get(sc),        # 维度2：adapter on_* 真实 gate 判定
+            "gate_outcome_source": "sdk+adapter" if sdk_cb else "adapter_fixture_only",
+        }
+        if sdk_cb:
+            entry["source"] = "subagent query" if ev in {"SubagentStart", "SubagentStop"} else "base query"
         else:
-            reason = {
-                "PreCompact": "PreCompact 需逼近上下文上限触发 auto-compact，单次 headless query 不触发；"
-                              "adapter on_pre_compact 逻辑由 run_sdk_hook_canary fixture 覆盖",
-                "SubagentStart": "subagent query 未触发 SubagentStart（proxy/Task 工具支持不确定）；"
-                                 "adapter on_subagent_start 逻辑由 run_sdk_hook_canary fixture 覆盖",
+            entry["sdk_callback_blocked_reason"] = {
+                "PreCompact": "PreCompact 需逼近上下文上限触发 auto-compact，单次 headless query 不可靠触发"
+                              "（实测 max_turns=12+30KB×3 读不触发）；gate 由 adapter on_pre_compact 真实代码路径覆盖",
             }.get(ev, f"{ev} 未在真实 query 中触发")
-            per_scenario[sc] = {"expected_event": ev, "real_proven": False, "blocked_reason": reason}
-    proven_scenarios = sorted(sc for sc, v in per_scenario.items() if v["real_proven"])
-    blocked_scenarios = sorted(sc for sc, v in per_scenario.items() if not v["real_proven"])
+            entry["blocked_reason"] = entry["sdk_callback_blocked_reason"]   # 向后兼容
+        per_scenario[sc] = entry
+    proven_scenarios = sorted(sc for sc, v in per_scenario.items() if v["sdk_callback_real_proven"])
+    blocked_scenarios = sorted(sc for sc, v in per_scenario.items() if not v["sdk_callback_real_proven"])
+    adapter_gate_covered = sorted(sc for sc, v in per_scenario.items() if v["adapter_gate_outcome"])
 
     return {
         "drill": "7.2 real SDK hook canary",
@@ -596,6 +609,10 @@ def real_sdk_canary(workdir: Path) -> dict:
         "per_scenario_real_triggers": per_scenario,
         "proven_scenarios": proven_scenarios,
         "blocked_scenarios": blocked_scenarios,
+        "sdk_callback_proven_scenarios": proven_scenarios,      # r3 P0-1：sdk_callback 维度（真实 query 触发）
+        "sdk_callback_blocked_scenarios": blocked_scenarios,
+        "adapter_gate_covered_scenarios": adapter_gate_covered,  # r3 P0-1：adapter on_* 真实 gate 覆盖
+        "adapter_gate_outcomes": adapter_gates,
         "real_triggered_event_types": sorted(real_triggered),
         "our_hook_journal_path": str(hook_path),
     }
@@ -1036,8 +1053,22 @@ def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
                 f"parity decision_unchanged={p.get('decision_unchanged')} "
                 f"reached_planned={p.get('reached_skip_dev_planned')}")
         if key == "7.2_sdk_canary":
-            ok = bool(res.get("lifecycle_callback_proven"))
-            return ok, None if ok else f"lifecycle_callback_proven={res.get('lifecycle_callback_proven')}"
+            # r3 P0-1：逐场景校验（非任意 callback 假绿）。两类维度均须满足：
+            #   (1) 6 SDK-callback 场景（no_test/test_red/stale_test/test_green/semantic_revise/subagent）
+            #       须 sdk_callback_real_proven（base/subagent query 真实触发对应 lifecycle callback）；
+            #   (2) 全 8 场景须有 adapter_gate_outcome（on_stop/on_post_tool_use/on_pre_compact/
+            #       on_subagent_start 真实代码路径 gate 判定，独立证据）。
+            # PreCompact 场景（compaction/hook_failure）SDK callback 诚实 blocked（单 query 不可靠触发），
+            # 其 gate 由 adapter fixture 覆盖——谓词不因 PreCompact SDK-callback blocked 假绿，gate 维度独立校验。
+            per = res.get("per_scenario_real_triggers", {})
+            sdk_cb_required = ("no_test", "test_red", "stale_test", "test_green", "semantic_revise", "subagent")
+            sdk_cb_ok = all(per.get(s, {}).get("sdk_callback_real_proven") for s in sdk_cb_required)
+            gate_ok = all(per.get(s, {}).get("adapter_gate_outcome") for s in per) and len(per) >= 8
+            cb_proven = bool(res.get("lifecycle_callback_proven"))
+            ok = cb_proven and sdk_cb_ok and gate_ok
+            return ok, None if ok else (
+                f"lifecycle_cb={cb_proven} sdk_callback_6={sdk_cb_ok} "
+                f"adapter_gate_all={gate_ok} blocked={res.get('blocked_scenarios')}")
         if key == "7.5_allowlist_rollout":
             ok = bool(res.get("triple_gate_proven"))
             return ok, None if ok else f"triple_gate_proven={res.get('triple_gate_proven')}"
