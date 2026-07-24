@@ -9,3 +9,6 @@ __pycache__/
 
 # 备份文件
 *.bak*
+
+# drill 运行态产物（含本机绝对路径 → 跨机器不可复核；P1-2 改走 CI artifact store）
+runtime-evidence-index.json

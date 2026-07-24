@@ -19,3 +19,16 @@ htmlcov/
 Thumbs.db
 .vscode/
 .idea/
+
+# === Claude Code 运行态（session/history/todos 本地私有，防未来泄漏）===
+# 保留共享配置：.claude/agents/ .claude/commands/ .claude/skills/ .claude/settings.json
+.claude/projects/
+.claude/todos/
+.claude/history
+.claude/shell-snapshots/
+.claude/statsig/
+
+# === 通用备份 / 临时 / 日志 ===
+*.bak
+*.tmp
+*.log
