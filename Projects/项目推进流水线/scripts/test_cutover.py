@@ -761,3 +761,55 @@ def test_run_full_cutover_suite_archive_is_content_addressed(tmp_path):
     a = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "a"))
     b = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "b"))
     assert a.archive_digest == b.archive_digest
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# r3 P0-2：passing manifest 子证据 fail-closed + 完整性门
+#   1. 子证据归档失败 → fail-closed（该维度 red + overall 不绿 + 不归档）
+#   2. 完整性门：7 outcome 均需可解析、可读、digest 匹配的证据引用，否则不允许 passing manifest
+# ════════════════════════════════════════════════════════════════════════════
+def test_run_full_cutover_suite_sub_evidence_archive_failure_fail_closed(tmp_path, monkeypatch):
+    """r3 P0-2：子证据归档失败（artifact_store.store 抛异常）→ fail-closed：该维度记 red、
+    overall 不绿、不归档 passing manifest，且 evidence_integrity 记可审计原因。"""
+    real_store = CT.artifact_store.store
+
+    def boom(root, content, kind, sensitivity):
+        # 仅子证据归档（kind=test_output）炸；manifest 归档（kind=cutover_suite）不触发
+        if kind == "test_output":
+            raise OSError("模拟磁盘满/IO 故障")
+        return real_store(root, content, kind, sensitivity)
+
+    monkeypatch.setattr(CT.artifact_store, "store", boom)
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "suite"))
+    assert m.overall_passed is False
+    assert m.archive_digest is None                       # 不归档「缺证据」的 passing manifest
+    red = [o for o in m.outcomes if not o.passed]
+    assert red and any("FAIL-CLOSED" in o.detail for o in red)   # 归档失败被记 red
+    assert m.evidence_integrity != "ok"                   # 完整性门原因可审计
+
+
+def test_verify_sub_evidence_complete_rejects_missing_digest():
+    """r3 P0-2：业务维度全 passed 但某 outcome 缺证据引用 → 完整性门拒绝（缺证据不允许绿）。"""
+    outcomes = tuple(CT.DrillOutcome(n, True, "ok", ()) for n in CT._EXPECTED_DRILL_NAMES)
+    ok, reason = CT._verify_sub_evidence_complete(outcomes, "/nonexistent-root")
+    assert ok is False
+    assert "无已归档子证据引用" in reason
+
+
+def test_verify_sub_evidence_complete_rejects_unreadable_digest():
+    """r3 P0-2：digest 不可读/不匹配（伪造或丢失）→ 完整性门拒绝（防伪造 digest 引用混入绿 manifest）。"""
+    outcomes = tuple(
+        CT.DrillOutcome(n, True, "ok", ("sha256:deadbeef",)) for n in CT._EXPECTED_DRILL_NAMES)
+    ok, reason = CT._verify_sub_evidence_complete(outcomes, "/nonexistent-root")
+    assert ok is False
+    assert "不可读" in reason or "digest 不匹配" in reason
+
+
+def test_verify_sub_evidence_complete_rejects_wrong_outcome_names():
+    """r3 P0-2：outcome 名字不齐全（漏跑维度）→ 完整性门拒绝。"""
+    # 少一个 quality_gate
+    names = CT._EXPECTED_DRILL_NAMES - {"quality_gate"}
+    outcomes = tuple(CT.DrillOutcome(n, True, "ok", ("sha256:x",)) for n in names)
+    ok, reason = CT._verify_sub_evidence_complete(outcomes, "/nonexistent-root")
+    assert ok is False
+    assert "不齐全" in reason and "quality_gate" in reason

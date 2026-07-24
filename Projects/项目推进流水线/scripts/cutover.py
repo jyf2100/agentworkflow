@@ -801,6 +801,8 @@ class CutoverManifest:
     overall_passed: bool
     archive_digest: str | None = None
     sub_evidence_refs: tuple[str, ...] = ()
+    # r3 P0-2：子证据完整性门结论（"ok" 或失败原因），便于上层独立复核为何不归档 passing manifest。
+    evidence_integrity: str = "ok"
 
     @property
     def summary(self) -> str:
@@ -879,8 +881,11 @@ class CutoverDrillBundle:
 def _archive_sub_evidence(artifact_root: str, name: str, ev) -> tuple[str, ...]:
     """归档单个子 drill evidence 到内容寻址 store，返回 digest tuple（r2 P0-5：manifest 引用子 evidence）。
 
-    序列化 robust：dataclass→``asdict``、tuple→list 递归、其余 ``default=str`` 兜底。归档失败返回 ``()``
-    （不阻断 manifest，但 outcome.evidence_digests 为空 → 审计可见该子 evidence 未归档）。
+    序列化 robust：dataclass→``asdict``、tuple→list 递归、其余 ``default=str`` 兜底。
+
+    r3 P0-2 fail-closed：归档失败（序列化/落盘/digest 异常）**绝不静默返回空 tuple**——上抛 ``RuntimeError``，
+    由 ``run_full_cutover_suite._exec`` 捕获记该维度 red（归档失败 = 套件不绿 = 不归档 passing manifest）。
+    任一子证据归档失败必须 fail closed，绝不归档「缺证据」的 passing manifest。
     """
     def _jsonable(o):
         if isinstance(o, tuple):
@@ -893,8 +898,47 @@ def _archive_sub_evidence(artifact_root: str, name: str, ev) -> tuple[str, ...]:
                           ensure_ascii=False, sort_keys=True, default=str)
         ref = artifact_store.store(artifact_root, blob, kind="test_output", sensitivity="internal")
         return (ref.digest,)
-    except Exception:
-        return ()
+    except Exception as exc:   # r3 P0-2：归档失败 fail-closed，不再静默吞掉返回空 tuple
+        raise RuntimeError(f"子证据归档失败（fail-closed）drill={name}: {exc!r}") from exc
+
+
+# r3 P0-2 完整性门：passing manifest 必须引用全部 7 个子 drill 的可解析、可读、digest 匹配的证据。
+_EXPECTED_DRILL_NAMES: frozenset[str] = frozenset({
+    "shadow_parity", "sdk_canary", "crash_reconciliation",
+    "recovery", "sandbox", "dispatch_cutover", "quality_gate",
+})
+
+
+def _verify_sub_evidence_complete(outcomes: "tuple[DrillOutcome, ...]",
+                                  artifact_root: str) -> tuple[bool, str]:
+    """r3 P0-2 完整性门：七个 outcome 均至少有一个**可解析、可读取且 digest 匹配**的证据引用。
+
+    三层校验（任一不满足 → ``(False, reason)``，runner 据此置 ``overall_passed=False`` 不归档 passing manifest）：
+        1. outcome 数量/名字齐全——恰好 7 个，名字匹配 ``_EXPECTED_DRILL_NAMES``（防漏跑/多跑维度）；
+        2. 每 outcome 至少 1 个 evidence digest（子证据已归档，非空——单纯业务 ``passed`` 但无证据引用不允许绿）；
+        3. 每个 digest 经 ``artifact_store.load`` 读回 + 重算 digest 校验（可读 + digest 匹配，fail-closed）。
+
+    digest → path 是 ``artifact_store._bucketed_path`` 单射（与 ``store`` 同源），故仅凭 digest 即可重构
+    ``ArtifactRef`` 完成真实读取校验，满足 r3「可解析、可读取且 digest 匹配」三要件。
+    """
+    names = {o.name for o in outcomes}
+    if names != _EXPECTED_DRILL_NAMES:
+        missing = _EXPECTED_DRILL_NAMES - names
+        extra = names - _EXPECTED_DRILL_NAMES
+        return False, f"outcome 名字不齐全: missing={sorted(missing)} extra={sorted(extra)}"
+    for o in outcomes:
+        if not o.evidence_digests:
+            return False, f"drill={o.name} 无已归档子证据引用（缺证据不允许 passing manifest）"
+        for d in o.evidence_digests:
+            ref = L.ArtifactRef(digest=d, size=0,
+                                kind=L.ArtifactKind.TEST_OUTPUT.value,
+                                path=artifact_store._bucketed_path(d),
+                                sensitivity=L.Sensitivity.INTERNAL.value)
+            try:
+                artifact_store.load(artifact_root, ref)   # load 自带 digest 重算校验（fail-closed）
+            except Exception as exc:
+                return False, f"drill={o.name} 子证据 {d} 不可读/digest 不匹配: {exc!r}"
+    return True, "ok"
 
 
 def run_full_cutover_suite(*, drills: CutoverDrillBundle,
@@ -917,9 +961,16 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
         artifact_root: 归档 manifest 的内容寻址 artifact store 根。
     """
     def _exec(execute: Callable, extractor: Callable, archive_name: str) -> DrillOutcome:
-        ev = execute()                            # 调 bundle callable，真实执行该子 drill
-        digests = _archive_sub_evidence(artifact_root, archive_name, ev)
-        return replace(extractor(ev), evidence_digests=digests)
+        # r3 P0-2 fail-closed：drill 执行（execute）、outcome 提取（extractor）、子证据归档
+        # （_archive_sub_evidence）任一异常 → 该维度记 red + 空证据引用，绝不归档缺证据的 passing manifest。
+        try:
+            ev = execute()                        # 调 bundle callable，真实执行该子 drill
+            outcome = extractor(ev)
+            digests = _archive_sub_evidence(artifact_root, archive_name, ev)
+            return replace(outcome, evidence_digests=digests)
+        except Exception as exc:
+            return DrillOutcome(archive_name, False,
+                                f"FAIL-CLOSED: drill 执行或子证据归档异常: {exc!r}")
 
     outcomes = (
         _exec(drills.shadow_parity, _shadow_parity_outcome, "shadow_parity"),
@@ -931,8 +982,14 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
         _exec(drills.quality_gate, _quality_outcome, "quality_gate"),
     )
     sub_refs = tuple(d for o in outcomes for d in o.evidence_digests)
-    manifest = CutoverManifest(outcomes=outcomes, overall_passed=all(o.passed for o in outcomes),
-                               sub_evidence_refs=sub_refs)
+    # r3 P0-2：overall_passed = 全维度业务 passed **且** 子证据完整性门通过（7 outcome 均有可解析、
+    # 可读、digest 匹配的证据引用）。缺任一 → overall_passed=False 不归档（绝不伪装绿归档）。
+    drill_ok = all(o.passed for o in outcomes)
+    evidence_ok, evidence_reason = _verify_sub_evidence_complete(outcomes, artifact_root)
+    manifest = CutoverManifest(outcomes=outcomes,
+                               overall_passed=(drill_ok and evidence_ok),
+                               sub_evidence_refs=sub_refs,
+                               evidence_integrity=evidence_reason)
     if not manifest.overall_passed:
         return manifest                        # red 套件不归档（绝不伪装绿归档）
     # kind 复用 ``cutover_suite``（ArtifactKind 分类）；manifest 内容自带 ``cutover manifest:`` 前缀，

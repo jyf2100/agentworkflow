@@ -868,6 +868,7 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
         "archive_digest": manifest.archive_digest,
         "manifest_summary": manifest.summary,
         "sub_evidence_refs": manifest.sub_evidence_refs,   # r2 P0-5：passing manifest 引用全部子 evidence digest
+        "evidence_integrity": manifest.evidence_integrity,  # r3 P0-2：子证据完整性门结论（"ok" 或失败原因）
         "outcomes": [{"name": o.name, "passed": o.passed, "detail": o.detail,
                       "evidence_digests": o.evidence_digests} for o in manifest.outcomes],
         "not_manual_event_flow": True,   # run_full_cutover_suite 编排真实 drill bundle callable
