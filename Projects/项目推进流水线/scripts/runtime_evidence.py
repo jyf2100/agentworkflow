@@ -1078,17 +1078,24 @@ def main() -> int:
     for drill_id, key, fn in drill_specs:
         if args.drill != "all" and args.drill != drill_id:
             continue
+        # r2 drill 隔离：每 drill 跑前快照 os.environ，跑后恢复——drill 内设的 PA_LOOP_* flag
+        # （3.3 设 SESSION_AWARE_RETRY+JOURNAL_SHADOW、7.2 设 LIFECYCLE_HOOKS+JOURNAL_SHADOW）
+        # 不泄漏污染后续 drill。否则 3.3 残留 SESSION_AWARE_RETRY=1 → 7.1 journal_off 分支
+        # （pop JOURNAL_SHADOW 但 retry 仍开）→ flag 组合非法 → dispatch skip → parity 假失败。
+        _env_snapshot = os.environ.copy()
         try:
             res = fn()
+            evidence["drills"][key] = res
+            ok, reason = _drill_predicate(key, res)
+            if not ok:
+                failed_drills.append({"key": key, "reason": reason})
         except Exception as e:   # drill 抛异常（如 P0-1 protection 恢复失败 raise）→ 标记 failed，不崩 main
             res = {"drill": key, "error": f"{type(e).__name__}: {e}"}
             failed_drills.append({"key": key, "reason": f"exception: {type(e).__name__}: {str(e)[:200]}"})
             evidence["drills"][key] = res
-            continue
-        evidence["drills"][key] = res
-        ok, reason = _drill_predicate(key, res)
-        if not ok:
-            failed_drills.append({"key": key, "reason": reason})
+        finally:
+            os.environ.clear()
+            os.environ.update(_env_snapshot)
 
     overall_ok = len(failed_drills) == 0
     evidence["failed"] = not overall_ok
