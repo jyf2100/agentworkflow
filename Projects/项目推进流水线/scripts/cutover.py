@@ -303,6 +303,10 @@ class SdkHookCanaryEvidence:
     real_query_proven: bool = True   # r2 P0-5：真实 SDK query 是否证明 lifecycle callback 真实触发
                                      # （run_sdk_hook_canary fixture 默认 True；real_cutover_suite 从 real_sdk_canary
                                      # 真实 query 结果填 → sdk_canary 通过需 adapter gate AND 真实 query proven）
+    # r3 P0-1 闭环：真实 SDK query 逐场景 proven 的场景名子集（SDK_CALLBACK_REQUIRED_SCENARIOS 须全含）。
+    # run_sdk_hook_canary fixture 假定全 proven（证 adapter 编排逻辑，非 SDK）；real_cutover_suite 从
+    # real_sdk_canary 真实 query 结果填真值 → sdk_canary 通过需 callback 逐场景 proven（非任意 callback 假绿）。
+    sdk_callback_proven: tuple[str, ...] = ()
 
 
 # canary 跑序（spec 7 path 对应 scenario + test_red 基线，按 GATE 严重度递减便于归档阅读）
@@ -330,7 +334,10 @@ def run_sdk_hook_canary(*, stamp_fn=None) -> SdkHookCanaryEvidence:
     summary = " | ".join(f"{r.scenario}={r.stop_decision}/{r.gate}" for r in scenarios)
     return SdkHookCanaryEvidence(
         scenarios=scenarios, stop_gates=stop_gates,
-        paths_covered=paths_covered, summary=summary)
+        paths_covered=paths_covered, summary=summary,
+        # r3 P0-1 闭环：fixture 证 adapter 编排/gate 逻辑（非真实 SDK），假定 6 场景 callback 全 proven；
+        # 真实 SDK query 逐场景 proven 由 real_cutover_suite 从 real_sdk_canary 路径填真值。
+        sdk_callback_proven=SDK_CALLBACK_REQUIRED_SCENARIOS)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -761,7 +768,9 @@ def run_cutover_suite(*, shadow_parity_matched, lifecycle_all_pass, crash_all_ex
 
 # lifecycle canary 每场景的预期 gate（lifecycle pass = 全场景 gate 符合预期，非"全 allow"——
 # no_test/test_red/stale_test 应 deny 阻断，test_green allow，revise/compaction/subagent/hook-failure 各符预期）
-_EXPECTED_LIFECYCLE_GATES: dict[str, str] = {
+# r3 P0-1 闭环：公开为验收契约常量——7.2 _drill_predicate gate exact-match + 7.6 _lifecycle_canary_passed
+# 共用同一份预期值，杜绝两处各写一份漂移致假绿。
+EXPECTED_LIFECYCLE_GATES: dict[str, str] = {
     "no_test": EV.GATE_NOT_RUN,
     "test_red": EV.GATE_FAILED,
     "stale_test": EV.GATE_STALE,
@@ -771,6 +780,11 @@ _EXPECTED_LIFECYCLE_GATES: dict[str, str] = {
     "subagent": "publication_blocked",
     "hook_failure": "fail_closed",
 }
+# r3 P0-1 闭环：SDK callback 维度须逐场景真实触发的 6 场景（8 lifecycle 场景除去 compaction/hook_failure——
+# 这俩 PreCompact SDK callback 单次 headless query 不可靠触发，诚实 blocked；其 gate 由 adapter on_pre_compact
+# 真实代码路径独立覆盖）。7.2 _drill_predicate sdk_cb_ok + 7.6 _sdk_canary_outcome callback_ok 共用，防漂移。
+SDK_CALLBACK_REQUIRED_SCENARIOS: tuple[str, ...] = (
+    "no_test", "test_red", "stale_test", "test_green", "semantic_revise", "subagent")
 
 
 @dataclass(frozen=True)
@@ -812,8 +826,8 @@ class CutoverManifest:
 
 
 def _lifecycle_canary_passed(ev: "SdkHookCanaryEvidence") -> bool:
-    """lifecycle pass = 每场景 gate 符合 ``_EXPECTED_LIFECYCLE_GATES``（非"全 allow"）。"""
-    return all(ev.stop_gates.get(sc) == exp for sc, exp in _EXPECTED_LIFECYCLE_GATES.items())
+    """lifecycle pass = 每场景 gate 符合 ``EXPECTED_LIFECYCLE_GATES``（非"全 allow"）。"""
+    return all(ev.stop_gates.get(sc) == exp for sc, exp in EXPECTED_LIFECYCLE_GATES.items())
 
 
 # 各 drill Result → DrillOutcome 提取器（runner 编排执行各 drill 后调用，从真实 Result 提取 pass+detail）
@@ -824,7 +838,10 @@ def _shadow_parity_outcome(ev: "ShadowParityEvidence") -> DrillOutcome:
 
 def _sdk_canary_outcome(ev: "SdkHookCanaryEvidence") -> DrillOutcome:
     # r2 P0-5：sdk_canary 通过 = adapter gate spec 7 场景符合预期 AND 真实 SDK query 证明 lifecycle callback 触发
-    passed = _lifecycle_canary_passed(ev) and ev.real_query_proven
+    # r3 P0-1 闭环 HIGH-1：进一步要求 SDK_CALLBACK_REQUIRED_SCENARIOS 6 场景 callback 逐场景真实 proven
+    # （非"任意 callback 出现即真"）。与 _drill_predicate 7.2 同语义，共用常量防两处漂移致假绿。
+    callback_ok = all(s in ev.sdk_callback_proven for s in SDK_CALLBACK_REQUIRED_SCENARIOS)
+    passed = _lifecycle_canary_passed(ev) and ev.real_query_proven and callback_ok
     return DrillOutcome("sdk_canary", passed, ev.summary)
 
 

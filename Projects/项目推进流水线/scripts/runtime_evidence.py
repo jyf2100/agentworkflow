@@ -829,6 +829,9 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
             summary=(f"[real SDK query proven={_r.get('lifecycle_callback_proven')}, "
                      f"types={_r.get('our_callback_hook_types')}, err={_r.get('query_error')}] "
                      f"+ [adapter-gate 7 scenarios: {_g.summary}]"),
+            # r3 P0-1 闭环 HIGH-1：真实 query 逐场景 callback proven（非任意 callback 假绿）——
+            # sdk_callback_proven_scenarios = 真实 query 触发 lifecycle callback 的场景子集，须含 6 必须场景。
+            sdk_callback_proven=tuple(_r.get("sdk_callback_proven_scenarios", ())),
             real_query_proven=bool(_r.get("lifecycle_callback_proven"))),
         # crash_reconciliation：真实 crash/restart + ls-remote 对账 → 真实 CrashDrillResult（非 results=()）
         crash_reconciliation=lambda _r=_crash_result: CT.CrashReconciliationEvidence(
@@ -1062,10 +1065,17 @@ def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
             #       on_subagent_start 真实代码路径 gate 判定，独立证据）。
             # PreCompact 场景（compaction/hook_failure）SDK callback 诚实 blocked（单 query 不可靠触发），
             # 其 gate 由 adapter fixture 覆盖——谓词不因 PreCompact SDK-callback blocked 假绿，gate 维度独立校验。
+            import cutover as CT   # r3 P0-1 闭环：谓词读 CT 公开常量（函数内 import，与 real_sdk_canary 同模式）
             per = res.get("per_scenario_real_triggers", {})
-            sdk_cb_required = ("no_test", "test_red", "stale_test", "test_green", "semantic_revise", "subagent")
+            # r3 P0-1 闭环：与 7.6 _sdk_canary_outcome 共用 CT 常量，防两处各写一份 6 场景清单漂移。
+            sdk_cb_required = CT.SDK_CALLBACK_REQUIRED_SCENARIOS
             sdk_cb_ok = all(per.get(s, {}).get("sdk_callback_real_proven") for s in sdk_cb_required)
-            gate_ok = all(per.get(s, {}).get("adapter_gate_outcome") for s in per) and len(per) >= 8
+            # r3 P0-1 闭环 MEDIUM-1：gate_ok 精确匹配 EXPECTED_LIFECYCLE_GATES（非只 truthy）——adapter gate
+            # 须每场景等于预期 gate 值，杜绝"非空但错的 gate"假绿（与 7.6 _lifecycle_canary_passed 同语义/同源）。
+            expected_gates = CT.EXPECTED_LIFECYCLE_GATES
+            gate_ok = (len(per) >= len(expected_gates)
+                       and all(per.get(s, {}).get("adapter_gate_outcome") == exp
+                               for s, exp in expected_gates.items()))
             cb_proven = bool(res.get("lifecycle_callback_proven"))
             ok = cb_proven and sdk_cb_ok and gate_ok
             return ok, None if ok else (

@@ -667,6 +667,25 @@ def test_run_shadow_parity_evidence_no_write_dry_run_published(tmp_path):
 # 评审 P0-2：旧 run_cutover_suite 接收外部布尔值做 all()（聚合器非运行器）。新 runner 调用每个 drill
 # 执行入口（注入 bundle）真实执行，从 Result 提取 pass+detail，构建 CutoverManifest，全绿归档 digest。
 # ════════════════════════════════════════════════════════════════════════════
+def test_sdk_canary_outcome_requires_all_six_callback_scenarios():
+    """r3 P0-1 闭环 HIGH-1：sdk_canary pass 须 SDK_CALLBACK_REQUIRED_SCENARIOS 6 场景逐个 callback proven，
+    非"任意 callback 出现即真"。构造缺 callback 场景的 evidence 须判 FAIL（即便 adapter gate 全对 +
+    real_query_proven=True）——杜绝 7.6 outcome 比 7.2 谓词弱的假绿。"""
+    green = CT.run_sdk_hook_canary()   # fixture：gate 8 场景符合预期 + 6 callback 全 proven → pass
+    assert CT._sdk_canary_outcome(green).passed is True
+    # 缺 subagent callback 场景 → callback_ok=False → FAIL
+    missing_one = CT.SdkHookCanaryEvidence(
+        scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
+        summary=green.summary, real_query_proven=True,
+        sdk_callback_proven=tuple(s for s in CT.SDK_CALLBACK_REQUIRED_SCENARIOS if s != "subagent"))
+    assert CT._sdk_canary_outcome(missing_one).passed is False
+    # 缺全部 callback（任意 callback 假绿旧路径：仅 real_query_proven=True 即 pass）→ FAIL
+    no_callback = CT.SdkHookCanaryEvidence(
+        scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
+        summary=green.summary, real_query_proven=True, sdk_callback_proven=())
+    assert CT._sdk_canary_outcome(no_callback).passed is False
+
+
 def _green_bundle():
     """全绿 fake bundle（callable 返回全绿 fake Result）+ 真实 sdk_canary/recovery（确定性绿）。"""
     return CT.CutoverDrillBundle(
