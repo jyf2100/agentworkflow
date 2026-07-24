@@ -1,0 +1,99 @@
+{
+  "cutover_sub_evidence": {
+    "archive_digest": "sha256:059bc4fb5fa1b921ff9ac1f7eb2147015541f56087ceafc9d9e62fece397f504",
+    "artifact_root": "/mnt/disk01/workspaces/worksummary/vault/.project-auto/runtime-evidence-artifacts/cutover",
+    "evidence_integrity": "ok",
+    "outcomes": [
+      {
+        "evidence_digests": [
+          "sha256:7ef469a8d4fb607cff610dc72db44668b0d2fd6c9dee46bbfbe628e1204165d4"
+        ],
+        "name": "shadow_parity",
+        "passed": true
+      },
+      {
+        "evidence_digests": [
+          "sha256:b390ddfe39c2ae76ca9c56822cba44067e3c9a9cb8eb99514ce568bcf67d98e6"
+        ],
+        "name": "sdk_canary",
+        "passed": true
+      },
+      {
+        "evidence_digests": [
+          "sha256:e564ce11200bcd8c52fbedd2f57f2f69d39cda49ce6f8611aee3864cff3e0e41"
+        ],
+        "name": "crash_reconciliation",
+        "passed": true
+      },
+      {
+        "evidence_digests": [
+          "sha256:6e45647bdbf28f6a771a66ce022ec8ccb0caa155d279a03e35e0f8e3fd07a418"
+        ],
+        "name": "recovery",
+        "passed": true
+      },
+      {
+        "evidence_digests": [
+          "sha256:d9c6f888845b50bea3463302610c785a632003ccff40faf5524e9380aa66281d"
+        ],
+        "name": "sandbox",
+        "passed": true
+      },
+      {
+        "evidence_digests": [
+          "sha256:d8a9171bf6ab75b792a8a9328e0b2fb82c484a488ae3cae3510b0de4fdbbc265"
+        ],
+        "name": "dispatch_cutover",
+        "passed": true
+      },
+      {
+        "evidence_digests": [
+          "sha256:b36d382fcd1dbea40f4ae85d71885db1d81a46ebba3e12f6b3828c75fd107d37"
+        ],
+        "name": "quality_gate",
+        "passed": true
+      }
+    ],
+    "overall_passed": true,
+    "sub_evidence_refs": [
+      "sha256:7ef469a8d4fb607cff610dc72db44668b0d2fd6c9dee46bbfbe628e1204165d4",
+      "sha256:b390ddfe39c2ae76ca9c56822cba44067e3c9a9cb8eb99514ce568bcf67d98e6",
+      "sha256:e564ce11200bcd8c52fbedd2f57f2f69d39cda49ce6f8611aee3864cff3e0e41",
+      "sha256:6e45647bdbf28f6a771a66ce022ec8ccb0caa155d279a03e35e0f8e3fd07a418",
+      "sha256:d9c6f888845b50bea3463302610c785a632003ccff40faf5524e9380aa66281d",
+      "sha256:d8a9171bf6ab75b792a8a9328e0b2fb82c484a488ae3cae3510b0de4fdbbc265",
+      "sha256:b36d382fcd1dbea40f4ae85d71885db1d81a46ebba3e12f6b3828c75fd107d37"
+    ]
+  },
+  "evidence_manifest": {
+    "artifact_root": "/mnt/disk01/workspaces/worksummary/vault/.project-auto/runtime-evidence-artifacts",
+    "digest": "sha256:540924c6bca90356aefa22fd875678fe896764ce3a8144ade8690c620ea1f2ff",
+    "path": "sha256/54/0924c6bca90356aefa22fd875678fe896764ce3a8144ade8690c620ea1f2ff",
+    "size": 19845
+  },
+  "generated_at": "2026-07-24T02:33:49.962977Z",
+  "git": {
+    "commit": "c698a9c54edca8d6737d33f131f5f5db524d71bb",
+    "describe": "c698a9c",
+    "dirty": true,
+    "repo_root": "/mnt/disk01/workspaces/worksummary/vault"
+  },
+  "host": "roc-epyc",
+  "result": {
+    "failed_drills": [],
+    "overall_passed": true
+  },
+  "runner": {
+    "drill": "all",
+    "python": "3.13.5",
+    "script": "Projects/项目推进流水线/scripts/runtime_evidence.py"
+  },
+  "schema_version": 1,
+  "verification": {
+    "digest_algorithm": "sha256 内容寻址（artifact_store.compute_digest）",
+    "load_command": "python3 -c 'import sys; sys.path.insert(0,\"Projects/项目推进流水线/scripts\");import artifact_store as A, loop_state as L;D=\"<digest>\"; R=L.ArtifactRef(digest=D,size=0,kind=\"test_output\",path=A._bucketed_path(D),sensitivity=\"internal\");print(A.load(\"<artifact_root>\", R)[:200])'  # load 自带 digest 重算校验（fail-closed ArtifactIntegrityError）",
+    "note": "digest 为本次运行指纹（evidence 含 collected_at/host），跨运行必变；独立复核 = 按 digest load 校验内容完整性（顶层 manifest 用 evidence_manifest.artifact_root；cutover 7 子证据用 cutover_sub_evidence.artifact_root），或重跑验证流程全绿",
+    "rerun_command": "python3 Projects/项目推进流水线/scripts/runtime_evidence.py --drill all --workdir <tmp> --artifact-root <persistent-dir>",
+    "sensitivity": "index 不含 evidence 内容/凭据；仅 digest + 元数据 + 公开验证命令"
+  }
+}

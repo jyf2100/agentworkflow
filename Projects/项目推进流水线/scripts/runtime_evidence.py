@@ -865,6 +865,7 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
                          "sandbox": sandbox_clean, "sandbox_docker_all_pass": docker_ok,
                          "dispatch_cutover": dispatch_ok},
         "overall_passed": manifest.overall_passed,
+        "artifact_root": str(artifact_root),   # r3 P1-2：cutover 子证据真实存储根（评审据此 load 子 digest）
         "archive_digest": manifest.archive_digest,
         "manifest_summary": manifest.summary,
         "sub_evidence_refs": manifest.sub_evidence_refs,   # r2 P0-5：passing manifest 引用全部子 evidence digest
@@ -1081,6 +1082,100 @@ def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
     return False, "unknown drill key"
 
 
+def write_evidence_index(*, index_path: Path, evidence: dict, manifest_ref,
+                         artifact_root: Path, drill: str) -> Path:
+    """r3 P1-2：写**可独立复核**的 evidence index 到仓内（不入 .gitignore 的临时 workdir）。
+
+    artifact 默认存 mkdtemp 临时目录（``pa_runtime_XXXX``），跑完不在仓、机器外不可访问 → digest 指向
+    的内容无法独立复核。本函数把本次运行的 digest 清单 + git 元数据 + 存储位置 + 验证命令写成 index 入仓，
+    让评审不依赖运行者口头声称即可独立核对。
+
+    index **只含 digest + 元数据 + 公开验证命令**——绝不内联 evidence blob 内容、绝不含任何凭据
+    （evidence blob 本身 sensitivity=internal 可能含路径/journal 片段）。digest 是本次运行指纹
+    （evidence 含 collected_at/host，跨运行必变）；独立复核 = 从 artifact_root 按 digest 经
+    ``artifact_store.load`` 读回重算校验（fail-closed），或按 rerun 命令重跑验证流程全绿——非跨运行比对 digest。
+
+    Args:
+        index_path: index 写入路径（仓内固定路径，默认 ``Projects/项目推进流水线/runtime-evidence-index.json``）。
+        evidence: main 收集的全量 evidence dict（取 collected_at/host/failed/failed_drills + 7.6 子证据）。
+        manifest_ref: 顶层 evidence blob 归档后的 ``ArtifactRef``（根 digest + path + size）。
+        artifact_root: artifact 存储根（存储位置，供评审 load）。
+        drill: 本次 ``--drill`` 值（记入 runner 元数据）。
+    Returns:
+        写入的 index_path。
+    """
+    script_dir = Path(__file__).resolve().parent
+
+    def _git_safe(args):
+        try:
+            return _git(args, cwd=str(script_dir)).strip()
+        except Exception as e:
+            return f"<unavailable: {type(e).__name__}>"
+
+    cutover = evidence.get("drills", {}).get("7.6_cutover_suite") or {}
+    repo_root = _git_safe(["rev-parse", "--show-toplevel"])
+    index = {
+        "schema_version": 1,
+        "generated_at": evidence.get("collected_at", _stamp()),
+        "host": evidence.get("host"),
+        "git": {
+            "repo_root": repo_root,
+            "commit": _git_safe(["rev-parse", "HEAD"]),
+            "describe": _git_safe(["describe", "--tags", "--always"]),
+            "dirty": _git_safe(["status", "--porcelain"]) != "",
+        },
+        "runner": {
+            "script": "Projects/项目推进流水线/scripts/runtime_evidence.py",
+            "drill": drill,
+            "python": sys.version.split()[0],
+        },
+        "result": {
+            "overall_passed": not evidence.get("failed", True),
+            "failed_drills": evidence.get("failed_drills", []),
+        },
+        "evidence_manifest": {
+            "digest": manifest_ref.digest,
+            "path": manifest_ref.path,
+            "size": manifest_ref.size,
+            "artifact_root": str(artifact_root),
+        },
+        # r3 P0-2 核心证据链：cutover 套件 7 子 evidence digest（完整性门已校验可解析/可读/digest 匹配）
+        "cutover_sub_evidence": {
+            "artifact_root": cutover.get("artifact_root") or str(Path(artifact_root) / "cutover"),
+            "archive_digest": cutover.get("archive_digest"),
+            "overall_passed": cutover.get("overall_passed"),
+            "evidence_integrity": cutover.get("evidence_integrity"),
+            "sub_evidence_refs": cutover.get("sub_evidence_refs", []),
+            "outcomes": [{"name": o.get("name"), "passed": o.get("passed"),
+                          "evidence_digests": o.get("evidence_digests", [])}
+                         for o in cutover.get("outcomes", [])],
+        },
+        "verification": {
+            "digest_algorithm": "sha256 内容寻址（artifact_store.compute_digest）",
+            "sensitivity": "index 不含 evidence 内容/凭据；仅 digest + 元数据 + 公开验证命令",
+            "load_command": (
+                "python3 -c '"
+                "import sys; sys.path.insert(0,\"Projects/项目推进流水线/scripts\");"
+                "import artifact_store as A, loop_state as L;"
+                "D=\"<digest>\"; R=L.ArtifactRef(digest=D,size=0,kind=\"test_output\","
+                "path=A._bucketed_path(D),sensitivity=\"internal\");"
+                "print(A.load(\"<artifact_root>\", R)[:200])'  "
+                "# load 自带 digest 重算校验（fail-closed ArtifactIntegrityError）"),
+            "rerun_command": (
+                "python3 Projects/项目推进流水线/scripts/runtime_evidence.py "
+                "--drill all --workdir <tmp> --artifact-root <persistent-dir>"),
+            "note": "digest 为本次运行指纹（evidence 含 collected_at/host），跨运行必变；"
+                    "独立复核 = 按 digest load 校验内容完整性（顶层 manifest 用 "
+                    "evidence_manifest.artifact_root；cutover 7 子证据用 "
+                    "cutover_sub_evidence.artifact_root），或重跑验证流程全绿",
+        },
+    }
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return index_path
+
+
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser(description="review §5 真实 runtime 执行证据收集器")
@@ -1088,6 +1183,10 @@ def main() -> int:
     ap.add_argument("--artifact-root", default=None, help="归档根（默认 workdir/artifacts）")
     ap.add_argument("--drill", default="all",
                     choices=["3.3", "7.3", "5.5", "7.1", "7.2", "7.5", "7.6", "all"])
+    ap.add_argument("--index-path", default=None,
+                    help="evidence index 写入路径（r3 P1-2；默认 Projects/项目推进流水线/runtime-evidence-index.json）")
+    ap.add_argument("--skip-index", action="store_true",
+                    help="不写 evidence index（默认写，便于独立复核）")
     args = ap.parse_args()
 
     workdir = (Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="pa_runtime_"))).resolve()
@@ -1139,6 +1238,16 @@ def main() -> int:
     tag = ("✅ ARCHIVED PASSING evidence manifest" if overall_ok
            else "⛔ ARCHIVED FAILED evidence（非 passing manifest，含失败 drill）")
     print(f"\n{tag}: digest={ref.digest} path={ref.path} size={ref.size} failed_drills={len(failed_drills)}")
+    # r3 P1-2：写可独立复核的 evidence index 到仓内（默认），失败不阻断 main 退出码
+    if not args.skip_index:
+        try:
+            default_index = Path(__file__).resolve().parent.parent / "runtime-evidence-index.json"
+            idx_path = Path(args.index_path) if args.index_path else default_index
+            write_evidence_index(index_path=idx_path, evidence=evidence, manifest_ref=ref,
+                                 artifact_root=artifact_root, drill=args.drill)
+            print(f"📋 evidence index（r3 P1-2 可独立复核）: {idx_path}")
+        except Exception as e:
+            print(f"⚠️ evidence index 写入失败（不阻断）: {type(e).__name__}: {e}", file=sys.stderr)
     return 0 if overall_ok else 1
 
 
