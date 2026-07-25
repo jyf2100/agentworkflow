@@ -959,6 +959,31 @@ def _rollback_evidence_commit(vault: Path, subject_commit: str, evidence_rel: Pa
         pass                    # best-effort（调用方已标记失败并 raise/return None）
 
 
+def _derive_evidence_whitelist(evidence_dir: Path) -> list[str]:
+    """r10-B2（审核员 r9 复审）：从 ``evidence_dir/manifest.json`` 派生 publish 实际写的白名单文件（相对 evidence_dir）。
+
+    白名单 = ``manifest.json`` + ``bundle.sha256`` + ``verify.py`` + ``artifacts/<d>`` for d in
+    manifest.sub_evidence_refs（publish_evidence_bundle 写的 4 类文件，cutover.py:1811-1818）。过滤**实际存在**
+    子集（单元测试常只建 manifest.json；生产 publish 建全 4 类）。``manifest.json`` 不存在/损坏 → 返回 ``[]``
+    （fail-closed：``_commit_evidence`` 据此返回 None，**绝不退回旧整目录 commit**——那是 B2 漏洞根因）。
+
+    返回相对 evidence_dir 的路径（如 ``["manifest.json", "artifacts/sha256:abc"]``），``_commit_evidence`` 拼成
+    相对 vault 的 pathspec 做 per-file ``git add`` + ``git commit``（堵 tracked-modified stray 进 commit）。
+    """
+    import json as _json
+    _mf = evidence_dir / "manifest.json"
+    if not _mf.exists():
+        return []
+    try:
+        _obj = _json.loads(_mf.read_text(encoding="utf-8"))
+    except Exception:
+        return []                 # manifest 损坏 → 不知白名单 → fail-closed（不让 _commit_evidence 退回整目录）
+    _refs = _obj.get("sub_evidence_refs", []) if isinstance(_obj, dict) else []
+    _candidates = (["manifest.json", "bundle.sha256", "verify.py"]
+                   + [f"artifacts/{_d}" for _d in _refs])
+    return [_c for _c in _candidates if (evidence_dir / _c).exists()]
+
+
 def _commit_evidence(evidence_dir: Path, subject_commit: str,
                      *, vault_root: Path | None = None, push: bool = True) -> str | None:
     """r6 P1-3（R4 §2.2 + §2.3）：生成独立 evidence_commit——只含 ``docs/evidence/<subject_commit>/`` 路径。
@@ -988,13 +1013,23 @@ def _commit_evidence(evidence_dir: Path, subject_commit: str,
                 "GIT_COMMITTER_EMAIL": os.environ.get("GIT_COMMITTER_EMAIL", _rem)}
     _committed = False                  # r8-3：evidence commit 是否已落地（except 兜底 reset 依据）
     try:
-        subprocess.run(["git", "add", "--", str(rel)], cwd=str(_vault), check=True,
+        # r10-B2（审核员 r9 复审）：per-file pathspec 白名单——git add **且** git commit 都只列 publish 写的
+        # 白名单文件。旧 ``git add/commit -- <整目录>``（rel=docs/evidence/<subject>/）让目录里任何 tracked-modified
+        # stray 文件（崩溃重跑残留 / 并发 claude 会话注入——CLAUDE.md 明言此为预期）被 ``git commit -- <dir>``
+        # 纳入（红队 DECISIVE 实测：per-file add 后 staged 空，但 tracked-modified stray 含 AKIA 凭据仍被
+        # ``git commit -- <dir>`` 提交，``git cat-file`` 可读）→ 绕过 publish 层 secret scan 直达远端。
+        # 白名单从 manifest.json 派生（_derive_evidence_whitelist），过滤实际存在；无白名单 → None（不退回旧漏洞）。
+        _expected = _derive_evidence_whitelist(evidence_dir)
+        if not _expected:
+            return None               # 无 manifest.json / 损坏 → fail-closed（不退回整目录 commit 旧漏洞）
+        _rel_files = [str(rel / _e) for _e in _expected]
+        subprocess.run(["git", "add", "--", *_rel_files], cwd=str(_vault), check=True,
                        capture_output=True, text=True, timeout=15, env=_git_env)
-        # r7-P0-1（审核员反例）：commit 限定 evidence 路径（``-- <rel>``）——只提交 docs/evidence/ 文件，
-        # 不吞入用户已暂存的其他业务改动（旧 ``git commit -m`` 无 pathspec 会提交全部 staged → 业务改动
-        # 被误并入 evidence commit，污染 ancestry）。
+        # r7-P0-1 + r10-B2：commit 限定白名单文件路径（per-file pathspec）——只提交 publish 写的 evidence 文件，
+        # 不吞用户已暂存的业务改动（旧 ``git commit -m`` 无 pathspec 会提交全部 staged），也不带目录里的
+        # tracked-modified stray（r10-B2 核心反例）。commit per-file 是堵 tracked-modified 真泄漏的关键（红队实证）。
         subprocess.run(["git", "commit", "-m",
-                        f"evidence: cutover suite for subject_commit={subject_commit[:12]}", "--", str(rel)],
+                        f"evidence: cutover suite for subject_commit={subject_commit[:12]}", "--", *_rel_files],
                        cwd=str(_vault), check=True, capture_output=True, text=True, timeout=15, env=_git_env)
         _committed = True               # commit 已落地——后续任一步骤异常须兜底 reset（r8-3）
         evidence_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(_vault),
@@ -1078,6 +1113,16 @@ def _publish_and_verify_evidence(manifest, subject_commit: str, vault_root: Path
     _br = vault_root / "docs" / "evidence" / subject_commit
     bundle_path, bundle_digest = CT.publish_evidence_bundle(
         artifact_root=str(artifact_root), manifest=manifest, bundle_root=_br)
+    # r10-B2（审核员 r9 复审）纵深防御：publish 后、commit 前对整个 ``docs/evidence/<subject>/`` 整目录跑
+    # ``_scan_for_secrets``——兜底 publish 未写但目录残留/注入的 stray 文件（崩溃重跑残留 / 并发 claude 会话写入，
+    # CLAUDE.md 明言此为预期）。publish_evidence_bundle 内部只 scan manifest.json + sub_evidence_refs 引用的
+    # blob（cutover.py:1789/1801），不扫目录散落的 stray；本处补扫，含凭据即 fail-closed raise（不 commit 不 push）。
+    # 与 per-file commit 白名单互补：per-file 挡 stray 进 commit（即便无凭据），整目录 scan 挡 stray 含凭据残留。
+    for _sf in sorted(_br.rglob("*")):
+        if _sf.is_file():
+            _hits = CT._scan_for_secrets(_sf.read_text(encoding="utf-8", errors="replace"))
+            if _hits:
+                raise RuntimeError(f"evidence 目录 stray 文件含凭据（{_sf.name}）: {_hits[:3]}")
     evidence_commit = _commit_evidence(_br, subject_commit, vault_root=vault_root, push=False)
     if not evidence_commit:
         raise RuntimeError("evidence_commit 创建失败（git add/commit/ancestry 自检）")
