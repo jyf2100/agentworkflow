@@ -12,6 +12,8 @@ evidence 路径）；(3) ancestry 自检 ``subject..evidence`` 只含 ``docs/evi
 """
 import subprocess
 
+import pytest
+
 import runtime_evidence as RE
 
 
@@ -500,3 +502,64 @@ def test_commit_evidence_rejects_directory_whitelist_entry(tmp_path):
     assert not any("leak.pem" in _f for _f in _files), (
         "r10-B2-traversal-v2 回归：目录白名单条目 bundle.sha256/ 递归让 leak.pem 进 commit\n"
         f"实际：{_files}")
+
+
+@pytest.mark.xfail(strict=True,
+                   reason="r10-B2-traversal-v2 residual Hole 1 (审计 DECISIVE/红队 SATISFIED 未复现, P2): "
+                          "白名单派生信任磁盘 manifest, 内容寻址 artifact 可注入. "
+                          "修复方向: _commit_evidence 接收 in-memory sub_evidence_refs")
+def test_derive_evidence_whitelist_residual_content_addressed_injection(tmp_path):
+    """r10-B2-traversal-v2 residual Hole 1（第三轮审计 DECISIVE，红队 SATISFIED 未复现 → P2 lock）：
+    白名单派生信任磁盘 manifest——attacker poison manifest 含合法 digest ref（sha256:<CRED 内容 digest>，
+    过 v2 regex）+ 写 artifacts/<dg>=CRED → _derive_evidence_whitelist 放行。
+
+    根因：白名单锚定「ref 名格式」而非「publish 时 in-memory intent」。verify.py 内容寻址（sha256(bytes)==filename）
+    让 attacker 控制 content 即造匹配 digest ref 名，叠加 _scan_for_secrets 盲区。红队实测 TOCTOU race 400 attempts
+    零胜（pa 单进程顺序运行无真实并发 attacker），机制成立但端到端未复现 → 非必修门槛（红队实测可利用）。
+
+    修复后（_commit_evidence 接收 publish 时 in-memory sub_evidence_refs，不重读磁盘 manifest）：
+    白名单基于 in-memory intent → 不含磁盘注入 ref → 断言通过 → xpass → strict 强制移除 xfail。"""
+    import hashlib
+    import json as _json
+    ev = tmp_path / "ev"
+    ev.mkdir()
+    (ev / "artifacts").mkdir()
+    cred = "-----BEGIN RSA PRIVATE KEY-----\nLEAKED_CONTENT_ADDRESSED\n-----END RSA PRIVATE KEY-----\n"
+    _dg = "sha256:" + hashlib.sha256(cred.encode()).hexdigest()  # 合法 digest 格式，过 v2 regex
+    (ev / "artifacts" / _dg).write_text(cred, encoding="utf-8")  # 内容寻址 artifact（attacker 写）
+    (ev / "manifest.json").write_text(
+        _json.dumps({"sub_evidence_refs": [_dg]}), encoding="utf-8")  # poison manifest（attacker 改）
+    wl = RE._derive_evidence_whitelist(ev)
+    # 修复后期望：磁盘注入的内容寻址 ref 不在白名单（锚定 in-memory intent 而非磁盘 manifest）
+    assert f"artifacts/{_dg}" not in wl, (
+        "r10-B2-traversal-v2 residual Hole 1：白名单派生信任磁盘 manifest，内容寻址 artifact 可注入\n"
+        f"实际白名单含 poison ref：{wl}")
+
+
+@pytest.mark.xfail(strict=True,
+                   reason="r10-B2-traversal-v2 residual Hole 2 (审计 MUST_FIX/红队 SATISFIED, P2): "
+                          "_commit_evidence 公开 API 零 scan. "
+                          "修复方向: _scan_for_secrets 提进 _commit_evidence per-file")
+def test_commit_evidence_residual_public_api_no_scan(tmp_path):
+    """r10-B2-traversal-v2 residual Hole 2（第三轮审计 MUST_FIX，红队 SATISFIED → P2 lock）：
+    _commit_evidence 公开 API 自身零 scan——直接调用方传含凭据 manifest.json/bundle.sha256 无 scan 兜底
+    （scan 在编排层 _publish_and_verify_evidence，docstring 自承 P2 但无代码强制）。
+
+    exploit（一行）：bundle.sha256 含 AKIA（_scan_for_secrets 非盲区能抓）→ _commit_evidence(push=False)
+    → commit 成功（无 scan 调用）。生产经 _publish_and_verify_evidence 有 Layer3 scan，但公开 API 面无强制。
+
+    修复后（_scan_for_secrets 提进 _commit_evidence per-file 扫白名单每个文件，含凭据即 raise）：
+    AKIA 被抓 → _commit_evidence fail-closed None → 断言通过 → xpass → strict 强制移除 xfail。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    (ev / "bundle.sha256").write_text(
+        "AKIAIOSFODNN7EXAMPLE leaked in bundle", encoding="utf-8")  # AKIA（非盲区，_scan_for_secrets 能抓）
+    sha = RE._commit_evidence(ev, subject, vault_root=vault, push=False)
+    # 修复后期望：公开 API per-file scan 抓 AKIA → fail-closed None
+    assert sha is None, (
+        "r10-B2-traversal-v2 residual Hole 2：_commit_evidence 公开 API 零 scan，含 AKIA 凭据仍 commit\n"
+        f"实际 sha={sha}（应 None——scan 须提进 _commit_evidence per-file）")
