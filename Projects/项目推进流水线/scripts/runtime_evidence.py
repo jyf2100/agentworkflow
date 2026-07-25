@@ -413,68 +413,123 @@ def real_dispatch_skip_dev(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
 # 契约：真实 claude_agent_sdk.query() + ClaudeAgentOptions.hooks（build_dev_hooks 6 lifecycle），
 # SDK 触发 lifecycle 事件 → 我们 callback（dispatch_hook_event → HookAdapter）写 .hooks.jsonl。
 # ════════════════════════════════════════════════════════════════════════════
-def real_sdk_canary(workdir: Path) -> dict:
-    """7.2 真实 SDK hook canary。
+# ─── r5 P0（评审 #1）：逐场景独立 query + runner-owned correlation ─────────────────────────────
+from dataclasses import dataclass   # r5 P0：SdkScenarioSpec（runtime_evidence 顶部未导 dataclass）
 
-    真实 ``claude_agent_sdk.query()``（roc 代理 glm-5.2，非 Anthropic 直连）+ ``ClaudeAgentOptions.hooks``
-    （``build_dev_hooks`` 注册 6 lifecycle events）。工具 prompt 触发 PreToolUse/PostToolUse/Stop，
-    双重证据：(1) SDK ``HookEventMessage`` 流的 ``hook_event_name``；(2) 我们 callback 写的 ``.hooks.jsonl``。
-    评审 P0-3：旧 ``run_sdk_hook_canary`` 用 ``run_lifecycle_drill`` fixture，未调真实 SDK query。
+# 旧 real_sdk_canary 跑 base + subagent 两条 query，汇总 real_triggered 后把「一个 PostToolUse」映射给
+# test_red/stale_test/test_green、「一个 Stop」给 no_test/semantic_revise、「一个 PreCompact」给
+# compaction/hook_failure——一个 event 批量证明多场景（评审 P0 反例：一旦出现 PreCompact 仍可能批量补绿）。
+# 修复：每场景跑**独立** SDK query，runner 生成 correlation_id（f"{stamp}:{scenario_id}"），建**独立** hook
+# journal（事件天然隔离），closure 把 correlation_id 注入每次 callback 调用记录。scenario proven = 该场景自己
+# 的 query 在自己的 journal 产出 expected event + invocation 带 own correlation_id（r4 §3：correlation 由 runner
+# 生成、closure 捕获，**不得依赖模型在 prompt/tool args/文本输出回传**——模型输出属不可信输入）。
+# test_red/green/stale_test 共享 PostToolUse 但各自独立 query+correlation → 不可互相批量补绿。
+_SDK_LIFECYCLE_EVENTS = frozenset({"PreToolUse", "PostToolUse", "Stop", "PreCompact", "SubagentStart", "SubagentStop"})
+
+
+@dataclass(frozen=True)
+class SdkScenarioSpec:
+    """单场景 SDK query 规格（r5 P0）。每场景独立 prompt/tools/max_turns 以产出该场景 expected event。"""
+    id: str
+    expected_event: str
+    prompt: str
+    tools: tuple[str, ...]
+    max_turns: int
+    blocked_reason: str | None = None   # 非 None → query 不跑（独立 correlation_id 诚实 blocked）
+    build_agents: bool = False          # subagent 场景需 AgentDefinition + Task 工具触发 SubagentStart
+
+
+SDK_SCENARIO_SPECS: tuple[SdkScenarioSpec, ...] = (
+    SdkScenarioSpec("no_test", "Stop",
+                    "Do not use any tools. Reply with exactly: NO TEST.", ("Read",), 2),
+    SdkScenarioSpec("test_red", "PostToolUse",
+                    "Use the Bash tool to run the command: false", ("Bash",), 3),
+    SdkScenarioSpec("test_green", "PostToolUse",
+                    "Use the Bash tool to run the command: echo GREEN", ("Bash",), 3),
+    SdkScenarioSpec("stale_test", "PostToolUse",
+                    "Use the Bash tool to run the command: echo STALE", ("Bash",), 3),
+    SdkScenarioSpec("semantic_revise", "Stop",
+                    "Read README.md if it exists, then reply: REVISE", ("Read",), 3),
+    SdkScenarioSpec("compaction", "PreCompact", "", (), 0,
+                    blocked_reason=("PreCompact 需逼近上下文上限触发 auto-compact，单次 headless query 不可靠触发"
+                                    "（实测 max_turns=12+30KB×3 读不触发）；gate 由 adapter on_pre_compact 真实代码路径"
+                                    "覆盖（adapter_contract_proven）。本场景持独立 correlation_id 诚实 blocked，"
+                                    "别处 PreCompact 无法批量补绿（评审 P0 修复）")),
+    SdkScenarioSpec("subagent", "SubagentStart",
+                    "Use the Task tool to delegate a sub-agent named 'pa-verify' to read README.md, "
+                    "then stop and reply: SUBAGENT DONE",
+                    ("Read", "Bash", "Task"), 4, build_agents=True),
+    SdkScenarioSpec("hook_failure", "PreCompact", "", (), 0,
+                    blocked_reason=("PreCompact 需逼近上下文上限触发 auto-compact，headless 不可靠触发"
+                                    "（r5 spike）；持独立 correlation_id 诚实 blocked，杜绝批量补绿")),
+)
+
+
+def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> dict:
+    """跑单场景独立 SDK query（r5 P0：runner-owned correlation——独立 hook journal + closure-captured correlation_id）。
+
+    每场景：runner 生成 ``correlation_id``（``f"{stamp}:{spec.id}"``），建**独立** coordinator（独立 journal 路径，
+    事件天然隔离，杜绝跨场景串味），wrap callback 把 correlation_id 闭包捕获注入每次调用记录，跑场景专属 query
+    （prompt/engineered input 产出该场景 expected event）。返回该场景的 per-scenario entry + 聚合用遥测字段。
+
+    scenario proven（``sdk_callback_real_proven``）= 该场景自己的 journal 产出 expected event（per-scenario journal
+    隔离 + closure correlation_id 双重绑定）。即便 test_red/green/stale_test 共享 PostToolUse，也只在各自 journal
+    独立判定——一个 event 不再批量证明多场景（评审 P0）。
     """
     import asyncio
     import claude_agent_sdk as CAS
+    from claude_agent_sdk import HookMatcher
     from coordinator import build_coordinator
     from hook_bridge import build_dev_hooks
 
-    os.environ["PA_LOOP_LIFECYCLE_HOOKS"] = "1"
-    os.environ["PA_LOOP_JOURNAL_SHADOW"] = "1"
+    correlation_id = f"{stamp}:{spec.id}"   # runner 生成（非模型输出回传，r4 §3 不可信边界）
+    scenario_state_dir = workdir / f"sdk_state_{spec.id}"
+    coord = build_coordinator(stamp=f"{stamp}_{spec.id}", prd_path=spec.id, proj="sdk-canary",
+                              slug=spec.id, state_dir=str(scenario_state_dir), stamp_fn=_stamp)
+    _, sdk_hooks = build_dev_hooks(coord)
+    # 独立 hook journal 路径（per-scenario coordinator → per-scenario journal，事件天然隔离）
+    hook_path = Path(coord.journal.path).with_suffix(".hooks.jsonl")
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
 
-    stamp = "sdkcanary_" + _stamp().replace(":", "").replace("-", "")[:14]
-    state_dir = workdir / "sdk_state"
-    coord = build_coordinator(stamp=stamp, prd_path="sdk_canary", proj="sdk-canary",
-                              slug="sdk_canary", state_dir=str(state_dir), stamp_fn=_stamp)
-    adapter, sdk_hooks = build_dev_hooks(coord)
-    # 建 hook journal 父目录（build_coordinator emit 时才建父目录；real_sdk_canary 不 emit coord.journal，
-    # 需预建，否则 HookJournal.append open("a") 静默失败吞异常 → hook 证据丢失）
-    Path(coord.journal.path).with_suffix(".hooks.jsonl").parent.mkdir(parents=True, exist_ok=True)
-    # 诊断：wrap callback 计数 SDK 是否真调（区分「lifecycle event 没发生」vs「callback 路由失败」）
-    callback_invocations: list[str] = []
+    callback_invocations: list[dict] = []
     callback_errors: list[dict] = []
+    sdk_hook_names: list[str | None] = []
+    query_error: dict = {"msg": None}
+    # wrap callback：closure 捕获 correlation_id 注入每次调用记录（runner-owned，非模型回传）
     for event, matchers in list(sdk_hooks.items()):
         new_matchers = []
         for m in matchers:
-            from claude_agent_sdk import HookMatcher
             wrapped = []
             for cb in m.hooks:
-                _ev = event   # 闭包捕获 event 名（避免被 SDK 位置参数覆盖）
-                async def _w(*args, _cb=cb, _evn=_ev, **kwargs):
-                    callback_invocations.append(_evn)
+                _ev, _cid = event, correlation_id
+                async def _w(*args, _cb=cb, _evn=_ev, _cid=_cid, **kwargs):
+                    callback_invocations.append({"event": _evn, "correlation_id": _cid})
                     try:
                         return await _cb(*args, **kwargs)
                     except Exception as e:
-                        callback_errors.append({"event": _evn, "error": str(e)[:150],
-                                                "input_keys": sorted(args[0].keys()) if args and isinstance(args[0], dict) else str(type(args[0]) if args else None)})
+                        callback_errors.append({"event": _evn, "correlation_id": _cid, "error": str(e)[:150]})
                         return {}   # 容错：返回空 hook output，避免 SDK 崩
                 wrapped.append(_w)
             new_matchers.append(HookMatcher(hooks=wrapped, matcher=getattr(m, "matcher", None)))
         sdk_hooks[event] = new_matchers
 
-    sdk_hook_names: list[str | None] = []
-    query_error: dict = {"msg": None}
-
     async def _run():
+        agents = None
+        if spec.build_agents:
+            try:
+                agent_def_cls = getattr(CAS, "AgentDefinition", None)
+                if agent_def_cls is not None:
+                    agents = {"pa-verify": agent_def_cls(
+                        description="verify diff", prompt="Read README.md then stop.", tools=["Read"])}
+            except Exception:
+                agents = None
         options = CAS.ClaudeAgentOptions(
             cwd=str(workdir),
-            permission_mode="bypassPermissions",   # 自动批工具（无 can_use_tool 闸）→ Bash 直接执行触发 PreToolUse
-            tools=["Read", "Bash", "Write"],
-            max_turns=4,
-            hooks=sdk_hooks,
-        )
-        # prompt 让 agent 用 Bash（bypassPermissions 自动批）触发 PreToolUse/PostToolUse，回复后自然 Stop
-        prompt = "Use the Bash tool to run the command `echo READY`, then stop and reply: READY"
+            permission_mode="bypassPermissions",   # 自动批工具 → Bash/Task 直接执行触发对应 lifecycle event
+            tools=list(spec.tools), max_turns=spec.max_turns, hooks=sdk_hooks, agents=agents)
         result = None
         try:
-            async for msg in CAS.query(prompt=prompt, options=options):
+            async for msg in CAS.query(prompt=spec.prompt, options=options):
                 if isinstance(msg, getattr(CAS, "HookEventMessage", ())):
                     hen = getattr(msg, "hook_event_name", None)
                     if hen is None and hasattr(msg, "model_dump"):
@@ -483,56 +538,14 @@ def real_sdk_canary(workdir: Path) -> dict:
                 if isinstance(msg, CAS.ResultMessage):
                     result = msg
         except Exception as e:
-            # max_turns 截断等不致命——lifecycle hooks 在截断前已被 SDK 触发，证据已落 .hooks.jsonl
             query_error["msg"] = str(e)[:200]
         return result
 
     result_msg = asyncio.run(_run())
 
-    # r2 P1-1：subagent 场景——第二次真实 query 尝试触发 SubagentStart/Stop（Task 工具 + agents）。
-    # proxy glm-5.2 headless 是否支持 Task/agents/SubagentStart hook 不确定 → try，未达成诚实 blocked。
-    subagent_query_error: dict = {"msg": None}
-    sub_result_msg = None
-
-    async def _run_subagent():
-        agents = None
-        try:
-            agent_def_cls = getattr(CAS, "AgentDefinition", None)
-            if agent_def_cls is not None:
-                agents = {"pa-verify": agent_def_cls(
-                    description="verify diff", prompt="Read README.md then stop.", tools=["Read"])}
-        except Exception:
-            agents = None
-        sub_options = CAS.ClaudeAgentOptions(
-            cwd=str(workdir),
-            permission_mode="bypassPermissions",
-            tools=["Read", "Bash", "Task"],
-            max_turns=4,
-            hooks=sdk_hooks,
-            agents=agents,
-        )
-        sub_prompt = ("Use the Task tool to delegate a sub-agent named 'pa-verify' to read README.md, "
-                      "then stop and reply: SUBAGENT DONE")
-        res = None
-        try:
-            async for msg in CAS.query(prompt=sub_prompt, options=sub_options):
-                if isinstance(msg, getattr(CAS, "HookEventMessage", ())):
-                    hen = getattr(msg, "hook_event_name", None)
-                    if hen is None and hasattr(msg, "model_dump"):
-                        hen = msg.model_dump().get("hook_event_name")
-                    sdk_hook_names.append(hen)
-                if isinstance(msg, CAS.ResultMessage):
-                    res = msg
-        except Exception as e:
-            subagent_query_error["msg"] = str(e)[:200]
-        return res
-
-    sub_result_msg = asyncio.run(_run_subagent())
-
-    # 我们的 callback 写的 hook journal（HookAdapter → HookJournal；base + subagent query 累积）
-    hook_path = Path(coord.journal.path).with_suffix(".hooks.jsonl")
+    # 读该场景**独立** journal（per-scenario 隔离）
     our_events: list[dict] = []
-    journal_decode_errors = 0   # r5 P1-5：hook journal 行 JSON 解析失败计数（不再静默吞 → 进 sdk_canary 谓词）
+    journal_decode_errors = 0
     if hook_path.exists():
         for line in hook_path.read_text(encoding="utf-8").splitlines():
             if line.strip():
@@ -540,85 +553,154 @@ def real_sdk_canary(workdir: Path) -> dict:
                     our_events.append(json.loads(line))
                 except json.JSONDecodeError:
                     journal_decode_errors += 1
-
-    lifecycle = {"PreToolUse", "PostToolUse", "Stop", "PreCompact", "SubagentStart", "SubagentStop"}
-    our_types = sorted({e.get("hook_event_name") or e.get("event_type") for e in our_events})
+    observed_event_types = sorted({e.get("hook_event_name") or e.get("event_type") for e in our_events})
+    # scenario proven = own journal 产出 expected event（独立 journal 隔离 + invocation 带 own correlation_id）
+    journal_has_expected = spec.expected_event in observed_event_types
+    invocation_carries_own_cid = any(i.get("correlation_id") == correlation_id for i in callback_invocations)
+    sdk_callback_real_proven = journal_has_expected and invocation_carries_own_cid
     sdk_types = sorted({h for h in sdk_hook_names if h})
-    real_triggered = set(our_types) & lifecycle
-
-    # r3 P0-1：per-scenario 逐场景校验矩阵（非任意 callback 假绿）。每场景两个独立证据维度：
-    #   (1) sdk_callback_real_proven：base/subagent 真实 query 是否触发该场景的 lifecycle callback；
-    #   (2) adapter_gate_outcome：adapter 业务逻辑（on_stop/on_post_tool_use/on_pre_compact/
-    #       on_subagent_start 真实代码路径，run_sdk_hook_canary fixture）产生的 gate 判定。
-    # PreCompact 场景（compaction/hook_failure）：SDK callback 需逼近上下文上限，单次 headless query 不可靠
-    # 触发（实测 max_turns=12 + 30KB×3 读 + budget $2 仍不触发）→ r5 P0-2 路B：sdk_callback 诚实缺失（不再用
-    # adapter gate 补绿）。SDK_CALLBACK_REQUIRED_SCENARIOS 含这两条 → 真实 query 缺即 callback_ok=False →
-    # sdk_canary/7.6 红、不归档。gate outcome（snapshot_persisted/fail_closed）由 adapter on_pre_compact 真实
-    # 代码路径覆盖，记 adapter_contract_proven（与 sdk_callback_proven 严格分离）。路 A 真触发见 r5 spike。
-    import cutover as CT
-    adapter_evidence = CT.run_sdk_hook_canary()
-    adapter_gates = dict(adapter_evidence.stop_gates)   # scenario → gate（adapter on_* 真实代码路径）
-    scenario_events = {
-        "no_test": "Stop",            # 无 evidence gate → Stop deny
-        "test_red": "PostToolUse",    # Bash pytest exit1 + Stop deny
-        "stale_test": "PostToolUse",  # 绿后候选写 mark_stale + Stop deny
-        "test_green": "PostToolUse",  # Bash pytest exit0 + Stop allow
-        "semantic_revise": "Stop",    # dual-gate inner 绿 outer 语义红（逻辑判定，event=Stop）
-        "compaction": "PreCompact",   # auto-compact + snapshot 持久化
-        "subagent": "SubagentStart",  # SubagentStart 记归属 + publication DENY
-        "hook_failure": "PreCompact", # snapshot_writer 抛异常 → fail-closed block
-    }
-    per_scenario: dict[str, dict] = {}
-    for sc, ev in scenario_events.items():
-        sdk_cb = ev in real_triggered
-        entry: dict = {
-            "expected_event": ev,
-            "real_proven": sdk_cb,                                # 向后兼容（= sdk_callback_real_proven）
-            "sdk_callback_real_proven": sdk_cb,                   # 维度1：真实 SDK query 触发 callback
-            "adapter_gate_outcome": adapter_gates.get(sc),        # 维度2：adapter on_* 真实 gate 判定
-            "gate_outcome_source": "sdk+adapter" if sdk_cb else "adapter_fixture_only",
-        }
-        if sdk_cb:
-            entry["source"] = "subagent query" if ev in {"SubagentStart", "SubagentStop"} else "base query"
-        else:
-            entry["sdk_callback_blocked_reason"] = {
-                "PreCompact": "PreCompact 需逼近上下文上限触发 auto-compact，单次 headless query 不可靠触发"
-                              "（实测 max_turns=12+30KB×3 读不触发）；gate 由 adapter on_pre_compact 真实代码路径覆盖",
-            }.get(ev, f"{ev} 未在真实 query 中触发")
-            entry["blocked_reason"] = entry["sdk_callback_blocked_reason"]   # 向后兼容
-        per_scenario[sc] = entry
-    proven_scenarios = sorted(sc for sc, v in per_scenario.items() if v["sdk_callback_real_proven"])
-    blocked_scenarios = sorted(sc for sc, v in per_scenario.items() if not v["sdk_callback_real_proven"])
-    adapter_gate_covered = sorted(sc for sc, v in per_scenario.items() if v["adapter_gate_outcome"])
-
     return {
-        "drill": "7.2 real SDK hook canary",
-        "real_sdk_query": True,
-        "model": "roc proxy default (glm-5.2)",
+        "per_scenario_entry": {
+            "expected_event": spec.expected_event,
+            "correlation_id": correlation_id,                     # runner-owned（closure 捕获，非模型回传）
+            "query_ran": True,
+            "result_received": result_msg is not None,
+            "query_error": query_error["msg"],
+            "journal_path": str(hook_path),
+            "observed_event_types": observed_event_types,
+            "invocation_count": len(callback_invocations),
+            "invocation_carries_own_cid": invocation_carries_own_cid,
+            "sdk_callback_real_proven": sdk_callback_real_proven,
+            "real_proven": sdk_callback_real_proven,              # 向后兼容
+        },
+        "callback_invocations": callback_invocations,
+        "callback_errors": callback_errors,
+        "sdk_types": sdk_types,
+        "observed_lifecycle_types": {t for t in observed_event_types if t in _SDK_LIFECYCLE_EVENTS},
+        "journal_decode_errors": journal_decode_errors,
+        "query_error": query_error["msg"],
         "result_received": result_msg is not None,
         "num_turns": getattr(result_msg, "num_turns", None),
         "cost_usd": getattr(result_msg, "total_cost_usd", None),
-        "query_error": query_error["msg"],
-        "subagent_result_received": sub_result_msg is not None,
-        "subagent_query_error": subagent_query_error["msg"],
-        "hooks_registered": list(sdk_hooks.keys()) if sdk_hooks else [],
-        "callback_invocations": callback_invocations,
-        "callback_errors": callback_errors,
-        "sdk_lifecycle_event_types_seen": sdk_types,
-        "our_callback_hook_events_count": len(our_events),
-        "our_callback_hook_types": our_types,
-        "lifecycle_hooks_triggered_by_callback": sorted(real_triggered),
-        "lifecycle_callback_proven": len(real_triggered) > 0,
+        "saw_lifecycle_event": sdk_callback_real_proven,
+    }
+
+
+def real_sdk_canary(workdir: Path) -> dict:
+    """7.2 真实 SDK hook canary — 逐场景独立 query + runner-owned correlation（r5 P0）。
+
+    r5 P0（评审 #1）：每场景跑**独立** SDK query（独立 hook journal + runner-owned correlation_id），杜绝「一个
+    event 批量证明多场景」。旧实现跑 base + subagent 两条 query 汇总 real_triggered，把一个 PostToolUse 映射给
+    test_red/stale_test/test_green、一个 Stop 给 no_test/semantic_revise、一个 PreCompact 给 compaction/hook_failure
+    ——路 B 只让当前运行诚实变红，一旦 PreCompact 出现仍可批量补绿。新设计：scenario X proven = X 自己的 query
+    在 X 自己的 journal 产出 expected event + invocation 带 X 的 correlation_id（runner 生成、closure 捕获注入
+    callback，非模型输出回传——r4 §3 不可信边界）。test_red/green/stale_test 共享 PostToolUse 但各自独立
+    query+correlation → 不可互相批量补绿；compaction/hook_failure（PreCompact）各持独立 correlation_id，即便别处
+    出现 PreCompact 也无法证明它们。pre-scenario 事件触发见 ``_run_scenario_query``；adapter gate 决策由
+    ``run_sdk_hook_canary``（adapter on_* 真实代码路径）提供，记 ``adapter_gate_outcome``。
+
+    真实 ``claude_agent_sdk.query()``（roc 代理 glm-5.2）+ ``ClaudeAgentOptions.hooks``（``build_dev_hooks`` 注册
+    lifecycle events）。双重证据：(1) SDK ``HookEventMessage`` 流的 ``hook_event_name``；(2) 我们 callback 写的
+    per-scenario ``.hooks.jsonl``。评审 P0-3：旧 ``run_sdk_hook_canary`` 用 fixture，未调真实 SDK query。
+    """
+    os.environ["PA_LOOP_LIFECYCLE_HOOKS"] = "1"
+    os.environ["PA_LOOP_JOURNAL_SHADOW"] = "1"
+    stamp = "sdkcanary_" + _stamp().replace(":", "").replace("-", "")[:14]
+
+    import cutover as CT
+    adapter_evidence = CT.run_sdk_hook_canary()
+    adapter_gates = dict(adapter_evidence.stop_gates)   # scenario → gate（adapter on_* 真实代码路径）
+
+    per_scenario: dict[str, dict] = {}
+    all_invocations: list[dict] = []
+    all_callback_errors: list[dict] = []
+    all_sdk_types: set[str] = set()
+    all_lifecycle_types: set[str] = set()
+    total_decode_errors = 0
+    aggregate_query_error: str | None = None
+    aggregate_result_received = True
+    any_lifecycle_callback = False
+    total_turns = 0
+    total_cost = 0.0
+    journal_paths: list[str] = []
+
+    for spec in SDK_SCENARIO_SPECS:
+        if spec.blocked_reason:
+            # compaction/hook_failure（PreCompact）：headless 单 query 不可靠触发 → 各持独立 correlation_id
+            # 诚实 blocked（query 不跑，sdk_callback_real_proven=False）。独立 correlation_id 保证别处 PreCompact
+            # 无法批量补绿（评审 P0：「一旦出现 PreCompact 仍可能批量补绿」→ 修）。
+            correlation_id = f"{stamp}:{spec.id}"
+            per_scenario[spec.id] = {
+                "expected_event": spec.expected_event,
+                "correlation_id": correlation_id,
+                "query_ran": False,
+                "result_received": False,
+                "query_error": None,
+                "observed_event_types": [],
+                "invocation_count": 0,
+                "invocation_carries_own_cid": False,
+                "sdk_callback_real_proven": False,
+                "real_proven": False,
+                "adapter_gate_outcome": adapter_gates.get(spec.id),
+                "gate_outcome_source": "adapter_fixture_only",
+                "sdk_callback_blocked_reason": spec.blocked_reason,
+                "blocked_reason": spec.blocked_reason,        # 向后兼容
+            }
+            continue
+        res = _run_scenario_query(spec, workdir=workdir, stamp=stamp)
+        entry = dict(res["per_scenario_entry"])
+        entry["adapter_gate_outcome"] = adapter_gates.get(spec.id)
+        entry["gate_outcome_source"] = "sdk+adapter" if entry["sdk_callback_real_proven"] else "adapter_fixture_only"
+        entry["source"] = "per-scenario query"
+        per_scenario[spec.id] = entry
+        all_invocations.extend(res["callback_invocations"])
+        all_callback_errors.extend(res["callback_errors"])
+        all_sdk_types.update(res["sdk_types"])
+        all_lifecycle_types.update(res["observed_lifecycle_types"])
+        total_decode_errors += res["journal_decode_errors"]
+        if res["query_error"] and not aggregate_query_error:
+            aggregate_query_error = res["query_error"]
+        aggregate_result_received = aggregate_result_received and res["result_received"]
+        any_lifecycle_callback = any_lifecycle_callback or res["saw_lifecycle_event"]
+        if res["num_turns"]:
+            total_turns += res["num_turns"]
+        if res["cost_usd"]:
+            total_cost += res["cost_usd"]
+        journal_paths.append(res["per_scenario_entry"]["journal_path"])
+
+    proven_scenarios = sorted(sc for sc, v in per_scenario.items() if v["sdk_callback_real_proven"])
+    blocked_scenarios = sorted(sc for sc, v in per_scenario.items() if not v["sdk_callback_real_proven"])
+    adapter_gate_covered = sorted(sc for sc, v in per_scenario.items() if v.get("adapter_gate_outcome"))
+
+    return {
+        "drill": "7.2 real SDK hook canary (per-scenario correlation)",
+        "real_sdk_query": True,
+        "model": "roc proxy default (glm-5.2)",
+        "correlation_model": "runner-owned per-scenario correlation_id（独立 journal + closure 捕获，非模型回传）",
+        "result_received": aggregate_result_received,
+        "num_turns": total_turns or None,
+        "cost_usd": total_cost or None,
+        "query_error": aggregate_query_error,
+        "subagent_result_received": per_scenario.get("subagent", {}).get("result_received", False),
+        "subagent_query_error": per_scenario.get("subagent", {}).get("query_error"),
+        "hooks_registered": sorted(all_sdk_types),
+        "callback_invocations": all_invocations,
+        "callback_errors": all_callback_errors,
+        "sdk_lifecycle_event_types_seen": sorted(all_sdk_types),
+        "our_callback_hook_events_count": len(all_invocations),
+        "our_callback_hook_types": sorted(all_lifecycle_types),
+        "lifecycle_hooks_triggered_by_callback": sorted(all_lifecycle_types),
+        "lifecycle_callback_proven": any_lifecycle_callback,
         "per_scenario_real_triggers": per_scenario,
         "proven_scenarios": proven_scenarios,
         "blocked_scenarios": blocked_scenarios,
-        "sdk_callback_proven_scenarios": proven_scenarios,      # r3 P0-1：sdk_callback 维度（真实 query 触发）
+        "sdk_callback_proven_scenarios": proven_scenarios,
         "sdk_callback_blocked_scenarios": blocked_scenarios,
-        "adapter_gate_covered_scenarios": adapter_gate_covered,  # r3 P0-1：adapter on_* 真实 gate 覆盖
+        "adapter_gate_covered_scenarios": adapter_gate_covered,
         "adapter_gate_outcomes": adapter_gates,
-        "real_triggered_event_types": sorted(real_triggered),
-        "our_hook_journal_path": str(hook_path),
-        "journal_decode_errors": journal_decode_errors,   # r5 P1-5：journal 解析错计数（进 sdk_canary 谓词）
+        "real_triggered_event_types": sorted(all_lifecycle_types),
+        "our_hook_journal_paths": journal_paths,   # per-scenario 独立 journal（r5 P0：事件天然隔离）
+        "journal_decode_errors": total_decode_errors,
     }
 
 
