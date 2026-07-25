@@ -1056,6 +1056,45 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _publish_and_verify_evidence(manifest, subject_commit: str, vault_root: Path,
+                                 artifact_root: Path) -> tuple[str | None, str | None, str | None, bool]:
+    """r9-8（综合裁判 MEDIUM 守门）：evidence publish → verify → push 编排，提取自 ``real_cutover_suite`` 可注入
+    ``vault_root``（生产=vault 根；集成测试=tmp git 仓）——堵「编排顺序无测试」（helper 各自绿，但 commit→verify→push
+    端到端顺序未来回归把 push 提前到 verify 前则现有单测守不住）。
+
+    顺序（r9-2 commit/push 分离核心）：
+      1. ``publish_evidence_bundle`` 落仓内 ``docs/evidence/<subject>/``；
+      2. ``_commit_evidence(push=False)`` 只本地 commit（不发布）；
+      3. **push 前实跑 verify.py**（manifest 字段 + subject 存在 + ancestry 真祖先 + runner binding + bundle digest）；
+         exit≠0 → ``_rollback_evidence_commit`` 回滚 commit + raise（fail-closed，绝不让未过独立自检的 evidence 上线）；
+      4. verify 绿 → ``git push``（跨机器发布）；push 失败 → 回滚 + raise（杜绝本地 commit 假装已发布）。
+
+    返回 ``(bundle_path, bundle_digest, evidence_commit, bundle_publish_ok=True)``；任一步失败 raise（调用方据
+    except 标 ``publish_failed`` + overall 红）。``vault_root`` 注入是 r9-8 守门的关键（旧版内联硬编码
+    ``Path(__file__).resolve().parents[2]`` 致 tmp 仓不可测）。
+    """
+    import cutover as CT
+    import sys
+    _br = vault_root / "docs" / "evidence" / subject_commit
+    bundle_path, bundle_digest = CT.publish_evidence_bundle(
+        artifact_root=str(artifact_root), manifest=manifest, bundle_root=_br)
+    evidence_commit = _commit_evidence(_br, subject_commit, vault_root=vault_root, push=False)
+    if not evidence_commit:
+        raise RuntimeError("evidence_commit 创建失败（git add/commit/ancestry 自检）")
+    _ev_rel = _br.resolve().relative_to(vault_root.resolve())
+    _v = subprocess.run([sys.executable, str(_br / "verify.py"), evidence_commit], cwd=str(vault_root),
+                        capture_output=True, text=True, timeout=60)
+    if _v.returncode != 0:
+        _rollback_evidence_commit(vault_root, subject_commit, _ev_rel)
+        raise RuntimeError(f"verify.py fail-closed（exit={_v.returncode}）: {_v.stderr[:300]!r}")
+    _push = subprocess.run(["git", "push"], cwd=str(vault_root), capture_output=True,
+                           text=True, timeout=30, env=_git_env_for_runner())
+    if _push.returncode != 0:
+        _rollback_evidence_commit(vault_root, subject_commit, _ev_rel)
+        raise RuntimeError(f"evidence push 失败: {_push.stderr[:300]!r}")
+    return bundle_path, bundle_digest, evidence_commit, True
+
+
 def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
                        artifact_root: Path | None = None) -> dict:
     """7.6 真实 cutover 套件运行器。
@@ -1212,34 +1251,12 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
     # 证据无法绑定被验收代码 → fail-closed（不 publish bundle，overall_passed=False）。r5 旧版 None 不阻断。
     if manifest.overall_passed and _subject:
         try:
-            # r6 P1-3（R4 §2.2）：bundle 落仓内 docs/evidence/<subject_commit>/（git 可追踪，ancestry 可验收）。
+            # r9-8（综合裁判 MEDIUM 守门）：publish→verify→push 编排提取为 _publish_and_verify_evidence（可注入
+            # vault_root 供集成测试端到端验证 commit→verify→push 顺序；生产 vault_root=vault 根）。r9-2 commit/push
+            # 分离 + verify.py fail-closed 回滚在 helper 内——旧版内联于 real_cutover_suite 致编排顺序无测试。
             _vault_root = Path(__file__).resolve().parents[2]
-            _br = _vault_root / "docs" / "evidence" / _subject
-            bundle_path, bundle_digest = CT.publish_evidence_bundle(
-                artifact_root=str(artifact_root), manifest=manifest, bundle_root=_br)
-            # r6 P1-3 + r9-2（审核员 P0）：独立 evidence_commit（只含 docs/evidence/<subject>/ 路径）+ ancestry 自检。
-            # r9-2：commit/push 分离——``push=False`` 只本地 commit，随后实跑 verify.py（exit 0 才 push），
-            # 杜绝「publish 未经独立自检即上线的 evidence」（验证器 ancestry/runner binding/digest 须绿才发布）。
-            evidence_commit = _commit_evidence(_br, _subject, push=False)
-            if not evidence_commit:
-                raise RuntimeError("evidence_commit 创建失败（git add/commit/ancestry 自检）")
-            # r9-2（审核员 P0）：push 前实跑 bundle verify.py（自检：manifest 字段 + subject 存在 + evidence
-            # ancestry + runner binding + bundle digest）。verify.py 非 0 → fail-closed：回滚 commit + 不 push +
-            # overall 红（绝不让未过独立自检的 evidence 上线）。verify.py 用 git log/diff，须在 vault 仓上下文跑。
-            import sys
-            _ev_rel = _br.resolve().relative_to(_vault_root.resolve())
-            _v = subprocess.run([sys.executable, str(_br / "verify.py"), evidence_commit], cwd=str(_vault_root),
-                                capture_output=True, text=True, timeout=60)
-            if _v.returncode != 0:
-                _rollback_evidence_commit(_vault_root, _subject, _ev_rel)
-                raise RuntimeError(f"verify.py fail-closed（exit={_v.returncode}）: {_v.stderr[:300]!r}")
-            # verify 绿 → push（跨机器发布）。push 失败 → 回滚 commit（杜绝本地 commit 假装已发布）。
-            _push = subprocess.run(["git", "push"], cwd=str(_vault_root), capture_output=True,
-                                   text=True, timeout=30, env=_git_env_for_runner())
-            if _push.returncode != 0:
-                _rollback_evidence_commit(_vault_root, _subject, _ev_rel)
-                raise RuntimeError(f"evidence push 失败: {_push.stderr[:300]!r}")
-            bundle_publish_ok = True
+            bundle_path, bundle_digest, evidence_commit, bundle_publish_ok = _publish_and_verify_evidence(
+                manifest, _subject, _vault_root, artifact_root)
         except Exception as exc:
             bundle_path = f"publish_failed: {exc!r}"
 
