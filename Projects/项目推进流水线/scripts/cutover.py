@@ -1277,19 +1277,22 @@ def _telemetry_outcome(ev: "TelemetryEvidence") -> DrillOutcome:
 
 
 def _otlp_export_verified() -> bool:
-    """r9-1（审核员 P0）：真实 OTLP export 验证（废除 r8-1 环境变量非空判定——可伪造）。
+    """r9-1（审核员 P0）+ r10-B1 诚实收敛（审核员 r9 复审 + 红队）：OTLP/HTTP 连通性探针。
 
-    r8-1 旧判 ``bool(OTEL_EXPORTER_OTLP_ENDPOINT or ..._TRACES_ENDPOINT)`` → 设 ``=x`` 即 True →
-    telemetry_connected=True → 7.6 假绿（审核员 r9 P0：未配置红已修，但配置后「真实执行并绿」仍可伪造）。
-    r9-1 改为**实际尝试 OTLP/HTTP export** 一个 minimal valid span 到 endpoint + 验证 collector 接收（2xx）：
+    ⚠️ r10-B1 **停止 overclaim**：本函数只是「endpoint 可达且对 OTLP/HTTP POST 返 2xx」的**连通性探针**，
+    **不证明**对端是真 OTLP collector、更不证明 collector 真的 ingest/存了 span。诚实边界：
 
-      - 无 endpoint → False（未接入）。
-      - endpoint 不可达（伪造 ``=x`` / 无 collector / 连接拒绝 / timeout）→ False（**不可伪造**——环境变量
-        非空不算接入）。
-      - collector 可达 + 接收 valid span（2xx）→ True（真实接入）。
+      - 能抓的最朴素误配：``ENDPOINT=x``（无服务）→ 连接失败 → False。相比 r8-1（环境变量非空即 True），
+        这堵住了「设个假值就假绿」的最弱路径——这是 r9-1 相对 r8-1 的**唯一**真实增益。
+      - **抓不住**的残余洞（留 P2 硬化）：
+        (a) dummy 2xx server：任何对 POST 返 200 的 HTTP 服务（含输入校验型）都让本函数返 True → 假绿；
+        (b) collector-behind-2xx-ack-proxy：proxy 返 2xx ack 但 collector 未真正 ingest → 误判真接入；
+        (c) gold-standard 唯一可信验证 =「export 一个已知 traceId → 事后从 collector/backend 回查该 traceId
+            确实被 ingest」——r9-1 未实现，留 P2（真接入唯一可信证明）。
 
     生产无真实 OTLP collector → 永远 False → telemetry 诚实红（open_items 标 telemetry open，同 P1-6）。
-    接真实 collector（OTLP/HTTP 4318）+ 有效 endpoint → export 成功 → True → telemetry 升真接入。
+    接真实 collector（OTLP/HTTP 4318）→ 本函数返 True，**但「2xx = 真接入」仅在 collector 直接裸暴露、无
+    2xx-ack 中间层时成立**；生产若 collector 经 proxy，须 P2 traceId 回查才可信。
 
     open_items + runtime 7.6 connected 共用本函数（单一真理源；runtime._telemetry_connected 转调）。
     """
@@ -1693,15 +1696,26 @@ _ALL_DRILL_FIELD_NAMES: frozenset[str] = frozenset().union(*_SUB_EVIDENCE_ALLOWL
 
 
 def _check_sub_evidence_allowlist(blob: bytes) -> list[str]:
-    """r8-4（审核员）：sub-evidence per-kind allowlist + 4 步校验。返回违规列表（空 = 合规）。
+    """r8-4（审核员）+ r10-B3 诚实收敛（审核员 r9 复审 + 红队）：sub-evidence publish 层 best-effort 校验。
 
-    旧 r7-S3 是 denylist（4 禁字段递归）——未知字段放过（假绿）。r8-4 改 allowlist：
-    (1) 顶层必须是 dict 且键 ⊆ {drill, evidence}（未知顶层键 fail）；
-    (2) drill 在 ``_SUB_EVIDENCE_ALLOWLIST_BY_KIND``（未知 drill fail-closed，防任意 drill 名发布）；
-    (3) evidence 顶层字段全在该 drill 的 dataclass 字段集（dict 直接查；list 查每元素——未知证据字段 fail，
-        堵任意 prompt/tool_input/user_input/raw_prompt/model_output 进 evidence）；
-    (4) 递归文本长度检查（保留 r7-S3，防完整原文）。
-    非 JSON blob（二进制 artifact）跳过（返回空，不误判）。secret scan 由 publish 层 ``_scan_for_secrets`` 互补。
+    ⚠️ r10-B3 **停止 overclaim**：本函数是 publish 层**字段名维度**的 best-effort 校验，**不**是「可被外部
+    构造的伪造 blob 都能堵住」的信任边界。真信任边界在 **runtime 发射端**（drill dataclass 字段集 +
+    ``_strip_leaky_invocation_fields`` 预剥离）——runtime 只发射固定已知键、且 tool_output 等泄漏字段已在
+    发射前剥离。本函数是第二层防线，防「已知泄漏字段名残留 + 字段名 schema 漂移」，**防不住**：
+
+      (a) 合法 VALUE 字段值里的凭据：``summary``/``detail``/``error`` 等字段名在 dataclass allowlist 内
+          （合法），但其**值**若含 AKIA/token 则 key-level allowlist 放过 → 残余洞（r10-B3 留 P2：需对
+          allowlist 字段的**值**也跑 ``_scan_for_secrets``，当前只对 publish 目录整文件 scan）。
+      (b) 嵌套深层未知字段名：r9-6 递归 denylist 只拒 ``_SUB_EVIDENCE_LEAKY_FIELDS``（14 已知名），新增的
+          未知泄漏字段名（如未来 ``ai_response``）不在表内 → 嵌套放过（P2：denylist 升覆盖式扫描）。
+
+    校验步骤（publish 层 best-effort）：
+    (1) 顶层 dict 且键 ⊆ {drill, evidence}；
+    (2) drill 在 ``_SUB_EVIDENCE_ALLOWLIST_BY_KIND``（未知 drill fail-closed）；
+    (3) evidence 顶层字段 ⊆ 该 drill dataclass 字段集（dict 直接查；list 查每元素）；
+    (4) 递归 denylist（``_SUB_EVIDENCE_LEAKY_FIELDS`` 14 名）+ 文本长度上限。
+    r9-6：非 JSON blob → fail-closed（旧版跳过 = 假绿）。secret scan 由 publish 层 ``_scan_for_secrets``
+    互补（整文件维度，含 manifest/bundle.sha256/verify.py + artifacts/<d>）。
     """
     try:
         obj = json.loads(blob.decode("utf-8", errors="replace"))
