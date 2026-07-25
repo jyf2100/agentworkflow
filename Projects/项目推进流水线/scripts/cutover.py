@@ -1647,7 +1647,20 @@ _MANIFEST_ALLOWED_FIELDS: frozenset[str] = frozenset({
 
 def _scan_for_secrets(text: str) -> list[str]:
     """扫描文本凭据模式（r6 P1-4）。返回命中描述（脱敏：模式名 + 首尾少量字符 + 长度，**不回显凭据值**）。
-    空列表 = 干净；非空 = fail-closed 信号（调用方据此 raise，绝不带凭据写盘/复制）。"""
+    空列表 = 干净；非空 = fail-closed 信号（调用方据此 raise，绝不带凭据写盘/复制）。
+
+    ⚠️ r10-B3-layer3（红队 r10 复审 + DECISIVE）：本函数是 publish/commit 层 **best-effort 第二防线**，模式表
+    （``_SECRET_PATTERNS`` 8 条）**有已知大类盲区**——实测零命中：PEM/RSA 私钥、AWS STS 临时凭据（``ASIA`` 前缀，
+    非 ``AKIA``）、无 label 的 AWS secret access key（40 字符）、Slack（``xoxb-``）、GitLab（``glpat-``）、
+    Stripe（``sk_live_``——``sk_`` 下划线 ≠ ``sk-`` 连字符，不匹配 openai_key）、JWT、Azure key、短 GitHub PAT
+    （``ghp_`` < 36 字符）。**本函数不是「堵一切凭据」的信任边界**。真信任边界有两层：(1) runtime 发射端
+    （drill dataclass 字段集 + ``_strip_leaky_invocation_fields`` 预剥离 tool_output 等 leaky 字段，runtime 不
+    发射凭据原文字段）；(2) ``_derive_evidence_whitelist`` 的 sub_evidence_refs **ref 安全校验**（r10-B2-traversal，
+    堵 path traversal ref 让 stray 进 commit 的根因——stray 进 commit 唯一路径是 traversal ref，Layer 1 校验断
+    该路径后，stray 即便含未检出凭据格式也不在 commit 白名单内，``_commit_evidence`` per-file pathspec 不触及）。
+    本函数是这两层之后的纵深冗余；盲区类别留 P2（升级为覆盖式扫描，如集成 truffleHog/gitleaks），不追每轮加
+    正则的兔子洞（r5→r9 反模式：每轮追凭据硬化，盲区永远追不完）。
+    """
     import re
     hits: list[str] = []
     for name, pat in _SECRET_PATTERNS:

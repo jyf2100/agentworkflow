@@ -960,17 +960,28 @@ def _rollback_evidence_commit(vault: Path, subject_commit: str, evidence_rel: Pa
 
 
 def _derive_evidence_whitelist(evidence_dir: Path) -> list[str]:
-    """r10-B2（审核员 r9 复审）：从 ``evidence_dir/manifest.json`` 派生 publish 实际写的白名单文件（相对 evidence_dir）。
+    """r10-B2（审核员 r9 复审）+ r10-B2-traversal（红队 DECISIVE）：从 ``evidence_dir/manifest.json`` 派生 publish
+    实际写的白名单文件（相对 evidence_dir）。
 
     白名单 = ``manifest.json`` + ``bundle.sha256`` + ``verify.py`` + ``artifacts/<d>`` for d in
     manifest.sub_evidence_refs（publish_evidence_bundle 写的 4 类文件，cutover.py:1811-1818）。过滤**实际存在**
     子集（单元测试常只建 manifest.json；生产 publish 建全 4 类）。``manifest.json`` 不存在/损坏 → 返回 ``[]``
     （fail-closed：``_commit_evidence`` 据此返回 None，**绝不退回旧整目录 commit**——那是 B2 漏洞根因）。
 
+    r10-B2-traversal（红队 DECISIVE 实测）：``sub_evidence_refs`` 是内容寻址 digest（``_archive_sub_evidence`` 返
+    ``ref.digest`` = ``"sha256:<hex>"``，cutover.py:1532/1829 文件名=digest），全 ``[A-Za-z0-9._:-]`` 安全字符。旧版
+    ``f"artifacts/{_d}"`` 对 ``_d`` **零校验**——``"../leaky.pem"`` → 候选 ``"artifacts/../leaky.pem"`` →
+    ``Path.exists()`` 归一化为 ``(evidence_dir/"leaky.pem").exists()`` 为真 → 白名单含该 ref → ``_commit_evidence``
+    的 ``git add/commit -- .../artifacts/../leaky.pem`` 被 git pathspec 归一化 → stage+commit 真实 stray →
+    ancestry ``startswith("docs/evidence/")`` 放行 → Layer 3 ``_scan_for_secrets`` 对 PEM 等盲区零命中（且不在
+    ``_commit_evidence`` 公开 API 内）→ push 远端泄漏。任一 ref 非法（非 str / 空 / 含 ``..`` / 含路径分隔符或
+    traversal 字符如斜杠与波浪号）→ 整白名单 fail-closed ``[]``（manifest 被外部构造带 traversal = 可疑，不部分信任）。
+
     返回相对 evidence_dir 的路径（如 ``["manifest.json", "artifacts/sha256:abc"]``），``_commit_evidence`` 拼成
     相对 vault 的 pathspec 做 per-file ``git add`` + ``git commit``（堵 tracked-modified stray 进 commit）。
     """
     import json as _json
+    import re as _re
     _mf = evidence_dir / "manifest.json"
     if not _mf.exists():
         return []
@@ -979,6 +990,14 @@ def _derive_evidence_whitelist(evidence_dir: Path) -> list[str]:
     except Exception:
         return []                 # manifest 损坏 → 不知白名单 → fail-closed（不让 _commit_evidence 退回整目录）
     _refs = _obj.get("sub_evidence_refs", []) if isinstance(_obj, dict) else []
+    if not isinstance(_refs, list):
+        return []                 # sub_evidence_refs 非 list（被外部构造）→ fail-closed
+    for _d in _refs:
+        # r10-B2-traversal：ref 须是安全 digest（[A-Za-z0-9._:-]+ + 无 ".." + 非空）——拒 path traversal 一切变体
+        if (not isinstance(_d, str) or not _d
+                or ".." in _d
+                or not _re.fullmatch(r"[A-Za-z0-9._:-]+", _d)):
+            return []
     _candidates = (["manifest.json", "bundle.sha256", "verify.py"]
                    + [f"artifacts/{_d}" for _d in _refs])
     return [_c for _c in _candidates if (evidence_dir / _c).exists()]
