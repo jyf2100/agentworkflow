@@ -969,13 +969,22 @@ def _derive_evidence_whitelist(evidence_dir: Path) -> list[str]:
     （fail-closed：``_commit_evidence`` 据此返回 None，**绝不退回旧整目录 commit**——那是 B2 漏洞根因）。
 
     r10-B2-traversal（红队 DECISIVE 实测）：``sub_evidence_refs`` 是内容寻址 digest（``_archive_sub_evidence`` 返
-    ``ref.digest`` = ``"sha256:<hex>"``，cutover.py:1532/1829 文件名=digest），全 ``[A-Za-z0-9._:-]`` 安全字符。旧版
+    ``ref.digest`` = ``"sha256:<hex>"``，cutover.py:1532/1829 文件名=digest），全 ``[A-Za-z0-9_:-]`` 安全字符（**不含 ``.``**，v2 见下）。旧版
     ``f"artifacts/{_d}"`` 对 ``_d`` **零校验**——``"../leaky.pem"`` → 候选 ``"artifacts/../leaky.pem"`` →
     ``Path.exists()`` 归一化为 ``(evidence_dir/"leaky.pem").exists()`` 为真 → 白名单含该 ref → ``_commit_evidence``
     的 ``git add/commit -- .../artifacts/../leaky.pem`` 被 git pathspec 归一化 → stage+commit 真实 stray →
     ancestry ``startswith("docs/evidence/")`` 放行 → Layer 3 ``_scan_for_secrets`` 对 PEM 等盲区零命中（且不在
     ``_commit_evidence`` 公开 API 内）→ push 远端泄漏。任一 ref 非法（非 str / 空 / 含 ``..`` / 含路径分隔符或
     traversal 字符如斜杠与波浪号）→ 整白名单 fail-closed ``[]``（manifest 被外部构造带 traversal = 可疑，不部分信任）。
+
+    r10-B2-traversal-v2（再审工作流 w0ftgsvxd：审计 + 红队一致 DECISIVE 推翻 v1「堵死所有变体」overclaim，两洞
+    同根因——白名单派生的输入信任边界）：(1) **单点 ``.`` ref**——v1 字符集 ``[A-Za-z0-9._:-]`` 含 ``.``，``_d="."`` 通过
+    校验 → 白名单 ``"artifacts/."`` → ``git add -- .../artifacts/.`` 把 ``.`` 解析为目录递归 stage 整 ``artifacts/`` 含 stray。
+    修复：字符集去 ``.`` → ``[A-Za-z0-9_:-]+``（生产 digest 不含 ``.``，不误杀）。(2) **目录白名单条目**——候选过滤
+    ``.exists()`` 对目录返 True，固定条目（``bundle.sha256``）或 ``artifacts/<ref>`` 被 TOCTOU 换目录 → ``git add -- <dir>``
+    递归 stage 目录内全部文件（红队实测 TOCTOU 双交换绕过 verify.py 读 working tree）。修复：``.exists()`` → ``.is_file()``
+    （目录不进白名单）。残余（红队 must-fix 但属职责分离设计，留 P2 合约声明）：``_commit_evidence`` 公开 API 自身不扫
+    凭据（scan 在编排层 ``_publish_and_verify_evidence``），直接调用方传含凭据 manifest.json 无 scan 兜底。
 
     返回相对 evidence_dir 的路径（如 ``["manifest.json", "artifacts/sha256:abc"]``），``_commit_evidence`` 拼成
     相对 vault 的 pathspec 做 per-file ``git add`` + ``git commit``（堵 tracked-modified stray 进 commit）。
@@ -993,14 +1002,18 @@ def _derive_evidence_whitelist(evidence_dir: Path) -> list[str]:
     if not isinstance(_refs, list):
         return []                 # sub_evidence_refs 非 list（被外部构造）→ fail-closed
     for _d in _refs:
-        # r10-B2-traversal：ref 须是安全 digest（[A-Za-z0-9._:-]+ + 无 ".." + 非空）——拒 path traversal 一切变体
+        # r10-B2-traversal + v2（审计+红队 DECISIVE）：ref 须是安全 digest——全 [A-Za-z0-9_:-]+ 字符（**不含 "."**：
+        # v1 字符集含 . 让单点 "." 通过 → "artifacts/." 递归 stage 整目录）+ 非空。生产 digest=sha256:<hex> 全
+        # [0-9a-f:] 不含 .，不误杀。".." 在此字符集外（无 .）故无须额外查，保留 ".." in _d 为防御纵深（防未来字符集回退）。
         if (not isinstance(_d, str) or not _d
                 or ".." in _d
-                or not _re.fullmatch(r"[A-Za-z0-9._:-]+", _d)):
+                or not _re.fullmatch(r"[A-Za-z0-9_:-]+", _d)):
             return []
     _candidates = (["manifest.json", "bundle.sha256", "verify.py"]
                    + [f"artifacts/{_d}" for _d in _refs])
-    return [_c for _c in _candidates if (evidence_dir / _c).exists()]
+    # r10-B2-traversal-v2（红队 DECISIVE）：.is_file() 非 .exists()——拒目录（git add <dir> 递归 stage
+    # 整目录含 stray；TOCTOU 把 bundle.sha256 换目录，verify.py 读 working tree 被 double-swap 绕过）
+    return [_c for _c in _candidates if (evidence_dir / _c).is_file()]
 
 
 def _commit_evidence(evidence_dir: Path, subject_commit: str,
