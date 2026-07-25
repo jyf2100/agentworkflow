@@ -29,18 +29,38 @@ def _green_per_scenario() -> dict:
     return per
 
 
-def _res(per=None, cb_proven=True) -> dict:
-    return {
+def _res(per=None, cb_proven=True, **integrity) -> dict:
+    base = {
         "lifecycle_callback_proven": cb_proven,
         "per_scenario_real_triggers": _green_per_scenario() if per is None else per,
         "blocked_scenarios": [],
+        # r5 P1-2（评审）：绿 query 须正常结束——result_received=True、query_error=None、无 callback 异常、
+        # journal 可解析。谓词经 evaluate_sdk_canary_scenarios 消费这些维度（integrity 违例即证据不可信）。
+        "result_received": True,
+        "query_error": None,
+        "callback_errors": [],
+        "journal_decode_errors": 0,
     }
+    base.update(integrity)
+    return base
 
 
 def test_drill_predicate_7_2_green_passes():
-    """全绿：6 callback 场景 proven + 8 场景 gate 精确匹配 + lifecycle_cb → 7.2 谓词 True。"""
+    """全绿：6 callback 场景 proven + 8 场景 gate 精确匹配 + lifecycle_cb + query 正常结束 → 7.2 谓词 True。"""
     ok, reason = RE._drill_predicate("7.2_sdk_canary", _res())
     assert ok is True and reason is None
+
+
+def test_drill_predicate_7_2_integrity_violation_rejected():
+    """r5 P1-2（评审反例，7.2 入口）：构造 callback_errors 非空 + journal_decode_errors>0 + query_error 非空 +
+    result_received=False **且** 场景矩阵（gate+callback）全真 → 7.2 谓词必 False。此前谓词只查 cb_proven +
+    scenario_verdict（不含 integrity），同输入返回 (True, None) 假绿。integrity 现经 evaluate_sdk_canary_scenarios
+    （7.2 + 7.6 共调纯函数）堵住。"""
+    res = _res(callback_errors=[{"event": "Stop"}], journal_decode_errors=1,
+               query_error="proxy 5xx", result_received=False)
+    ok, reason = RE._drill_predicate("7.2_sdk_canary", res)
+    assert ok is False and reason is not None
+    assert "evidence_intact=False" in reason
 
 
 def test_drill_predicate_7_2_wrong_gate_rejected():

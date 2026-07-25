@@ -446,6 +446,59 @@ def test_sandbox_credential_denied_regardless_of_kind(tmp_path):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# r5 P0-1：evaluate_sandbox_verdict（docker canary 全 7 项 → sandbox 通过判定，纯函数）
+# 旧 real_cutover_suite 只查 credential_isolated + denied_egress_enforced，docker 其余 5 项
+# （node/allowed-egress/resource/unavailable-runtime/python）失败仍 sandbox_pass=True → overall PASS
+# → 归档（评审 r5 P0-1 假绿）。本纯函数堵该路径：all_pass 任一红即 sandbox 红。
+# ════════════════════════════════════════════════════════════════════════════
+def _docker_summary_all_pass():
+    return {"python_exec": True, "credential_isolated": True, "node_exec": True,
+            "denied_egress_enforced": True, "allowed_egress_works": True,
+            "unavailable_runtime_fail_fast": True, "resource_limit_enforced": True,
+            "all_pass": True}
+
+
+def test_sandbox_green_when_all_seven_dims_pass():
+    v = CT.evaluate_sandbox_verdict(_docker_summary_all_pass())
+    assert v.sandbox_pass is True
+    assert v.docker_all_pass is True
+    assert v.failing_dims == ()
+
+
+def test_sandbox_red_when_docker_node_unavailable():  # 评审 r5 P0-1 反例（精确复刻）
+    s = _docker_summary_all_pass(); s["node_exec"] = False; s["all_pass"] = False
+    v = CT.evaluate_sandbox_verdict(s)
+    assert v.sandbox_pass is False               # 旧逻辑：cred+net 全真 → 假绿 True
+    assert "node_exec" in v.failing_dims
+
+
+def test_sandbox_red_when_resource_limit_not_enforced():
+    s = _docker_summary_all_pass(); s["resource_limit_enforced"] = False; s["all_pass"] = False
+    assert CT.evaluate_sandbox_verdict(s).sandbox_pass is False
+
+
+def test_sandbox_red_when_unavailable_runtime_not_blocked():
+    s = _docker_summary_all_pass(); s["unavailable_runtime_fail_fast"] = False; s["all_pass"] = False
+    assert CT.evaluate_sandbox_verdict(s).sandbox_pass is False
+
+
+def test_sandbox_red_when_allowed_egress_not_enforced():
+    s = _docker_summary_all_pass(); s["allowed_egress_works"] = False; s["all_pass"] = False
+    assert CT.evaluate_sandbox_verdict(s).sandbox_pass is False
+
+
+def test_sandbox_red_when_credential_not_isolated():  # 原有核心语义保留
+    s = _docker_summary_all_pass(); s["credential_isolated"] = False; s["all_pass"] = False
+    assert CT.evaluate_sandbox_verdict(s).sandbox_pass is False
+
+
+def test_sandbox_red_failing_dims_lists_all_red_dims():
+    s = _docker_summary_all_pass(); s["node_exec"] = False; s["resource_limit_enforced"] = False; s["all_pass"] = False
+    v = CT.evaluate_sandbox_verdict(s)
+    assert v.failing_dims == ("node_exec", "resource_limit_enforced")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 8.6 dispatch cutover（journal-driven + legacy fallback）
 # ════════════════════════════════════════════════════════════════════════════
 def test_dispatch_cutover_journal_driven_when_flag_on():
@@ -667,23 +720,198 @@ def test_run_shadow_parity_evidence_no_write_dry_run_published(tmp_path):
 # 评审 P0-2：旧 run_cutover_suite 接收外部布尔值做 all()（聚合器非运行器）。新 runner 调用每个 drill
 # 执行入口（注入 bundle）真实执行，从 Result 提取 pass+detail，构建 CutoverManifest，全绿归档 digest。
 # ════════════════════════════════════════════════════════════════════════════
-def test_sdk_canary_outcome_requires_all_six_callback_scenarios():
-    """r3 P0-1 闭环 HIGH-1：sdk_canary pass 须 SDK_CALLBACK_REQUIRED_SCENARIOS 6 场景逐个 callback proven，
-    非"任意 callback 出现即真"。构造缺 callback 场景的 evidence 须判 FAIL（即便 adapter gate 全对 +
-    real_query_proven=True）——杜绝 7.6 outcome 比 7.2 谓词弱的假绿。"""
-    green = CT.run_sdk_hook_canary()   # fixture：gate 8 场景符合预期 + 6 callback 全 proven → pass
+def _fake_sdk_canary_all_proven():
+    """全 8 场景 callback proven 的 fake sdk_canary（测 run_full_cutover_suite 归档逻辑，非 SDK 真实性）。
+    adapter fixture（run_sdk_hook_canary）r5 P0-2 后不填 sdk_callback_proven（口径4），故全绿编排测试需显式 fake。"""
+    base = CT.run_sdk_hook_canary()
+    return CT.SdkHookCanaryEvidence(
+        scenarios=base.scenarios, stop_gates=base.stop_gates, paths_covered=base.paths_covered,
+        summary=base.summary, real_query_proven=True,
+        sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS,
+        adapter_contract_proven=base.adapter_contract_proven)
+
+
+def test_sdk_canary_outcome_requires_all_callback_scenarios():
+    """r5 P0-2：sdk_canary pass 须 SDK_CALLBACK_REQUIRED_SCENARIOS 8 场景逐个 callback proven（含 compaction/
+    hook_failure——task 7.2 契约全 7 path），非"任意 callback 出现即真"。缺任一 callback 场景须 FAIL（即便
+    adapter gate 全对 + real_query_proven=True）——杜绝 7.6 outcome 比 7.2 谓词弱的假绿。"""
+    green = _fake_sdk_canary_all_proven()   # fake：gate 8 场景符合预期 + 8 callback 全 proven → pass
     assert CT._sdk_canary_outcome(green).passed is True
-    # 缺 subagent callback 场景 → callback_ok=False → FAIL
-    missing_one = CT.SdkHookCanaryEvidence(
+    # 缺 compaction callback（PreCompact 单 query 不可靠触发）→ callback_ok=False → FAIL（路B 诚实标红）
+    missing_compaction = CT.SdkHookCanaryEvidence(
         scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
         summary=green.summary, real_query_proven=True,
-        sdk_callback_proven=tuple(s for s in CT.SDK_CALLBACK_REQUIRED_SCENARIOS if s != "subagent"))
-    assert CT._sdk_canary_outcome(missing_one).passed is False
+        sdk_callback_proven=tuple(s for s in CT.SDK_CALLBACK_REQUIRED_SCENARIOS if s != "compaction"),
+        adapter_contract_proven=green.adapter_contract_proven)
+    assert CT._sdk_canary_outcome(missing_compaction).passed is False
+    # 缺 hook_failure callback → FAIL
+    missing_hook_failure = CT.SdkHookCanaryEvidence(
+        scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
+        summary=green.summary, real_query_proven=True,
+        sdk_callback_proven=tuple(s for s in CT.SDK_CALLBACK_REQUIRED_SCENARIOS if s != "hook_failure"),
+        adapter_contract_proven=green.adapter_contract_proven)
+    assert CT._sdk_canary_outcome(missing_hook_failure).passed is False
     # 缺全部 callback（任意 callback 假绿旧路径：仅 real_query_proven=True 即 pass）→ FAIL
     no_callback = CT.SdkHookCanaryEvidence(
         scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
-        summary=green.summary, real_query_proven=True, sdk_callback_proven=())
+        summary=green.summary, real_query_proven=True, sdk_callback_proven=(),
+        adapter_contract_proven=green.adapter_contract_proven)
     assert CT._sdk_canary_outcome(no_callback).passed is False
+
+
+def test_adapter_fixture_does_not_fake_sdk_callback_proven():
+    """r5 P0-2 口径4：adapter fixture（run_sdk_hook_canary）不得填 sdk_callback_proven（adapter 非 SDK），
+    只填 adapter_contract_proven（gate 逻辑）。杜绝 adapter 冒充真实 callback 的假绿。"""
+    ev = CT.run_sdk_hook_canary()
+    assert ev.sdk_callback_proven == ()                     # adapter 不证 SDK callback
+    assert ev.adapter_contract_proven == CT._CANARY_ORDER   # adapter 证全 8 场景 gate 逻辑
+
+
+def test_sdk_canary_fails_on_callback_errors():
+    """r5 P1-5：真实 query 中 callback 抛异常（callback_errors 非空）→ lifecycle 证据不可信 → sdk_canary FAIL，
+    即便 8 场景 callback 全 proven + real_query_proven=True。杜绝 callback 路由失败被吞后仍归档的假绿。"""
+    green = _fake_sdk_canary_all_proven()
+    with_err = CT.SdkHookCanaryEvidence(
+        scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
+        summary=green.summary, real_query_proven=True,
+        sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS,
+        adapter_contract_proven=green.adapter_contract_proven,
+        callback_errors=({"event": "Stop", "error": "boom"},))
+    assert CT._sdk_canary_outcome(with_err).passed is False
+
+
+def test_sdk_canary_fails_on_journal_decode_errors():
+    """r5 P1-5：hook journal 行 JSON 解析失败（journal_decode_errors>0）→ lifecycle 证据可能丢失 → sdk_canary FAIL。
+    对应 runtime_evidence.py:540 旧 `except json.JSONDecodeError: pass` 静默吞 → 现计数进谓词。"""
+    green = _fake_sdk_canary_all_proven()
+    with_err = CT.SdkHookCanaryEvidence(
+        scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
+        summary=green.summary, real_query_proven=True,
+        sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS,
+        adapter_contract_proven=green.adapter_contract_proven,
+        journal_decode_errors=2)
+    assert CT._sdk_canary_outcome(with_err).passed is False
+
+
+def test_evaluate_evidence_intact_pure_function():
+    """r5 P1-2（评审）：evaluate_evidence_intact 纯函数——callback_errors / journal_decode_errors /
+    query_error / result_received 四维度，任一违例即 (False, failures)。全空 → (True, ())。"""
+    ok, fail = CT.evaluate_evidence_intact()
+    assert ok is True and fail == ()
+    ok, fail = CT.evaluate_evidence_intact(callback_errors=({"event": "Stop"},))
+    assert ok is False and "callback_errors" in fail[0]
+    ok, fail = CT.evaluate_evidence_intact(journal_decode_errors=3)
+    assert ok is False and "journal_decode_errors" in fail[0]
+    ok, fail = CT.evaluate_evidence_intact(query_error="proxy 5xx")
+    assert ok is False and fail == ("query_error",)
+    ok, fail = CT.evaluate_evidence_intact(result_received=False)
+    assert ok is False and fail == ("result_not_received",)
+    # 多维同时违例 → 全部列出
+    ok, fail = CT.evaluate_evidence_intact(query_error="boom", result_received=False)
+    assert ok is False and "query_error" in fail and "result_not_received" in fail
+
+
+def test_evaluate_sdk_canary_scenarios_blocks_fake_green_on_integrity():
+    """r5 P1-2（评审反例）：构造 callback_errors 非空、journal_decode_errors=1、query_error 非空、
+    result_received=False **且** 场景矩阵（gate+callback）全真 → evaluate_sdk_canary_scenarios.passed 必 False。
+    此前 7.2 _drill_predicate 只查 cb_proven + scenario_verdict（不含 integrity），同输入返回 (True, None) 假绿。
+    本纯函数由 7.2 谓词 + 7.6 outcome 共调 → 两入口同时堵住该假绿。"""
+    gates = dict(CT.EXPECTED_LIFECYCLE_GATES)              # 全 8 场景 gate 精确匹配（gate_ok=True）
+    callbacks_proven = CT.SDK_CALLBACK_REQUIRED_SCENARIOS    # 全 callback proven（callback_ok=True）
+    verdict = CT.evaluate_sdk_canary_scenarios(
+        gates=gates, callbacks_proven=callbacks_proven,
+        callback_errors=({"event": "Stop"},), journal_decode_errors=1,
+        query_error="proxy 5xx", result_received=False)
+    assert verdict.passed is False                          # integrity 违例阻断
+    assert verdict.gate_ok is True                          # gate 维度本身绿
+    assert verdict.callback_ok is True                      # callback 维度本身绿
+    assert verdict.evidence_intact is False                 # 但 evidence 完整性红
+    assert verdict.integrity_failures                       # 含具体违例标签
+
+
+def test_sdk_canary_fails_on_query_error():
+    """r5 P1-2（评审）：真实 SDK query 抛异常（query_error 非空）→ query 未正常结束 → lifecycle 证据不可信 →
+    sdk_canary FAIL，即便 8 场景 callback 全 proven + real_query_proven=True。"""
+    green = _fake_sdk_canary_all_proven()
+    with_err = CT.SdkHookCanaryEvidence(
+        scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
+        summary=green.summary, real_query_proven=True,
+        sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS,
+        adapter_contract_proven=green.adapter_contract_proven,
+        query_error="query timed out")
+    assert CT._sdk_canary_outcome(with_err).passed is False
+
+
+def test_sdk_canary_fails_on_result_not_received():
+    """r5 P1-2（评审）：SDK query 未正常返回 result（result_received=False）→ 残缺 evidence 不可作通过依据 →
+    sdk_canary FAIL，即便其余维度全绿。杜绝「query 崩但 adapter fixture gate 全对」的假绿。"""
+    green = _fake_sdk_canary_all_proven()
+    with_err = CT.SdkHookCanaryEvidence(
+        scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
+        summary=green.summary, real_query_proven=True,
+        sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS,
+        adapter_contract_proven=green.adapter_contract_proven,
+        result_received=False)
+    assert CT._sdk_canary_outcome(with_err).passed is False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# r5 P1-3（评审）：telemetry 维度成为 gate（_telemetry_outcome 明确通过谓词）
+#   旧实现：_telemetry 仅追加到 quality_gate.evidence_items（归档），run_quality_gate 只验内容写入、
+#   不判 OTLP/degradation 契约 → SDK 降级为 no-op（无 invocation）仍 overall PASS 假绿。
+# ════════════════════════════════════════════════════════════════════════════
+def test_telemetry_outcome_green_passes():
+    """r5 P1-3：SDK 遥测通道在线（callback_invocations 非空 + lifecycle 可观测 + query 正常结束 + 无降级）→ PASS。"""
+    ev = CT.TelemetryEvidence(
+        callback_invocations=({"event": "PostToolUse"}, {"event": "Stop"}),
+        lifecycle_types_seen=("PostToolUse", "Stop"), num_turns=2, query_error=None)
+    assert CT._telemetry_outcome(ev).passed is True
+
+
+def test_telemetry_outcome_fails_on_no_invocations():
+    """r5 P1-3（评审反例）：SDK 降级为 no-op（callback_invocations 空）→ 遥测通道未证在线 → telemetry FAIL。
+    即便 lifecycle_types 非空（adapter fixture 可造 lifecycle 事件，但 SDK 未真实调用 hook）。"""
+    ev = CT.TelemetryEvidence(
+        callback_invocations=(), lifecycle_types_seen=("Stop",), num_turns=1, query_error=None)
+    assert CT._telemetry_outcome(ev).passed is False
+    assert "no_callback_invocations" in CT._telemetry_outcome(ev).detail
+
+
+def test_telemetry_outcome_fails_on_no_lifecycle_types():
+    """r5 P1-3：lifecycle 事件不可观测（lifecycle_types_seen 空）→ telemetry FAIL。"""
+    ev = CT.TelemetryEvidence(
+        callback_invocations=({"event": "PostToolUse"},), lifecycle_types_seen=(), num_turns=1, query_error=None)
+    assert CT._telemetry_outcome(ev).passed is False
+
+
+def test_telemetry_outcome_fails_on_query_interrupted():
+    """r5 P1-3：query 未正常结束（query_error 非空 或 num_turns None）→ 遥测中断 → telemetry FAIL。"""
+    err = CT.TelemetryEvidence(
+        callback_invocations=({"event": "Stop"},), lifecycle_types_seen=("Stop",),
+        num_turns=1, query_error="proxy 5xx")
+    assert CT._telemetry_outcome(err).passed is False
+    no_result = CT.TelemetryEvidence(
+        callback_invocations=({"event": "Stop"},), lifecycle_types_seen=("Stop",),
+        num_turns=None, query_error=None)
+    assert CT._telemetry_outcome(no_result).passed is False
+
+
+def test_telemetry_outcome_fails_on_degradation_marker():
+    """r5 P1-3：显式降级标记（runner 检测到 SDK 降级路径）→ telemetry FAIL。"""
+    ev = CT.TelemetryEvidence(
+        callback_invocations=({"event": "Stop"},), lifecycle_types_seen=("Stop",),
+        num_turns=1, query_error=None, degradation="sdk_no_telemetry_export")
+    assert CT._telemetry_outcome(ev).passed is False
+    assert "degradation" in CT._telemetry_outcome(ev).detail
+
+
+def _green_telemetry():
+    """全绿 fake telemetry evidence（r5 P1-3）：SDK 遥测通道在线——callback_invocations 非空、lifecycle 可观测、
+    query 正常结束（num_turns 非 None、无 query_error）、无降级。测归档/编排逻辑，非 SDK 真实性。"""
+    return CT.TelemetryEvidence(
+        callback_invocations=({"event": "PostToolUse"},),
+        lifecycle_types_seen=("PostToolUse", "Stop"), num_turns=2, query_error=None,
+        summary="[fake green telemetry] 1 invocation, lifecycle observed")
 
 
 def _green_bundle():
@@ -692,7 +920,8 @@ def _green_bundle():
         shadow_parity=lambda: CT.ShadowParityEvidence(
             parity=CT.ShadowParityReport(dispatch_counts={}, journal_counts={}, matched=True),
             dry_run_terminal="published", dry_run_run_id="r"),
-        sdk_canary=lambda: CT.run_sdk_hook_canary(),   # 真实 canary：全场景 gate 符合预期 → pass
+        sdk_canary=lambda: _fake_sdk_canary_all_proven(),   # 全 callback proven fake（测归档逻辑，非 SDK 真实性）
+        telemetry=lambda: _green_telemetry(),   # r5 P1-3：telemetry 维度绿（SDK 遥测通道在线）
         crash_reconciliation=lambda: CT.CrashReconciliationEvidence(
             results=(), boundaries_run=(), all_exactly_once=True, summary="all exactly-once"),
         recovery=lambda: (CT.run_recovery_drill("resume"), CT.run_recovery_drill("fork"),
@@ -704,14 +933,17 @@ def _green_bundle():
     )
 
 
+_EXPECTED_OUTCOME_NAMES = {"shadow_parity", "sdk_canary", "crash_reconciliation", "recovery",
+                           "sandbox", "dispatch_cutover", "quality_gate", "telemetry"}   # r5 P1-3：8 维度
+
+
 def test_run_full_cutover_suite_green_archives_manifest(tmp_path):
     """runner 自行执行各 drill → 全绿 → overall_passed + 归档 manifest digest（archive immutable evidence）。"""
     m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "suite"))
     assert m.overall_passed is True
     assert m.archive_digest is not None               # manifest 已归档为内容寻址 artifact
     names = {o.name for o in m.outcomes}
-    assert names == {"shadow_parity", "sdk_canary", "crash_reconciliation", "recovery",
-                     "sandbox", "dispatch_cutover", "quality_gate"}
+    assert names == _EXPECTED_OUTCOME_NAMES
     assert all(o.passed for o in m.outcomes)
 
 
@@ -720,6 +952,7 @@ def test_run_full_cutover_suite_red_does_not_archive(tmp_path):
     green = _green_bundle()
     bundle = CT.CutoverDrillBundle(
         shadow_parity=green.shadow_parity, sdk_canary=green.sdk_canary,
+        telemetry=green.telemetry,
         crash_reconciliation=green.crash_reconciliation, recovery=green.recovery,
         sandbox=lambda: (CT.SandboxDrillResult("python", "local_worktree", 1, False, True),),
         dispatch_cutover=green.dispatch_cutover, quality_gate=green.quality_gate)
@@ -731,7 +964,7 @@ def test_run_full_cutover_suite_red_does_not_archive(tmp_path):
 
 def test_run_full_cutover_suite_invokes_every_drill(tmp_path):
     """评审 P0-2 核心：runner **调用**每个 drill 执行入口（编排执行），而非接收外部布尔值。
-    用带计数副作用的 callable 证明 7 个 drill 都被真实调用一次。"""
+    用带计数副作用的 callable 证明 8 个 drill 都被真实调用一次。"""
     calls = []
 
     def wrap(name, result):
@@ -743,6 +976,7 @@ def test_run_full_cutover_suite_invokes_every_drill(tmp_path):
     bundle = CT.CutoverDrillBundle(
         shadow_parity=wrap("shadow_parity", green.shadow_parity()),
         sdk_canary=wrap("sdk_canary", green.sdk_canary()),
+        telemetry=wrap("telemetry", green.telemetry()),
         crash_reconciliation=wrap("crash_reconciliation", green.crash_reconciliation()),
         recovery=wrap("recovery", green.recovery()),
         sandbox=wrap("sandbox", green.sandbox()),
@@ -750,9 +984,8 @@ def test_run_full_cutover_suite_invokes_every_drill(tmp_path):
         quality_gate=wrap("quality_gate", green.quality_gate()),
     )
     m = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(tmp_path / "suite"))
-    assert len(calls) == 7                            # 每个 drill 都被真实调用一次
-    assert set(calls) == {"shadow_parity", "sdk_canary", "crash_reconciliation", "recovery",
-                          "sandbox", "dispatch_cutover", "quality_gate"}
+    assert len(calls) == 8                            # 每个 drill 都被真实调用一次
+    assert set(calls) == _EXPECTED_OUTCOME_NAMES
     assert m.overall_passed is True
 
 
@@ -767,12 +1000,13 @@ def test_real_cutover_drills_orchestrates_real_drills(tmp_path):
         dispatch_events=events, dispatch_legacy=None,
         test_counts={"passed": 5, "failed": 0},
         evidence_items=[("test_output", "ok")],
-        artifact_root=str(tmp_path / "q"))
+        artifact_root=str(tmp_path / "q"),
+        sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS,   # r5 P0-2：测试替身（测编排全绿，非 SDK 真实性）
+        telemetry_proven=True)   # r5 P1-3：telemetry 维度测试替身（生产真值见 real_cutover_suite）
     m = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(tmp_path / "q"))
     assert m.overall_passed is True
     assert m.archive_digest is not None
-    assert {o.name for o in m.outcomes} == {"shadow_parity", "sdk_canary", "crash_reconciliation",
-                                            "recovery", "sandbox", "dispatch_cutover", "quality_gate"}
+    assert {o.name for o in m.outcomes} == _EXPECTED_OUTCOME_NAMES
 
 
 def test_run_full_cutover_suite_archive_is_content_addressed(tmp_path):
