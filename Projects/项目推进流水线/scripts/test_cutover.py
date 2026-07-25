@@ -1844,3 +1844,81 @@ def test_verify_argv_sha_distinguishes_dup_message_commits_where_grep_ambiguous(
                                        cwd=str(vault), text=True).strip()
     assert len(grep_out.splitlines()) >= 2, (
         f"grep 同 message 应 ≥2 匹配（证明 r8-2 grep 反查 ambiguous；r9-3 argv 必要）；实际: {grep_out!r}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# r10-B1/B3 regression lock：xfail(strict=True) 已知洞 RED baseline（诚实收敛路线，留 P2 硬化）。
+# B2 必须-修复代码已闭合（见 test_runtime_evidence_commit.py r10-B2 反向测试）；B1（dummy 2xx 假绿）/ B3
+# （合法 VALUE 字段值含凭据 + 嵌套未知字段名）是**残留洞**，本批不做代码硬化，但用 xfail strict 锁定——
+# P2 硬化让测试意外变 GREEN 时 strict 失败，强制移除 xfail（防「悄悄变绿却无人知」的守门弱循环）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "r10-B1 已知洞（留 P2 traceId 回查）：_otlp_export_verified 只验 endpoint 对 POST 返 2xx，dummy / 输入"
+    "校验型 2xx server 即返 True → 假绿。探针不证明真 collector / 真 ingest。"))
+def test_r10_b1_known_hole_dummy_2xx_is_not_real_collector(monkeypatch):
+    """r10-B1 regression lock：dummy 2xx server 让连通性探针假绿（探针分不清真 collector 与 dummy）。
+
+    现有 ``test_otlp_..._true_when_collector_receives_2xx`` 隐式接受「2xx=True」；本测试显式锁定其为已知洞。
+    P2 gold-standard traceId 回查硬化后，dummy 场景应返 False → 本测试 GREEN → xfail(strict) FAILED → 移除标记。
+    """
+    import urllib.request
+
+    class _Dummy2xxResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, *a):
+            return b"{}"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://dummy-2xx-collector.test")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Dummy2xxResp())
+    # 洞：dummy 2xx → _otlp_export_verified 返 True（假绿——不证明真 collector）
+    assert CT._otlp_export_verified() is False, (
+        "若 GREEN：P2 traceId 回查已硬化（dummy 2xx 不再假绿），移除本 xfail")
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "r10-B3 已知洞（留 P2 值维度 scan）：_check_sub_evidence_allowlist 是 key-level allowlist，summary 等"
+    "合法字段名的【值】含凭据则放过。需对 allowlist 字段值也跑 _scan_for_secrets（P2）。"))
+def test_r10_b3_known_hole_credential_in_legal_value_field():
+    """r10-B3 regression lock (a)：合法 VALUE 字段（``summary`` 在 TelemetryEvidence 字段集内）的值含 AKIA
+    凭据 → key-level allowlist 放过（``_walk`` 只查字段名 denylist + 超长，不查值里的凭据模式）。
+
+    publish 层 ``_scan_for_secrets`` 整文件 scan 互补，但模式有限（派生值 / 新格式漏检）→ 残留风险。
+    P2：对 allowlist 字段值跑 _scan_for_secrets → violations 非空 → 本测试 GREEN → xfail strict FAILED。
+    """
+    import json
+    blob = json.dumps({
+        "drill": "telemetry",
+        "evidence": {"summary": "export failed: leaked AKIA" + "C" * 16 + " in legal summary field"},
+    }).encode("utf-8")
+    violations = CT._check_sub_evidence_allowlist(blob)
+    # 洞：summary 字段名合法（在 telemetry allowlist），值含 AKIA 但 key-level 放过 → violations 空
+    assert violations, (
+        "若 GREEN：P2 已对 allowlist 字段值跑 _scan_for_secrets，移除本 xfail")
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "r10-B3 已知洞（留 P2 嵌套覆盖扫描）：_walk 递归 denylist 只拒 _SUB_EVIDENCE_LEAKY_FIELDS（14 已知"
+    "名），新增未知泄漏字段名（如 ai_response）嵌套放过。需 denylist 升覆盖式扫描（P2）。"))
+def test_r10_b3_known_hole_nested_unknown_leaky_field_name():
+    """r10-B3 regression lock (b)：嵌套未知字段名（``ai_response`` 不在 14 leaky 名表）→ 递归 denylist 放过。
+
+    evidence.callback_invocations 是 TelemetryEvidence 合法字段（顶层过）；list 元素 dict 的未知 key
+    ``ai_response`` 不在 14 名表 → ``_walk`` 不拒。P2 嵌套覆盖式扫描 → violations 非空 → GREEN → strict FAILED。
+    """
+    import json
+    blob = json.dumps({
+        "drill": "telemetry",
+        "evidence": {"callback_invocations": [{"ai_response": "leaked nested output"}]},
+    }).encode("utf-8")
+    violations = CT._check_sub_evidence_allowlist(blob)
+    # 洞：ai_response 不在 14 leaky 名表 + 顶层 callback_invocations 合法 → violations 空
+    assert violations, (
+        "若 GREEN：P2 已升嵌套覆盖扫描，移除本 xfail")
