@@ -475,6 +475,20 @@ def _extract_reply(result_msg) -> str:
     return (getattr(result_msg, "result", None) or "")
 
 
+def _strip_leaky_invocation_fields(inv: dict) -> dict:
+    """r9-6（审核员）：剥离 callback invocation 的 leaky 字段（``tool_output`` 等）后返回**副本**。
+
+    evidence 不收工具输入/输出原文（R4 §4 最小充分证据）。``inv`` 暂存 ``tool_output``（:535 截断 200 的 Bash
+    stdout）仅供 ``observed_state.bash_results[].output`` 提取（state 判定 GREEN/STALE；字段名 ``output`` 非
+    leaky，且 :598 在返回前已提取完）。但 ``callback_invocations`` 经 :628 → real_sdk_canary ``all_invocations``
+    → :1158 ``TelemetryEvidence.callback_invocations`` 进 sub-evidence blob 时，``tool_output`` 须剥离——否则
+    cutover ``_check_sub_evidence_allowlist`` r9-6 递归 denylist（``_SUB_EVIDENCE_LEAKY_FIELDS``）拒 → 生产
+    publish fail-closed 永红。剥离在 :628 返回副本时做，:598（在前）用原 ``inv`` 取 ``tool_output`` 不受影响。
+    """
+    import cutover as CT
+    return {k: v for k, v in inv.items() if k not in CT._SUB_EVIDENCE_LEAKY_FIELDS}
+
+
 def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> dict:
     """跑单场景独立 SDK query（r5 P0：runner-owned correlation——独立 hook journal + closure-captured correlation_id）。
 
@@ -625,7 +639,7 @@ def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> 
             "observed_state": observed_state,
             "adapter_gate": None,
         },
-        "callback_invocations": callback_invocations,
+        "callback_invocations": [_strip_leaky_invocation_fields(inv) for inv in callback_invocations],
         "callback_errors": callback_errors,
         "sdk_types": sdk_types,
         "observed_lifecycle_types": {t for t in observed_event_types if t in _SDK_LIFECYCLE_EVENTS},
@@ -917,8 +931,36 @@ def _git_subject_commit() -> str | None:
         return None
 
 
+def _git_env_for_runner() -> dict:
+    """r9-2（审核员）：evidence commit/push 的 git env——``_runner_identity`` 注入 GIT_AUTHOR/COMMITTER，
+    让 verify.py 的 committer==runner_version 绑定可校验。提取自 _commit_evidence（DRY；real_cutover_suite
+    分离 push 也复用）。"""
+    _rn, _rem = _runner_identity()
+    return {**os.environ,
+            "GIT_AUTHOR_NAME": os.environ.get("GIT_AUTHOR_NAME", _rn),
+            "GIT_AUTHOR_EMAIL": os.environ.get("GIT_AUTHOR_EMAIL", _rem),
+            "GIT_COMMITTER_NAME": os.environ.get("GIT_COMMITTER_NAME", _rn),
+            "GIT_COMMITTER_EMAIL": os.environ.get("GIT_COMMITTER_EMAIL", _rem)}
+
+
+def _rollback_evidence_commit(vault: Path, subject_commit: str, evidence_rel: Path) -> None:
+    """r9-2 + r9-5（审核员）：evidence commit 回滚——撤 commit（``reset --soft <subject>``）+ unstage evidence
+    （``reset HEAD -- <rel>``），恢复 index 到 subject 状态。evidence 文件 working tree 保留但 unstaged；用户
+    暂存的其他业务文件（非 evidence 路径）保留。旧 ``reset --soft`` 不动 index → evidence 仍 staged（r9-5 反例：
+    回滚后用户暂存区被 evidence 污染）。best-effort（reset 失败不二次抛；调用方据 return None / raise 标记失败）。"""
+    import subprocess
+    _git_env = _git_env_for_runner()
+    try:
+        subprocess.run(["git", "reset", "--soft", subject_commit], cwd=str(vault),
+                       capture_output=True, text=True, timeout=10, env=_git_env)
+        subprocess.run(["git", "reset", "HEAD", "--", str(evidence_rel)], cwd=str(vault),
+                       capture_output=True, text=True, timeout=10, env=_git_env)
+    except Exception:
+        pass                    # best-effort（调用方已标记失败并 raise/return None）
+
+
 def _commit_evidence(evidence_dir: Path, subject_commit: str,
-                     *, vault_root: Path | None = None) -> str | None:
+                     *, vault_root: Path | None = None, push: bool = True) -> str | None:
     """r6 P1-3（R4 §2.2 + §2.3）：生成独立 evidence_commit——只含 ``docs/evidence/<subject_commit>/`` 路径。
 
     生产：在 vault 仓 ``git add -- <evidence_dir>`` + ``git commit``（基于 subject_commit），返回 evidence_commit
@@ -964,36 +1006,32 @@ def _commit_evidence(evidence_dir: Path, subject_commit: str,
         changed = [ln for ln in diff_out.splitlines() if ln.strip()]
         _bad = [f for f in changed if not f.startswith("docs/evidence/")]
         if _bad:
-            # r7-P0-1（审核员反例）：ancestry 不符 → 回滚 evidence commit（``reset --soft HEAD~1`` 撤销 commit，
-            # HEAD 退回、evidence 文件保留于工作区）。旧实现 ``return None`` 但 commit 已生成 → HEAD 被污染。
-            subprocess.run(["git", "reset", "--soft", "HEAD~1"], cwd=str(_vault),
-                           capture_output=True, text=True, timeout=10, env=_git_env)
+            # r7-P0-1 + r9-5（审核员）：ancestry 不符 → 回滚 evidence commit（撤 commit + unstage evidence，
+            # 恢复 index 到 subject）。r9-5：用 _rollback_evidence_commit（含 ``reset HEAD -- <rel>`` unstage；
+            # 旧 ``reset --soft HEAD~1`` 不动 index → evidence 仍 staged 污染用户暂存区）。
+            _rollback_evidence_commit(_vault, subject_commit, rel)
             _committed = False          # 已显式回滚
             return None
-        # r7-S2（审核员）：evidence commit 须推送才算跨机器发布（本地 commit 不算——他机 fetch 不到）。
-        # push 失败（无 upstream/远程/网络/non-fast-forward 被拒）→ fail-closed 回滚 commit + None
-        # （杜绝「本地有 commit 假装已发布」）。push 依赖 upstream（``git push``，需 ``git push -u origin
-        # <branch>`` 预建立）。生产 vault main 干净可 push；CI 无远程环境 → 诚实 None（overall 红）。
-        _push = subprocess.run(["git", "push"], cwd=str(_vault), capture_output=True,
-                               text=True, timeout=30, env=_git_env)
-        if _push.returncode != 0:
-            subprocess.run(["git", "reset", "--soft", "HEAD~1"], cwd=str(_vault),
-                           capture_output=True, text=True, timeout=10, env=_git_env)
-            _committed = False          # 已显式回滚
-            return None
+        # r7-S2 + r9-2（审核员）：evidence commit 须推送才算跨机器发布。r9-2 把 commit/push 分离——``push=False``
+        # 只本地 commit（real_cutover_suite 跑 verify.py 绿后才调 push，杜绝 publish 未经独立自检的 evidence）。
+        # push=True（默认，向后兼容现有测试）：commit 后即 push，失败 → 回滚 commit + None（杜绝「本地 commit
+        # 假装已发布」）。push 依赖 upstream；生产 vault main 干净可 push；CI 无远程 → 诚实 None（overall 红）。
+        if push:
+            _push = subprocess.run(["git", "push"], cwd=str(_vault), capture_output=True,
+                                   text=True, timeout=30, env=_git_env)
+            if _push.returncode != 0:
+                # r9-5：push 失败回滚用 _rollback_evidence_commit（撤 commit + unstage evidence）
+                _rollback_evidence_commit(_vault, subject_commit, rel)
+                _committed = False      # 已显式回滚
+                return None
         return evidence_sha or None
     except Exception:
-        # r8-3（审核员）：commit 后任一步骤异常（rev-parse/diff/push timeout 或抛；push timeout 是 CI 最常见）
-        # → 旧 except 仅 ``return None`` 不 reset → evidence commit 残留污染 HEAD。兜底：若 commit 已落地
-        # （_committed=True，未走显式 reset）则 ``reset --soft <subject_commit>`` 回滚到确切 subject 锚点
-        # （比 HEAD~1 更安全——不依赖 HEAD 当前位置，防多退；commit 后 HEAD 在 evidence commit，HEAD~1=subject
-        # 等价，但锚点更显式稳定）。reset 自身失败不二次抛（best-effort；return None 仍标记失败）。
+        # r8-3 + r9-5（审核员）：commit 后任一步骤异常（rev-parse/diff/push timeout 或抛；push timeout 是 CI
+        # 最常见）→ 兜底回滚 evidence commit（撤 commit + unstage evidence，恢复 index 到 subject）。r9-5：用
+        # _rollback_evidence_commit（含 ``reset HEAD -- <rel>`` unstage；旧 ``reset --soft subject`` 不动 index →
+        # evidence 仍 staged 污染用户暂存区）。best-effort（helper 内已吞 reset 异常；return None 仍标记失败）。
         if _committed:
-            try:
-                subprocess.run(["git", "reset", "--soft", subject_commit], cwd=str(_vault),
-                               capture_output=True, text=True, timeout=10, env=_git_env)
-            except Exception:
-                pass                    # 兜底 reset 失败不二次抛（已尽力；return None 标记失败）
+            _rollback_evidence_commit(_vault, subject_commit, rel)
         return None
 
 
@@ -1179,11 +1217,28 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
             _br = _vault_root / "docs" / "evidence" / _subject
             bundle_path, bundle_digest = CT.publish_evidence_bundle(
                 artifact_root=str(artifact_root), manifest=manifest, bundle_root=_br)
-            # r6 P1-3（R4 §2.2 + §2.3）：独立 evidence_commit（只含 docs/evidence/<subject>/ 路径）+ ancestry 自检。
-            # 失败（git 不可用/ancestry 含非 evidence 路径）→ fail-closed 阻断 overall_passed。
-            evidence_commit = _commit_evidence(_br, _subject)
+            # r6 P1-3 + r9-2（审核员 P0）：独立 evidence_commit（只含 docs/evidence/<subject>/ 路径）+ ancestry 自检。
+            # r9-2：commit/push 分离——``push=False`` 只本地 commit，随后实跑 verify.py（exit 0 才 push），
+            # 杜绝「publish 未经独立自检即上线的 evidence」（验证器 ancestry/runner binding/digest 须绿才发布）。
+            evidence_commit = _commit_evidence(_br, _subject, push=False)
             if not evidence_commit:
                 raise RuntimeError("evidence_commit 创建失败（git add/commit/ancestry 自检）")
+            # r9-2（审核员 P0）：push 前实跑 bundle verify.py（自检：manifest 字段 + subject 存在 + evidence
+            # ancestry + runner binding + bundle digest）。verify.py 非 0 → fail-closed：回滚 commit + 不 push +
+            # overall 红（绝不让未过独立自检的 evidence 上线）。verify.py 用 git log/diff，须在 vault 仓上下文跑。
+            import sys
+            _ev_rel = _br.resolve().relative_to(_vault_root.resolve())
+            _v = subprocess.run([sys.executable, str(_br / "verify.py"), evidence_commit], cwd=str(_vault_root),
+                                capture_output=True, text=True, timeout=60)
+            if _v.returncode != 0:
+                _rollback_evidence_commit(_vault_root, _subject, _ev_rel)
+                raise RuntimeError(f"verify.py fail-closed（exit={_v.returncode}）: {_v.stderr[:300]!r}")
+            # verify 绿 → push（跨机器发布）。push 失败 → 回滚 commit（杜绝本地 commit 假装已发布）。
+            _push = subprocess.run(["git", "push"], cwd=str(_vault_root), capture_output=True,
+                                   text=True, timeout=30, env=_git_env_for_runner())
+            if _push.returncode != 0:
+                _rollback_evidence_commit(_vault_root, _subject, _ev_rel)
+                raise RuntimeError(f"evidence push 失败: {_push.stderr[:300]!r}")
             bundle_publish_ok = True
         except Exception as exc:
             bundle_path = f"publish_failed: {exc!r}"
@@ -1382,18 +1437,15 @@ def real_session_lifecycle(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
 
 
 def _telemetry_connected() -> bool:
-    """r7-S5（审核员）：真实 OTLP/degradation telemetry suite 是否接入。
+    """r7-S5 → r9-1（审核员 P0）：真实 OTLP/degradation telemetry suite 是否接入。
 
-    runner 层诚实判定——当前未接真实 OTLP exporter / degradation suite（P1-6 known limitation：headless 无
-    OTEL endpoint，telemetry 仅 SDK callback 维度可验）。故生产（无 ``OTEL_*`` env）返回 False。7.6 谓词据此
-    强制：未接入时 7.6 success 必须显式声明 telemetry open（进 open_items），不可返回假装 telemetry 就绪的
-    无条件 success（堵假绿）。接真实 OTLP exporter 后设 ``OTEL_EXPORTER_OTLP_ENDPOINT`` → True，telemetry 升
-    为真接入维度（届时可移出 open_items）。
-
-    判定代理：``OTEL_EXPORTER_OTLP_ENDPOINT`` / ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` 存在 ⇔ 已配 exporter。
+    r9-1 转调 ``CT._otlp_export_verified()``（单一真理源）——实际尝试 OTLP/HTTP export test span + 验 collector
+    接收（2xx），非 r8-1 环境变量非空（旧判可伪造 ``OTEL_EXPORTER_OTLP_ENDPOINT=x`` → 假绿）。生产无真实
+    collector → export 失败 → False → 7.6 谓词强制 telemetry open（诚实红，不可返回假装就绪的无条件 success）。
+    接真实 collector + export 成功 → True → telemetry 升真接入（移出 open_items）。
     """
-    return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-                or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+    import cutover as CT   # 函数内延迟 import（避循环，同 real_cutover_suite 等处模式）
+    return CT._otlp_export_verified()
 
 
 def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:

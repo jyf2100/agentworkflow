@@ -1276,16 +1276,48 @@ def _telemetry_outcome(ev: "TelemetryEvidence") -> DrillOutcome:
     return DrillOutcome("telemetry", passed, diag)
 
 
-def _otlp_exporter_configured() -> bool:
-    """r8-1（审核员）：真实 OTLP exporter 是否配置（与 runtime_evidence._telemetry_connected 同语义）。
+def _otlp_export_verified() -> bool:
+    """r9-1（审核员 P0）：真实 OTLP export 验证（废除 r8-1 环境变量非空判定——可伪造）。
 
-    open_items 据此决定 telemetry 是否诚实 open：未配 OTEL endpoint → telemetry 是 known limitation
-    （真实 OTLP/degradation suite 未接入）→ 进 open_items（passed=False，OTLP 维度红）；配置后 → 不进。
-    消除旧 cutover 无条件塞 telemetry 进 open_items 与 runtime 7.6 connected 断言的矛盾（接入后不再被矛盾拒绝）。
+    r8-1 旧判 ``bool(OTEL_EXPORTER_OTLP_ENDPOINT or ..._TRACES_ENDPOINT)`` → 设 ``=x`` 即 True →
+    telemetry_connected=True → 7.6 假绿（审核员 r9 P0：未配置红已修，但配置后「真实执行并绿」仍可伪造）。
+    r9-1 改为**实际尝试 OTLP/HTTP export** 一个 minimal valid span 到 endpoint + 验证 collector 接收（2xx）：
+
+      - 无 endpoint → False（未接入）。
+      - endpoint 不可达（伪造 ``=x`` / 无 collector / 连接拒绝 / timeout）→ False（**不可伪造**——环境变量
+        非空不算接入）。
+      - collector 可达 + 接收 valid span（2xx）→ True（真实接入）。
+
+    生产无真实 OTLP collector → 永远 False → telemetry 诚实红（open_items 标 telemetry open，同 P1-6）。
+    接真实 collector（OTLP/HTTP 4318）+ 有效 endpoint → export 成功 → True → telemetry 升真接入。
+
+    open_items + runtime 7.6 connected 共用本函数（单一真理源；runtime._telemetry_connected 转调）。
     """
+    import json as _json
     import os
-    return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-                or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+    import time
+    import urllib.error
+    import urllib.request
+    _ep = (os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+           or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
+    if not _ep:
+        return False
+    # OTLP/HTTP traces：TRACES_ENDPOINT 是完整 URL（含 /v1/traces）；ENDPOINT 是 base（需加 /v1/traces）。
+    _url = _ep if _ep.rstrip("/").endswith("/v1/traces") else _ep.rstrip("/") + "/v1/traces"
+    # minimal valid OTLP/JSON span（traceId 16B / spanId 8B hex + 纳秒时间戳）——验 collector 接收 valid span。
+    _tid, _sid = os.urandom(16).hex(), os.urandom(8).hex()
+    _ns = int(time.time() * 1_000_000_000)
+    _payload = _json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": [{
+        "traceId": _tid, "spanId": _sid, "name": "pa.cutover.telemetry.probe",
+        "kind": 1, "startTimeUnixNano": str(_ns), "endTimeUnixNano": str(_ns + 1_000_000)}]}]}]},
+        ensure_ascii=False).encode("utf-8")
+    try:
+        _req = urllib.request.Request(_url, data=_payload, method="POST",
+                                      headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(_req, timeout=3) as _r:
+            return 200 <= _r.status < 300
+    except Exception:
+        return False                 # 不可达 / 非 2xx / timeout → False（不可伪造；生产无 collector 走此）
 
 
 @dataclass(frozen=True)
@@ -1522,37 +1554,40 @@ def main() -> int:
         if _rp.returncode != 0:
             failures.append(f"subject_commit {_subj} 不存在于 git object store（rev-parse 失败）")
         else:
-            # r8-2（审核员）：evidence_commit ancestry + runner binding。evidence_commit 不在 manifest（时序：
-            # publish 在 commit 前），用 commit message 模板反查 git log --all --grep（与 _commit_evidence 的
-            # commit message 同步：``evidence: cutover suite for subject_commit=<sha[:12]>``）。期望恰好 1 个匹配。
-            # (1) ancestry subject..evidence 只含 docs/evidence/（防 evidence_commit 夹带业务代码被误当 subject 重新执行）；
-            # (2) committer name == manifest.runner_version（runner 绑定——谁产的 evidence，杜绝旧固定 runner 名漂移）。
-            _msg = f"evidence: cutover suite for subject_commit={_subj[:12]}"
-            _gl = subprocess.run(["git", "log", "--all", "--format=%H", f"--grep=^{_msg}$"],
-                                 capture_output=True, text=True)
-            if _gl.returncode != 0:
-                failures.append(f"git log --grep 反查 evidence_commit 失败（returncode={_gl.returncode}）")
+            # r9-3（审核员）：evidence_commit 从 argv[1] 取（real_cutover_suite 传 exact SHA），fallback HEAD
+            # （跨机器 checkout evidence commit 后跑 verify.py）。**消除 r8-2 的 git log --grep 反查**——grep 有
+            # 多匹配（同 message 多 evidence commit）+ commit message 漂移风险。verify.py 在 evidence commit 上下文
+            # 跑（real_cutover_suite cwd=vault + 传 SHA；跨机器 checkout evidence 后跑），HEAD 即 evidence commit。
+            import sys as _sys
+            _ev = _sys.argv[1].strip() if len(_sys.argv) > 1 and _sys.argv[1].strip() else None
+            if not _ev:
+                _hp = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+                _ev = _hp.stdout.strip() if _hp.returncode == 0 else ""
+            if not _ev:
+                failures.append("无法取 evidence_commit（argv 未传 + git rev-parse HEAD 失败；verify.py 须在 vault git 仓跑）")
             else:
-                _evs = [s for s in _gl.stdout.split() if s.strip()]
-                if len(_evs) == 0:
-                    failures.append(f"未找到 evidence_commit（git log --grep '{_msg}' 无匹配；evidence 未提交或 message 漂移）")
-                elif len(_evs) > 1:
-                    failures.append(f"evidence_commit 不唯一（{len(_evs)} 个匹配 '{_msg}'；防歧义）")
+                # r9-4（审核员）：真祖先断言——subject 必须是 evidence 的祖先（``merge-base --is-ancestor``）。
+                # r8-2 旧版仅 ``git diff subject..evidence``（树差异，非祖先——subject 与 evidence 平行分支也过，
+                # 假绿）。r9-4 加 --is-ancestor：subject 非 evidence 祖先 → fail（防 evidence 基于 unrelated commit）。
+                _mb = subprocess.run(["git", "merge-base", "--is-ancestor", _subj, _ev],
+                                     capture_output=True, text=True)
+                if _mb.returncode != 0:
+                    failures.append(f"subject_commit {_subj[:12]} 非 evidence_commit {_ev[:12]} 祖先（merge-base --is-ancestor 失败；evidence 须基于 subject）")
+                # ancestry 路径 allowlist：subject..evidence 只含 docs/evidence/（防夹带业务代码被误当 subject 重新执行）
+                _anc = subprocess.run(["git", "diff", "--name-only", f"{_subj}..{_ev}"],
+                                      capture_output=True, text=True)
+                if _anc.returncode != 0:
+                    failures.append(f"evidence_commit ancestry diff 失败（{_subj}..{_ev}）")
                 else:
-                    _ev = _evs[0]
-                    _anc = subprocess.run(["git", "diff", "--name-only", f"{_subj}..{_ev}"],
-                                          capture_output=True, text=True)
-                    if _anc.returncode != 0:
-                        failures.append(f"evidence_commit ancestry diff 失败（{_subj}..{_ev}）")
-                    else:
-                        _bad = [f for f in _anc.stdout.splitlines() if f.strip() and not f.startswith("docs/evidence/")]
-                        if _bad:
-                            failures.append(f"evidence_commit ancestry 含非 docs/evidence/ 路径 {_bad}（防夹带业务代码）")
-                    _cn = subprocess.run(["git", "log", "-1", "--format=%cn", _ev],
-                                         capture_output=True, text=True)
-                    _runner = manifest.get("runner_version", "")
-                    if _cn.returncode != 0 or (_cn.stdout.strip() != _runner):
-                        failures.append(f"evidence_commit committer '{_cn.stdout.strip()}' != runner_version '{_runner}'（runner 绑定失败）")
+                    _bad = [f for f in _anc.stdout.splitlines() if f.strip() and not f.startswith("docs/evidence/")]
+                    if _bad:
+                        failures.append(f"evidence_commit ancestry 含非 docs/evidence/ 路径 {_bad}（防夹带业务代码）")
+                # runner binding：committer name == manifest.runner_version（谁产的 evidence，杜绝旧固定 runner 名漂移）
+                _cn = subprocess.run(["git", "log", "-1", "--format=%cn", _ev],
+                                     capture_output=True, text=True)
+                _runner = manifest.get("runner_version", "")
+                if _cn.returncode != 0 or (_cn.stdout.strip() != _runner):
+                    failures.append(f"evidence_commit committer '{_cn.stdout.strip()}' != runner_version '{_runner}'（runner 绑定失败）")
     sub = list(manifest.get("sub_evidence_refs", []))
     for d in sub:
         p = ROOT / "artifacts" / d
@@ -1625,6 +1660,15 @@ def _scan_for_secrets(text: str) -> list[str]:
 # allowlist 字段源自各 drill 的 dataclass（``fields()``），无编造，schema 漂移自动跟随（dataclass 加字段 →
 # allowlist 自动含）。secret scan（``_scan_for_secrets``，publish 层）查凭据模式，allowlist 查字段类型，互补。
 _SUB_EVIDENCE_MAX_TEXT_LEN = 1000   # 单字符串值上限（防完整 prompt/output 原文；drill 产出已截断 500/300）
+# r9-6（审核员）：递归泄漏字段 denylist——raw_prompt/tool_output/prompt/model_output 等输入/输出原文字段，
+# 无论嵌套多深一律拒（callback_invocations[].tool_output / per_scenario[].prompt/model_output 泄漏反例）。
+# r8-4 顶层 allowlist 不查嵌套 dict/list 内字段 → 审核员反例：telemetry.callback_invocations[].raw_prompt/
+# tool_output + sdk_canary.per_scenario[].prompt/model_output 泄漏。r9-6 递归 denylist 与 r8-4 allowlist 互补。
+_SUB_EVIDENCE_LEAKY_FIELDS: frozenset[str] = frozenset({
+    "raw_prompt", "tool_output", "tool_input", "tool_result",
+    "prompt", "model_output", "user_input", "user_message",
+    "stdin", "stdout", "stderr", "response_body", "request_body",
+})
 
 
 def _dc_field_names(cls: type) -> frozenset[str]:
@@ -1662,7 +1706,10 @@ def _check_sub_evidence_allowlist(blob: bytes) -> list[str]:
     try:
         obj = json.loads(blob.decode("utf-8", errors="replace"))
     except Exception:
-        return []
+        # r9-6（审核员）：非 JSON blob → fail-closed（旧版跳过返回 [] = 视为干净 → 假绿）。
+        # sub-evidence 经 ``_archive_sub_evidence`` 总是 ``json.dumps`` 序列化（:1360），非 JSON = 损坏/伪造，
+        # 绝不当二进制 artifact 干净放过。
+        return ["sub-evidence 非 JSON（须 json.dumps 序列化；非 JSON = 损坏/伪造 → fail-closed）"]
     if not isinstance(obj, dict):
         return ["sub-evidence 顶层非 dict（期望 {drill, evidence}）"]
     violations: list[str] = []
@@ -1690,9 +1737,16 @@ def _check_sub_evidence_allowlist(blob: bytes) -> list[str]:
                 if _bad_it:
                     violations.append(f"drill={_drill} evidence[{i}] 未知字段 {_bad_it}（list 元素字段须在 allowlist）")
     # (4) 递归文本长度检查（保留 r7-S3，防完整 prompt/output 原文）
+    #     + r9-6（审核员）：递归泄漏字段 denylist。r8-4 (3) 只查 evidence 顶层字段，嵌套 dict/list 元素
+    #       （callback_invocations[].tool_output / per_scenario[].prompt/model_output）不查 → 审核员反例：
+    #       顶层 allowlist 过但嵌套仍泄漏输入/输出原文。r9-6 在 _walk 递归中补 denylist，与 r8-4 顶层
+    #       allowlist 互补——顶层结构合法 + 嵌套无任何 leaky 字段。
     def _walk(o, path: str = "") -> None:
         if isinstance(o, dict):
             for k, v in o.items():
+                if k in _SUB_EVIDENCE_LEAKY_FIELDS:
+                    violations.append(
+                        f"泄漏字段 {path + '.' + k if path else k}（输入/输出原文字段，禁入 sub-evidence——r9-6 递归 denylist）")
                 _walk(v, f"{path}.{k}" if path else k)
         elif isinstance(o, list):
             for i, x in enumerate(o):
@@ -1821,13 +1875,14 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
     evidence_ok, evidence_reason = _verify_sub_evidence_complete(outcomes, artifact_root)
     _telemetry_o = next((o for o in outcomes if o.name == "telemetry"), None)
     _open_items: tuple[dict, ...] = ()
-    # r8-1（审核员）：open_items 基于 OTLP 接入（connected），非无条件塞。未配 OTEL endpoint → telemetry 是
-    # known limitation（真实 OTLP/degradation suite 未接入）→ 诚实 open（passed=False，OTLP 维度红；与 S4
-    # read-back step7 白名单 + runtime 7.6 connected 断言一致）；配置后 → 不 open（已接入）。消除旧「无条件塞
-    # telemetry」与 runtime connected 断言的矛盾（接入后不再被矛盾拒绝）。
-    if _telemetry_o is not None and not _otlp_exporter_configured():
+    # r8-1 → r9-1（审核员 P0）：open_items 基于**真实 OTLP export 验证**（``_otlp_export_verified`` 实际 export
+    # test span + 验 collector 接收），非 r8-1 环境变量非空（旧判可伪造 ``=x`` → telemetry_connected=True → 假绿）。
+    # 未接真实 collector（生产常态）→ export 失败 → telemetry 诚实 open（passed=False，OTLP 维度红；与 S4 read-back
+    # step7 白名单 + runtime 7.6 connected 断言一致）；接真实 collector + export 成功 → 不 open（已接入）。
+    if _telemetry_o is not None and not _otlp_export_verified():
         _open_items = ({"item": "telemetry", "passed": False,
-                        "limitation": "真实 OTLP/degradation suite 未接入（OTEL_EXPORTER_OTLP_ENDPOINT 未配）；仅 SDK callback 维度可验"},)
+                        "limitation": "真实 OTLP/degradation suite 未接入（_otlp_export_verified 实际 export 失败："
+                                      "无 OTEL endpoint 或 collector 不可达）；仅 SDK callback 维度可验"},)
     manifest = CutoverManifest(outcomes=outcomes,
                                overall_passed=(drill_ok and evidence_ok),
                                sub_evidence_refs=sub_refs,
