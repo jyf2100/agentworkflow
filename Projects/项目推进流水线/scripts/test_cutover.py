@@ -1142,28 +1142,124 @@ def test_read_back_manifest_rejects_overall_outcomes_mismatch(tmp_path):
     assert ok is False and "[7]" in reason
 
 
-def test_publish_evidence_bundle_cross_machine_verify(tmp_path):
-    """r5 P1-4（评审④）：cross-machine immutable bundle——verify.py exit 0（完整）；篡改 artifact → exit 1；
-    两次发布同 manifest → bundle_digest 一致（跨机器可复核锚点，不依赖本机路径）。
-
-    审查者：「artifact root 仍为本机路径，没有 immutable cross-machine bundle」。"""
+def test_read_back_manifest_rejects_non_allowlist_open_item(tmp_path):
+    """r7-S4（审核员反例精髓）：open_items 塞进**任意**红色 outcome（如 quality_gate 真 red）即从 overall
+    ``all()`` 偷排 → overall 假绿。旧 step 7 从 ``open_items`` 无白名单取 red 名排除 → quality_gate 被
+    偷排 → ``business_outcomes`` 空 → ``all([])``=True → overall(True)==True 过（假绿）。r7-S4：open_items
+    白名单（仅 telemetry 允许 open）→ 非白名单 red 项进 open_items → read-back [7] 拒。"""
     root = tmp_path / "suite"
-    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root))
+    digest = _store_fake_manifest(root, {
+        "schema_version": "cutover-manifest/v1", "subject_commit": "abc123",
+        "runner_version": "v1", "executed_at": "2026-07-25",
+        "overall_passed": True,
+        "outcomes": [{"name": "quality_gate", "passed": False, "detail": "x",
+                      "evidence_digests": []}],
+        "open_items": [{"item": "quality_gate", "passed": False,
+                        "limitation": "偷排假绿"}],
+        "sub_evidence_refs": [], "evidence_integrity": "ok", "digest_algorithm": "sha256",
+    })
+    ok, reason = CT._read_back_manifest(str(root), digest)
+    assert ok is False and "[7]" in reason and "quality_gate" in reason, (
+        "非白名单 red 项进 open_items 未被拒——S4 open_items 白名单未生效（任意红色 outcome 可偷排致 overall 假绿）")
+
+
+def test_read_back_manifest_accepts_telemetry_open_item(tmp_path):
+    """r7-S4（白名单正向）：telemetry 是唯一允许的 open 项（真实 OTLP/degradation suite 未接入，同 P1-6）。
+    telemetry red + 其余 outcome 绿 + overall_passed=True + open_items 含 telemetry → read-back [7] 过
+    （telemetry 从 all() 合法排除，非假绿）。确认 S4 白名单收紧不误伤合法 telemetry-open 语义。"""
+    root = tmp_path / "suite"
+    digest = _store_fake_manifest(root, {
+        "schema_version": "cutover-manifest/v1", "subject_commit": "abc123",
+        "runner_version": "v1", "executed_at": "2026-07-25",
+        "overall_passed": True,
+        "outcomes": [
+            {"name": "shadow_parity", "passed": True, "detail": "x", "evidence_digests": []},
+            {"name": "telemetry", "passed": False, "detail": "red", "evidence_digests": []},
+        ],
+        "open_items": [{"item": "telemetry", "passed": False,
+                        "limitation": "真实 OTLP/degradation suite 未接入"}],
+        "sub_evidence_refs": [], "evidence_integrity": "ok", "digest_algorithm": "sha256",
+    })
+    ok, reason = CT._read_back_manifest(str(root), digest)
+    assert ok is True, f"telemetry 合法 open 项被误拒——S4 白名单过紧误伤 P1-6 语义: {reason}"
+
+
+def test_publish_evidence_bundle_cross_machine_verify(tmp_path):
+    """r5 P1-4（评审④）+ r7-S2：cross-machine immutable bundle——verify.py exit 0（完整 + subject 存在）；
+    篡改 artifact → exit 1；两次发布同 manifest → bundle_digest 一致（跨机器可复核锚点）。
+
+    r7-S2（审核员）：verify.py 校验 subject_commit 真实存在于 git（rev-parse）→ bundle 须在 git 仓内 +
+    manifest 声明真 subject。审查者原反例：「artifact root 仍为本机路径，没有 immutable cross-machine bundle」。"""
+    # r7-S2：verify.py 在 vault 仓上下文跑（git rev-parse 校验 subject 存在）
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(vault), check=True)
+    (vault / "README.md").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
+    subject = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root), subject_commit=subject)
     assert m.overall_passed is True
-    b1 = tmp_path / "bundle1"
+    b1 = vault / "docs" / "evidence" / subject      # bundle 落 git 仓内（verify.py 在仓上下文跑）
     _, digest1 = CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
-    # verify.py 自检通过（bundle 完整可独立复核）
-    r = subprocess.run([sys.executable, str(b1 / "verify.py")], capture_output=True, text=True)
-    assert r.returncode == 0, f"verify.py 应 exit 0（完整）: {r.stderr}"
+    # verify.py 自检通过（bundle 完整 + subject_commit 真实存在于 git）
+    r = subprocess.run([sys.executable, str(b1 / "verify.py")], cwd=str(vault), capture_output=True, text=True)
+    assert r.returncode == 0, f"verify.py 应 exit 0（完整 + subject 存在）: {r.stderr}"
     # 篡改一个子证据 → verify.py exit 非 0（检测篡改）
     first_art = next((b1 / "artifacts").iterdir())
     first_art.write_text("TAMPERED", encoding="utf-8")
-    r2 = subprocess.run([sys.executable, str(b1 / "verify.py")], capture_output=True, text=True)
+    r2 = subprocess.run([sys.executable, str(b1 / "verify.py")], cwd=str(vault), capture_output=True, text=True)
     assert r2.returncode != 0, "篡改后 verify.py 应 exit 非 0"
     # 两次发布同 manifest → bundle_digest 一致（跨机器一致，passing 可复核锚点）
     b2 = tmp_path / "bundle2"
     _, digest2 = CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b2)
     assert digest1 == digest2
+
+
+def test_verify_rejects_nonexistent_subject_commit(tmp_path):
+    """r7-S2（审核员反例）：verify.py 对不存在的 subject commit 须 exit 非 0。旧版只校验字段存在 →
+    manifest 声明假 sha 仍 exit 0（假绿）。r7-S2：verify.py 加 ``git rev-parse --verify <subject>^{commit}``。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(vault), check=True)
+    (vault / "README.md").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
+    root = tmp_path / "suite"
+    _fake = "0" * 40    # manifest 声明一个**不存在**的 subject（假 sha；vault 仓无此 object）
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root), subject_commit=_fake)
+    b1 = vault / "docs" / "evidence" / _fake
+    CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
+    r = subprocess.run([sys.executable, str(b1 / "verify.py")], cwd=str(vault), capture_output=True, text=True)
+    assert r.returncode != 0, "假 subject_commit 应使 verify.py exit 非 0（旧版字段存在校验假绿）"
+    assert "subject_commit" in r.stderr or "rev-parse" in r.stderr, f"stderr 应指出 subject 问题: {r.stderr}"
+
+
+def test_check_sub_evidence_allowlist_rejects_input_fields_and_long_text():
+    """r7-S3（审核员）：_check_sub_evidence_allowlist 检测禁止输入字段（prompt/tool_input）+ 超长文本。
+    P1-4 manifest allowlist 只覆盖 manifest 顶层；S3 扩展到 sub-evidence——任意 prompt/tool input/超长
+    output 不进 bundle（R4 §4 最小充分证据）。secret scan 查凭据，allowlist 查字段类型+长度，互补。"""
+    import json as _json
+    blob = _json.dumps({"drill": "x", "evidence": {
+        "prompt": "do something", "tool_input": "raw", "ok": True,
+        "long": "a" * 1500}}).encode("utf-8")
+    v = CT._check_sub_evidence_allowlist(blob)
+    assert any("prompt" in x for x in v), "应检出禁止字段 prompt"
+    assert any("tool_input" in x for x in v), "应检出禁止字段 tool_input"
+    assert any("超长" in x for x in v), "应检出超长文本"
+
+
+def test_check_sub_evidence_allowlist_accepts_minimal_evidence():
+    """r7-S3：结构化判定字段（exit/stdout/stderr/passed）+ 短文本 → 合规（空违规，不误伤 drill 产出）。"""
+    import json as _json
+    blob = _json.dumps({"drill": "x", "evidence": {
+        "exit": 0, "stdout": "GREEN", "stderr": "warn", "passed": True}}).encode("utf-8")
+    assert CT._check_sub_evidence_allowlist(blob) == []
 
 
 # ---- r6 P1-4：bundle publication allowlist + secret scan（评审 R4 §4：凭据不得跨机器泄漏） ----
