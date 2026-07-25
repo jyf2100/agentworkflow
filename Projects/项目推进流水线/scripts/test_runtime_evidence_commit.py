@@ -418,3 +418,85 @@ def test_commit_evidence_rejects_path_traversal_ref_fail_closed(tmp_path):
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault),
                                    text=True).strip()
     assert head == subject, "traversal ref 须 fail-closed 不 commit（HEAD 不应前进）"
+
+
+def test_derive_evidence_whitelist_rejects_single_dot_ref(tmp_path):
+    """r10-B2-traversal-v2（审计 DECISIVE）：单点 ref ``"."`` 须拒——与 ``".."`` 同根因（目录展开）。
+
+    审计实测：旧字符集 ``[A-Za-z0-9._:-]+`` 含 ``.``，``_d="."`` 通过 fullmatch（``"."`` 在字符类）+
+    ``".." in "."`` = False + 非空 → 白名单含 ``"artifacts/."`` → ``git add -- .../artifacts/.`` 把 ``.``
+    解析为目录 → 递归 stage 整个 ``artifacts/`` 含 stray → ancestry 放行 → push 泄漏。修复：字符集去 ``.``
+    （``[A-Za-z0-9_:-]+``；生产 digest ``sha256:<hex>`` 不含 ``.``，不误杀）。
+    """
+    ev = tmp_path / "ev"
+    ev.mkdir()
+    (ev / "manifest.json").write_text('{"sub_evidence_refs": ["."]}', encoding="utf-8")
+    (ev / "artifacts").mkdir()
+    (ev / "artifacts" / "stray.pem").write_text("PEM", encoding="utf-8")
+    assert RE._derive_evidence_whitelist(ev) == [], (
+        "r10-B2-traversal-v2 回归：单点 ref '.' 须拒（artifacts/. 递归 stage 整目录）")
+
+
+def test_commit_evidence_rejects_single_dot_ref(tmp_path):
+    """r10-B2-traversal-v2 端到端（审计 DECISIVE）：``sub_evidence_refs: ["."]`` + ``artifacts/stray.pem``
+    含 PEM 凭据 → ``_commit_evidence`` 须 fail-closed ``None``（``artifacts/.`` 不进白名单）。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    (ev / "manifest.json").write_text('{"sub_evidence_refs": ["."]}', encoding="utf-8")
+    (ev / "artifacts").mkdir()
+    (ev / "artifacts" / "stray.pem").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nLEAKED\n", encoding="utf-8")
+    sha = RE._commit_evidence(ev, subject, vault_root=vault, push=False)
+    assert sha is None, (
+        "r10-B2-traversal-v2 回归：单点 ref '.' 让 artifacts/. 递归 stage stray.pem 进 commit")
+
+
+def test_derive_evidence_whitelist_rejects_directory_entry(tmp_path):
+    """r10-B2-traversal-v2（红队 DECISIVE）：白名单条目在盘上是**目录**时须拒（``.is_file`` 非 ``.exists``）。
+
+    红队实测：旧 ``(evidence_dir/_c).exists()`` 对目录返 True。固定白名单条目（``bundle.sha256``）或
+    ``artifacts/<ref>`` 被 TOCTOU 换成目录（CLAUDE.md 明言并发 claude 会话是预期威胁）→
+    ``git add -- <dir>`` 递归 stage 目录内全部文件（含 PEM 等 Layer 3 盲区凭据）→ ancestry 放行 → push 泄漏。
+    修复：``.exists()`` → ``.is_file()``（目录不进白名单）。
+    """
+    ev = tmp_path / "ev"
+    ev.mkdir()
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    # bundle.sha256 被 TOCTOU 换成目录（含 stray PEM，Layer 3 盲区）
+    (ev / "bundle.sha256").mkdir()
+    (ev / "bundle.sha256" / "leak.pem").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\n", encoding="utf-8")
+    wl = RE._derive_evidence_whitelist(ev)
+    assert wl == ["manifest.json"], (
+        "r10-B2-traversal-v2 回归：目录白名单条目 bundle.sha256/ 须 .is_file() 拒（git add <dir> 递归）\n"
+        f"实际白名单：{wl}")
+
+
+def test_commit_evidence_rejects_directory_whitelist_entry(tmp_path):
+    """r10-B2-traversal-v2 端到端（红队 DECISIVE TOCTOU）：``bundle.sha256`` 被 TOCTOU 换成目录含 PEM
+    盲区凭据 → ``_commit_evidence`` commit 不得含目录内 stray（``.is_file`` 拒目录，只 commit manifest.json）。
+
+    红队 TOCTOU 双交换：commit 前 bundle.sha256 文件→目录（含 PEM），verify.py 前目录→文件，verify.py 读
+    working tree 通过 exit 0，而 commit tree 含 PEM。本测试静态版（目录恒在）验证 ``.is_file`` 拒目录根因。
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    (ev / "bundle.sha256").mkdir()
+    (ev / "bundle.sha256" / "leak.pem").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nLEAKED_AKIA\n", encoding="utf-8")
+    sha = RE._commit_evidence(ev, subject, vault_root=vault, push=False)
+    # manifest.json 仍 commit（白名单非空），但 bundle.sha256 目录内容不得进
+    assert sha is not None, "manifest.json 白名单应正常 commit"
+    show = subprocess.check_output(["git", "show", "--name-only", "--format=", sha],
+                                   cwd=str(vault), text=True).strip()
+    _files = show.splitlines()
+    assert not any("leak.pem" in _f for _f in _files), (
+        "r10-B2-traversal-v2 回归：目录白名单条目 bundle.sha256/ 递归让 leak.pem 进 commit\n"
+        f"实际：{_files}")
