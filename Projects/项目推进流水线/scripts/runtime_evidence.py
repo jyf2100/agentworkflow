@@ -842,6 +842,34 @@ def real_allowlist_rollout(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
 # crash/sandbox/dispatch_cutover）用真实 runtime drill 结果映射 evidence（非 fixture），3 维（sdk_canary/
 # recovery/quality_gate）用真实 run_*。全绿归档不可变 cutover_suite manifest（design#6）。
 # ════════════════════════════════════════════════════════════════════════════
+def _git_subject_commit() -> str | None:
+    """r5 P1-4（§2.1）：被验收代码 commit（git HEAD）——runner-owned subject_commit（非模型回传）。
+
+    manifest 声明的 subject_commit 让评审可独立核验「证据绑定的是哪段代码」（evidence_commit 基于/记录此 commit）。
+    失败返回 None（manifest 记 None，不阻断——subject_commit 缺失 ≠ 证据不可信，read-back 仍强制）。
+    """
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parents[2]),   # vault 根（被验收代码仓 HEAD）
+            stderr=subprocess.DEVNULL, text=True, timeout=5)
+        return out.strip() or None
+    except Exception:
+        return None
+
+
+def _runner_version() -> str:
+    """r5 P1-4（§5）：runner 版本标识（谁/什么版本产了此 manifest）。env 注入或默认标记。"""
+    return os.environ.get("PA_RUNNER_VERSION") or "pa-cutover-runner"
+
+
+def _now_iso() -> str:
+    """r5 P1-4（§5）：执行时间（UTC ISO，runner 生成记入 manifest，非凭据/非模型回传）。"""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
                        artifact_root: Path | None = None) -> dict:
     """7.6 真实 cutover 套件运行器。
@@ -981,7 +1009,24 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
     )
 
     # 3) run_full_cutover_suite（真实 runner）编排执行 bundle callable → manifest → 全绿归档
-    manifest = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(artifact_root))
+    # r5 P1-4（§5）：runner-owned manifest 元数据（subject_commit=被验收代码 HEAD / runner_version / executed_at）
+    _subject, _rv, _at = _git_subject_commit(), _runner_version(), _now_iso()
+    manifest = CT.run_full_cutover_suite(
+        drills=bundle, artifact_root=str(artifact_root),
+        subject_commit=_subject, runner_version=_rv, executed_at=_at)
+    # r5 P1-4（评审④）：cross-machine immutable bundle——本机 mkdtemp artifact_root 跨机器不可访问，bundle 把
+    # 结构化 manifest + 全部子证据 + 自检脚本打成自包含、内容寻址、相对路径目录（bundle_digest 跨机器一致）。
+    bundle_path = bundle_digest = None
+    bundle_publish_ok = False
+    if manifest.overall_passed:
+        try:
+            _short = (manifest.archive_digest or "norun").replace(":", "")[:24]
+            _br = artifact_root.parent / f"cutover_bundle_{_short}"
+            bundle_path, bundle_digest = CT.publish_evidence_bundle(
+                artifact_root=str(artifact_root), manifest=manifest, bundle_root=_br)
+            bundle_publish_ok = True
+        except Exception as exc:
+            bundle_path = f"publish_failed: {exc!r}"
 
     return {
         "drill": "7.6 real cutover suite runner",
@@ -996,11 +1041,19 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
         "artifact_root": str(artifact_root),   # r3 P1-2：cutover 子证据真实存储根（评审据此 load 子 digest）
         "archive_digest": manifest.archive_digest,
         "manifest_summary": manifest.summary,
-        "sub_evidence_refs": manifest.sub_evidence_refs,   # r2 P0-5：passing manifest 引用全部子 evidence digest
+        "manifest_digest": manifest.manifest_digest,        # r5 P1-4（②）：结构化 manifest 自身 digest（read-back 锚点）
+        "structured_manifest": manifest.overall_passed,      # r5 P1-4（①）：归档结构化 JSON（非 summary 字符串）
+        "subject_commit": manifest.subject_commit,          # r5 P1-4（§2.1）：被验收代码 commit
+        "runner_version": manifest.runner_version,          # r5 P1-4（§5）
+        "executed_at": manifest.executed_at,                # r5 P1-4（§5）
+        "sub_evidence_refs": manifest.sub_evidence_refs,    # r2 P0-5：passing manifest 引用全部子 evidence digest
         "evidence_integrity": manifest.evidence_integrity,  # r3 P0-2：子证据完整性门结论（"ok" 或失败原因）
         "outcomes": [{"name": o.name, "passed": o.passed, "detail": o.detail,
                       "evidence_digests": o.evidence_digests} for o in manifest.outcomes],
         "not_manual_event_flow": True,   # run_full_cutover_suite 编排真实 drill bundle callable
+        "bundle_path": bundle_path,            # r5 P1-4（④）：cross-machine immutable bundle（自包含可移植）
+        "bundle_digest": bundle_digest,        # passing 声明跨机器可复核锚点（bundle.sha256，跨机器一致）
+        "bundle_publish_ok": bundle_publish_ok,
     }
 
 
@@ -1286,12 +1339,17 @@ def write_evidence_index(*, index_path: Path, evidence: dict, manifest_ref,
         "cutover_sub_evidence": {
             "artifact_root": cutover.get("artifact_root") or str(Path(artifact_root) / "cutover"),
             "archive_digest": cutover.get("archive_digest"),
+            "manifest_digest": cutover.get("manifest_digest"),      # r5 P1-4（②）：结构化 manifest 自身 digest
+            "structured_manifest": cutover.get("structured_manifest"),  # r5 P1-4（①）：归档结构化 JSON（非 summary）
+            "subject_commit": cutover.get("subject_commit"),        # r5 P1-4（§2.1）：被验收代码 commit
             "overall_passed": cutover.get("overall_passed"),
             "evidence_integrity": cutover.get("evidence_integrity"),
             "sub_evidence_refs": cutover.get("sub_evidence_refs", []),
             "outcomes": [{"name": o.get("name"), "passed": o.get("passed"),
                           "evidence_digests": o.get("evidence_digests", [])}
                          for o in cutover.get("outcomes", [])],
+            "bundle_path": cutover.get("bundle_path"),              # r5 P1-4（④）：cross-machine immutable bundle
+            "bundle_digest": cutover.get("bundle_digest"),          # 跨机器可复核锚点（不依赖本机 artifact_root）
         },
         "verification": {
             "digest_algorithm": "sha256 内容寻址（artifact_store.compute_digest）",
@@ -1374,6 +1432,12 @@ def main() -> int:
     overall_ok = len(failed_drills) == 0
     evidence["failed"] = not overall_ok
     evidence["failed_drills"] = failed_drills
+    # r5 P1-4（评审③④）：passing 声明的跨机器可复核锚点——cross-machine bundle digest。即便 --skip-index
+    # 跳过仓内 index 写入，bundle 仍由 real_cutover_suite 产出（自包含、内容寻址、verify.py 跨机器自检），
+    # passing 声明据此可独立复核，不依赖本机 artifact_root 绝对路径（评审④）。
+    _cutover_drill = evidence.get("drills", {}).get("7.6_cutover_suite") or {}
+    evidence["bundle_digest"] = _cutover_drill.get("bundle_digest")
+    evidence["bundle_path"] = _cutover_drill.get("bundle_path")
 
     blob = json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True)
     print(blob)
@@ -1381,6 +1445,12 @@ def main() -> int:
     tag = ("✅ ARCHIVED PASSING evidence manifest" if overall_ok
            else "⛔ ARCHIVED FAILED evidence（非 passing manifest，含失败 drill）")
     print(f"\n{tag}: digest={ref.digest} path={ref.path} size={ref.size} failed_drills={len(failed_drills)}")
+    # r5 P1-4（评审③④）：bundle 是 passing 声明的跨机器可复核锚点（--skip-index 也不影响：bundle 在
+    # real_cutover_suite 内产，独立于仓内 index 写入）。
+    _bd = evidence.get("bundle_digest")
+    if _bd:
+        print(f"📦 cross-machine evidence bundle: digest={_bd} path={evidence.get('bundle_path')} "
+              f"| 独立复核: python3 <bundle>/verify.py（跨机器 exit 0 ⇔ 完整）")
     # r3 P1-2 闭环（评审 response §3）：evidence index 是验收声明的必要组成——写入失败不得静默降级为成功
     # （否则 passing 声明无可复核 index 支撑）。--skip-index 显式跳过；否则写入/校验失败 → return 1。
     if not args.skip_index:

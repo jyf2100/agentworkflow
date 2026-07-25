@@ -947,6 +947,81 @@ def test_run_full_cutover_suite_green_archives_manifest(tmp_path):
     assert all(o.passed for o in m.outcomes)
 
 
+def test_manifest_structured_has_section5_fields():
+    """r5 P1-4（评审① + r4-response-revise §5）：CutoverManifest.structured() 含 §5 全字段（非 summary 字符串）。
+
+    审查者：「run_full_cutover_suite() 仍归档 manifest.summary，没有结构化 manifest」。"""
+    m = CT.CutoverManifest(
+        outcomes=(CT.DrillOutcome("x", True, "d"),), overall_passed=True,
+        subject_commit="abc123", runner_version="rv1", executed_at="2026-07-25T00:00:00Z")
+    s = m.structured()
+    for f in ("schema_version", "subject_commit", "runner_version", "executed_at",
+              "overall_passed", "outcomes", "sub_evidence_refs", "evidence_integrity", "digest_algorithm"):
+        assert f in s, f"structured() 缺 §5 字段 {f}"
+    assert s["outcomes"][0]["name"] == "x"
+    assert s["schema_version"] == "cutover-manifest/v1"
+    assert "schema_version" not in m.summary   # summary 是可读字符串，非结构化载体
+
+
+def test_run_full_cutover_suite_archives_structured_json(tmp_path):
+    """r5 P1-4（评审①②）：green suite 归档**结构化 JSON**（非 summary 字符串）+ manifest_digest 非空 +
+    归档后 read-back 自动通过（load 回来是结构化 dict 含 §5 字段）。"""
+    import artifact_store as A
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root))
+    assert m.overall_passed is True
+    assert m.manifest_digest == m.archive_digest          # 结构化 manifest 自身 digest = 归档 digest
+    ref = L.ArtifactRef(digest=m.archive_digest, size=0,
+                        kind=L.ArtifactKind.CUTOVER_SUITE.value,
+                        path=A._bucketed_path(m.archive_digest),
+                        sensitivity=L.Sensitivity.INTERNAL.value)
+    blob = A.load(str(root), ref)
+    text = blob.decode("utf-8") if isinstance(blob, bytes) else blob
+    assert not text.startswith("cutover manifest:")       # 非旧 summary 字符串归档（评审①）
+    import json
+    parsed = json.loads(text)
+    assert parsed["schema_version"] == "cutover-manifest/v1"
+    assert {o["name"] for o in parsed["outcomes"]} == _EXPECTED_OUTCOME_NAMES
+
+
+def test_read_back_manifest_failclosed_on_tamper(tmp_path):
+    """r5 P1-4（评审②）：归档内容被篡改（digest 不再匹配）→ _read_back_manifest 返回 False（fail-closed）。
+
+    审查者：「没有 read-back」。防归档内容被篡改/损坏仍声明 passing manifest。"""
+    import artifact_store as A
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root))
+    p = root / A._bucketed_path(m.archive_digest)
+    p.write_text("TAMPERED:not-the-manifest", encoding="utf-8")   # 篡改 → digest 不匹配
+    ok, reason = CT._read_back_manifest(str(root), m.archive_digest)
+    assert ok is False
+    assert "digest" in reason.lower() or "read-back" in reason.lower()
+
+
+def test_publish_evidence_bundle_cross_machine_verify(tmp_path):
+    """r5 P1-4（评审④）：cross-machine immutable bundle——verify.py exit 0（完整）；篡改 artifact → exit 1；
+    两次发布同 manifest → bundle_digest 一致（跨机器可复核锚点，不依赖本机路径）。
+
+    审查者：「artifact root 仍为本机路径，没有 immutable cross-machine bundle」。"""
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root))
+    assert m.overall_passed is True
+    b1 = tmp_path / "bundle1"
+    _, digest1 = CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
+    # verify.py 自检通过（bundle 完整可独立复核）
+    r = subprocess.run([sys.executable, str(b1 / "verify.py")], capture_output=True, text=True)
+    assert r.returncode == 0, f"verify.py 应 exit 0（完整）: {r.stderr}"
+    # 篡改一个子证据 → verify.py exit 非 0（检测篡改）
+    first_art = next((b1 / "artifacts").iterdir())
+    first_art.write_text("TAMPERED", encoding="utf-8")
+    r2 = subprocess.run([sys.executable, str(b1 / "verify.py")], capture_output=True, text=True)
+    assert r2.returncode != 0, "篡改后 verify.py 应 exit 非 0"
+    # 两次发布同 manifest → bundle_digest 一致（跨机器一致，passing 可复核锚点）
+    b2 = tmp_path / "bundle2"
+    _, digest2 = CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b2)
+    assert digest1 == digest2
+
+
 def test_run_full_cutover_suite_red_does_not_archive(tmp_path):
     """任一 drill red（sandbox fixture exit1 且未 net_denied → 不 clean）→ overall red 且不归档（绝不伪装绿归档）。"""
     green = _green_bundle()
