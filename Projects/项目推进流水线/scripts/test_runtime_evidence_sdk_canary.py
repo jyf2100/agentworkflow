@@ -29,11 +29,33 @@ def _restore_loop_env(monkeypatch):
     yield
 
 
+def _fake_observed_state(scenario_id: str) -> dict:
+    """每场景**正确**的 observed_state（让 evaluate_scenario state 匹配通过）。r6 P0：state 精确匹配维度。"""
+    if scenario_id == "test_red":
+        return {"bash_results": [{"exit_code": 1, "output": ""}], "reply_text": "",
+                "saw_tool_use": True, "saw_subagent_start": False}
+    if scenario_id == "test_green":
+        return {"bash_results": [{"exit_code": 0, "output": "GREEN"}], "reply_text": "",
+                "saw_tool_use": True, "saw_subagent_start": False}
+    if scenario_id == "stale_test":
+        return {"bash_results": [{"exit_code": 0, "output": "STALE"}], "reply_text": "",
+                "saw_tool_use": True, "saw_subagent_start": False}
+    if scenario_id == "semantic_revise":
+        return {"bash_results": [], "reply_text": "...REVISE...", "saw_tool_use": False, "saw_subagent_start": False}
+    if scenario_id == "no_test":
+        return {"bash_results": [], "reply_text": "NO TEST", "saw_tool_use": False, "saw_subagent_start": False}
+    if scenario_id == "subagent":
+        return {"bash_results": [], "reply_text": "SUBAGENT DONE", "saw_tool_use": False, "saw_subagent_start": True}
+    return {"bash_results": [], "reply_text": "", "saw_tool_use": False, "saw_subagent_start": False}
+
+
 def _fake_runner(proven_map):
     """构造受控 ``_run_scenario_query`` 替身：按 ``spec.id`` 决定该场景独立 journal 是否产出 expected event。
 
     ``proven_map[spec.id]=True`` → 该场景独立 journal 含 expected event + invocation 带 own correlation_id
-    （``sdk_callback_real_proven=True``）；``False`` → 空 journal（proven=False，即便别处同 event 类型也不补绿）。
+    + observed_state 正确匹配（``sdk_callback_real_proven=True``）；``False`` → 空 journal（proven=False，
+    即便别处同 event 类型也不补绿）。r6 P0：per-scenario 绑定字段 journal_has_expected/carries_own_cid/
+    observed_state/adapter_gate 全部反映该场景单一 query 契约。
     """
     def fake(spec, *, workdir, stamp):
         cid = f"{stamp}:{spec.id}"   # runner-owned（r4 §3：runner 生成、closure 捕获，非模型回传）
@@ -48,6 +70,11 @@ def _fake_runner(proven_map):
                 "invocation_count": 1 if proven else 0,
                 "invocation_carries_own_cid": proven,
                 "sdk_callback_real_proven": proven, "real_proven": proven,
+                # r6 P0：per-scenario 绑定字段（journal/cid/state 同源）。proven 时三者皆真 + state 正确匹配。
+                "journal_has_expected": proven,
+                "carries_own_cid": proven,
+                "observed_state": _fake_observed_state(spec.id),
+                "adapter_gate": None,
             },
             "callback_invocations": invs,
             "callback_errors": [],
@@ -111,3 +138,57 @@ def test_real_sdk_canary_correlation_id_runner_owned(monkeypatch, tmp_path):
     invs = res["callback_invocations"]
     assert any(i.get("correlation_id") == per["correlation_id"] for i in invs), (
         "callback invocation 未携带 own correlation_id——runner-owned correlation 未注入")
+
+
+def test_evaluate_scenario_state_mismatch_blocks_proven():
+    """r6 P0 核心：journal 有 expected event + cid 但 observed state 不匹配 → proven=False（杜绝假绿）。
+
+    审查者 P0 反例：旧实现 proven = journal_has_expected and carries_own_cid，不校验 test state →
+    「journal 有 event + cid」即 proven。r6：evaluate_scenario 加 state 精确匹配（R4 §3.4）——test_red 须
+    bash 非零退出，若 observed_state 显示 exit_code=0（state 错）→ proven=False 即便 journal/cid 都真。
+    """
+    import cutover as CT
+    # journal + cid 都真，但 state 错（test_red 应非零退出，实际 exit_code=0）
+    j = CT.evaluate_scenario(
+        "test_red", journal_has_expected=True, carries_own_cid=True,
+        observed_state={"bash_results": [{"exit_code": 0, "output": ""}], "reply_text": "",
+                        "saw_tool_use": True, "saw_subagent_start": False},
+        expected_state_label="bash_nonzero")
+    assert j.proven is False, "state 不匹配仍 proven——P0 state 维度未生效"
+    assert j.diagnostic.startswith("state_mismatch"), j.diagnostic
+    # state 正确（exit_code=1）→ proven=True（三维度同时成立）
+    j2 = CT.evaluate_scenario(
+        "test_red", journal_has_expected=True, carries_own_cid=True,
+        observed_state={"bash_results": [{"exit_code": 1, "output": ""}], "reply_text": "",
+                        "saw_tool_use": True, "saw_subagent_start": False},
+        expected_state_label="bash_nonzero")
+    assert j2.proven is True
+
+
+def test_evaluate_sdk_canary_rejects_independent_sets_with_wrong_state():
+    """r6 P0（审查者反例精髓）：「全 callback proven + 正确 gate + journal/cid 全真」但 state 错 → passed=False。
+
+    旧 evaluate_sdk_canary_scenarios(gates, callbacks_proven) 接收两独立集合，构造「全场景 callback proven +
+    fixture stop_gates 全匹配」即 passed=True——即便场景实际 test state 错。r6：per_scenario 绑定 + state
+    维度——即便 gate/callback 维度全过，state 任一场景不匹配 → passed=False（独立集合假绿被堵）。
+    """
+    import cutover as CT
+    per = {}
+    for sc in CT.SDK_CALLBACK_REQUIRED_SCENARIOS:
+        exp_gate = CT.EXPECTED_LIFECYCLE_GATES.get(sc)
+        per[sc] = {
+            "journal_has_expected": True, "carries_own_cid": True,
+            "adapter_gate": exp_gate,            # gate 全匹配（隔离 state 维度归因）
+            "observed_state": {"bash_results": [{"exit_code": 0, "output": ""}],  # state 全错
+                               "reply_text": "", "saw_tool_use": True, "saw_subagent_start": False},
+        }
+    # compaction/hook_failure 是 blocked 场景，须带 blocked_reason（否则走非 blocked 分支，其 state 错）
+    per["compaction"]["blocked_reason"] = "test blocked"
+    per["hook_failure"]["blocked_reason"] = "test blocked"
+    verdict = CT.evaluate_sdk_canary_scenarios(per_scenario=per)
+    # gate 维度过（全匹配）→ 隔离证明 passed=False 归因于 callback/state，非 gate
+    assert verdict.gate_ok is True, "gate 全匹配应过（隔离 state 维度归因）"
+    assert verdict.passed is False, "state 错仍 passed——P0 独立集合 + state 绑定未生效"
+    assert verdict.state_ok is False
+    # state_failures 含具体非 blocked 场景（test_red 等），便于反例定位
+    assert any(sf.startswith("test_red:") for sf in verdict.state_failures), verdict.state_failures

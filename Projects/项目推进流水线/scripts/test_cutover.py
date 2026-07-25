@@ -720,42 +720,80 @@ def test_run_shadow_parity_evidence_no_write_dry_run_published(tmp_path):
 # 评审 P0-2：旧 run_cutover_suite 接收外部布尔值做 all()（聚合器非运行器）。新 runner 调用每个 drill
 # 执行入口（注入 bundle）真实执行，从 Result 提取 pass+detail，构建 CutoverManifest，全绿归档 digest。
 # ════════════════════════════════════════════════════════════════════════════
+def _fake_state(sc):
+    """每场景**正确** observed_state（让 evaluate_scenario state 匹配通过）。r6 P0：state 精确匹配维度。"""
+    states = {
+        "test_red": {"bash_results": [{"exit_code": 1, "output": ""}], "reply_text": "", "saw_tool_use": True, "saw_subagent_start": False},
+        "test_green": {"bash_results": [{"exit_code": 0, "output": "GREEN"}], "reply_text": "", "saw_tool_use": True, "saw_subagent_start": False},
+        "stale_test": {"bash_results": [{"exit_code": 0, "output": "STALE"}], "reply_text": "", "saw_tool_use": True, "saw_subagent_start": False},
+        "semantic_revise": {"bash_results": [], "reply_text": "REVISE", "saw_tool_use": False, "saw_subagent_start": False},
+        "no_test": {"bash_results": [], "reply_text": "NO TEST", "saw_tool_use": False, "saw_subagent_start": False},
+        "subagent": {"bash_results": [], "reply_text": "", "saw_tool_use": False, "saw_subagent_start": True},
+        "compaction": {"bash_results": [], "reply_text": "", "saw_tool_use": False, "saw_subagent_start": False},
+        "hook_failure": {"bash_results": [], "reply_text": "", "saw_tool_use": False, "saw_subagent_start": False},
+    }
+    return states.get(sc, {})
+
+
+def _fake_per_scenario(scenarios=None):
+    """r6 P0：per_scenario 绑定 dict——每场景 journal/cid/state/gate 全绿（同源绑定）。``scenarios`` 缺省
+    全 8；指定子集则只含该子集（缺场景 → missing_callbacks → callback_ok=False，测「缺 callback 场景 FAIL」）。
+    compaction/hook_failure 不设 blocked_reason → 走非 blocked 分支（state 标签 blocked 恒匹配）→ fake 全绿。"""
+    scn = scenarios if scenarios is not None else CT.SDK_CALLBACK_REQUIRED_SCENARIOS
+    return {
+        sc: {"scenario_id": sc, "journal_has_expected": True, "carries_own_cid": True,
+             "adapter_gate": CT.EXPECTED_LIFECYCLE_GATES.get(sc), "observed_state": _fake_state(sc)}
+        for sc in scn
+    }
+
+
 def _fake_sdk_canary_all_proven():
     """全 8 场景 callback proven 的 fake sdk_canary（测 run_full_cutover_suite 归档逻辑，非 SDK 真实性）。
-    adapter fixture（run_sdk_hook_canary）r5 P0-2 后不填 sdk_callback_proven（口径4），故全绿编排测试需显式 fake。"""
+    adapter fixture（run_sdk_hook_canary）r5 P0-2 后不填 sdk_callback_proven（口径4），故全绿编排测试需显式 fake。
+    r6 P0：per_scenario 全绿绑定（journal/cid/state/gate 同源），让 _sdk_canary_outcome passed=True 基线。"""
     base = CT.run_sdk_hook_canary()
     return CT.SdkHookCanaryEvidence(
         scenarios=base.scenarios, stop_gates=base.stop_gates, paths_covered=base.paths_covered,
         summary=base.summary, real_query_proven=True,
         sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS,
-        adapter_contract_proven=base.adapter_contract_proven)
+        adapter_contract_proven=base.adapter_contract_proven,
+        per_scenario=tuple({"scenario_id": s, **e} for s, e in _fake_per_scenario().items()))
+
+
+def _per_scenario_tuple(scenarios):
+    """per_scenario dict → SdkHookCanaryEvidence.per_scenario 用的 tuple[dict]。"""
+    return tuple({"scenario_id": s, **e} for s, e in _fake_per_scenario(scenarios).items())
 
 
 def test_sdk_canary_outcome_requires_all_callback_scenarios():
-    """r5 P0-2：sdk_canary pass 须 SDK_CALLBACK_REQUIRED_SCENARIOS 8 场景逐个 callback proven（含 compaction/
-    hook_failure——task 7.2 契约全 7 path），非"任意 callback 出现即真"。缺任一 callback 场景须 FAIL（即便
-    adapter gate 全对 + real_query_proven=True）——杜绝 7.6 outcome 比 7.2 谓词弱的假绿。"""
-    green = _fake_sdk_canary_all_proven()   # fake：gate 8 场景符合预期 + 8 callback 全 proven → pass
+    """r5 P0-2 + r6 P0：sdk_canary pass 须 SDK_CALLBACK_REQUIRED_SCENARIOS 8 场景逐个 per-scenario proven
+    （journal+cid+state+gate 同源绑定），非"任意 callback 出现即真"。缺任一场景 → callback_ok=False → FAIL
+    （即便 adapter gate 全对 + real_query_proven=True）——杜绝 7.6 outcome 比 7.2 谓词弱的假绿。"""
+    green = _fake_sdk_canary_all_proven()   # fake：8 场景 per-scenario 全绿 → pass
     assert CT._sdk_canary_outcome(green).passed is True
-    # 缺 compaction callback（PreCompact 单 query 不可靠触发）→ callback_ok=False → FAIL（路B 诚实标红）
+    # 缺 compaction（PreCompact 单 query 不可靠触发）→ missing → FAIL（路B 诚实标红）
+    sans_compaction = tuple(s for s in CT.SDK_CALLBACK_REQUIRED_SCENARIOS if s != "compaction")
     missing_compaction = CT.SdkHookCanaryEvidence(
         scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
         summary=green.summary, real_query_proven=True,
-        sdk_callback_proven=tuple(s for s in CT.SDK_CALLBACK_REQUIRED_SCENARIOS if s != "compaction"),
-        adapter_contract_proven=green.adapter_contract_proven)
+        sdk_callback_proven=sans_compaction,
+        adapter_contract_proven=green.adapter_contract_proven,
+        per_scenario=_per_scenario_tuple(sans_compaction))
     assert CT._sdk_canary_outcome(missing_compaction).passed is False
-    # 缺 hook_failure callback → FAIL
+    # 缺 hook_failure → FAIL
+    sans_hook = tuple(s for s in CT.SDK_CALLBACK_REQUIRED_SCENARIOS if s != "hook_failure")
     missing_hook_failure = CT.SdkHookCanaryEvidence(
         scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
         summary=green.summary, real_query_proven=True,
-        sdk_callback_proven=tuple(s for s in CT.SDK_CALLBACK_REQUIRED_SCENARIOS if s != "hook_failure"),
-        adapter_contract_proven=green.adapter_contract_proven)
+        sdk_callback_proven=sans_hook,
+        adapter_contract_proven=green.adapter_contract_proven,
+        per_scenario=_per_scenario_tuple(sans_hook))
     assert CT._sdk_canary_outcome(missing_hook_failure).passed is False
     # 缺全部 callback（任意 callback 假绿旧路径：仅 real_query_proven=True 即 pass）→ FAIL
     no_callback = CT.SdkHookCanaryEvidence(
         scenarios=green.scenarios, stop_gates=green.stop_gates, paths_covered=green.paths_covered,
         summary=green.summary, real_query_proven=True, sdk_callback_proven=(),
-        adapter_contract_proven=green.adapter_contract_proven)
+        adapter_contract_proven=green.adapter_contract_proven, per_scenario=())
     assert CT._sdk_canary_outcome(no_callback).passed is False
 
 
@@ -812,19 +850,18 @@ def test_evaluate_evidence_intact_pure_function():
 
 
 def test_evaluate_sdk_canary_scenarios_blocks_fake_green_on_integrity():
-    """r5 P1-2（评审反例）：构造 callback_errors 非空、journal_decode_errors=1、query_error 非空、
-    result_received=False **且** 场景矩阵（gate+callback）全真 → evaluate_sdk_canary_scenarios.passed 必 False。
+    """r5 P1-2 + r6 P0（评审反例）：构造 callback_errors 非空、journal_decode_errors=1、query_error 非空、
+    result_received=False **且** 场景矩阵（gate+callback+state）全真 → evaluate_sdk_canary_scenarios.passed 必 False。
     此前 7.2 _drill_predicate 只查 cb_proven + scenario_verdict（不含 integrity），同输入返回 (True, None) 假绿。
-    本纯函数由 7.2 谓词 + 7.6 outcome 共调 → 两入口同时堵住该假绿。"""
-    gates = dict(CT.EXPECTED_LIFECYCLE_GATES)              # 全 8 场景 gate 精确匹配（gate_ok=True）
-    callbacks_proven = CT.SDK_CALLBACK_REQUIRED_SCENARIOS    # 全 callback proven（callback_ok=True）
+    本纯函数由 7.2 谓词 + 7.6 outcome 共调 → 两入口同时堵住该假绿。r6 P0：per_scenario 绑定（state 维度亦绿）。"""
     verdict = CT.evaluate_sdk_canary_scenarios(
-        gates=gates, callbacks_proven=callbacks_proven,
+        per_scenario=_fake_per_scenario(),
         callback_errors=({"event": "Stop"},), journal_decode_errors=1,
         query_error="proxy 5xx", result_received=False)
     assert verdict.passed is False                          # integrity 违例阻断
     assert verdict.gate_ok is True                          # gate 维度本身绿
     assert verdict.callback_ok is True                      # callback 维度本身绿
+    assert verdict.state_ok is True                         # r6 P0：state 维度本身绿
     assert verdict.evidence_intact is False                 # 但 evidence 完整性红
     assert verdict.integrity_failures                       # 含具体违例标签
 
@@ -937,6 +974,39 @@ _EXPECTED_OUTCOME_NAMES = {"shadow_parity", "sdk_canary", "crash_reconciliation"
                            "sandbox", "dispatch_cutover", "quality_gate", "telemetry"}   # r5 P1-3：8 维度
 
 
+def test_run_full_cutover_suite_telemetry_red_keeps_overall_green_with_open_item(tmp_path):
+    """r6 P1-6（评审反例精髓）：telemetry 红（真实 OTLP/degradation suite 未接入，callback invocations 空）
+    但其余 7 维度全绿 → overall_passed 仍 True + telemetry outcome 诚实 passed=False + open_items 记 telemetry
+    red + known limitation。
+
+    评审 P1-6 反例：旧实现 telemetry 进 overall ``all()``（``cutover.py`` 旧 ``drill_ok = all(o.passed for o in outcomes)``）
+    ——headless 无真实 OTLP/degradation suite → telemetry 永远红 → overall 永远红（套件无法绿归档 = 停摆），
+    或为「让套件能绿」而偷偷把 telemetry 假绿。r6 P1-6：telemetry 移出 overall ``all()``，其 passed 进新
+    ``open_items``（诚实 red/open + known limitation，不阻断 overall，同 P1-1 语义）；telemetry outcome 仍
+    执行 + 归档子证据（evidence_ok 查 8 维度，含 telemetry）。
+    """
+    from dataclasses import replace
+    # telemetry red：callback invocations 空 + lifecycle 空 + num_turns None + 显式 degradation（_telemetry_outcome 必判红）
+    red_tel = lambda: CT.TelemetryEvidence(
+        callback_invocations=(), lifecycle_types_seen=(), num_turns=None, query_error=None,
+        summary="red: no real OTLP/degradation suite", degradation="no_callback_invocations")
+    # CutoverDrillBundle 是 frozen dataclass → dataclasses.replace 复制 7 个绿色 callable + 换 telemetry 为 red
+    red_bundle = replace(_green_bundle(), telemetry=red_tel)
+    m = CT.run_full_cutover_suite(drills=red_bundle, artifact_root=str(tmp_path / "suite"))
+    # telemetry 红但其余 7 维度绿 → overall 仍 green（telemetry 已移出 drill_ok）
+    assert m.overall_passed is True, "telemetry 红阻断 overall——P1-6 未把 telemetry 移出 all()"
+    # telemetry outcome 诚实标红（不假绿）
+    tel_o = next(o for o in m.outcomes if o.name == "telemetry")
+    assert tel_o.passed is False, "telemetry outcome 假绿——P1-6 未诚实标 red"
+    # open_items 含 telemetry 条目（passed=False + known limitation 非空）
+    assert len(m.open_items) >= 1, "overall 绿但 telemetry red 未进 open_items——P1-6 诚实报告缺失"
+    oi = next((i for i in m.open_items if i.get("item") == "telemetry"), None)
+    assert oi is not None and oi["passed"] is False and oi["limitation"], (
+        "open_items 缺 telemetry red + limitation——P1-6 未诚实记录")
+    # structured() 也导出 open_items（跨机器可复核 manifest 见诚实 red/open，非假绿）
+    assert len(m.structured()["open_items"]) >= 1
+
+
 def test_run_full_cutover_suite_green_archives_manifest(tmp_path):
     """runner 自行执行各 drill → 全绿 → overall_passed + 归档 manifest digest（archive immutable evidence）。"""
     m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "suite"))
@@ -998,6 +1068,80 @@ def test_read_back_manifest_failclosed_on_tamper(tmp_path):
     assert "digest" in reason.lower() or "read-back" in reason.lower()
 
 
+# ---- r6 P1-5：manifest read-back 7 步严格校验（评审反例：空/残缺/篡改 manifest 不得过 read-back） ----
+
+def _store_fake_manifest(root, manifest_dict):
+    """归档一个伪造 manifest dict → 返回 digest（供 _read_back_manifest 反例测试）。
+
+    内容寻址 store：store 后内容未篡改 → step 1（load 重算 digest）通过，反例靠后续结构/自洽校验（step 3+）触发。
+    """
+    import json
+    blob = json.dumps(manifest_dict, ensure_ascii=False, sort_keys=True)
+    return CT.artifact_store.store(str(root), blob, kind="cutover_suite",
+                                   sensitivity="internal").digest
+
+
+def test_read_back_manifest_rejects_legacy_5key_manifest(tmp_path):
+    """r6 P1-5 step 3（评审反例）：旧版只查 5 键（schema_version/outcomes/sub_evidence_refs/
+    evidence_integrity/digest_algorithm）→ 缺 subject_commit/runner_version/executed_at/overall_passed
+    的残缺 manifest 能过 read-back 假绿。P1-5 step 3 扩展 §5 全字段校验 → 拒。"""
+    root = tmp_path / "suite"
+    digest = _store_fake_manifest(root, {
+        "schema_version": "cutover-manifest/v1",
+        "outcomes": [], "sub_evidence_refs": [],
+        "evidence_integrity": "ok", "digest_algorithm": "sha256",
+    })
+    ok, reason = CT._read_back_manifest(str(root), digest)
+    assert ok is False and "[3]" in reason
+
+
+def test_read_back_manifest_rejects_empty_outcomes_with_overall_true(tmp_path):
+    """r6 P1-5 step 4（评审反例精髓）：空结构 manifest——outcomes=[] 但 overall_passed=True、
+    sub_evidence_refs=[]。旧版「只查 5 键存在」会放行此空 manifest 假绿。P1-5 step 4（outcomes 非空）→ 拒。"""
+    root = tmp_path / "suite"
+    digest = _store_fake_manifest(root, {
+        "schema_version": "cutover-manifest/v1", "subject_commit": "abc123",
+        "runner_version": "v1", "executed_at": "2026-07-25",
+        "overall_passed": True, "outcomes": [], "sub_evidence_refs": [],
+        "evidence_integrity": "ok", "digest_algorithm": "sha256",
+    })
+    ok, reason = CT._read_back_manifest(str(root), digest)
+    assert ok is False and "[4]" in reason
+
+
+def test_read_back_manifest_rejects_subrefs_outcome_digest_mismatch(tmp_path):
+    """r6 P1-5 step 5（评审反例）：manifest 自洽——sub_evidence_refs 多一个 outcome 未引用的假 digest。
+    旧版不校验全局一致性 → 假 digest 混入 refs 不被发现。P1-5 step 5（outcome digest 并集 == sub_refs）→ 拒。"""
+    root = tmp_path / "suite"
+    digest = _store_fake_manifest(root, {
+        "schema_version": "cutover-manifest/v1", "subject_commit": "abc123",
+        "runner_version": "v1", "executed_at": "2026-07-25",
+        "overall_passed": True,
+        "outcomes": [{"name": "shadow_parity", "passed": True, "detail": "x",
+                      "evidence_digests": ["sha256:real1"]}],
+        "sub_evidence_refs": ["sha256:real1", "sha256:FAKE_EXTRA"],
+        "evidence_integrity": "ok", "digest_algorithm": "sha256",
+    })
+    ok, reason = CT._read_back_manifest(str(root), digest)
+    assert ok is False and "[5]" in reason
+
+
+def test_read_back_manifest_rejects_overall_outcomes_mismatch(tmp_path):
+    """r6 P1-5 step 7（评审反例）：篡改 manifest——outcomes 全 passed=False 但 overall_passed=True
+    （声称 passing 实则全红）。P1-5 step 7（overall_passed == all(outcome.passed) 自洽校验）→ 拒。"""
+    root = tmp_path / "suite"
+    digest = _store_fake_manifest(root, {
+        "schema_version": "cutover-manifest/v1", "subject_commit": "abc123",
+        "runner_version": "v1", "executed_at": "2026-07-25",
+        "overall_passed": True,
+        "outcomes": [{"name": "shadow_parity", "passed": False, "detail": "x",
+                      "evidence_digests": []}],
+        "sub_evidence_refs": [], "evidence_integrity": "ok", "digest_algorithm": "sha256",
+    })
+    ok, reason = CT._read_back_manifest(str(root), digest)
+    assert ok is False and "[7]" in reason
+
+
 def test_publish_evidence_bundle_cross_machine_verify(tmp_path):
     """r5 P1-4（评审④）：cross-machine immutable bundle——verify.py exit 0（完整）；篡改 artifact → exit 1；
     两次发布同 manifest → bundle_digest 一致（跨机器可复核锚点，不依赖本机路径）。
@@ -1020,6 +1164,71 @@ def test_publish_evidence_bundle_cross_machine_verify(tmp_path):
     b2 = tmp_path / "bundle2"
     _, digest2 = CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b2)
     assert digest1 == digest2
+
+
+# ---- r6 P1-4：bundle publication allowlist + secret scan（评审 R4 §4：凭据不得跨机器泄漏） ----
+
+def test_scan_for_secrets_detects_credentials():
+    """r6 P1-4：_scan_for_secrets 识别各凭据模式（GitHub PAT/token、AWS、OpenAI/Anthropic、Google、Bearer、
+    secret kv）+ 干净文本无误报 + 脱敏不回显凭据值。"""
+    assert any("github_token" in h for h in CT._scan_for_secrets("ghp_" + "a" * 36))
+    assert any("github_pat" in h for h in CT._scan_for_secrets("github_pat_" + "b" * 82))
+    assert any("aws_access_key" in h for h in CT._scan_for_secrets("AKIA" + "A" * 16))
+    assert any("openai_key" in h for h in CT._scan_for_secrets("sk-" + "c" * 24))
+    assert any("bearer_token" in h for h in CT._scan_for_secrets("Bearer " + "d" * 24))
+    assert any("secret_kv" in h for h in CT._scan_for_secrets('password: "supersecret123"'))
+    # 干净文本（evidence 常见字段）无误报
+    assert CT._scan_for_secrets("matched=parity_ok; mismatches=0; drill=sdk_canary") == []
+    # 脱敏：不回显完整凭据值
+    h = CT._scan_for_secrets("ghp_" + "a" * 36)
+    assert "a" * 36 not in h[0], "scan 诊断不得回显完整凭据值"
+
+
+def test_publish_evidence_bundle_failclosed_on_secret_in_sub_evidence(tmp_path):
+    """r6 P1-4（评审反例）：子证据 blob 含凭据（GitHub PAT）→ publish_evidence_bundle scan 命中 →
+    raise（fail-closed，不复制凭据进 bundle）。raise 经 real_cutover_suite catch → bundle_publish_ok=False
+    → overall_passed=False（P1-2 接力非零退出）。"""
+    import json
+    from dataclasses import replace
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root))
+    # 构造含 GitHub PAT 的子证据 blob，归档得 digest
+    bad_blob = json.dumps({"drill": "sdk_canary",
+                           "evidence": {"env": {"GITHUB_TOKEN": "ghp_" + "a" * 36}}},
+                          ensure_ascii=False, sort_keys=True)
+    bad_digest = CT.artifact_store.store(str(root), bad_blob, kind="test_output",
+                                         sensitivity="internal").digest
+    m_bad = replace(m, sub_evidence_refs=(bad_digest,))
+    with pytest.raises(ValueError, match="凭据模式"):
+        CT.publish_evidence_bundle(artifact_root=str(root), manifest=m_bad,
+                                   bundle_root=tmp_path / "bundle")
+    # bundle 不得被创建（fail-closed 在写盘前 raise）
+    assert not (tmp_path / "bundle" / "manifest.json").exists()
+
+
+def test_publish_evidence_bundle_rejects_unknown_manifest_field(tmp_path):
+    """r6 P1-4 step 1（allowlist）：manifest structured() 被注入未知字段 → publish 拒（防绕过结构校验）。"""
+    import json
+
+    class _BadManifest:
+        """duck-typed manifest：structured_json 注入未知字段（模拟 manifest 被篡改/外部构造）。"""
+        def __init__(self, real):
+            self._r = real
+        def structured_json(self):
+            return json.dumps({**self._r.structured(), "INJECTED_FIELD": "evil"},
+                              ensure_ascii=False, sort_keys=True)
+        @property
+        def sub_evidence_refs(self):
+            return self._r.sub_evidence_refs
+        @property
+        def manifest_digest(self):
+            return self._r.manifest_digest
+
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root))
+    with pytest.raises(ValueError, match="未知字段"):
+        CT.publish_evidence_bundle(artifact_root=str(root), manifest=_BadManifest(m),
+                                   bundle_root=tmp_path / "bundle")
 
 
 def test_run_full_cutover_suite_red_does_not_archive(tmp_path):
