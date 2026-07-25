@@ -1752,3 +1752,95 @@ def test_verify_rejects_non_ancestor_evidence_commit(tmp_path):
     assert r.returncode != 0, "subject 非 evidence 祖先应使 verify.py exit 非 0（r9-4 merge-base 未生效）"
     assert "祖先" in r.stderr or "merge-base" in r.stderr, (
         f"应报 merge-base 祖先失败，实际 stderr: {r.stderr}")
+
+
+def test_publish_and_verify_evidence_rollbacks_when_verify_fails(tmp_path, monkeypatch):
+    """r9-2（审核员 P0）编排层端到端守门（综合裁判 MEDIUM 缺口）：``_publish_and_verify_evidence``（r9-8 提取自
+    real_cutover_suite）编排 publish→commit(push=False)→verify.py→push。verify.py exit≠0 → ``_rollback_evidence_commit``
+    回滚 commit + raise + 不 push。旧版仅 helper 各自单测（_commit_evidence/_rollback_evidence_commit 绿），编排顺序
+    （verify 前绝不 push）无测试——未来回归把 push 提前到 verify 前，现有测试守不住。本测试注入 tmp git 仓作
+    vault_root，monkeypatch verify.py 那次 subprocess.run 返非零（git 调用透传 real_run），断言：(1) raise
+    RuntimeError；(2) HEAD 退回 subject（commit 被 rollback）；(3) 远端 main 仍是 subject（verify 红绝不 push）。"""
+    import runtime_evidence as RE
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.name", "pa-cutover-runner"], cwd=str(vault), check=True)
+    (vault / "README.md").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
+    subject = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    _bare = vault.parent / f"{vault.name}-bare.git"              # bare remote + upstream（push 依赖 upstream）
+    subprocess.run(["git", "init", "-q", "--bare", str(_bare)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(_bare)], cwd=str(vault), check=True)
+    subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=str(vault), check=True)
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root),
+                                  subject_commit=subject, runner_version="pa-cutover-runner")
+    assert m.overall_passed is True, "precondition: 全绿 manifest"
+
+    # monkeypatch verify.py 那次 subprocess.run 返非零；git add/commit/rev-parse/diff 透传 real_run（cmd[0]=="git"）
+    real_run = subprocess.run
+
+    def _fake_run(cmd, *a, **kw):
+        if cmd and str(cmd[0]) == sys.executable and len(cmd) > 1 and "verify.py" in str(cmd[1]):
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="",
+                                               stderr="simulated verify fail（r9-2 编排守门）")
+        return real_run(cmd, *a, **kw)
+    monkeypatch.setattr(RE.subprocess, "run", _fake_run)
+
+    # verify.py 红 → _rollback_evidence_commit 回滚 + raise（编排 fail-closed）
+    with pytest.raises(RuntimeError, match="verify.py fail-closed"):
+        RE._publish_and_verify_evidence(m, subject, vault_root=vault, artifact_root=root)
+
+    # (1) HEAD 退回 subject（evidence commit 被 _rollback_evidence_commit 撤；r9-5 unstage 一并生效）
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    assert head == subject, "verify.py 失败后 evidence commit 未回滚——r9-2 编排 fail-closed 未生效"
+    # (2) 远端 main 仍是 subject（verify 红绝不 push；若编排误先 push 再 verify，远端 main 会进 evidence commit）
+    remote_main = subprocess.check_output(["git", "ls-remote", str(_bare), "refs/heads/main"],
+                                          text=True).strip().split()[0]
+    assert remote_main == subject, "verify 红后远端 main 进了 evidence commit——r9-2 编排先 push 了（顺序错）"
+
+
+def test_verify_argv_sha_distinguishes_dup_message_commits_where_grep_ambiguous(tmp_path):
+    """r9-3（审核员 P1）反例编码（综合裁判 MEDIUM 缺口）：仓内 ≥2 个相同 evidence message commit 时，argv[1] exact
+    SHA 精确区分（exit 0），而 r8-2 旧 ``git log --grep`` 反查会多匹配 ambiguous（无法定唯一 evidence_commit）。现有
+    ``test_verify_accepts_evidence_commit_argv_exact_sha`` 是 happy-path（单 evidence commit），回退到 grep 在单 commit
+    仓仍只 1 匹配→测试仍绿→守不住「不准退回 grep」。本测试造 2 同 message commit，显式编码「grep 多匹配」缺陷 +
+    argv 精确性（argv=e1 exit 0，不受 e2 存在影响）。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(vault), check=True)
+    (vault / "README.md").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
+    subject = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root),
+                                  subject_commit=subject, runner_version="pa-cutover-runner")
+    b1 = vault / "docs" / "evidence" / subject
+    CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
+    subprocess.run(["git", "config", "user.name", m.runner_version], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "runner@pa-cutover.local"], cwd=str(vault), check=True)
+    msg = f"evidence: cutover suite for subject_commit={subject[:12]}"
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", msg], cwd=str(vault), check=True)
+    e1 = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    # 第 2 个**相同 message** commit（空 commit，仅制造 grep 多匹配；不 verify 它——它仅证明 grep ambiguous）
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", msg], cwd=str(vault), check=True)
+    e2 = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    assert e1 != e2
+
+    # argv[1]=e1 → verify exit 0（argv 精确，e2 存在不影响——argv 不依赖 message 唯一性；工作树仍是 e1 内容因 e2 空）
+    r1 = subprocess.run([sys.executable, str(b1 / "verify.py"), e1],
+                        cwd=str(vault), capture_output=True, text=True)
+    assert r1.returncode == 0, f"argv=e1 应 exit 0（r9-3 argv 精确，不受同 message e2 影响）: {r1.stderr}"
+
+    # r8-2 grep 反查在同 message 仓多匹配 ambiguous（编码 r9-3 删 grep 理由——回退 grep 无法定唯一 evidence_commit）
+    grep_out = subprocess.check_output(["git", "log", "--grep", msg, "--format=%H"],
+                                       cwd=str(vault), text=True).strip()
+    assert len(grep_out.splitlines()) >= 2, (
+        f"grep 同 message 应 ≥2 匹配（证明 r8-2 grep 反查 ambiguous；r9-3 argv 必要）；实际: {grep_out!r}")
