@@ -935,11 +935,16 @@ def _commit_evidence(evidence_dir: Path, subject_commit: str,
                if evidence_dir.is_absolute() else Path(evidence_dir))
     except Exception:
         return None
+    # r8-2（审核员）：git author/committer 身份用 _runner_identity()——与 manifest.runner_version 共用 runner
+    # 标识，让 verify.py 的 committer==runner_version 绑定可校验（旧固定 "pa-cutover-runner" 与
+    # _runner_version() 的 PA_RUNNER_VERSION 默认值可能漂移 → runner 绑定不可校验）。
+    _rn, _rem = _runner_identity()
     _git_env = {**os.environ,
-                "GIT_AUTHOR_NAME": os.environ.get("GIT_AUTHOR_NAME", "pa-cutover-runner"),
-                "GIT_AUTHOR_EMAIL": os.environ.get("GIT_AUTHOR_EMAIL", "runner@pa-cutover.local"),
-                "GIT_COMMITTER_NAME": os.environ.get("GIT_COMMITTER_NAME", "pa-cutover-runner"),
-                "GIT_COMMITTER_EMAIL": os.environ.get("GIT_COMMITTER_EMAIL", "runner@pa-cutover.local")}
+                "GIT_AUTHOR_NAME": os.environ.get("GIT_AUTHOR_NAME", _rn),
+                "GIT_AUTHOR_EMAIL": os.environ.get("GIT_AUTHOR_EMAIL", _rem),
+                "GIT_COMMITTER_NAME": os.environ.get("GIT_COMMITTER_NAME", _rn),
+                "GIT_COMMITTER_EMAIL": os.environ.get("GIT_COMMITTER_EMAIL", _rem)}
+    _committed = False                  # r8-3：evidence commit 是否已落地（except 兜底 reset 依据）
     try:
         subprocess.run(["git", "add", "--", str(rel)], cwd=str(_vault), check=True,
                        capture_output=True, text=True, timeout=15, env=_git_env)
@@ -949,6 +954,7 @@ def _commit_evidence(evidence_dir: Path, subject_commit: str,
         subprocess.run(["git", "commit", "-m",
                         f"evidence: cutover suite for subject_commit={subject_commit[:12]}", "--", str(rel)],
                        cwd=str(_vault), check=True, capture_output=True, text=True, timeout=15, env=_git_env)
+        _committed = True               # commit 已落地——后续任一步骤异常须兜底 reset（r8-3）
         evidence_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(_vault),
                                                text=True, timeout=5).strip()
         # ancestry 自检（R4 §2.3-3）：subject..evidence 只含 docs/evidence/ 路径变更（路径 allowlist）
@@ -962,6 +968,7 @@ def _commit_evidence(evidence_dir: Path, subject_commit: str,
             # HEAD 退回、evidence 文件保留于工作区）。旧实现 ``return None`` 但 commit 已生成 → HEAD 被污染。
             subprocess.run(["git", "reset", "--soft", "HEAD~1"], cwd=str(_vault),
                            capture_output=True, text=True, timeout=10, env=_git_env)
+            _committed = False          # 已显式回滚
             return None
         # r7-S2（审核员）：evidence commit 须推送才算跨机器发布（本地 commit 不算——他机 fetch 不到）。
         # push 失败（无 upstream/远程/网络/non-fast-forward 被拒）→ fail-closed 回滚 commit + None
@@ -972,15 +979,37 @@ def _commit_evidence(evidence_dir: Path, subject_commit: str,
         if _push.returncode != 0:
             subprocess.run(["git", "reset", "--soft", "HEAD~1"], cwd=str(_vault),
                            capture_output=True, text=True, timeout=10, env=_git_env)
+            _committed = False          # 已显式回滚
             return None
         return evidence_sha or None
     except Exception:
+        # r8-3（审核员）：commit 后任一步骤异常（rev-parse/diff/push timeout 或抛；push timeout 是 CI 最常见）
+        # → 旧 except 仅 ``return None`` 不 reset → evidence commit 残留污染 HEAD。兜底：若 commit 已落地
+        # （_committed=True，未走显式 reset）则 ``reset --soft <subject_commit>`` 回滚到确切 subject 锚点
+        # （比 HEAD~1 更安全——不依赖 HEAD 当前位置，防多退；commit 后 HEAD 在 evidence commit，HEAD~1=subject
+        # 等价，但锚点更显式稳定）。reset 自身失败不二次抛（best-effort；return None 仍标记失败）。
+        if _committed:
+            try:
+                subprocess.run(["git", "reset", "--soft", subject_commit], cwd=str(_vault),
+                               capture_output=True, text=True, timeout=10, env=_git_env)
+            except Exception:
+                pass                    # 兜底 reset 失败不二次抛（已尽力；return None 标记失败）
         return None
 
 
 def _runner_version() -> str:
     """r5 P1-4（§5）：runner 版本标识（谁/什么版本产了此 manifest）。env 注入或默认标记。"""
     return os.environ.get("PA_RUNNER_VERSION") or "pa-cutover-runner"
+
+
+def _runner_identity() -> tuple[str, str]:
+    """r8-2（审核员）：runner 身份（name + email）——``_commit_evidence`` 的 git env 与 ``_runner_version`` 共用。
+
+    name = ``_runner_version()``（``PA_RUNNER_VERSION`` 或默认 ``pa-cutover-runner``），email = ``PA_RUNNER_EMAIL``
+    或默认 ``runner@pa-cutover.local``。让 evidence_commit 的 committer name == manifest.runner_version，
+    verify.py 据此校验 runner 绑定（谁产的 evidence），杜绝旧「固定 runner 名与 runner_version 漂移」致绑定不可校验。
+    """
+    return _runner_version(), (os.environ.get("PA_RUNNER_EMAIL") or "runner@pa-cutover.local")
 
 
 def _now_iso() -> str:
@@ -1434,29 +1463,32 @@ def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
                   and bool(res.get("bundle_publish_ok"))
                   and bool(res.get("bundle_digest"))
                   and bool(res.get("evidence_commit")))
-            # r7-S5（审核员）：telemetry 未接入时 7.6 不可返回**无条件** success（假绿）。P1-6 让 telemetry red
-            # 不阻断 overall（套件归档 + open_items 诚实 open），但 7.6 谓词强制 telemetry 接入状态显式诚实：
-            #   - telemetry_connected=False（未接入）+ open_items 含 telemetry red → 诚实 open，ok 不变（P1-6
-            #     不阻断；但 success 已显式暴露 telemetry 未接入，非假装全绿）。
-            #   - 缺 telemetry_connected / connected=True 但 open_items 含 telemetry red（矛盾）/ connected=False
-            #     但未进 open_items → 假绿/不诚实，ok=False（杜绝 7.6 在 telemetry 未接入时无条件声称成功）。
+            # r7-S5 → r8-1（审核员 P0）：telemetry 接入状态显式声明 + runtime 层诚实红。
+            # 旧 S5「一致规则」(connected == telemetry 不在 open_items) 与 cutover 无条件把 telemetry 塞进
+            # open_items 叠加 → 逻辑反向：未接入(connected=False) + open_items 含 telemetry → 三个 fail 分支
+            # 全不命中(False-and / True-and-False) → ok=True 假绿；接入后(connected=True) + open_items 仍含
+            # telemetry → 矛盾分支命中 → ok=False（接入反失败）。完全反向。
+            # r8-1 修正为 **connected 驱动**——runtime main 层与 manifest 归档层**独立**：
+            #   - connected=None：接入状态未声明 → 拒绝（不可假装 telemetry 就绪）。
+            #   - connected=False：真实 OTLP/degradation suite 未接入 → ok=False（runtime 层诚实红，**接受红色
+            #     直到 OTEL_EXPORTER_OTLP_ENDPOINT 接入**；不阻断 manifest 归档层——manifest overall_passed 仍
+            #     可绿（P1-6 drill_ok 排除 telemetry + open_items 诚实 open），两层独立，杜绝假绿）。
+            #   - connected=True + telemetry 在 open_items：矛盾（已接入不应 open）→ 拒绝（防 manifest 不诚实）。
+            #   - connected=True + 不在 open_items：真接入全绿 → ok。
             if ok:
-                # 一致规则：connected == (telemetry 不在 open_items)。telemetry_connected 反映真实 OTLP 接入，
-                # open_items 含 telemetry 是 P1-6 诚实 open 标记（未接入才需 open）。两者须一致——
-                # connected=False 须 open / connected=True 不应 open。telemetry outcome 自身 passed（SDK callback
-                # 维度）独立于此（可能绿，但不影响「OTLP 未接入须诚实 open」判定，故 _tel_in_open 只查 item）。
                 _connected = res.get("telemetry_connected")
-                _open_items = res.get("open_items") or []
-                _tel_in_open = any(isinstance(_i, dict) and _i.get("item") == "telemetry" for _i in _open_items)
                 if _connected is None:
-                    return False, ("telemetry 接入状态未显式声明 (r7-S5: res 缺 telemetry_connected；"
+                    return False, ("telemetry 接入状态未显式声明 (r8-1: res 缺 telemetry_connected；"
                                    "7.6 不可返回无条件 success 假装 telemetry 就绪)")
-                if _connected and _tel_in_open:
-                    return False, ("telemetry_connected=True 但 telemetry 仍在 open_items (r7-S5: 已接入不应 "
-                                   "open；接入状态与 open_items 矛盾，不诚实假绿)")
-                if not _connected and not _tel_in_open:
-                    return False, ("telemetry_connected=False 但 telemetry 未进 open_items (r7-S5: 未接入须 "
-                                   "诚实 open，P1-6 + read-back step7/S4 白名单强制；不可隐瞒)")
+                if not _connected:
+                    return False, ("telemetry_connected=False (r8-1: 真实 OTLP/degradation suite 未接入 → "
+                                   "7.6 runtime 层诚实红；接受红色直到 OTEL_EXPORTER_OTLP_ENDPOINT 接入。"
+                                   "manifest 归档层 overall 仍可绿（P1-6），runtime 与归档两层独立)")
+                # connected=True：telemetry 不应在 open_items（已接入不应 open）——防 manifest 不诚实。
+                _open_items = res.get("open_items") or []
+                if any(isinstance(_i, dict) and _i.get("item") == "telemetry" for _i in _open_items):
+                    return False, ("telemetry_connected=True 但 telemetry 仍在 open_items (r8-1: 已接入不应 "
+                                   "open；接入状态与 open_items 矛盾，manifest 不诚实)")
             return ok, None if ok else (
                 f"overall_passed={res.get('overall_passed')} "
                 f"bundle_publish_ok={res.get('bundle_publish_ok')} "

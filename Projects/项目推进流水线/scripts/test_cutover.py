@@ -1201,13 +1201,23 @@ def test_publish_evidence_bundle_cross_machine_verify(tmp_path):
     subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
     subject = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
     root = tmp_path / "suite"
-    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root), subject_commit=subject)
+    # r8-2：显式 runner_version（与 evidence commit committer 一致；默认 "" 会让 runner 绑定校验无锚点）
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root),
+                                  subject_commit=subject, runner_version="pa-cutover-runner")
     assert m.overall_passed is True
     b1 = vault / "docs" / "evidence" / subject      # bundle 落 git 仓内（verify.py 在仓上下文跑）
     _, digest1 = CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
-    # verify.py 自检通过（bundle 完整 + subject_commit 真实存在于 git）
+    # r8-2（审核员）：造 evidence commit（让 verify.py 的 git log --grep 反查能找到 + ancestry + runner binding
+    # 校验通过）。committer name = m.runner_version；commit message 用 _commit_evidence 同模板（verify --grep
+    # 精确匹配）。手动 commit 不 push——verify.py 的 ``git log --all`` 搜本地 refs 即找到。
+    subprocess.run(["git", "config", "user.name", m.runner_version], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "runner@pa-cutover.local"], cwd=str(vault), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", f"evidence: cutover suite for subject_commit={subject[:12]}"],
+                   cwd=str(vault), check=True)
+    # verify.py 自检通过（bundle 完整 + subject 存在 + evidence_commit ancestry + runner binding）
     r = subprocess.run([sys.executable, str(b1 / "verify.py")], cwd=str(vault), capture_output=True, text=True)
-    assert r.returncode == 0, f"verify.py 应 exit 0（完整 + subject 存在）: {r.stderr}"
+    assert r.returncode == 0, f"verify.py 应 exit 0（完整 + subject + ancestry + runner 绑定）: {r.stderr}"
     # 篡改一个子证据 → verify.py exit 非 0（检测篡改）
     first_art = next((b1 / "artifacts").iterdir())
     first_art.write_text("TAMPERED", encoding="utf-8")
@@ -1217,6 +1227,64 @@ def test_publish_evidence_bundle_cross_machine_verify(tmp_path):
     b2 = tmp_path / "bundle2"
     _, digest2 = CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b2)
     assert digest1 == digest2
+
+
+def test_verify_rejects_evidence_commit_ancestry_with_business_files(tmp_path):
+    """r8-2（审核员反例）：evidence_commit ancestry subject..evidence 含非 docs/evidence/ 路径（夹带业务代码）
+    → verify.py exit 非 0。防 evidence_commit 夹带 scripts/ 等业务变更被误当 subject 重新执行。committer
+    正确（runner 绑定 pass），唯独 ancestry 污染 → 隔离测 ancestry 校验。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(vault), check=True)
+    (vault / "README.md").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
+    subject = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root),
+                                  subject_commit=subject, runner_version="pa-cutover-runner")
+    b1 = vault / "docs" / "evidence" / subject
+    CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
+    subprocess.run(["git", "config", "user.name", m.runner_version], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "runner@pa-cutover.local"], cwd=str(vault), check=True)
+    (vault / "scripts").mkdir()
+    (vault / "scripts" / "foo.py").write_text("print(1)", encoding="utf-8")  # 业务文件污染 ancestry
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", f"evidence: cutover suite for subject_commit={subject[:12]}"],
+                   cwd=str(vault), check=True)
+    r = subprocess.run([sys.executable, str(b1 / "verify.py")], cwd=str(vault), capture_output=True, text=True)
+    assert r.returncode != 0, "evidence_commit ancestry 含业务文件应使 verify.py exit 非 0"
+    assert "ancestry" in r.stderr or "docs/evidence" in r.stderr, f"stderr 应指出 ancestry 问题: {r.stderr}"
+
+
+def test_verify_rejects_evidence_commit_runner_mismatch(tmp_path):
+    """r8-2（审核员反例）：evidence_commit committer name != manifest.runner_version → verify.py exit 非 0。
+    防「evidence 被他人/异 runner 产出」伪装成 runner_version 绑定。ancestry 干净（只 docs/evidence/），
+    唯独 committer 不符 → 隔离测 runner 绑定校验。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(vault), check=True)
+    (vault / "README.md").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
+    subject = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root),
+                                  subject_commit=subject, runner_version="pa-cutover-runner")
+    b1 = vault / "docs" / "evidence" / subject
+    CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
+    subprocess.run(["git", "config", "user.name", "impostor-runner"], cwd=str(vault), check=True)  # ≠ m.runner_version
+    subprocess.run(["git", "config", "user.email", "x@x"], cwd=str(vault), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", f"evidence: cutover suite for subject_commit={subject[:12]}"],
+                   cwd=str(vault), check=True)
+    r = subprocess.run([sys.executable, str(b1 / "verify.py")], cwd=str(vault), capture_output=True, text=True)
+    assert r.returncode != 0, "committer != runner_version 应使 verify.py exit 非 0"
+    assert "runner_version" in r.stderr or "committer" in r.stderr, f"stderr 应指出 runner 绑定问题: {r.stderr}"
 
 
 def test_verify_rejects_nonexistent_subject_commit(tmp_path):
@@ -1241,25 +1309,78 @@ def test_verify_rejects_nonexistent_subject_commit(tmp_path):
 
 
 def test_check_sub_evidence_allowlist_rejects_input_fields_and_long_text():
-    """r7-S3（审核员）：_check_sub_evidence_allowlist 检测禁止输入字段（prompt/tool_input）+ 超长文本。
-    P1-4 manifest allowlist 只覆盖 manifest 顶层；S3 扩展到 sub-evidence——任意 prompt/tool input/超长
-    output 不进 bundle（R4 §4 最小充分证据）。secret scan 查凭据，allowlist 查字段类型+长度，互补。"""
+    """r7-S3 → r8-4（审核员）：_check_sub_evidence_allowlist 检测未知字段（prompt/tool_input——不在任何
+    dataclass 字段集）+ 超长文本。旧 r7-S3 是 denylist（4 禁字段）；r8-4 改 per-kind allowlist——任意非
+    dataclass 字段（prompt/tool_input/model_output 等）均拒（未知字段 fail，堵假绿）。用真 drill（telemetry）
+    隔离测字段 allowlist（非 drill 校验）。secret scan 查凭据，allowlist 查字段类型，互补。"""
     import json as _json
-    blob = _json.dumps({"drill": "x", "evidence": {
-        "prompt": "do something", "tool_input": "raw", "ok": True,
+    blob = _json.dumps({"drill": "telemetry", "evidence": {
+        "prompt": "do something", "tool_input": "raw",   # 不在 TelemetryEvidence 字段集 → 未知字段
         "long": "a" * 1500}}).encode("utf-8")
     v = CT._check_sub_evidence_allowlist(blob)
-    assert any("prompt" in x for x in v), "应检出禁止字段 prompt"
-    assert any("tool_input" in x for x in v), "应检出禁止字段 tool_input"
+    assert any("prompt" in x for x in v), "应检出未知字段 prompt（不在 dataclass allowlist）"
+    assert any("tool_input" in x for x in v), "应检出未知字段 tool_input"
     assert any("超长" in x for x in v), "应检出超长文本"
 
 
 def test_check_sub_evidence_allowlist_accepts_minimal_evidence():
-    """r7-S3：结构化判定字段（exit/stdout/stderr/passed）+ 短文本 → 合规（空违规，不误伤 drill 产出）。"""
+    """r8-4：真 drill + dataclass 合法字段（``_dc_field_names`` 动态取）+ 短文本 → 合规（空违规）。
+    旧 r7-S3 用假 drill "x" + {exit/stdout/...}（r8-4 后未知 drill/字段会被拒）；r8-4 改用真 telemetry
+    drill + 动态字段集（schema 漂移自动跟随，不硬编码字段名）。"""
     import json as _json
-    blob = _json.dumps({"drill": "x", "evidence": {
-        "exit": 0, "stdout": "GREEN", "stderr": "warn", "passed": True}}).encode("utf-8")
-    assert CT._check_sub_evidence_allowlist(blob) == []
+    _fields = CT._dc_field_names(CT.TelemetryEvidence)
+    _ev = {f: "v" for f in _fields}    # 全合法字段，短值
+    blob = _json.dumps({"drill": "telemetry", "evidence": _ev}).encode("utf-8")
+    assert CT._check_sub_evidence_allowlist(blob) == [], (
+        f"真 drill + dataclass 字段应合规: {CT._check_sub_evidence_allowlist(blob)}")
+
+
+# ---- r8-4（审核员）：sub-evidence per-kind allowlist 反例（denylist→allowlist） ----
+
+def test_check_sub_evidence_rejects_unknown_drill():
+    """r8-4：未知 drill（不在 per-kind allowlist）→ 违规（防任意 drill 名发布，旧 denylist 不查 drill）。"""
+    import json as _json
+    blob = _json.dumps({"drill": "bogus_drill", "evidence": {}}).encode("utf-8")
+    v = CT._check_sub_evidence_allowlist(blob)
+    assert any("未知 drill" in x for x in v), "未知 drill 应被拒（per-kind allowlist）"
+
+
+def test_check_sub_evidence_rejects_unknown_top_level_key():
+    """r8-4：顶层未知键（非 drill/evidence）→ 违规（防 blob 夹带额外顶层结构）。"""
+    import json as _json
+    blob = _json.dumps({"drill": "telemetry", "evidence": {}, "extra": "x"}).encode("utf-8")
+    v = CT._check_sub_evidence_allowlist(blob)
+    assert any("顶层" in x or "extra" in x for x in v), "顶层未知键应被拒"
+
+
+def test_check_sub_evidence_rejects_list_element_unknown_field():
+    """r8-4：list drill（recovery/sandbox）元素含未知字段 → 违规（list 元素也查 allowlist）。"""
+    import json as _json
+    blob = _json.dumps({"drill": "recovery", "evidence": [{"prompt": "x"}]}).encode("utf-8")
+    v = CT._check_sub_evidence_allowlist(blob)
+    assert any("prompt" in x or "未知字段" in x for x in v), "list 元素未知字段应被拒"
+
+
+def test_check_sub_evidence_allowlist_matches_dataclass_fields():
+    """r8-4 schema 漂移守卫：_SUB_EVIDENCE_ALLOWLIST_BY_KIND 每 drill 字段集 == 对应 dataclass 的 ``fields()``。
+    allowlist 由 ``_dc_field_names`` 动态构建，本应自动跟随；本测试锁定该不变式——dataclass 改字段时此测试
+    提醒 allowlist 同步（防手动维护 allowlist 漂移）。"""
+    from dataclasses import fields as _dc_fields
+    pairs = [
+        ("shadow_parity", CT.ShadowParityEvidence),
+        ("sdk_canary", CT.SdkHookCanaryEvidence),
+        ("crash_reconciliation", CT.CrashReconciliationEvidence),
+        ("dispatch_cutover", CT.DispatchCutoverResult),
+        ("quality_gate", CT.QualityGateResult),
+        ("telemetry", CT.TelemetryEvidence),
+        ("recovery", CT.RecoveryDrillResult),
+        ("sandbox", CT.SandboxDrillResult),
+    ]
+    for drill, cls in pairs:
+        expected = frozenset(f.name for f in _dc_fields(cls))
+        assert CT._SUB_EVIDENCE_ALLOWLIST_BY_KIND[drill] == expected, (
+            f"allowlist({drill}) 与 dataclass fields 漂移: "
+            f"{sorted(CT._SUB_EVIDENCE_ALLOWLIST_BY_KIND[drill])} != {sorted(expected)}")
 
 
 # ---- r6 P1-4：bundle publication allowlist + secret scan（评审 R4 §4：凭据不得跨机器泄漏） ----
