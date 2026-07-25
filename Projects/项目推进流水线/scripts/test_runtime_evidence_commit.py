@@ -333,3 +333,88 @@ def test_commit_evidence_excludes_tracked_modified_stray_with_credential(tmp_pat
         "r10-B2 回归：tracked-modified stray.log 进了 evidence commit——git commit 须 per-file（红队 DECISIVE："
         "per-file add 拦不住 tracked-modified；commit --<dir> 照带 stray 含凭据，git cat-file 可读直达远端）\n"
         f"实际 commit 文件：{_files}")
+
+
+def test_derive_evidence_whitelist_rejects_path_traversal_ref(tmp_path):
+    """r10-B2-traversal（红队 DECISIVE）：``_derive_evidence_whitelist`` 对 ``sub_evidence_refs`` 的 path
+    traversal ref（``../leaky.pem`` / 绝对路径 / ``~`` / ``\\``）须 fail-closed 返 ``[]``。
+
+    红队实测：旧版 ``_d`` 直接拼接 ``f"artifacts/{_d}"`` 零校验——``"../leaky.pem"`` → 候选
+    ``"artifacts/../leaky.pem"`` → ``Path.exists()`` 归一化为 ``(evidence_dir/"leaky.pem").exists()`` 为真 →
+    白名单含该 ref → ``_commit_evidence`` 的 ``git add/commit -- docs/evidence/<subj>/artifacts/../leaky.pem``
+    被 git pathspec 归一化 → stage+commit 真实 stray。``sub_evidence_refs`` 是内容寻址 digest
+    （``sha256:<hex>``，``_archive_sub_evidence`` 返 ``ref.digest``），全安全字符，校验安全字符集 + 拒 ``..``
+    不误杀生产。任一 ref 非法 → 整白名单 ``[]``（manifest 被外部构造带 traversal = 可疑，不部分信任）。
+    """
+    ev = tmp_path / "ev"
+    ev.mkdir()
+    (ev / "manifest.json").write_text(
+        '{"sub_evidence_refs": ["../leaky.pem", "sha256:abc"]}', encoding="utf-8")
+    (ev / "leaky.pem").write_text("stray", encoding="utf-8")          # traversal 目标存在（诱饵）
+    # 任一 ref 含 path traversal → 整白名单 fail-closed []（即便另一 ref 合法）
+    assert RE._derive_evidence_whitelist(ev) == [], (
+        "r10-B2-traversal 回归：含 '../leaky.pem' 的 sub_evidence_refs 须 fail-closed 返 []\n"
+        "红队 DECISIVE：ref 零校验 + Path.exists 归一化 + git pathspec 归一化 = traversal ref 让白名单指向 stray")
+
+
+def test_derive_evidence_whitelist_rejects_absolute_and_tilde_ref(tmp_path):
+    """r10-B2-traversal 边界：绝对路径 / ``~`` home / 反斜杠 / 空皆须拒（traversal 变体，同根因）。"""
+    import json as _json
+    ev = tmp_path / "ev"
+    ev.mkdir()
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    for _bad in ("/etc/passwd", "~/leaky.pem", "a\\b", "", "a/../b", "a/.."):
+        (ev / "manifest.json").write_text(
+            _json.dumps({"sub_evidence_refs": [_bad]}), encoding="utf-8")
+        assert RE._derive_evidence_whitelist(ev) == [], (
+            f"r10-B2-traversal 回归：恶意 ref {_bad!r} 须被拒（traversal 变体）")
+
+
+def test_derive_evidence_whitelist_accepts_legal_digest_ref(tmp_path):
+    """r10-B2-traversal 正向：合法内容寻址 digest ref（``sha256:<hex>``）须通过——校验不误杀生产。
+
+    生产 ``_archive_sub_evidence`` 返 ``ref.digest`` = ``sha256:<hex>``（cutover.py:1532/1829 文件名=digest），
+    全 ``[A-Za-z0-9._:-]`` 安全字符。校验后白名单含 ``manifest.json`` + ``artifacts/<digest>``（存在的）。
+    """
+    ev = tmp_path / "ev"
+    ev.mkdir()
+    _digest = "sha256:" + "a" * 64
+    (ev / "manifest.json").write_text(
+        '{"sub_evidence_refs": ["%s"]}' % _digest, encoding="utf-8")
+    (ev / "artifacts").mkdir()
+    (ev / "artifacts" / _digest).write_text("blob", encoding="utf-8")
+    wl = RE._derive_evidence_whitelist(ev)
+    assert "manifest.json" in wl and f"artifacts/{_digest}" in wl, (
+        f"合法 digest ref 误杀——生产 sha256:<hex> 须通过校验。实际白名单：{wl}")
+
+
+def test_commit_evidence_rejects_path_traversal_ref_fail_closed(tmp_path):
+    """r10-B2-traversal 端到端（红队 DECISIVE）：manifest.sub_evidence_refs 含 traversal ref + 同目录 stray
+    含**未检出凭据格式**（PEM 私钥，``_scan_for_secrets`` 盲区）→ ``_commit_evidence`` 须 fail-closed 返
+    ``None``（``_derive_evidence_whitelist`` 返 [] → ``if not _expected: return None``），HEAD 不前进、stray 不进 commit。
+
+    红队 exploit 链（旧代码成立）：traversal ref 让 stray 进白名单(1) → git pathspec 归一化 stage stray(2)
+    → ancestry ``startswith("docs/evidence/")`` 放行(3) → Layer 3 ``_scan_for_secrets`` 对 PEM 盲区零命中(4)
+    → push 远端泄漏(5)。修 Layer 1（ref 校验）断链第(1)步；Layer 3 不在 ``_commit_evidence`` 内（公开 API，
+    测试直接用），故 ``_commit_evidence`` 自身须堵 traversal（不依赖 publish 层 scan 兜底）。
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    # manifest 被「外部构造」带 traversal ref（生产 TOCTOU：并发 claude 会话改写 / retry sidecar 重注入）
+    (ev / "manifest.json").write_text(
+        '{"sub_evidence_refs": ["../leaky.pem"]}', encoding="utf-8")
+    # stray 含 PEM 私钥（Layer 3 _scan_for_secrets 无此模式 → 盲区；AKIA 也用上确保双格式都不被兜底）
+    (ev / "leaky.pem").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nLEAKED_AKIA_CREDENTIAL_VALUE\n", encoding="utf-8")
+    sha = RE._commit_evidence(ev, subject, vault_root=vault, push=False)
+    # 修复：traversal ref → _derive_evidence_whitelist fail-closed [] → _commit_evidence None
+    assert sha is None, (
+        "r10-B2-traversal 回归：path traversal sub_evidence_ref 让 stray leaky.pem 进白名单 → commit\n"
+        "红队 DECISIVE：ref 零校验 + git pathspec 归一化 + ancestry 前缀放行 + Layer 3 PEM 盲区 = 含凭据 stray 直达远端")
+    # fail-closed 不 commit → HEAD 退回 subject（无污染 commit 残留）
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault),
+                                   text=True).strip()
+    assert head == subject, "traversal ref 须 fail-closed 不 commit（HEAD 不应前进）"
