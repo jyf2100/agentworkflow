@@ -983,8 +983,18 @@ def _derive_evidence_whitelist(evidence_dir: Path) -> list[str]:
     修复：字符集去 ``.`` → ``[A-Za-z0-9_:-]+``（生产 digest 不含 ``.``，不误杀）。(2) **目录白名单条目**——候选过滤
     ``.exists()`` 对目录返 True，固定条目（``bundle.sha256``）或 ``artifacts/<ref>`` 被 TOCTOU 换目录 → ``git add -- <dir>``
     递归 stage 目录内全部文件（红队实测 TOCTOU 双交换绕过 verify.py 读 working tree）。修复：``.exists()`` → ``.is_file()``
-    （目录不进白名单）。残余（红队 must-fix 但属职责分离设计，留 P2 合约声明）：``_commit_evidence`` 公开 API 自身不扫
-    凭据（scan 在编排层 ``_publish_and_verify_evidence``），直接调用方传含凭据 manifest.json 无 scan 兜底。
+    （目录不进白名单）。残余（第三轮专家团队 wfv2p9oc9：审计 DECISIVE / 红队 SATISFIED 未复现 → P2 regression lock，非紧急必修）：
+    (a) **内容寻址 artifact injection（审计 Hole 1 DECISIVE）**——白名单派生信任磁盘 ``manifest.json``，attacker
+    poison manifest 含合法 digest ref（``sha256:<CRED 内容 digest>``，过 regex）+ 写 ``artifacts/<dg>=CRED`` →
+    白名单放行。根因：白名单锚定「ref 名格式」而非「publish 时 in-memory intent」；verify.py 内容寻址
+    （``sha256(bytes)==filename``）让 attacker 控制 content 即造匹配 digest ref 名，叠加 ``_scan_for_secrets`` 盲区。
+    红队实测 TOCTOU race 400 attempts 零胜（pa 单进程顺序运行无真实并发 attacker 写 evidence 目录），机制成立但端到端
+    未复现 → 非必修门槛（红队实测可利用）。修复方向：``_commit_evidence`` 接收 publish 时 in-memory
+    ``sub_evidence_refs``，不重读磁盘 manifest（锚定不可变 intent）。xfail strict lock。
+    (b) **``_commit_evidence`` 公开 API 零 scan（审计 Hole 2 MUST_FIX）**——scan 在编排层
+    ``_publish_and_verify_evidence``，直接调用方传含凭据 manifest.json 无 scan 兜底（职责分离设计，无代码强制）。
+    修复方向：``_scan_for_secrets`` 提进 ``_commit_evidence`` per-file 扫白名单每个文件。xfail strict lock。
+    (c) 固定候选 ``is_file()``→``git add`` 间 TOCTOU 目录/符号链接交换（审计 Hole 3 FOLLOWUP，被 verify.py 间接阻断）。
 
     返回相对 evidence_dir 的路径（如 ``["manifest.json", "artifacts/sha256:abc"]``），``_commit_evidence`` 拼成
     相对 vault 的 pathspec 做 per-file ``git add`` + ``git commit``（堵 tracked-modified stray 进 commit）。
