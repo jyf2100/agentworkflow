@@ -28,6 +28,9 @@ Thumbs.db
 .claude/shell-snapshots/
 .claude/statsig/
 
+# 例外：rocketmq-produce-consume skill 含本地 RocketMQ endpoints 与 node 运行态（node_modules），整体不入仓
+.claude/skills/rocketmq-produce-consume/
+
 # === 通用备份 / 临时 / 日志 ===
 *.bak
 *.tmp
