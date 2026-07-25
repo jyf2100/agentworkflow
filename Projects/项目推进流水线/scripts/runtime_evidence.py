@@ -503,7 +503,29 @@ def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> 
             for cb in m.hooks:
                 _ev, _cid = event, correlation_id
                 async def _w(*args, _cb=cb, _evn=_ev, _cid=_cid, **kwargs):
-                    callback_invocations.append({"event": _evn, "correlation_id": _cid})
+                    inv: dict = {"event": _evn, "correlation_id": _cid}
+                    # r6 P0：best-effort 从该场景同一 query 的 hook_input 提取 tool 证据（PostToolUse 的
+                    # tool_name + tool_response.exit_code/stdout）。提取失败字段留空 → state 不匹配 → 诚实红
+                    # （fail-closed，绝不假绿）。observed_state 与 journal/cid 同源（同一 query）。
+                    hi = args[0] if args else kwargs.get("hook_input")
+                    if _evn == "PostToolUse" and hi is not None:
+                        tn = getattr(hi, "tool_name", None)
+                        if tn is None and isinstance(hi, dict):
+                            tn = hi.get("tool_name")
+                        tr = getattr(hi, "tool_response", None)
+                        if tr is None and isinstance(hi, dict):
+                            tr = hi.get("tool_response")
+                        ec = getattr(tr, "exit_code", None)
+                        out = getattr(tr, "stdout", None)
+                        if isinstance(tr, dict):
+                            ec = ec if ec is not None else tr.get("exit_code")
+                            out = out if out is not None else tr.get("stdout")
+                        inv["tool_name"] = tn
+                        inv["tool_exit_code"] = ec
+                        inv["tool_output"] = (out or "")[:200]
+                    if _evn == "SubagentStart":
+                        inv["saw_subagent"] = True
+                    callback_invocations.append(inv)
                     try:
                         return await _cb(*args, **kwargs)
                     except Exception as e:
@@ -559,6 +581,20 @@ def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> 
     invocation_carries_own_cid = any(i.get("correlation_id") == correlation_id for i in callback_invocations)
     sdk_callback_real_proven = journal_has_expected and invocation_carries_own_cid
     sdk_types = sorted({h for h in sdk_hook_names if h})
+    # r6 P0：从该场景同一 query 的 callback + result 聚合 observed_state（与 journal/cid 同源）。
+    # bash_results 从 PostToolUse callback 提取（exit_code/stdout）；reply 从 result_msg.text；
+    # saw_tool_use/saw_subagent_start 从 callback event 类型。evaluate_scenario 按标签精确匹配。
+    bash_results = [
+        {"exit_code": i.get("tool_exit_code"), "output": i.get("tool_output") or ""}
+        for i in callback_invocations if i.get("event") == "PostToolUse" and i.get("tool_name")]
+    saw_tool_use = any(i.get("event") == "PostToolUse" for i in callback_invocations)
+    saw_subagent_start = any(i.get("event") == "SubagentStart" for i in callback_invocations)
+    observed_state = {
+        "bash_results": bash_results,
+        "reply_text": (getattr(result_msg, "text", None) or ""),
+        "saw_tool_use": saw_tool_use,
+        "saw_subagent_start": saw_subagent_start,
+    }
     return {
         "per_scenario_entry": {
             "expected_event": spec.expected_event,
@@ -572,6 +608,12 @@ def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> 
             "invocation_carries_own_cid": invocation_carries_own_cid,
             "sdk_callback_real_proven": sdk_callback_real_proven,
             "real_proven": sdk_callback_real_proven,              # 向后兼容
+            # r6 P0：per-scenario 绑定字段（gate+callback+state 同源），供 evaluate_sdk_canary_scenarios
+            # 做 state 精确匹配（杜绝 journal+cid 即 proven 假绿）。adapter_gate 由 real_sdk_canary 层填。
+            "journal_has_expected": journal_has_expected,
+            "carries_own_cid": invocation_carries_own_cid,
+            "observed_state": observed_state,
+            "adapter_gate": None,
         },
         "callback_invocations": callback_invocations,
         "callback_errors": callback_errors,
@@ -645,11 +687,17 @@ def real_sdk_canary(workdir: Path) -> dict:
                 "gate_outcome_source": "adapter_fixture_only",
                 "sdk_callback_blocked_reason": spec.blocked_reason,
                 "blocked_reason": spec.blocked_reason,        # 向后兼容
+                # r6 P0：per-scenario 绑定字段（blocked 场景 query 不跑 → journal/cid/state 皆空 → proven=False 诚实）
+                "journal_has_expected": False,
+                "carries_own_cid": False,
+                "observed_state": {},
+                "adapter_gate": adapter_gates.get(spec.id),
             }
             continue
         res = _run_scenario_query(spec, workdir=workdir, stamp=stamp)
         entry = dict(res["per_scenario_entry"])
         entry["adapter_gate_outcome"] = adapter_gates.get(spec.id)
+        entry["adapter_gate"] = adapter_gates.get(spec.id)   # r6 P0：绑定到该场景（evaluate 用此字段做 gate 精确匹配）
         entry["gate_outcome_source"] = "sdk+adapter" if entry["sdk_callback_real_proven"] else "adapter_fixture_only"
         entry["source"] = "per-scenario query"
         per_scenario[spec.id] = entry
@@ -859,6 +907,50 @@ def _git_subject_commit() -> str | None:
         return None
 
 
+def _commit_evidence(evidence_dir: Path, subject_commit: str,
+                     *, vault_root: Path | None = None) -> str | None:
+    """r6 P1-3（R4 §2.2 + §2.3）：生成独立 evidence_commit——只含 ``docs/evidence/<subject_commit>/`` 路径。
+
+    生产：在 vault 仓 ``git add -- <evidence_dir>`` + ``git commit``（基于 subject_commit），返回 evidence_commit
+    sha。ancestry 自检（R4 §2.3-3）：``subject..evidence`` 之间只含 allowlist 的 evidence 路径
+    （``docs/evidence/``），否则 fail-closed 返回 None（杜绝 evidence_commit 夹带业务代码变更被误当 subject
+    重新执行）。任何 git 步骤失败 → None（fail-closed，real_cutover_suite 据此阻断 overall_passed）。
+
+    ``vault_root`` 可注入（测试用 tmp git 仓验证 ancestry；生产默认 ``parents[2]`` = vault 根）。
+    """
+    import subprocess
+    _vault = vault_root or Path(__file__).resolve().parents[2]
+    try:
+        rel = (evidence_dir.resolve().relative_to(_vault.resolve())
+               if evidence_dir.is_absolute() else Path(evidence_dir))
+    except Exception:
+        return None
+    _git_env = {**os.environ,
+                "GIT_AUTHOR_NAME": os.environ.get("GIT_AUTHOR_NAME", "pa-cutover-runner"),
+                "GIT_AUTHOR_EMAIL": os.environ.get("GIT_AUTHOR_EMAIL", "runner@pa-cutover.local"),
+                "GIT_COMMITTER_NAME": os.environ.get("GIT_COMMITTER_NAME", "pa-cutover-runner"),
+                "GIT_COMMITTER_EMAIL": os.environ.get("GIT_COMMITTER_EMAIL", "runner@pa-cutover.local")}
+    try:
+        subprocess.run(["git", "add", "--", str(rel)], cwd=str(_vault), check=True,
+                       capture_output=True, text=True, timeout=15, env=_git_env)
+        subprocess.run(["git", "commit", "-m",
+                        f"evidence: cutover suite for subject_commit={subject_commit[:12]}"],
+                       cwd=str(_vault), check=True, capture_output=True, text=True, timeout=15, env=_git_env)
+        evidence_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(_vault),
+                                               text=True, timeout=5).strip()
+        # ancestry 自检（R4 §2.3-3）：subject..evidence 只含 docs/evidence/ 路径变更（路径 allowlist）
+        diff_out = subprocess.check_output(
+            ["git", "diff", "--name-only", f"{subject_commit}..{evidence_sha}"],
+            cwd=str(_vault), text=True, timeout=10).strip()
+        changed = [ln for ln in diff_out.splitlines() if ln.strip()]
+        _bad = [f for f in changed if not f.startswith("docs/evidence/")]
+        if _bad:
+            return None
+        return evidence_sha or None
+    except Exception:
+        return None
+
+
 def _runner_version() -> str:
     """r5 P1-4（§5）：runner 版本标识（谁/什么版本产了此 manifest）。env 注入或默认标记。"""
     return os.environ.get("PA_RUNNER_VERSION") or "pa-cutover-runner"
@@ -973,7 +1065,11 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
             # r5 P1-2（评审）：query 完整性——result_received/query_error 进 SdkHookCanaryEvidence，
             # 由 evaluate_evidence_intact（7.2 谓词 + 7.6 outcome 共调）判定。query 未正常结束 → 证据不可信。
             result_received=bool(_r.get("result_received")),
-            query_error=_r.get("query_error")),
+            query_error=_r.get("query_error"),
+            # r6 P0：per-scenario 绑定证据（每场景 journal/cid/state/gate 同源），7.6 _sdk_canary_outcome
+            # 从此构造 per dict 传 evaluate_sdk_canary_scenarios（替代 sdk_callback_proven 场景名 tuple）。
+            per_scenario=tuple({"scenario_id": s, **e}
+                               for s, e in (_r.get("per_scenario_real_triggers") or {}).items())),
         # r5 P1-3（评审）：telemetry 升为独立 gate 维度——从 real_sdk_canary 真实遥测填（callback_invocations
         # /lifecycle_hooks_triggered_by_callback/num_turns/query_error）。_telemetry_outcome 判 SDK 遥测通道
         # 在线/未降级（callback_invocations 非空 + lifecycle 可观测 + query 未中断）。杜绝旧"仅归档进
@@ -1016,14 +1112,22 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
         subject_commit=_subject, runner_version=_rv, executed_at=_at)
     # r5 P1-4（评审④）：cross-machine immutable bundle——本机 mkdtemp artifact_root 跨机器不可访问，bundle 把
     # 结构化 manifest + 全部子证据 + 自检脚本打成自包含、内容寻址、相对路径目录（bundle_digest 跨机器一致）。
-    bundle_path = bundle_digest = None
+    bundle_path = bundle_digest = evidence_commit = None
     bundle_publish_ok = False
-    if manifest.overall_passed:
+    # r6 P1-3（R4 §2.1）：subject_commit 是 evidence_commit ancestry 锚点——缺失（git HEAD 不可取）即
+    # 证据无法绑定被验收代码 → fail-closed（不 publish bundle，overall_passed=False）。r5 旧版 None 不阻断。
+    if manifest.overall_passed and _subject:
         try:
-            _short = (manifest.archive_digest or "norun").replace(":", "")[:24]
-            _br = artifact_root.parent / f"cutover_bundle_{_short}"
+            # r6 P1-3（R4 §2.2）：bundle 落仓内 docs/evidence/<subject_commit>/（git 可追踪，ancestry 可验收）。
+            _vault_root = Path(__file__).resolve().parents[2]
+            _br = _vault_root / "docs" / "evidence" / _subject
             bundle_path, bundle_digest = CT.publish_evidence_bundle(
                 artifact_root=str(artifact_root), manifest=manifest, bundle_root=_br)
+            # r6 P1-3（R4 §2.2 + §2.3）：独立 evidence_commit（只含 docs/evidence/<subject>/ 路径）+ ancestry 自检。
+            # 失败（git 不可用/ancestry 含非 evidence 路径）→ fail-closed 阻断 overall_passed。
+            evidence_commit = _commit_evidence(_br, _subject)
+            if not evidence_commit:
+                raise RuntimeError("evidence_commit 创建失败（git add/commit/ancestry 自检）")
             bundle_publish_ok = True
         except Exception as exc:
             bundle_path = f"publish_failed: {exc!r}"
@@ -1037,7 +1141,10 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
         "per_dim_pass": {"shadow_parity": parity_passed, "crash_reconciliation": crash_ok,
                          "sandbox": sandbox_clean, "sandbox_docker_all_pass": docker_ok,
                          "dispatch_cutover": dispatch_ok},
-        "overall_passed": manifest.overall_passed,
+        # r6 P1-2 + P1-3（评审）：bundle publication fail-closed + evidence_commit 绑定——manifest 全绿但
+        # publish/write/digest/evidence_commit 任一失败或 subject_commit 缺失 → overall_passed=False。
+        "overall_passed": (manifest.overall_passed and bundle_publish_ok and bool(bundle_digest)
+                           and bool(evidence_commit) and bool(_subject)),
         "artifact_root": str(artifact_root),   # r3 P1-2：cutover 子证据真实存储根（评审据此 load 子 digest）
         "archive_digest": manifest.archive_digest,
         "manifest_summary": manifest.summary,
@@ -1053,6 +1160,7 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
         "not_manual_event_flow": True,   # run_full_cutover_suite 编排真实 drill bundle callable
         "bundle_path": bundle_path,            # r5 P1-4（④）：cross-machine immutable bundle（自包含可移植）
         "bundle_digest": bundle_digest,        # passing 声明跨机器可复核锚点（bundle.sha256，跨机器一致）
+        "evidence_commit": evidence_commit,    # r6 P1-3（R4 §2.2）：独立 evidence git commit（ancestry 锚点）
         "bundle_publish_ok": bundle_publish_ok,
     }
 
@@ -1247,13 +1355,13 @@ def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
             per = res.get("per_scenario_real_triggers", {})
             # r3 P0-1 闭环：场景级判定收敛到 evaluate_sdk_canary_scenarios 单一纯函数（7.6 outcome 共调，
             # 杜绝两入口漂移；评审 response §2.2 建议）。per_scenario 两维度规范化为纯函数入参。
-            gates = {s: e.get("adapter_gate_outcome") for s, e in per.items()}
-            callbacks_proven = frozenset(s for s, e in per.items() if e.get("sdk_callback_real_proven"))
+            # r6 P0：per_scenario 绑定证据（每场景 journal/cid/state/gate 同源），替代 gates+callbacks_proven
+            # 两独立集合（审查者反例：全 callback 名 + fixture gates = passed）。state 维度由 evaluate 内部
+            # evaluate_scenario 精确匹配（杜绝 journal+cid 即 proven 假绿，R4 §3.4）。
             # r5 P1-2（评审）：evidence 完整性入参从 res 传入共享纯函数——callback_errors / journal_decode_errors /
-            # query_error / result_received 任一违例即证据不可信（即便场景矩阵全绿）。此前 7.2 谓词只查
-            # cb_proven + scenario_verdict，构造「完整性违例 + 矩阵全真」输入仍返回 (True, None) 假绿。
+            # query_error / result_received 任一违例即证据不可信（即便场景矩阵全绿）。
             verdict = CT.evaluate_sdk_canary_scenarios(
-                gates=gates, callbacks_proven=callbacks_proven,
+                per_scenario=per,
                 callback_errors=res.get("callback_errors") or (),
                 journal_decode_errors=int(res.get("journal_decode_errors") or 0),
                 query_error=res.get("query_error"),
@@ -1263,16 +1371,27 @@ def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
             return ok, None if ok else (
                 f"lifecycle_cb={cb_proven} scenario_verdict={verdict.passed} "
                 f"gate_ok={verdict.gate_ok} callback_ok={verdict.callback_ok} "
-                f"evidence_intact={verdict.evidence_intact} "
+                f"state_ok={verdict.state_ok} evidence_intact={verdict.evidence_intact} "
                 f"integrity_failures={verdict.integrity_failures} "
                 f"mismatches={verdict.gate_mismatches} missing={verdict.missing_callbacks} "
+                f"state_failures={verdict.state_failures} "
                 f"blocked={res.get('blocked_scenarios')}")
         if key == "7.5_allowlist_rollout":
             ok = bool(res.get("triple_gate_proven"))
             return ok, None if ok else f"triple_gate_proven={res.get('triple_gate_proven')}"
         if key == "7.6_cutover_suite":
-            ok = bool(res.get("overall_passed"))
-            return ok, None if ok else f"overall_passed={res.get('overall_passed')}"
+            # r6 P1-2 + P1-3：bundle publication fail-closed + evidence_commit 绑定——overall_passed 已含
+            # bundle_publish_ok + bundle_digest + evidence_commit + subject_commit（return 处合成）。谓词显式
+            # 查四者给诊断（publish/digest/evidence_commit/subject 缺失的具体原因）。
+            ok = (bool(res.get("overall_passed"))
+                  and bool(res.get("bundle_publish_ok"))
+                  and bool(res.get("bundle_digest"))
+                  and bool(res.get("evidence_commit")))
+            return ok, None if ok else (
+                f"overall_passed={res.get('overall_passed')} "
+                f"bundle_publish_ok={res.get('bundle_publish_ok')} "
+                f"bundle_digest={res.get('bundle_digest')} "
+                f"evidence_commit={res.get('evidence_commit')}")
     except Exception as e:
         return False, f"predicate error: {type(e).__name__}: {e}"
     return False, "unknown drill key"

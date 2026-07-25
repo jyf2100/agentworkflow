@@ -17,14 +17,33 @@ _ADAPTER_GATES = dict(CT.run_sdk_hook_canary().stop_gates)
 _REQUIRED = CT.SDK_CALLBACK_REQUIRED_SCENARIOS
 
 
+def _state_for(sc):
+    """每场景正确 observed_state（r6 P0：state 精确匹配，让 evaluate_scenario 通过）。"""
+    return {
+        "test_red": {"bash_results": [{"exit_code": 1, "output": ""}], "reply_text": "", "saw_tool_use": True, "saw_subagent_start": False},
+        "test_green": {"bash_results": [{"exit_code": 0, "output": "GREEN"}], "reply_text": "", "saw_tool_use": True, "saw_subagent_start": False},
+        "stale_test": {"bash_results": [{"exit_code": 0, "output": "STALE"}], "reply_text": "", "saw_tool_use": True, "saw_subagent_start": False},
+        "semantic_revise": {"bash_results": [], "reply_text": "REVISE", "saw_tool_use": False, "saw_subagent_start": False},
+        "no_test": {"bash_results": [], "reply_text": "NO TEST", "saw_tool_use": False, "saw_subagent_start": False},
+        "subagent": {"bash_results": [], "reply_text": "", "saw_tool_use": False, "saw_subagent_start": True},
+        "compaction": {"bash_results": [], "reply_text": "", "saw_tool_use": False, "saw_subagent_start": False},
+        "hook_failure": {"bash_results": [], "reply_text": "", "saw_tool_use": False, "saw_subagent_start": False},
+    }.get(sc, {"bash_results": [], "reply_text": "", "saw_tool_use": False, "saw_subagent_start": False})
+
+
 def _green_per_scenario() -> dict:
-    """全绿 per_scenario 矩阵：6 必须场景 sdk_callback_real_proven + 全 8 场景 adapter_gate_outcome 精确匹配。"""
+    """全绿 per_scenario 矩阵：8 场景 journal+cid+state+gate 全绑定（r6 P0：同源 + state 精确匹配）。"""
     per: dict = {}
     for sc, gate in CT.EXPECTED_LIFECYCLE_GATES.items():
         per[sc] = {
             "expected_event": "Stop",
-            "sdk_callback_real_proven": sc in _REQUIRED,   # 6 必须场景 proven；PreCompact 两场景诚实 blocked
-            "adapter_gate_outcome": _ADAPTER_GATES.get(sc, gate),
+            "sdk_callback_real_proven": True,                       # 向后兼容（旧字段）
+            "adapter_gate_outcome": _ADAPTER_GATES.get(sc, gate),   # 向后兼容
+            # r6 P0：per-scenario 绑定字段（evaluate_sdk_canary_scenarios 消费）
+            "journal_has_expected": True,
+            "carries_own_cid": True,
+            "adapter_gate": _ADAPTER_GATES.get(sc, gate),
+            "observed_state": _state_for(sc),
         }
     return per
 
@@ -67,7 +86,7 @@ def test_drill_predicate_7_2_wrong_gate_rejected():
     """r3 P0-1 闭环 MEDIUM-1：adapter gate 非空但错（test_green 应 PUBLISH 实给错值）→ False。
     旧 truthy 判定会假绿（错值非空→True）；exact-match 必须拒。"""
     per = _green_per_scenario()
-    per["test_green"] = {**per["test_green"], "adapter_gate_outcome": "WRONG_NONEMPTY_GATE"}
+    per["test_green"] = {**per["test_green"], "adapter_gate": "WRONG_NONEMPTY_GATE"}
     ok, reason = RE._drill_predicate("7.2_sdk_canary", _res(per))
     assert ok is False and reason is not None
 
@@ -75,7 +94,7 @@ def test_drill_predicate_7_2_wrong_gate_rejected():
 def test_drill_predicate_7_2_missing_callback_scenario_rejected():
     """r3 P0-1 闭环 HIGH-1（谓词侧）：缺一个必须 callback 场景的 proven → sdk_cb_ok False → False。"""
     per = _green_per_scenario()
-    per["subagent"] = {**per["subagent"], "sdk_callback_real_proven": False}
+    per["subagent"] = {**per["subagent"], "journal_has_expected": False, "carries_own_cid": False}
     ok, reason = RE._drill_predicate("7.2_sdk_canary", _res(per))
     assert ok is False and reason is not None
 
@@ -86,3 +105,46 @@ def test_drill_predicate_7_2_missing_scenario_entry_rejected():
     del per["hook_failure"]
     ok, reason = RE._drill_predicate("7.2_sdk_canary", _res(per))
     assert ok is False and reason is not None
+
+
+# ---- r6 P1-2：bundle publication fail-closed（7.6 入口） ----
+
+def test_drill_predicate_7_6_bundle_publish_failure_rejected():
+    """r6 P1-2（评审反例，7.6 入口）：overall_passed=True 但 bundle_publish_ok=False + digest=None
+    → 谓词必 False。旧谓词只查 overall_passed，同输入返回 (True, None) 假绿——manifest 全绿但 bundle
+    publish 抛异常（写盘/scan/digest 失败）仍声称 passing。P1-2：bundle publication fail-closed。"""
+    res = {
+        "overall_passed": True,        # manifest 维度全绿
+        "bundle_publish_ok": False,    # 但 publish 失败
+        "bundle_digest": None,         # 无 digest
+    }
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is False and reason is not None
+    assert "bundle_publish_ok=False" in reason
+
+
+def test_drill_predicate_7_6_bundle_digest_missing_rejected():
+    """r6 P1-2 另一面：overall_passed=True + bundle_publish_ok=True 但 bundle_digest=None（publish 写盘
+    但未产出 digest）→ 谓词 False。digest 是跨机器可复核锚点，缺失即不可复核 → fail-closed。"""
+    res = {"overall_passed": True, "bundle_publish_ok": True, "bundle_digest": None}
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is False and reason is not None
+    assert "bundle_digest=None" in reason
+
+
+def test_drill_predicate_7_6_green_passes():
+    """r6 P1-2 + P1-3 正向：overall_passed + bundle_publish_ok + bundle_digest + evidence_commit 四者全真 → 谓词 True。"""
+    res = {"overall_passed": True, "bundle_publish_ok": True,
+           "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef"}
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is True and reason is None
+
+
+def test_drill_predicate_7_6_missing_evidence_commit_rejected():
+    """r6 P1-3（R4 §2.2）：evidence_commit 缺失（subject 阻断/git 不可用/ancestry 失败）→ 谓词 False。
+    overall_passed + bundle 全真但 evidence_commit=None → 仍红（证据未绑定 git ancestry，不可独立验收）。"""
+    res = {"overall_passed": True, "bundle_publish_ok": True,
+           "bundle_digest": "sha256:abc", "evidence_commit": None}
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is False and reason is not None
+    assert "evidence_commit=None" in reason
