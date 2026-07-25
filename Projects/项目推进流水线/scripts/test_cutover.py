@@ -1361,6 +1361,50 @@ def test_check_sub_evidence_rejects_list_element_unknown_field():
     assert any("prompt" in x or "未知字段" in x for x in v), "list 元素未知字段应被拒"
 
 
+# ---- r9-6（审核员）：sub-evidence 递归 leaky denylist + 非 JSON fail-closed ----
+# r8-4 顶层 allowlist 只查 evidence 顶层键 + list 元素顶层键，不深入嵌套 dict/list → 审核员反例：
+# telemetry.callback_invocations[].raw_prompt/tool_output + sdk_canary.per_scenario[].prompt/model_output
+# 经嵌套结构泄漏。r9-6 在 _walk 递归中补 denylist（_SUB_EVIDENCE_LEAKY_FIELDS），任意深度命中即拒。
+
+def test_check_sub_evidence_rejects_non_json_blob():
+    """r9-6（审核员）：非 JSON blob → fail-closed。旧版 ``except: return []`` 跳过 = 视为干净 → 假绿。
+    sub-evidence 经 ``_archive_sub_evidence`` 总是 ``json.dumps`` 序列化，非 JSON = 损坏/伪造，绝不当二进制
+    artifact 干净放过。"""
+    blob = b"\x00\x01\x02 not json \xff\xfe"
+    v = CT._check_sub_evidence_allowlist(blob)
+    assert any("非 JSON" in x for x in v), "非 JSON blob 应 fail-closed（旧版跳过返回 [] = 假绿）"
+
+
+def test_check_sub_evidence_rejects_nested_leaky_field_in_callback_invocations():
+    """r9-6（审核员反例）：``telemetry.callback_invocations[].tool_output`` 经嵌套 dict/list 泄漏。
+    r8-4 顶层 allowlist 只查 evidence 顶层键（callback_invocations 是合法顶层字段）+ list 元素顶层键，
+    不深入 callback_invocations[].tool_output → 嵌套 leaky 字段漏网。r9-6 ``_walk`` 递归 denylist 补：
+    任意深度命中 ``_SUB_EVIDENCE_LEAKY_FIELDS``（tool_output/raw_prompt/prompt/model_output/...）→ 违规。"""
+    import json as _json
+    blob = _json.dumps({"drill": "telemetry", "evidence": {
+        "callback_invocations": [
+            {"event": "PostToolUse", "correlation_id": "c1", "tool_output": "SECRET_STDOUT_WITH_TOKEN"},
+            {"event": "PostToolUse", "correlation_id": "c2", "raw_prompt": "system prompt leak"}],
+    }}).encode("utf-8")
+    v = CT._check_sub_evidence_allowlist(blob)
+    assert any("tool_output" in x and "泄漏" in x for x in v), (
+        "嵌套 callback_invocations[].tool_output 须被 r9-6 递归 denylist 检出（r8-4 顶层 allowlist 漏网）")
+    assert any("raw_prompt" in x and "泄漏" in x for x in v), "raw_prompt 同属 leaky denylist"
+
+
+def test_check_sub_evidence_accepts_clean_callback_invocations():
+    """r9-6 回归：callback_invocations 元素只含非 leaky 字段（event/correlation_id/tool_name/tool_exit_code）
+    → 合规。证明 r9-6 denylist 精确拒 leaky 字段名，不误伤合法诊断元数据（runtime
+    ``_strip_leaky_invocation_fields`` 剥离 tool_output 后的 callback_invocations 须过 allowlist）。"""
+    import json as _json
+    blob = _json.dumps({"drill": "telemetry", "evidence": {
+        "callback_invocations": [
+            {"event": "PostToolUse", "correlation_id": "c1", "tool_name": "Bash", "tool_exit_code": 0}],
+    }}).encode("utf-8")
+    v = CT._check_sub_evidence_allowlist(blob)
+    assert v == [], f"无 leaky 字段的 callback_invocations 应合规: {v}"
+
+
 def test_check_sub_evidence_allowlist_matches_dataclass_fields():
     """r8-4 schema 漂移守卫：_SUB_EVIDENCE_ALLOWLIST_BY_KIND 每 drill 字段集 == 对应 dataclass 的 ``fields()``。
     allowlist 由 ``_dc_field_names`` 动态构建，本应自动跟随；本测试锁定该不变式——dataclass 改字段时此测试
@@ -1567,3 +1611,144 @@ def test_verify_sub_evidence_complete_rejects_wrong_outcome_names():
     ok, reason = CT._verify_sub_evidence_complete(outcomes, "/nonexistent-root")
     assert ok is False
     assert "不齐全" in reason and "quality_gate" in reason
+
+
+def test_otlp_export_verified_false_when_no_endpoint(monkeypatch):
+    """r9-1：无 OTEL endpoint（生产常态）→ False（不连网，诚实未接入 → telemetry 进 open_items）。"""
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    assert CT._otlp_export_verified() is False
+
+
+def test_otlp_export_verified_not_forgeable_by_env_nonempty(monkeypatch):
+    """r9-1 核心（审核员 P0 反向反例）：设 ``OTEL_EXPORTER_OTLP_ENDPOINT=x`` → r8-1 旧判 ``bool(env)=True``
+    （telemetry_connected=True → 7.6 假绿）。r9-1 改实际 export——collector 不可达 → False。
+
+    环境变量非空**不可伪造**接入：必须真实 collector 可达 + 接收 valid span（2xx）。"""
+    import urllib.error
+    import urllib.request
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://nonexistent-collector.invalid")
+
+    def _boom(req, timeout=None):
+        raise urllib.error.URLError("unreachable")     # 连接失败（伪造 endpoint =x 走此路径）
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    assert CT._otlp_export_verified() is False, "环境变量非空即 True——r8-1 旧判未废，假绿路径仍在"
+
+
+def test_otlp_export_verified_true_when_collector_receives_2xx(monkeypatch):
+    """r9-1：接真实 collector + export test span 接收（HTTP 2xx）→ True（真实接入，telemetry 可移出 open_items）。
+
+    同时验 url 拼接：base endpoint（无 /v1/traces）自动补 /v1/traces（OTLP/HTTP traces 路径）。"""
+    import urllib.request
+    captured = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _ok(req, timeout=None):
+        captured["url"] = req.full_url
+        return _Resp()
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+    monkeypatch.setattr(urllib.request, "urlopen", _ok)
+    assert CT._otlp_export_verified() is True
+    assert captured["url"] == "http://collector:4318/v1/traces", "base endpoint 须补 /v1/traces"
+
+
+def test_otlp_export_verified_uses_traces_endpoint_as_full_url(monkeypatch):
+    """r9-1：``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` 是完整 URL（含 /v1/traces）→ 直接用，不重复补路径。"""
+    import urllib.request
+    captured = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _ok(req, timeout=None):
+        captured["url"] = req.full_url
+        return _Resp()
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://collector:4318/v1/traces")
+    monkeypatch.setattr(urllib.request, "urlopen", _ok)
+    assert CT._otlp_export_verified() is True
+    assert captured["url"] == "http://collector:4318/v1/traces", "TRACES_ENDPOINT 已含路径，不可重复补"
+
+
+def test_telemetry_connected_delegates_to_otlp_export_verified(monkeypatch):
+    """r9-1：runtime ``_telemetry_connected`` 转调 ``CT._otlp_export_verified``（单一真理源）——
+    无 endpoint → False（7.6 谓词强制 telemetry open，不可假装就绪）。"""
+    import runtime_evidence as RE
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    assert RE._telemetry_connected() is False
+
+
+def test_verify_accepts_evidence_commit_argv_exact_sha(tmp_path):
+    """r9-3（审核员）：verify.py 接受 ``argv[1]`` exact evidence SHA（real_cutover_suite 传），**消除 r8-2 的
+    git log --grep 反查**（多匹配 + commit message 漂移风险）。传 exact SHA → exit 0（绿）。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(vault), check=True)
+    (vault / "README.md").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
+    subject = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root),
+                                  subject_commit=subject, runner_version="pa-cutover-runner")
+    b1 = vault / "docs" / "evidence" / subject
+    CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
+    subprocess.run(["git", "config", "user.name", m.runner_version], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "runner@pa-cutover.local"], cwd=str(vault), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", f"evidence: cutover suite for subject_commit={subject[:12]}"],
+                   cwd=str(vault), check=True)
+    evidence_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    # r9-3：传 exact SHA 作 argv（real_cutover_suite 同款）—— 非 grep 反查
+    r = subprocess.run([sys.executable, str(b1 / "verify.py"), evidence_commit],
+                       cwd=str(vault), capture_output=True, text=True)
+    assert r.returncode == 0, f"verify.py 传 exact SHA 应 exit 0（r9-3 argv 路径）: {r.stderr}"
+
+
+def test_verify_rejects_non_ancestor_evidence_commit(tmp_path):
+    """r9-4（审核员）：evidence_commit 不基于 subject（subject 非 evidence 祖先）→ verify.py exit 非 0。
+    r8-2 旧版仅 ``git diff subject..evidence``（树差异——subject 与 evidence 平行分支也过，假绿）。r9-4 加
+    ``merge-base --is-ancestor``：subject 非 evidence 祖先 → fail（防 evidence 基于 unrelated commit）。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(vault), check=True)
+    (vault / "README.md").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "subject"], cwd=str(vault), check=True)
+    subject = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    root = tmp_path / "suite"
+    m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(root),
+                                  subject_commit=subject, runner_version="pa-cutover-runner")
+    b1 = vault / "docs" / "evidence" / subject
+    CT.publish_evidence_bundle(artifact_root=str(root), manifest=m, bundle_root=b1)
+    subprocess.run(["git", "config", "user.name", m.runner_version], cwd=str(vault), check=True)
+    subprocess.run(["git", "config", "user.email", "runner@pa-cutover.local"], cwd=str(vault), check=True)
+    subprocess.run(["git", "add", "."], cwd=str(vault), check=True)
+    # 造 **orphan** evidence commit（commit-tree 无父 → 不含 subject 历史）—— 模拟 evidence 基于 unrelated commit
+    _tree = subprocess.check_output(["git", "write-tree"], cwd=str(vault), text=True).strip()
+    orphan = subprocess.check_output(["git", "commit-tree", _tree, "-m", "orphan evidence"],
+                                     cwd=str(vault), text=True).strip()
+    # subject 非 orphan 祖先 → merge-base --is-ancestor 失败 → verify.py exit 非 0
+    r = subprocess.run([sys.executable, str(b1 / "verify.py"), orphan],
+                       cwd=str(vault), capture_output=True, text=True)
+    assert r.returncode != 0, "subject 非 evidence 祖先应使 verify.py exit 非 0（r9-4 merge-base 未生效）"
+    assert "祖先" in r.stderr or "merge-base" in r.stderr, (
+        f"应报 merge-base 祖先失败，实际 stderr: {r.stderr}")

@@ -194,3 +194,75 @@ def test_commit_evidence_rolls_back_on_post_commit_exception(tmp_path, monkeypat
     head_after = subprocess.check_output(["git", "rev-parse", "HEAD"],
                                          cwd=str(vault), text=True).strip()
     assert head_after == subject, "commit 后异常未兜底 reset——HEAD 被 evidence commit 污染（r8-3 未生效）"
+
+
+def test_commit_evidence_push_false_commits_without_pushing(tmp_path):
+    """r9-2（审核员 P0）：``push=False`` 只本地 commit，不 push（real_cutover_suite 跑 verify.py 绿后才 push）。
+    本地 HEAD 进 evidence commit，但 bare remote 无该 commit（未跨机器发布）。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)            # 配 bare remote + upstream（push=True 才会 push）
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    sha = RE._commit_evidence(ev, subject, vault_root=vault, push=False)
+    assert sha is not None
+    # 本地 HEAD = evidence commit（commit 已落地）
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    assert head == sha
+    # bare remote 无 evidence commit（未 push）—— r9-2 commit/push 分离的核心：push 留给 verify 绿后
+    bare = vault.parent / f"{vault.name}-bare.git"
+    remote_refs = subprocess.check_output(["git", "ls-remote", str(bare)], text=True).strip()
+    assert sha not in remote_refs, "push=False 不应 push，但 remote 有 evidence commit——r9-2 分离未生效"
+
+
+def test_rollback_evidence_commit_unstages_evidence_and_keeps_user_staged(tmp_path):
+    """r9-5（审核员）：``_rollback_evidence_commit`` 撤 commit + unstage evidence（``reset HEAD -- <rel>``），
+    恢复 index 到 subject 状态。evidence 文件 working tree 保留但 unstaged；用户暂存的其他业务文件保留。
+
+    旧 ``reset --soft`` 不动 index → evidence 仍 staged（污染用户暂存区）。r9-5：``reset HEAD -- <rel>`` 只
+    unstage evidence 路径，保留用户其他 staged（如 scripts/foo.py）。"""
+    from pathlib import Path
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    sha = RE._commit_evidence(ev, subject, vault_root=vault, push=False)   # 本地 evidence commit
+    assert sha is not None
+    # 用户暂存一个业务文件（非 evidence 路径）—— 验回滚后保留
+    (vault / "scripts").mkdir()
+    (vault / "scripts" / "foo.py").write_text("print(1)", encoding="utf-8")
+    subprocess.run(["git", "add", "scripts/foo.py"], cwd=str(vault), check=True)
+    # 回滚 evidence commit（r9-5 helper：reset --soft subject + reset HEAD -- <rel>）
+    RE._rollback_evidence_commit(vault, subject, Path("docs/evidence") / subject)
+    # HEAD 退回 subject（commit 撤销）
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    assert head == subject, "回滚后 HEAD 未退回 subject"
+    # evidence 文件 working tree 保留（未删）
+    assert (ev / "manifest.json").exists(), "回滚删了 evidence 文件（应只 unstage，不删 working tree）"
+    # evidence unstaged（index 不含 docs/evidence/）—— r9-5 核心
+    staged = subprocess.check_output(["git", "diff", "--name-only", "--cached"],
+                                     cwd=str(vault), text=True).strip()
+    staged_lines = staged.splitlines() if staged else []
+    assert not any(ln.startswith("docs/evidence/") for ln in staged_lines), (
+        "evidence 仍 staged——r9-5 unstate（reset HEAD -- <rel>）未生效，用户暂存区被污染")
+    # 用户业务文件仍 staged（保留，未被回滚吞掉）
+    assert "scripts/foo.py" in staged_lines, "用户暂存文件被回滚吞掉——r9-5 过度清理"
+
+
+def test_strip_leaky_invocation_fields_removes_tool_output_keeps_metadata():
+    """r9-6（审核员）：``_strip_leaky_invocation_fields`` 剥离 leaky 字段（tool_output）保留诊断元数据。
+    callback_invocations 经 ``_run_scenario_query`` :628 → real_sdk_canary ``all_invocations`` → :1158
+    ``TelemetryEvidence.callback_invocations`` 进 sub-evidence blob 前须剥离 tool_output（否则 cutover r9-6
+    递归 denylist 拒 → 生产 publish fail-closed 永红）。tool_name/tool_exit_code（state 判定 + 诊断）保留；
+    返回**副本**，不改原 inv（immutability，:598 仍能从原 inv 取 tool_output 构造 observed_state）。"""
+    inv = {"event": "PostToolUse", "correlation_id": "c1",
+           "tool_name": "Bash", "tool_exit_code": 0, "tool_output": "SECRET_STDOUT_WITH_TOKEN"}
+    stripped = RE._strip_leaky_invocation_fields(inv)
+    assert "tool_output" not in stripped, "tool_output 须剥离（leaky，禁入 sub-evidence）"
+    assert stripped["tool_name"] == "Bash" and stripped["tool_exit_code"] == 0, "非 leaky 诊断元数据须保留"
+    assert stripped["correlation_id"] == "c1"
+    # 原 inv 不变（返回副本，非原地改——:598 仍能从原 inv 取 tool_output）
+    assert inv.get("tool_output") == "SECRET_STDOUT_WITH_TOKEN", "须返回副本，不改原 dict"
