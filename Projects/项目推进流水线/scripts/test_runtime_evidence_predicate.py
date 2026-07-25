@@ -133,11 +133,64 @@ def test_drill_predicate_7_6_bundle_digest_missing_rejected():
 
 
 def test_drill_predicate_7_6_green_passes():
-    """r6 P1-2 + P1-3 正向：overall_passed + bundle_publish_ok + bundle_digest + evidence_commit 四者全真 → 谓词 True。"""
+    """r6 P1-2 + P1-3 + r7-S5 正向：overall + bundle 三件全真 + telemetry_connected=True（已接入，无 open）
+    → 谓词 True。r7-S5：telemetry 接入状态须显式声明（connected=True + open_items 空 = 诚实全绿）。"""
     res = {"overall_passed": True, "bundle_publish_ok": True,
-           "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef"}
+           "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef",
+           "telemetry_connected": True, "open_items": []}
     ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
     assert ok is True and reason is None
+
+
+# ---- r7-S5（审核员）：telemetry 未接入时 7.6 不可返回无条件 success（强制接入状态显式诚实声明） ----
+
+def test_drill_predicate_7_6_telemetry_status_must_be_declared():
+    """r7-S5（审核员反例精髓）：res 缺 ``telemetry_connected``（接入状态未声明）→ 即便 overall+bundle 全绿，
+    7.6 也不可返回无条件 success。旧谓词只查 overall_passed → telemetry 未接入仍声称成功（假绿）。S5 强制：
+    base_ok 时 telemetry_connected 必须显式声明（不可假装 telemetry 就绪）。"""
+    res = {"overall_passed": True, "bundle_publish_ok": True,
+           "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef"}   # 无 telemetry_connected
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is False and reason is not None and "telemetry_connected" in reason, (
+        "res 缺 telemetry_connected 仍返回 success——S5 未强制 telemetry 接入状态显式声明（假绿）")
+
+
+def test_drill_predicate_7_6_telemetry_not_connected_requires_open_item():
+    """r7-S5（生产语义，P1-6 协调）：telemetry_connected=False（真实 OTLP suite 未接入，生产常态）+
+    open_items 含 telemetry red（诚实 open）+ overall+bundle 全绿 → 7.6 ok=True（**不阻断**，尊重 P1-6）。
+
+    关键：这不是「干净 success」——7.6 success 已显式暴露 telemetry 未接入（open_items 诚实标记），区别于
+    旧谓词「telemetry 未接入仍无条件声称成功」的假绿。确认 S5 不破坏 P1-6「telemetry 不阻断 overall」语义。"""
+    res = {"overall_passed": True, "bundle_publish_ok": True,
+           "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef",
+           "telemetry_connected": False,
+           "open_items": [{"item": "telemetry", "passed": False,
+                           "limitation": "真实 OTLP/degradation suite 未接入"}]}
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is True, f"telemetry 诚实 open（P1-6）被误拒——S5 破坏了 P1-6 不阻断语义: {reason}"
+
+
+def test_drill_predicate_7_6_telemetry_not_connected_without_open_item_rejected():
+    """r7-S5（堵偷假绿）：telemetry_connected=False 但 telemetry **未**进 open_items → overall 按 P1-6 排除
+    telemetry 假装绿，却没诚实标 open → 假绿。7.6 拒（与 S4 read-back step7 叠加：未接入须诚实 open）。"""
+    res = {"overall_passed": True, "bundle_publish_ok": True,
+           "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef",
+           "telemetry_connected": False, "open_items": []}   # 未接入但没诚实 open
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is False and reason is not None and "open_items" in reason, (
+        "telemetry 未接入但未进 open_items 仍 success——S5 未堵「偷偷不标 open」假绿")
+
+
+def test_drill_predicate_7_6_telemetry_connected_but_open_item_contradiction_rejected():
+    """r7-S5（堵矛盾声明）：telemetry_connected=True（声称已接入）但 open_items 仍含 telemetry red → 自相矛盾
+    （接入不应 red）→ 不诚实假绿。7.6 拒。"""
+    res = {"overall_passed": True, "bundle_publish_ok": True,
+           "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef",
+           "telemetry_connected": True,
+           "open_items": [{"item": "telemetry", "passed": False, "limitation": "矛盾"}]}
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is False and reason is not None and "矛盾" in reason, (
+        "telemetry_connected=True 但 open_items 含 telemetry red 的矛盾声明未拒——S5 未堵矛盾假绿")
 
 
 def test_drill_predicate_7_6_missing_evidence_commit_rejected():

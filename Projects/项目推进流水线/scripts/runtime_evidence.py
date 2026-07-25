@@ -465,6 +465,16 @@ SDK_SCENARIO_SPECS: tuple[SdkScenarioSpec, ...] = (
 )
 
 
+def _extract_reply(result_msg) -> str:
+    """r7-S1（审核员）：SDK ``ResultMessage`` 文本字段是 ``.result``（dataclass 实测字段：result/num_turns/
+    total_cost_usd/...），**无 ``.text`` 字段**。旧 ``_run_scenario_query`` 读 ``getattr(result_msg, "text", None)``
+    → 恒 None → ``reply_text`` 恒空 → ``semantic_revise``/``no_test`` 场景靠 reply 文本的 state 匹配恒红
+    （被 fixture gate 补绿掩盖，P0-2 待 spike）。抽成纯函数固化字段选择，防回退。``dev-agent.py:470/476``
+    自身就用 ``result_msg.result``，旁证字段正确。
+    """
+    return (getattr(result_msg, "result", None) or "")
+
+
 def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> dict:
     """跑单场景独立 SDK query（r5 P0：runner-owned correlation——独立 hook journal + closure-captured correlation_id）。
 
@@ -582,7 +592,7 @@ def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> 
     sdk_callback_real_proven = journal_has_expected and invocation_carries_own_cid
     sdk_types = sorted({h for h in sdk_hook_names if h})
     # r6 P0：从该场景同一 query 的 callback + result 聚合 observed_state（与 journal/cid 同源）。
-    # bash_results 从 PostToolUse callback 提取（exit_code/stdout）；reply 从 result_msg.text；
+    # bash_results 从 PostToolUse callback 提取（exit_code/stdout）；reply 从 result_msg.result（r7-S1：旧 .text 字段不存在→恒 None→reply 场景恒红）；
     # saw_tool_use/saw_subagent_start 从 callback event 类型。evaluate_scenario 按标签精确匹配。
     bash_results = [
         {"exit_code": i.get("tool_exit_code"), "output": i.get("tool_output") or ""}
@@ -591,7 +601,7 @@ def _run_scenario_query(spec: SdkScenarioSpec, *, workdir: Path, stamp: str) -> 
     saw_subagent_start = any(i.get("event") == "SubagentStart" for i in callback_invocations)
     observed_state = {
         "bash_results": bash_results,
-        "reply_text": (getattr(result_msg, "text", None) or ""),
+        "reply_text": _extract_reply(result_msg),
         "saw_tool_use": saw_tool_use,
         "saw_subagent_start": saw_subagent_start,
     }
@@ -933,8 +943,11 @@ def _commit_evidence(evidence_dir: Path, subject_commit: str,
     try:
         subprocess.run(["git", "add", "--", str(rel)], cwd=str(_vault), check=True,
                        capture_output=True, text=True, timeout=15, env=_git_env)
+        # r7-P0-1（审核员反例）：commit 限定 evidence 路径（``-- <rel>``）——只提交 docs/evidence/ 文件，
+        # 不吞入用户已暂存的其他业务改动（旧 ``git commit -m`` 无 pathspec 会提交全部 staged → 业务改动
+        # 被误并入 evidence commit，污染 ancestry）。
         subprocess.run(["git", "commit", "-m",
-                        f"evidence: cutover suite for subject_commit={subject_commit[:12]}"],
+                        f"evidence: cutover suite for subject_commit={subject_commit[:12]}", "--", str(rel)],
                        cwd=str(_vault), check=True, capture_output=True, text=True, timeout=15, env=_git_env)
         evidence_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(_vault),
                                                text=True, timeout=5).strip()
@@ -945,6 +958,20 @@ def _commit_evidence(evidence_dir: Path, subject_commit: str,
         changed = [ln for ln in diff_out.splitlines() if ln.strip()]
         _bad = [f for f in changed if not f.startswith("docs/evidence/")]
         if _bad:
+            # r7-P0-1（审核员反例）：ancestry 不符 → 回滚 evidence commit（``reset --soft HEAD~1`` 撤销 commit，
+            # HEAD 退回、evidence 文件保留于工作区）。旧实现 ``return None`` 但 commit 已生成 → HEAD 被污染。
+            subprocess.run(["git", "reset", "--soft", "HEAD~1"], cwd=str(_vault),
+                           capture_output=True, text=True, timeout=10, env=_git_env)
+            return None
+        # r7-S2（审核员）：evidence commit 须推送才算跨机器发布（本地 commit 不算——他机 fetch 不到）。
+        # push 失败（无 upstream/远程/网络/non-fast-forward 被拒）→ fail-closed 回滚 commit + None
+        # （杜绝「本地有 commit 假装已发布」）。push 依赖 upstream（``git push``，需 ``git push -u origin
+        # <branch>`` 预建立）。生产 vault main 干净可 push；CI 无远程环境 → 诚实 None（overall 红）。
+        _push = subprocess.run(["git", "push"], cwd=str(_vault), capture_output=True,
+                               text=True, timeout=30, env=_git_env)
+        if _push.returncode != 0:
+            subprocess.run(["git", "reset", "--soft", "HEAD~1"], cwd=str(_vault),
+                           capture_output=True, text=True, timeout=10, env=_git_env)
             return None
         return evidence_sha or None
     except Exception:
@@ -1157,6 +1184,11 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
         "evidence_integrity": manifest.evidence_integrity,  # r3 P0-2：子证据完整性门结论（"ok" 或失败原因）
         "outcomes": [{"name": o.name, "passed": o.passed, "detail": o.detail,
                       "evidence_digests": o.evidence_digests} for o in manifest.outcomes],
+        # r7-S5（审核员）：telemetry 接入状态 + open_items 显式暴露给 7.6 谓词——telemetry 未接入时
+        # overall_passed（按 P1-6 排除 telemetry）仍可 True，但 7.6 谓词据此强制诚实：不可返回无条件 success
+        # 假装 telemetry 就绪；须 telemetry_connected=False + open_items 含 telemetry red（诚实 open）才 ok=True。
+        "telemetry_connected": _telemetry_connected(),
+        "open_items": list(manifest.open_items),
         "not_manual_event_flow": True,   # run_full_cutover_suite 编排真实 drill bundle callable
         "bundle_path": bundle_path,            # r5 P1-4（④）：cross-machine immutable bundle（自包含可移植）
         "bundle_digest": bundle_digest,        # passing 声明跨机器可复核锚点（bundle.sha256，跨机器一致）
@@ -1320,6 +1352,21 @@ def real_session_lifecycle(workdir: Path, gh_repo: str = "jyf2100/agentworkflow"
     }
 
 
+def _telemetry_connected() -> bool:
+    """r7-S5（审核员）：真实 OTLP/degradation telemetry suite 是否接入。
+
+    runner 层诚实判定——当前未接真实 OTLP exporter / degradation suite（P1-6 known limitation：headless 无
+    OTEL endpoint，telemetry 仅 SDK callback 维度可验）。故生产（无 ``OTEL_*`` env）返回 False。7.6 谓词据此
+    强制：未接入时 7.6 success 必须显式声明 telemetry open（进 open_items），不可返回假装 telemetry 就绪的
+    无条件 success（堵假绿）。接真实 OTLP exporter 后设 ``OTEL_EXPORTER_OTLP_ENDPOINT`` → True，telemetry 升
+    为真接入维度（届时可移出 open_items）。
+
+    判定代理：``OTEL_EXPORTER_OTLP_ENDPOINT`` / ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` 存在 ⇔ 已配 exporter。
+    """
+    return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+                or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+
+
 def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
     """每个 drill 的 pass predicate（r2 P0-4：定义每 drill pass predicate；失败给出原因）。
 
@@ -1387,6 +1434,29 @@ def _drill_predicate(key: str, res: dict) -> tuple[bool, str | None]:
                   and bool(res.get("bundle_publish_ok"))
                   and bool(res.get("bundle_digest"))
                   and bool(res.get("evidence_commit")))
+            # r7-S5（审核员）：telemetry 未接入时 7.6 不可返回**无条件** success（假绿）。P1-6 让 telemetry red
+            # 不阻断 overall（套件归档 + open_items 诚实 open），但 7.6 谓词强制 telemetry 接入状态显式诚实：
+            #   - telemetry_connected=False（未接入）+ open_items 含 telemetry red → 诚实 open，ok 不变（P1-6
+            #     不阻断；但 success 已显式暴露 telemetry 未接入，非假装全绿）。
+            #   - 缺 telemetry_connected / connected=True 但 open_items 含 telemetry red（矛盾）/ connected=False
+            #     但未进 open_items → 假绿/不诚实，ok=False（杜绝 7.6 在 telemetry 未接入时无条件声称成功）。
+            if ok:
+                # 一致规则：connected == (telemetry 不在 open_items)。telemetry_connected 反映真实 OTLP 接入，
+                # open_items 含 telemetry 是 P1-6 诚实 open 标记（未接入才需 open）。两者须一致——
+                # connected=False 须 open / connected=True 不应 open。telemetry outcome 自身 passed（SDK callback
+                # 维度）独立于此（可能绿，但不影响「OTLP 未接入须诚实 open」判定，故 _tel_in_open 只查 item）。
+                _connected = res.get("telemetry_connected")
+                _open_items = res.get("open_items") or []
+                _tel_in_open = any(isinstance(_i, dict) and _i.get("item") == "telemetry" for _i in _open_items)
+                if _connected is None:
+                    return False, ("telemetry 接入状态未显式声明 (r7-S5: res 缺 telemetry_connected；"
+                                   "7.6 不可返回无条件 success 假装 telemetry 就绪)")
+                if _connected and _tel_in_open:
+                    return False, ("telemetry_connected=True 但 telemetry 仍在 open_items (r7-S5: 已接入不应 "
+                                   "open；接入状态与 open_items 矛盾，不诚实假绿)")
+                if not _connected and not _tel_in_open:
+                    return False, ("telemetry_connected=False 但 telemetry 未进 open_items (r7-S5: 未接入须 "
+                                   "诚实 open，P1-6 + read-back step7/S4 白名单强制；不可隐瞒)")
             return ok, None if ok else (
                 f"overall_passed={res.get('overall_passed')} "
                 f"bundle_publish_ok={res.get('bundle_publish_ok')} "

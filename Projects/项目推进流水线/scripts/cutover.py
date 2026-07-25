@@ -1361,6 +1361,13 @@ def _verify_sub_evidence_complete(outcomes: "tuple[DrillOutcome, ...]",
     return True, "ok"
 
 
+# r7-S4（审核员）：open_items 白名单——仅允许真实 OTLP/degradation suite 未接入的 ``telemetry`` 作合法 open
+# 项（同 P1-1/P1-6 known-limitation 语义，不阻断 overall）。read-back step 7 只允许白名单内的 red 项从
+# ``all()`` 排除；非白名单 red 项进 open_items → read-back fail（杜绝「任意红色 outcome 塞进 open_items
+# 即从 overall 排除」的假绿——如 quality_gate 真 red 被偷排）。
+_ALLOWED_OPEN_ITEMS: frozenset[str] = frozenset({"telemetry"})
+
+
 def _read_back_manifest(artifact_root: str, archive_digest: str) -> tuple[bool, str]:
     """r5 P1-4 + r6 P1-5（评审② + R4 §5）：结构化 manifest 归档后 read-back——7 步 fail-closed 严格校验。
 
@@ -1445,8 +1452,17 @@ def _read_back_manifest(artifact_root: str, archive_digest: str) -> tuple[bool, 
     # all() 时排除 ``open_items`` 诚实声明的 red 项——且这加强语义：telemetry red 要 overall 绿必须诚实进
     # open_items；若 telemetry red 但未进 open_items（偷假绿），仍含于 business_outcomes → all()=False →
     # 与 overall=True 冲突 → 拒（杜绝悄悄假绿，强制诚实 red/open + known limitation）。
-    open_red_names = {it["item"] for it in parsed.get("open_items", [])
-                      if isinstance(it, dict) and it.get("passed") is False and isinstance(it.get("item"), str)}
+    # r7-S4（审核员）：open_items 仅允许 ``_ALLOWED_OPEN_ITEMS``（白名单 {telemetry}）的 red 项从 all()
+    # 排除——防「任意红色 outcome 塞进 open_items 即从 overall 排除」的假绿（如 quality_gate 真 red 被偷
+    # 排 → overall 假绿）。非白名单 red 项进 open_items → read-back [7] fail（杜绝任意排除红色 outcome）。
+    open_red_names: set[str] = set()
+    for _it in parsed.get("open_items") or []:
+        if not (isinstance(_it, dict) and _it.get("passed") is False and isinstance(_it.get("item"), str)):
+            continue
+        if _it["item"] not in _ALLOWED_OPEN_ITEMS:
+            return False, (f"manifest read-back [7] open_items 含非白名单 red 项 {_it['item']!r}"
+                           f"（仅 {sorted(_ALLOWED_OPEN_ITEMS)} 允许 open；防任意红色 outcome 被排除致 overall 假绿）")
+        open_red_names.add(_it["item"])
     business_outcomes = [o for o in outcomes if o["name"] not in open_red_names]
     outcomes_all = all(o["passed"] for o in business_outcomes)
     if parsed["overall_passed"] != outcomes_all:
@@ -1481,6 +1497,18 @@ def main() -> int:
                   "outcomes", "sub_evidence_refs", "evidence_integrity", "digest_algorithm"):
         if field not in manifest:
             failures.append(f"manifest 缺字段 {field}")
+    # r7-S2（审核员）：subject_commit 必须真实存在于 git object store（rev-parse），杜绝 manifest 声明假 sha
+    # 仍 exit 0。旧版只校验字段存在 → 假 subject 也过（假绿）。verify.py 须在 vault 仓上下文跑
+    # （cross-machine = clone vault 后跑），故 git 可用且 subject 应在 ancestry 内。
+    import subprocess
+    _subj = manifest.get("subject_commit")
+    if not _subj:
+        failures.append("subject_commit 为空（evidence ancestry 锚点缺失）")
+    else:
+        _rp = subprocess.run(["git", "rev-parse", "--verify", "--quiet", _subj + "^{commit}"],
+                             capture_output=True, text=True)
+        if _rp.returncode != 0:
+            failures.append(f"subject_commit {_subj} 不存在于 git object store（rev-parse 失败）")
     sub = list(manifest.get("sub_evidence_refs", []))
     for d in sub:
         p = ROOT / "artifacts" / d
@@ -1548,6 +1576,45 @@ def _scan_for_secrets(text: str) -> list[str]:
     return hits
 
 
+# r7-S3（审核员）：sub-evidence allowlist——P1-4 的 manifest allowlist（_MANIFEST_ALLOWED_FIELDS）只覆盖
+# manifest 顶层字段，sub-evidence blob（_archive_sub_evidence 序列化的 drill evidence）原样复制进 bundle，
+# 任意 prompt/tool 输出都能发布。R4 §4 最小充分证据：不收完整 prompt/model output/stderr。本 allowlist 在
+# publish 层防御：禁输入字段 + 限文本长度（secret scan 查凭据模式，allowlist 查字段类型 + 长度，互补）。
+_SUB_EVIDENCE_FORBIDDEN_FIELDS = frozenset({
+    "prompt", "tool_input", "user_input", "raw_prompt",   # 输入字段（非判定）不进 bundle
+})
+_SUB_EVIDENCE_MAX_TEXT_LEN = 1000   # 单字符串值上限（防完整 prompt/output 原文；drill 产出已截断 500/300）
+
+
+def _check_sub_evidence_allowlist(blob: bytes) -> list[str]:
+    """r7-S3（审核员）：sub-evidence 字段 allowlist + 文本长度校验。返回违规列表（空 = 合规）。
+
+    递归遍历 JSON：禁止输入字段（prompt/tool_input/user_input/raw_prompt）+ 单字符串值 > 上限（防任意长
+    prompt/tool output 原文）。非 JSON blob（二进制 artifact）跳过（返回空，不误判）。
+    """
+    try:
+        obj = json.loads(blob.decode("utf-8", errors="replace"))
+    except Exception:
+        return []
+    violations: list[str] = []
+
+    def _walk(o, path: str = "") -> None:
+        if isinstance(o, dict):
+            for k, v in o.items():
+                np = f"{path}.{k}" if path else k
+                if k in _SUB_EVIDENCE_FORBIDDEN_FIELDS:
+                    violations.append(f"禁止字段 {np}（输入字段不进 bundle）")
+                _walk(v, np)
+        elif isinstance(o, list):
+            for i, x in enumerate(o):
+                _walk(x, f"{path}[{i}]")
+        elif isinstance(o, str) and len(o) > _SUB_EVIDENCE_MAX_TEXT_LEN:
+            violations.append(f"超长文本 {path}（len={len(o)} > {_SUB_EVIDENCE_MAX_TEXT_LEN}，疑似完整原文）")
+
+    _walk(obj)
+    return violations
+
+
 def publish_evidence_bundle(*, artifact_root: str, manifest: "CutoverManifest",
                             bundle_root) -> tuple[str, str]:
     """r5 P1-4（评审④）：发布 cross-machine immutable evidence bundle。
@@ -1592,6 +1659,11 @@ def publish_evidence_bundle(*, artifact_root: str, manifest: "CutoverManifest",
         _sub_hits = _scan_for_secrets(blob.decode("utf-8", errors="replace"))
         if _sub_hits:
             raise ValueError(f"bundle publish fail-closed: 子证据 {d} 含凭据模式: {_sub_hits[:3]}")
+        # r7-S3（审核员）：sub-evidence allowlist——禁输入字段（prompt/tool_input）+ 超长文本（防任意
+        # prompt/tool output 原文）。P1-4 manifest allowlist 只覆盖 manifest 顶层，本处覆盖 sub-evidence。
+        _forbidden = _check_sub_evidence_allowlist(blob)
+        if _forbidden:
+            raise ValueError(f"bundle publish fail-closed: 子证据 {d} 违反 allowlist: {_forbidden[:5]}")
         _blobs.append((d, blob))
     # 全 scan 通过 → 写盘（fail-closed：scan 失败时不创建任何 bundle 文件）
     (root / "artifacts").mkdir(parents=True, exist_ok=True)
