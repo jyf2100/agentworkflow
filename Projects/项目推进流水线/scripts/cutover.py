@@ -964,12 +964,47 @@ class CutoverManifest:
     sub_evidence_refs: tuple[str, ...] = ()
     # r3 P0-2：子证据完整性门结论（"ok" 或失败原因），便于上层独立复核为何不归档 passing manifest。
     evidence_integrity: str = "ok"
+    # r5 P1-4（评审① + r4-response-revise §5）：结构化 manifest 字段——归档结构化 JSON（非 summary 字符串）。
+    # 审查者：「run_full_cutover_suite() 仍归档 manifest.summary，没有结构化 manifest」。§5 要求 manifest 至少含
+    # schema_version/subject_commit/runner version+时间/七 outcome 判定+诊断+evidence digests/全局 sub_evidence_refs/
+    # evidence_integrity/manifest 自身 digest 算法。manifest_digest 由归档 store 内容寻址算出后回填（read-back 锚点）。
+    schema_version: str = "cutover-manifest/v1"
+    subject_commit: str | None = None
+    runner_version: str = ""
+    executed_at: str = ""
+    digest_algorithm: str = "sha256"
+    manifest_digest: str | None = None
 
     @property
     def summary(self) -> str:
         parts = [f"{o.name}={'PASS' if o.passed else 'FAIL'}" for o in self.outcomes]
         head = "PASS" if self.overall_passed else "FAIL"
         return f"cutover manifest: {head} (" + ", ".join(parts) + ")"
+
+    def structured(self) -> dict:
+        """r5 P1-4（评审① + §5）：结构化 manifest dict——归档此（非 summary 字符串）。
+
+        含 §5 全部必填字段：schema_version/subject_commit/runner_version/executed_at/overall_passed/
+        outcomes[]（name/passed/detail/evidence_digests）/sub_evidence_refs/evidence_integrity/digest_algorithm。
+        ``manifest_digest`` 不含于此 dict（它由归档 store 对本 dict 序列化内容算内容寻址 digest，回填到
+        ``CutoverManifest.manifest_digest``，作 read-back 锚点——避免 digest 自引用循环）。
+        """
+        return {
+            "schema_version": self.schema_version,
+            "subject_commit": self.subject_commit,
+            "runner_version": self.runner_version,
+            "executed_at": self.executed_at,
+            "overall_passed": self.overall_passed,
+            "outcomes": [{"name": o.name, "passed": o.passed, "detail": o.detail,
+                          "evidence_digests": list(o.evidence_digests)} for o in self.outcomes],
+            "sub_evidence_refs": list(self.sub_evidence_refs),
+            "evidence_integrity": self.evidence_integrity,
+            "digest_algorithm": self.digest_algorithm,
+        }
+
+    def structured_json(self) -> str:
+        """结构化 manifest 的规范序列化（sort_keys + ensure_ascii=False，供归档 + read-back digest 稳定）。"""
+        return json.dumps(self.structured(), ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _lifecycle_canary_passed(ev: "SdkHookCanaryEvidence") -> bool:
@@ -1172,8 +1207,132 @@ def _verify_sub_evidence_complete(outcomes: "tuple[DrillOutcome, ...]",
     return True, "ok"
 
 
+def _read_back_manifest(artifact_root: str, archive_digest: str) -> tuple[bool, str]:
+    """r5 P1-4（评审②）：结构化 manifest 归档后 read-back——load 回来重算 digest 比对（fail-closed）+ 结构校验。
+
+    审查者：「没有 read-back」。与 ``_verify_sub_evidence_complete``（子证据 read-back）互补：本函数验 manifest
+    自身——归档的结构化 JSON 须 (1) 可 load 且 digest 匹配（``artifact_store.load`` 自带重算校验，篡改/损坏即抛）；
+    (2) JSON 可解析；(3) 含 §5 必填结构字段（schema_version/outcomes/sub_evidence_refs/evidence_integrity/
+    digest_algorithm）。任一不满足 → ``(False, reason)``，runner 据此置 overall_passed=False 不归档 passing manifest
+    （fail-closed，防归档内容被篡改仍声明 passing）。
+    """
+    ref = L.ArtifactRef(digest=archive_digest, size=0,
+                        kind=L.ArtifactKind.CUTOVER_SUITE.value,
+                        path=artifact_store._bucketed_path(archive_digest),
+                        sensitivity=L.Sensitivity.INTERNAL.value)
+    try:
+        blob = artifact_store.load(artifact_root, ref)   # load 重算 digest 校验（fail-closed）
+    except Exception as exc:
+        return False, f"manifest read-back load/digest 失败: {exc!r}"
+    try:
+        parsed = json.loads(blob)
+    except Exception as exc:
+        return False, f"manifest read-back JSON 解析失败: {exc!r}"
+    required = {"schema_version", "outcomes", "sub_evidence_refs", "evidence_integrity", "digest_algorithm"}
+    missing = required - set(parsed)
+    if missing:
+        return False, f"manifest read-back 缺结构字段: {sorted(missing)}"
+    return True, "ok"
+
+
+# r5 P1-4（评审④）：cross-machine bundle 自检脚本模板——随 bundle 分发，跨机器独立复核（仅 stdlib）。
+# 复核：(1) 每个 artifacts/<digest> 内容重算 sha256 == 文件名；(2) manifest.json 含 §5 字段；
+# (3) bundle.sha256 = manifest_digest + 排序子 digest 聚合（与 _compute_bundle_digest 同算法）。exit 0 ⇔ 完整。
+_BUNDLE_VERIFY_TEMPLATE = r'''#!/usr/bin/env python3
+"""cross-machine evidence bundle 自检（r5 P1-4）。无外部依赖；跨机器运行结果一致。"""
+import hashlib, json, sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+def _digest(b: bytes) -> str:
+    return "sha256:" + hashlib.sha256(b).hexdigest()
+
+def main() -> int:
+    failures = []
+    try:
+        manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"manifest.json 不可解析: {exc!r}", file=sys.stderr)
+        return 1
+    for field in ("schema_version", "outcomes", "sub_evidence_refs", "evidence_integrity", "digest_algorithm"):
+        if field not in manifest:
+            failures.append(f"manifest 缺字段 {field}")
+    sub = list(manifest.get("sub_evidence_refs", []))
+    for d in sub:
+        p = ROOT / "artifacts" / d
+        if not p.exists():
+            failures.append(f"子证据缺失 {d}")
+        elif _digest(p.read_bytes()) != d:
+            failures.append(f"子证据 digest 不匹配 {d}")
+    md = _digest((ROOT / "manifest.json").read_bytes())
+    expected = _digest((md + "\n" + "\n".join(sorted(sub))).encode("utf-8"))
+    claim = (ROOT / "bundle.sha256").read_text(encoding="utf-8").strip()
+    if expected != claim:
+        failures.append("bundle.sha256 不匹配（bundle 内容被篡改）")
+    if failures:
+        print("\n".join(failures), file=sys.stderr)
+        return 1
+    print(f"bundle OK: manifest_digest={md} sub_evidence={len(sub)} bundle={claim}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def _compute_bundle_digest(manifest_digest: str, sub_digests: tuple[str, ...]) -> str:
+    """r5 P1-4（评审④）：cross-machine bundle 内容 digest——manifest digest + 排序子证据 digest 聚合 sha256。
+
+    基于内容（非路径/时间），跨机器一致。与 ``_BUNDLE_VERIFY_TEMPLATE`` 内同算法（评审据此独立复核 bundle 完整性）。
+    """
+    import hashlib
+    payload = (manifest_digest + "\n" + "\n".join(sorted(sub_digests))).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def publish_evidence_bundle(*, artifact_root: str, manifest: "CutoverManifest",
+                            bundle_root) -> tuple[str, str]:
+    """r5 P1-4（评审④）：发布 cross-machine immutable evidence bundle。
+
+    审查者：「artifact root 仍为本机路径，没有 immutable cross-machine bundle」。本机 mkdtemp artifact_root
+    跨机器不可访问。bundle 把结构化 manifest + 全部子证据（按 digest load 原始内容）+ 自检脚本打成**自包含、
+    内容寻址、相对路径**目录，digest 跨机器独立复核（``bundle.sha256`` = manifest_digest + 排序子 digest 聚合）。
+
+    bundle 结构（自包含，不依赖本机 artifact_root 绝对路径）::
+
+        <bundle_root>/
+          manifest.json          # 结构化 manifest（manifest_digest = 内容寻址 digest）
+          bundle.sha256          # bundle 内容 digest（跨机器一致，passing 声明可复核锚点）
+          verify.py              # 自检脚本（stdlib，跨机器 exit 0 ⇔ 完整）
+          artifacts/<digest>     # 每个子证据原始内容（文件名 = 内容 digest，自校验）
+
+    Returns:
+        ``(bundle_root_str, bundle_digest)``——bundle_digest 跨机器一致。
+    """
+    from pathlib import Path
+    root = Path(bundle_root)
+    (root / "artifacts").mkdir(parents=True, exist_ok=True)
+    mj = manifest.structured_json()
+    (root / "manifest.json").write_text(mj, encoding="utf-8")
+    manifest_digest = manifest.manifest_digest or artifact_store._digest(mj.encode("utf-8"))
+    for d in manifest.sub_evidence_refs:
+        ref = L.ArtifactRef(digest=d, size=0, kind=L.ArtifactKind.TEST_OUTPUT.value,
+                            path=artifact_store._bucketed_path(d),
+                            sensitivity=L.Sensitivity.INTERNAL.value)
+        blob = artifact_store.load(artifact_root, ref)   # load 重算 digest 校验（fail-closed）
+        (root / "artifacts" / d).write_bytes(blob)
+    (root / "verify.py").write_text(_BUNDLE_VERIFY_TEMPLATE, encoding="utf-8")
+    bundle_digest = _compute_bundle_digest(manifest_digest, manifest.sub_evidence_refs)
+    (root / "bundle.sha256").write_text(bundle_digest, encoding="utf-8")
+    return str(root), bundle_digest
+
+
 def run_full_cutover_suite(*, drills: CutoverDrillBundle,
-                           artifact_root: str) -> CutoverManifest:
+                           artifact_root: str,
+                           subject_commit: str | None = None,
+                           runner_version: str = "",
+                           executed_at: str = "") -> CutoverManifest:
     """task 7.6：完整 cutover 套件**运行器**——自行编排执行各子 drill + 归档不可变通过证据 manifest。
 
     评审 P0-2 修正：旧 ``run_cutover_suite`` 接收外部布尔值做 ``all()``，不执行任何 drill。本函数**调用
@@ -1223,14 +1382,24 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
     manifest = CutoverManifest(outcomes=outcomes,
                                overall_passed=(drill_ok and evidence_ok),
                                sub_evidence_refs=sub_refs,
-                               evidence_integrity=evidence_reason)
+                               evidence_integrity=evidence_reason,
+                               subject_commit=subject_commit,
+                               runner_version=runner_version,
+                               executed_at=executed_at)
     if not manifest.overall_passed:
         return manifest                        # red 套件不归档（绝不伪装绿归档）
-    # kind 复用 ``cutover_suite``（ArtifactKind 分类）；manifest 内容自带 ``cutover manifest:`` 前缀，
-    # 内容寻址 digest 区分具体归档（design#6 archive immutable evidence）。
-    ref = artifact_store.store(artifact_root, manifest.summary, kind="cutover_suite",
-                               sensitivity="internal")
-    return replace(manifest, archive_digest=ref.digest)
+    # r5 P1-4（评审①）：归档结构化 JSON（非 summary 字符串）——含 §5 全字段（schema_version/subject_commit/
+    # runner_version/executed_at/outcomes[]/sub_evidence_refs/evidence_integrity/digest_algorithm）。
+    ref = artifact_store.store(artifact_root, manifest.structured_json(),
+                               kind="cutover_suite", sensitivity="internal")
+    # r5 P1-4（评审②）：归档后 read-back——load 回来重算 digest + 结构校验（fail-closed）。归档内容被篡改/损坏
+    # → read-back 失败 → overall_passed=False（不声明 passing，archive/manifest_digest 不回填——归档不可信）。
+    read_ok, read_reason = _read_back_manifest(artifact_root, ref.digest)
+    if not read_ok:
+        return replace(manifest,
+                       evidence_integrity=f"manifest_read_back_fail: {read_reason}",
+                       overall_passed=False)
+    return replace(manifest, archive_digest=ref.digest, manifest_digest=ref.digest)
 
 
 def real_cutover_drills(*, state_dir, stamp_fn, resolver, sandbox_runs,
