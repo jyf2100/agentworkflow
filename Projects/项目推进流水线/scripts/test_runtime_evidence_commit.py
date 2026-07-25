@@ -266,3 +266,70 @@ def test_strip_leaky_invocation_fields_removes_tool_output_keeps_metadata():
     assert stripped["correlation_id"] == "c1"
     # 原 inv 不变（返回副本，非原地改——:598 仍能从原 inv 取 tool_output）
     assert inv.get("tool_output") == "SECRET_STDOUT_WITH_TOKEN", "须返回副本，不改原 dict"
+
+
+def test_commit_evidence_excludes_untracked_stray_file(tmp_path):
+    """r10-B2（审核员 r9 复审）：docs/evidence/<subject>/ 里未引用的 untracked stray 文件不得进 evidence commit。
+
+    反例：publish 写白名单文件后，目录残留 untracked stray.log（崩溃重跑残留 / 并发 claude 会话注入），
+    含 AWS 凭据模式。旧 ``git add/commit -- <整目录>`` 会 stage+commit stray.log → push → 凭据泄漏远端，
+    绕过 publish 层 secret scan（publish 只 scan manifest.json + sub_evidence_refs 引用的 blob）。
+    r10-B2：per-file pathspec 白名单（git add + commit 只列 publish 写的文件）→ stray.log 不进 commit。
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    (ev / "stray.log").write_text("leaked: AKIA" + "A" * 16, encoding="utf-8")   # untracked stray 含凭据
+    sha = RE._commit_evidence(ev, subject, vault_root=vault, push=False)
+    assert sha is not None, "per-file 白名单 manifest.json 应正常 commit"
+    show = subprocess.check_output(["git", "show", "--name-only", "--format=", sha],
+                                   cwd=str(vault), text=True).strip()
+    # ⚠️ 断言须匹配完整路径行（docs/evidence/<subject>/stray.log），非精确等于 "stray.log"——
+    # 否则恒真（vacuously pass），守不住回归（r5→r9「守门弱」病根，mutation 验证暴露）
+    _files = show.splitlines()
+    assert not any("stray.log" in _f for _f in _files), (
+        "r10-B2 回归：untracked stray.log 进了 evidence commit → 未引用文件绕过 secret scan + push 远端\n"
+        f"实际 commit 文件：{_files}")
+
+
+def test_commit_evidence_excludes_tracked_modified_stray_with_credential(tmp_path):
+    """r10-B2（审核员 r9 复审 + 红队 DECISIVE）：tracked-modified stray 是真泄漏路径，commit 必须 per-file。
+
+    ``git commit -- <dir>`` 提交匹配 pathspec 的【已跟踪文件工作树状态，忽略 index】，故仅改 ``git add`` 为
+    per-file 拦不住 tracked-modified stray——必须 ``git commit`` 也 per-file。反例：前次崩溃 evidence run
+    （旧整目录逻辑）已把 stray.log 提交为 tracked（CLAUDE.md 明言 durable runtime 预期 crash+restart），本次
+    重跑改写它含 AKIA 凭据（并发会话注入 / retry sidecar / 重注入），旧 ``git commit -- <dir>`` 照常纳入 →
+    ``git cat-file -p HEAD:.../stray.log`` 可读凭据，per-file ``git add`` 形同虚设。r10-B2：commit per-file →
+    tracked-modified stray 不进新 evidence commit（凭据改动留在 working tree，不 push）。
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    rel_ev = ev.relative_to(vault)
+    # 1. 模拟前次崩溃 run（旧整目录 commit）把 stray.log + manifest.json 一起提交 → stray.log tracked
+    (ev / "stray.log").write_text("clean", encoding="utf-8")
+    subprocess.run(["git", "add", str(rel_ev)], cwd=str(vault), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "prior evidence run (legacy dir-pathspec add)"],
+                   cwd=str(vault), check=True)
+    prior = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(vault), text=True).strip()
+    # 2. 本次重跑：改写 tracked stray.log 含 AWS 凭据 + 重写 manifest.json
+    (ev / "stray.log").write_text("leaked: AKIA" + "B" * 16, encoding="utf-8")
+    (ev / "manifest.json").write_text('{"redrill": true}', encoding="utf-8")
+    # 3. r10-B2 per-file _commit_evidence（白名单只 manifest.json；stray.log 不在白名单）
+    sha = RE._commit_evidence(ev, prior, vault_root=vault, push=False)
+    assert sha is not None, "per-file 白名单 manifest.json 应正常 commit"
+    # 4. 反向断言（红队 DECISIVE 核心）：新 evidence commit 不得含 tracked-modified stray.log
+    #    ⚠️ 须匹配完整路径行（mutation 验证暴露：精确等于断言恒真，vacuously pass）
+    show = subprocess.check_output(["git", "show", "--name-only", "--format=", sha],
+                                   cwd=str(vault), text=True).strip()
+    _files = show.splitlines()
+    assert not any("stray.log" in _f for _f in _files), (
+        "r10-B2 回归：tracked-modified stray.log 进了 evidence commit——git commit 须 per-file（红队 DECISIVE："
+        "per-file add 拦不住 tracked-modified；commit --<dir> 照带 stray 含凭据，git cat-file 可读直达远端）\n"
+        f"实际 commit 文件：{_files}")
