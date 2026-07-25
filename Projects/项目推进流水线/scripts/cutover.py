@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -1276,6 +1276,18 @@ def _telemetry_outcome(ev: "TelemetryEvidence") -> DrillOutcome:
     return DrillOutcome("telemetry", passed, diag)
 
 
+def _otlp_exporter_configured() -> bool:
+    """r8-1（审核员）：真实 OTLP exporter 是否配置（与 runtime_evidence._telemetry_connected 同语义）。
+
+    open_items 据此决定 telemetry 是否诚实 open：未配 OTEL endpoint → telemetry 是 known limitation
+    （真实 OTLP/degradation suite 未接入）→ 进 open_items（passed=False，OTLP 维度红）；配置后 → 不进。
+    消除旧 cutover 无条件塞 telemetry 进 open_items 与 runtime 7.6 connected 断言的矛盾（接入后不再被矛盾拒绝）。
+    """
+    import os
+    return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+                or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+
+
 @dataclass(frozen=True)
 class CutoverDrillBundle:
     """task 7.6：各子 drill 的执行入口注入（runner 编排**调用执行**，非接收 bool）。
@@ -1509,6 +1521,38 @@ def main() -> int:
                              capture_output=True, text=True)
         if _rp.returncode != 0:
             failures.append(f"subject_commit {_subj} 不存在于 git object store（rev-parse 失败）")
+        else:
+            # r8-2（审核员）：evidence_commit ancestry + runner binding。evidence_commit 不在 manifest（时序：
+            # publish 在 commit 前），用 commit message 模板反查 git log --all --grep（与 _commit_evidence 的
+            # commit message 同步：``evidence: cutover suite for subject_commit=<sha[:12]>``）。期望恰好 1 个匹配。
+            # (1) ancestry subject..evidence 只含 docs/evidence/（防 evidence_commit 夹带业务代码被误当 subject 重新执行）；
+            # (2) committer name == manifest.runner_version（runner 绑定——谁产的 evidence，杜绝旧固定 runner 名漂移）。
+            _msg = f"evidence: cutover suite for subject_commit={_subj[:12]}"
+            _gl = subprocess.run(["git", "log", "--all", "--format=%H", f"--grep=^{_msg}$"],
+                                 capture_output=True, text=True)
+            if _gl.returncode != 0:
+                failures.append(f"git log --grep 反查 evidence_commit 失败（returncode={_gl.returncode}）")
+            else:
+                _evs = [s for s in _gl.stdout.split() if s.strip()]
+                if len(_evs) == 0:
+                    failures.append(f"未找到 evidence_commit（git log --grep '{_msg}' 无匹配；evidence 未提交或 message 漂移）")
+                elif len(_evs) > 1:
+                    failures.append(f"evidence_commit 不唯一（{len(_evs)} 个匹配 '{_msg}'；防歧义）")
+                else:
+                    _ev = _evs[0]
+                    _anc = subprocess.run(["git", "diff", "--name-only", f"{_subj}..{_ev}"],
+                                          capture_output=True, text=True)
+                    if _anc.returncode != 0:
+                        failures.append(f"evidence_commit ancestry diff 失败（{_subj}..{_ev}）")
+                    else:
+                        _bad = [f for f in _anc.stdout.splitlines() if f.strip() and not f.startswith("docs/evidence/")]
+                        if _bad:
+                            failures.append(f"evidence_commit ancestry 含非 docs/evidence/ 路径 {_bad}（防夹带业务代码）")
+                    _cn = subprocess.run(["git", "log", "-1", "--format=%cn", _ev],
+                                         capture_output=True, text=True)
+                    _runner = manifest.get("runner_version", "")
+                    if _cn.returncode != 0 or (_cn.stdout.strip() != _runner):
+                        failures.append(f"evidence_commit committer '{_cn.stdout.strip()}' != runner_version '{_runner}'（runner 绑定失败）")
     sub = list(manifest.get("sub_evidence_refs", []))
     for d in sub:
         p = ROOT / "artifacts" / d
@@ -1576,41 +1620,85 @@ def _scan_for_secrets(text: str) -> list[str]:
     return hits
 
 
-# r7-S3（审核员）：sub-evidence allowlist——P1-4 的 manifest allowlist（_MANIFEST_ALLOWED_FIELDS）只覆盖
-# manifest 顶层字段，sub-evidence blob（_archive_sub_evidence 序列化的 drill evidence）原样复制进 bundle，
-# 任意 prompt/tool 输出都能发布。R4 §4 最小充分证据：不收完整 prompt/model output/stderr。本 allowlist 在
-# publish 层防御：禁输入字段 + 限文本长度（secret scan 查凭据模式，allowlist 查字段类型 + 长度，互补）。
-_SUB_EVIDENCE_FORBIDDEN_FIELDS = frozenset({
-    "prompt", "tool_input", "user_input", "raw_prompt",   # 输入字段（非判定）不进 bundle
-})
+# r7-S3 → r8-4（审核员）：sub-evidence per-kind **allowlist**（旧 r7-S3 是 denylist——4 禁字段，未知字段
+# 放过，如新输入字段 model_output 不在禁集即过 → 假绿）。R4 §4 最小充分证据 + 审核员 r8：denylist→allowlist。
+# allowlist 字段源自各 drill 的 dataclass（``fields()``），无编造，schema 漂移自动跟随（dataclass 加字段 →
+# allowlist 自动含）。secret scan（``_scan_for_secrets``，publish 层）查凭据模式，allowlist 查字段类型，互补。
 _SUB_EVIDENCE_MAX_TEXT_LEN = 1000   # 单字符串值上限（防完整 prompt/output 原文；drill 产出已截断 500/300）
 
 
-def _check_sub_evidence_allowlist(blob: bytes) -> list[str]:
-    """r7-S3（审核员）：sub-evidence 字段 allowlist + 文本长度校验。返回违规列表（空 = 合规）。
+def _dc_field_names(cls: type) -> frozenset[str]:
+    """r8-4：dataclass 字段名集（``fields()`` 推导，无编造，schema 漂移自动跟随）。"""
+    return frozenset(f.name for f in fields(cls))
 
-    递归遍历 JSON：禁止输入字段（prompt/tool_input/user_input/raw_prompt）+ 单字符串值 > 上限（防任意长
-    prompt/tool output 原文）。非 JSON blob（二进制 artifact）跳过（返回空，不误判）。
+
+# r8-4：per-kind allowlist——drill → 该 drill evidence 的合法字段集（dataclass 顶层字段）。
+# recovery/sandbox 的 evidence 是 list[DrillResult]，字段集 = 元素 dataclass 字段。
+_SUB_EVIDENCE_ALLOWLIST_BY_KIND: dict[str, frozenset[str]] = {
+    "shadow_parity": _dc_field_names(ShadowParityEvidence),
+    "sdk_canary": _dc_field_names(SdkHookCanaryEvidence),
+    "crash_reconciliation": _dc_field_names(CrashReconciliationEvidence),
+    "dispatch_cutover": _dc_field_names(DispatchCutoverResult),
+    "quality_gate": _dc_field_names(QualityGateResult),
+    "telemetry": _dc_field_names(TelemetryEvidence),
+    "recovery": _dc_field_names(RecoveryDrillResult),      # list 元素字段
+    "sandbox": _dc_field_names(SandboxDrillResult),        # list 元素字段
+}
+# 所有 drill 字段名并集（drill 未知时兜底诊断 + 未来嵌套校验参考）
+_ALL_DRILL_FIELD_NAMES: frozenset[str] = frozenset().union(*_SUB_EVIDENCE_ALLOWLIST_BY_KIND.values())
+
+
+def _check_sub_evidence_allowlist(blob: bytes) -> list[str]:
+    """r8-4（审核员）：sub-evidence per-kind allowlist + 4 步校验。返回违规列表（空 = 合规）。
+
+    旧 r7-S3 是 denylist（4 禁字段递归）——未知字段放过（假绿）。r8-4 改 allowlist：
+    (1) 顶层必须是 dict 且键 ⊆ {drill, evidence}（未知顶层键 fail）；
+    (2) drill 在 ``_SUB_EVIDENCE_ALLOWLIST_BY_KIND``（未知 drill fail-closed，防任意 drill 名发布）；
+    (3) evidence 顶层字段全在该 drill 的 dataclass 字段集（dict 直接查；list 查每元素——未知证据字段 fail，
+        堵任意 prompt/tool_input/user_input/raw_prompt/model_output 进 evidence）；
+    (4) 递归文本长度检查（保留 r7-S3，防完整原文）。
+    非 JSON blob（二进制 artifact）跳过（返回空，不误判）。secret scan 由 publish 层 ``_scan_for_secrets`` 互补。
     """
     try:
         obj = json.loads(blob.decode("utf-8", errors="replace"))
     except Exception:
         return []
+    if not isinstance(obj, dict):
+        return ["sub-evidence 顶层非 dict（期望 {drill, evidence}）"]
     violations: list[str] = []
-
+    # (1) 顶层键 allowlist
+    _top_bad = [k for k in obj if k not in ("drill", "evidence")]
+    if _top_bad:
+        violations.append(f"顶层未知键 {_top_bad}（期望仅 {{drill, evidence}}）")
+    # (2) drill 在 per-kind 表
+    _drill = obj.get("drill")
+    if _drill not in _SUB_EVIDENCE_ALLOWLIST_BY_KIND:
+        violations.append(f"未知 drill {_drill!r}（不在 per-kind allowlist；防任意 drill 名发布）")
+        _allowed = _ALL_DRILL_FIELD_NAMES    # 兜底（继续长度诊断，不阻断）
+    else:
+        _allowed = _SUB_EVIDENCE_ALLOWLIST_BY_KIND[_drill]
+    # (3) evidence 顶层字段 allowlist（dict 直接查；list 查每元素）
+    _ev = obj.get("evidence")
+    if isinstance(_ev, dict):
+        _bad_ev = [k for k in _ev if k not in _allowed]
+        if _bad_ev:
+            violations.append(f"drill={_drill} evidence 未知字段 {_bad_ev}（不在 dataclass 字段集；防输入字段进 evidence）")
+    elif isinstance(_ev, list):
+        for i, item in enumerate(_ev):
+            if isinstance(item, dict):
+                _bad_it = [k for k in item if k not in _allowed]
+                if _bad_it:
+                    violations.append(f"drill={_drill} evidence[{i}] 未知字段 {_bad_it}（list 元素字段须在 allowlist）")
+    # (4) 递归文本长度检查（保留 r7-S3，防完整 prompt/output 原文）
     def _walk(o, path: str = "") -> None:
         if isinstance(o, dict):
             for k, v in o.items():
-                np = f"{path}.{k}" if path else k
-                if k in _SUB_EVIDENCE_FORBIDDEN_FIELDS:
-                    violations.append(f"禁止字段 {np}（输入字段不进 bundle）")
-                _walk(v, np)
+                _walk(v, f"{path}.{k}" if path else k)
         elif isinstance(o, list):
             for i, x in enumerate(o):
                 _walk(x, f"{path}[{i}]")
         elif isinstance(o, str) and len(o) > _SUB_EVIDENCE_MAX_TEXT_LEN:
             violations.append(f"超长文本 {path}（len={len(o)} > {_SUB_EVIDENCE_MAX_TEXT_LEN}，疑似完整原文）")
-
     _walk(obj)
     return violations
 
@@ -1733,9 +1821,13 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
     evidence_ok, evidence_reason = _verify_sub_evidence_complete(outcomes, artifact_root)
     _telemetry_o = next((o for o in outcomes if o.name == "telemetry"), None)
     _open_items: tuple[dict, ...] = ()
-    if _telemetry_o is not None:
-        _open_items = ({"item": "telemetry", "passed": _telemetry_o.passed,
-                        "limitation": "真实 OTLP/degradation suite 未接入；仅 SDK callback 维度可验"},)
+    # r8-1（审核员）：open_items 基于 OTLP 接入（connected），非无条件塞。未配 OTEL endpoint → telemetry 是
+    # known limitation（真实 OTLP/degradation suite 未接入）→ 诚实 open（passed=False，OTLP 维度红；与 S4
+    # read-back step7 白名单 + runtime 7.6 connected 断言一致）；配置后 → 不 open（已接入）。消除旧「无条件塞
+    # telemetry」与 runtime connected 断言的矛盾（接入后不再被矛盾拒绝）。
+    if _telemetry_o is not None and not _otlp_exporter_configured():
+        _open_items = ({"item": "telemetry", "passed": False,
+                        "limitation": "真实 OTLP/degradation suite 未接入（OTEL_EXPORTER_OTLP_ENDPOINT 未配）；仅 SDK callback 维度可验"},)
     manifest = CutoverManifest(outcomes=outcomes,
                                overall_passed=(drill_ok and evidence_ok),
                                sub_evidence_refs=sub_refs,

@@ -165,3 +165,32 @@ def test_commit_evidence_returns_none_when_push_fails(tmp_path):
     head_after = subprocess.check_output(["git", "rev-parse", "HEAD"],
                                          cwd=str(vault), text=True).strip()
     assert head_after == subject, "push 失败但 evidence commit 未回滚——HEAD 被污染"
+
+
+def test_commit_evidence_rolls_back_on_post_commit_exception(tmp_path, monkeypatch):
+    """r8-3（审核员）：commit 成功后任一步骤**异常**（非 returncode 失败）——push timeout 是 CI 最常见——
+    → 旧 except 仅 ``return None`` 不 reset → evidence commit 残留污染 HEAD。r8-3：``_committed`` 标志 +
+    except 兜底 ``reset --soft <subject_commit>`` 回滚到确切 subject 锚点。
+
+    区别于 S2 push-returncode-!=0 测试（走显式 reset 分支）：本测试 push **抛 TimeoutExpired**（走 except），
+    验证 except 块的兜底 reset 路径——堵 commit 后异常（rev-parse/diff/push timeout）的 HEAD 污染。"""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    subject = _init_tmp_vault(vault)
+    ev = vault / "docs" / "evidence" / subject
+    ev.mkdir(parents=True)
+    (ev / "manifest.json").write_text("{}", encoding="utf-8")
+    real_run = subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        # push 抛 timeout（commit 已成功、HEAD 已进 evidence commit；模拟 CI push hang/timeout 走 except）
+        if cmd[:2] == ["git", "push"]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout", 30))
+        return real_run(cmd, *a, **kw)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    sha = RE._commit_evidence(ev, subject, vault_root=vault)
+    assert sha is None
+    # commit 后异常 → except 兜底 reset → HEAD 退回 subject（无 evidence commit 残留污染）
+    head_after = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                         cwd=str(vault), text=True).strip()
+    assert head_after == subject, "commit 后异常未兜底 reset——HEAD 被 evidence commit 污染（r8-3 未生效）"

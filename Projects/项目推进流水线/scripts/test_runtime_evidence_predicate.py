@@ -155,30 +155,54 @@ def test_drill_predicate_7_6_telemetry_status_must_be_declared():
         "res 缺 telemetry_connected 仍返回 success——S5 未强制 telemetry 接入状态显式声明（假绿）")
 
 
-def test_drill_predicate_7_6_telemetry_not_connected_requires_open_item():
-    """r7-S5（生产语义，P1-6 协调）：telemetry_connected=False（真实 OTLP suite 未接入，生产常态）+
-    open_items 含 telemetry red（诚实 open）+ overall+bundle 全绿 → 7.6 ok=True（**不阻断**，尊重 P1-6）。
+def test_drill_predicate_7_6_telemetry_not_connected_is_runtime_red():
+    """r8-1（审核员 P0 反向修复）：telemetry_connected=False（真实 OTLP suite 未接入，生产常态）+
+    open_items 含 telemetry red（manifest 诚实 open）+ overall+bundle 全绿 → **7.6 runtime 层 ok=False**。
 
-    关键：这不是「干净 success」——7.6 success 已显式暴露 telemetry 未接入（open_items 诚实标记），区别于
-    旧谓词「telemetry 未接入仍无条件声称成功」的假绿。确认 S5 不破坏 P1-6「telemetry 不阻断 overall」语义。"""
+    旧 S5「一致规则」在此输入（connected=False + telemetry 在 open_items）落不到任何 fail 分支 → ok=True 假绿
+    （审核员抓的反向：未接入时 7.6 通过）。r8-1 改 connected 驱动：未接入即 runtime 红，接受红色直到
+    OTEL_EXPORTER_OTLP_ENDPOINT 接入。与 P1-6 协调：manifest 归档层 overall 仍可绿（drill_ok 排除 telemetry），
+    但 runtime main 层 7.6 drill 断言红——两层独立，杜绝「未接入仍声称 runtime 成功」假绿。"""
     res = {"overall_passed": True, "bundle_publish_ok": True,
            "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef",
            "telemetry_connected": False,
            "open_items": [{"item": "telemetry", "passed": False,
                            "limitation": "真实 OTLP/degradation suite 未接入"}]}
     ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
-    assert ok is True, f"telemetry 诚实 open（P1-6）被误拒——S5 破坏了 P1-6 不阻断语义: {reason}"
+    assert ok is False and reason is not None and "telemetry_connected=False" in reason, (
+        "telemetry_connected=False 仍返回 runtime success——r8-1 未修正反向（未接入应 runtime 红）")
 
 
-def test_drill_predicate_7_6_telemetry_not_connected_without_open_item_rejected():
-    """r7-S5（堵偷假绿）：telemetry_connected=False 但 telemetry **未**进 open_items → overall 按 P1-6 排除
-    telemetry 假装绿，却没诚实标 open → 假绿。7.6 拒（与 S4 read-back step7 叠加：未接入须诚实 open）。"""
+def test_drill_predicate_7_6_two_layers_independent_manifest_green_runtime_red():
+    """r8-1（审核员 P0 + P1-6 协调）：manifest 归档层 overall_passed=True（P1-6 drill_ok 排除 telemetry，
+    套件仍归档绿）与 runtime main 层 7.6 drill 断言 ok=False（connected=False → 红）**两层独立**。
+
+    这是 r8-1 的核心不变式：manifest 可诚实归档绿（open_items 标 telemetry open），但 runtime 7.6 不可因此
+    声称成功。旧 S5 把两层耦合（open_items 有 telemetry 就让 7.6 绿）→ 假绿；r8-1 解耦：runtime 只看 connected。"""
+    # manifest 维度：overall 绿（P1-6 不阻断）+ open_items 诚实标 telemetry open
     res = {"overall_passed": True, "bundle_publish_ok": True,
            "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef",
-           "telemetry_connected": False, "open_items": []}   # 未接入但没诚实 open
+           "telemetry_connected": False,                # runtime 维度：OTLP 未接入
+           "open_items": [{"item": "telemetry", "passed": False,
+                           "limitation": "真实 OTLP/degradation suite 未接入"}]}
     ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
-    assert ok is False and reason is not None and "open_items" in reason, (
-        "telemetry 未接入但未进 open_items 仍 success——S5 未堵「偷偷不标 open」假绿")
+    # manifest overall 绿，但 runtime 7.6 断言红（两层独立）
+    assert ok is False, "manifest overall 绿不应让 runtime 7.6 假绿——r8-1 两层解耦未生效"
+    assert res["overall_passed"] is True, "manifest 归档层 overall 应保持绿（P1-6 不阻断）"
+
+
+def test_drill_predicate_7_6_telemetry_not_connected_runtime_red_regardless_of_open_items():
+    """r8-1（审核员 P0）：telemetry_connected=False → 7.6 runtime 红，**不管** open_items 是否含 telemetry。
+
+    旧 S5 在此（connected=False + 空 open_items）命中「未进 open_items」分支拒，但那是错误的一致规则（耦合两层）；
+    r8-1 改 connected 驱动后，未接入即红（open_items 有无不影响 runtime 判定——open_items 是 manifest 归档层
+    诚实标记，runtime 层只看 connected）。与 telemetry_in_open 版（#is_runtime_red）共同覆盖两种 open_items 输入。"""
+    res = {"overall_passed": True, "bundle_publish_ok": True,
+           "bundle_digest": "sha256:abc", "evidence_commit": "deadbeef",
+           "telemetry_connected": False, "open_items": []}   # 未接入且 open_items 空
+    ok, reason = RE._drill_predicate("7.6_cutover_suite", res)
+    assert ok is False and reason is not None and "telemetry_connected=False" in reason, (
+        "telemetry_connected=False（空 open_items）仍 runtime success——r8-1 未改 connected 驱动")
 
 
 def test_drill_predicate_7_6_telemetry_connected_but_open_item_contradiction_rejected():

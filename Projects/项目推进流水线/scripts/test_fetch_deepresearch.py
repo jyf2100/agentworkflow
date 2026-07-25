@@ -18,6 +18,9 @@ def test_run_persona_allowed_tools_appended(monkeypatch):
         captured["cmd"] = cmd
         return _P()
     monkeypatch.setattr(run_daily.subprocess, "run", fake_run)
+    # r8-5：本测试测 cmd 构造（--allowedTools 附加），不依赖真 claude 二进制；monkeypatch resolve_claude_bin
+    # 绕过 CLI 存在性检查（CI 无 claude → 旧 sys.exit SystemExit），CI 也能跑 + 覆盖 cmd 构造逻辑。
+    monkeypatch.setattr(run_daily, "resolve_claude_bin", lambda: "/fake/claude")
     run_daily.run_persona("pa-x", "hi", "radar", "t1", allowed_tools=["mcp__a__b", "mcp__c__d"])
     cmd = captured["cmd"]
     assert "--allowedTools" in cmd
@@ -34,6 +37,8 @@ def test_run_persona_no_allowed_tools_omits_flag(monkeypatch):
         captured["cmd"] = cmd
         return _P()
     monkeypatch.setattr(run_daily.subprocess, "run", fake_run)
+    # r8-5：同上——monkeypatch resolve_claude_bin 绕过 CLI 检查，CI 无 claude 也能跑。
+    monkeypatch.setattr(run_daily, "resolve_claude_bin", lambda: "/fake/claude")
     run_daily.run_persona("pa-x", "hi", "radar", "t1")
     assert "--allowedTools" not in captured["cmd"]
 
