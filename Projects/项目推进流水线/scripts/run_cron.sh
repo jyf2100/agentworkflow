@@ -19,6 +19,10 @@ cd "$VAULT"   # run_daily.py 的 .project-auto 相对 cwd，必须从 vault 根�
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 
+# claude CLI 装在 ~/.local/bin（非 nvm node bin）；cron 极简 PATH 不含它 → 须显式补
+# （2026-07-26 修：0722-0726 连挂于「✗ 找不到 claude CLI」）
+export PATH="$HOME/.local/bin:$PATH"
+
 CLAUDE_BIN="$(command -v claude || true)"
 [ -n "$CLAUDE_BIN" ] && export PA_CLAUDE_BIN="$CLAUDE_BIN"
 
