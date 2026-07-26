@@ -1492,6 +1492,7 @@ def _attach_learning_memory(rec: dict, prof: dict, entry: dict, stamp: str, *,
                     envelope=envelope, state_dir=str(STATE_DIR),
                     project_id=proj, run_id=_coord2.run_id, prd_id=_coord2.prd_id,
                     iteration_id=_coord2.iteration_id, timestamp=_now_iso(),
+                    is_terminal_outcome=_dispatch_is_terminal_outcome(rec),
                     **refl_kwargs)
                 learning_rec = {
                     "reflection": result.outcome,   # "ok" / "degraded"
@@ -1717,6 +1718,47 @@ def _dispatch_status_to_envelope_terminal(rec: dict) -> str:
         return "published" if "merged" in status else "revise"
     # 4. 兜底：未知/空 status → ""（fail-open：reflection 走 not_terminal degraded，不改 terminal outcome）
     return ""
+
+
+# dispatch-terminal 出口集合（评审 #1 残留修复）：dispatch_one 已 return 的所有出口 status。
+# 这些 status 在 dispatch 视角是 terminal outcome（dispatch 已结束），即便 loop_state 视角对应中间态
+# （blocked_test_gate/blocked_external_state/interrupted_pr/retry_* → loop_state test_blocked/
+# external_blocked/revise）。冻结契约（spec L97 stalled/gate-blocked/verifier-revise-exhausted/failed
+# + L101-105 post-verifier blocked_external_state + design L43）：这些终态必须能贡献候选。
+# 与 _DISPATCH_STATUS_TO_ENVELOPE_TERMINAL 区别：那个表是 status→envelope label 映射（label 可能中间态）；
+# 本集合是 status→dispatch-terminal? 判定（解耦 reflection 守护，不依赖 label 是否 loop_state 真终态）。
+# 同步要求：dispatch_one 任何新 return 出口（rec.update(status=...) / rec["status"]=...）须同步加入本集合，
+# 否则该出口会被 _dispatch_is_terminal_outcome 判 False → reflection degrade{not_terminal}（漏候选）。
+_DISPATCH_TERMINAL_OUTCOMES: frozenset[str] = frozenset({
+    # 直接映射表覆盖的 dispatch status（对齐 _DISPATCH_STATUS_TO_ENVELOPE_TERMINAL）
+    "skip", "fail", "blocked_test_gate", "blocked_evidence", "blocked_external_state", "stalled",
+    "orphan_deleted",
+    # pr_* 系列（dispatch 已开/合并/关闭/中断 PR = terminal outcome）
+    "pr_open", "pr_merged", "pr_closed", "interrupted_pr",
+    # retry 阻断/耗尽（dispatch 已放弃 = terminal outcome；未映射 envelope label 但 is_terminal_outcome 解锁）
+    "retry_blocked", "retry_budget_exhausted",
+    # loop_state 真终态名直传场景（identity pass-through；这些 label 也在 loop_state.TERMINAL_STATUSES）
+    "sandbox_blocked", "state_corrupt", "published", "aborted", "failed",
+})
+
+
+def _dispatch_is_terminal_outcome(rec: dict) -> bool:
+    """dispatch rec.status 是否 terminal outcome（评审 #1 残留修复：解耦 reflection terminal 守护）。
+
+    Why（design L43）：``loop_state.is_terminal`` 是 state-machine 内部视角，不覆盖 dispatch-terminal
+    语义。dispatch_one 已 return 的出口（gate-blocked/revise-exhausted/blocked_external_state/pr_*/...）
+    在 loop_state 视角可能对应中间态 label（test_blocked/external_blocked/revise），但 dispatch 视角
+    已 terminal outcome（可贡献候选）。本函数让调用方（``_attach_learning_memory``）把「dispatch 已
+    terminal」的判定显式传给 ``run_terminal_reflection(is_terminal_outcome=...)``，解耦 reflection 守护
+    对 ``loop_state.is_terminal(envelope.terminal_status label)`` 的绑死。
+
+    判定规则：``rec["status"] in _DISPATCH_TERMINAL_OUTCOMES`` → True；中间态/未知/空 → False（fail-safe）。
+    绝不动 ``loop_state.TERMINAL_STATUSES`` / ``_TRANSITIONS``（spec L90 terminal predicates 不变量）。
+
+    fail-safe：未知 status 默认 False（degrade，绝不假阳）；rec 无 status 键 / status=None → False。
+    """
+    status = rec.get("status") if isinstance(rec, dict) else None
+    return isinstance(status, str) and status in _DISPATCH_TERMINAL_OUTCOMES
 
 
 # dispatch record status → journal 终态 event（task 3.2 + 3.5）。

@@ -723,3 +723,113 @@ class TestEnvelopeTerminalStatusMapping:
         assert rec["status"] == "some_unmapped_status"
         assert rec["skip_reason"] == "??"
         assert rec["pr_url"] == "https://x"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 外部评审 #1 残留修复：dispatch status → is_terminal_outcome → reflection 触发
+# ════════════════════════════════════════════════════════════════════════
+class TestDispatchTerminalOutcomeWiring:
+    """评审 #1 残留修复：run_daily 接线——dispatch rec.status（终态出口集合）→
+    ``_dispatch_is_terminal_outcome(rec)=True`` → ``run_terminal_reflection(is_terminal_outcome=True)``。
+
+    冻结契约（spec L97 + L101-105 + design L43）：stalled/gate-blocked/verifier-revise-exhausted/
+    failed/post-verifier blocked_external_state 等 dispatch-terminal 出口必须能贡献候选。
+
+    bug 复现（修复前）：blocked_test_gate/blocked_external_state/interrupted_pr+revise 映射到 loop_state
+    中间态 label（test_blocked/external_blocked/revise）→ ``is_terminal(label)=False`` → degrade
+    {not_terminal}；retry_blocked/retry_budget_exhausted 未映射 → label="" → ``IterationStatus("")``
+    ValueError → degrade{not_terminal}。修复后：``_dispatch_is_terminal_outcome`` 声明 dispatch-terminal
+    outcome → reflection 守护 OR 逻辑放行。
+    """
+
+    @pytest.mark.parametrize("status", [
+        "blocked_test_gate",        # → label=test_blocked（中间态）
+        "blocked_external_state",   # → label=external_blocked（中间态；post-verifier short-circuit）
+        "interrupted_pr",           # → label=revise（中间态；verify 不双绿）
+        "retry_blocked",            # → label=""（未映射）
+        "retry_budget_exhausted",   # → label=""（未映射）
+    ])
+    def test_dispatch_terminal_status_triggers_reflection(self, status, tmp_path, monkeypatch):
+        """dispatch 终态出口（评审方 5 场景）→ SDK 被调 + reflection ok（**不** degraded{not_terminal}）。"""
+        _set_flags(shadow=True, injection=False, monkeypatch=monkeypatch)
+        monkeypatch.setattr(RD, "STATE_DIR", tmp_path)
+        _seed_journal(tmp_path, "proj-a", "20260726-0000", "test-prd",
+                      events=[{"event_type": "verifier_feedback", "payload": {"verdict": "pass"}}])
+        sdk_calls = []
+
+        def _sdk(p, o):
+            sdk_calls.append(p); return json.dumps({"candidates": [], "audit_summary": ""})
+
+        rec = {"status": status, "verify": {"pass": False}, "verify_verdict": "revise",
+               "skip_reason": "gate X"}
+        RD._attach_learning_memory(rec, _profile(), _entry(),
+                                   stamp="20260726-0000", sdk_query_fn=_sdk)
+        # SDK 被调 1 次（未在 not_terminal degraded 拦）
+        assert len(sdk_calls) == 1, (
+            f"status={status!r} 是 dispatch-terminal 出口，应触发 reflection；SDK 未被调说明守护拒了")
+        assert rec["learning_memory"]["reflection"] == "ok"
+        assert rec["learning_memory"].get("class") is None    # not_terminal 不发生
+        # fail-open：terminal outcome 不变
+        assert rec["status"] == status
+
+    def test_dispatch_intermediate_status_still_degrades(self, tmp_path, monkeypatch):
+        """守护回归：中间态 status（planned）→ SDK 不被调 + degraded{not_terminal}。
+
+        ``_dispatch_is_terminal_outcome`` 对 planned/running/verifying/publish_ready/revise/test_blocked/
+        external_blocked 等中间态返 False（保守 degrade）。
+        """
+        _set_flags(shadow=True, injection=False, monkeypatch=monkeypatch)
+        monkeypatch.setattr(RD, "STATE_DIR", tmp_path)
+        _seed_journal(tmp_path, "proj-a", "20260726-0000", "test-prd",
+                      events=[{"event_type": "verifier_feedback", "payload": {"verdict": "pass"}}])
+        sdk_calls = []
+        rec = {"status": "planned"}
+        RD._attach_learning_memory(rec, _profile(), _entry(),
+                                   stamp="20260726-0000",
+                                   sdk_query_fn=lambda p, o: (sdk_calls.append(p), "{}")[1])
+        assert sdk_calls == [], "planned 是中间态，SDK 不应被调"
+        assert rec["learning_memory"]["reflection"] == "degraded"
+        assert rec["learning_memory"]["class"] == "not_terminal"
+
+    def test_dispatch_real_terminal_status_still_triggers_reflection(self, tmp_path, monkeypatch):
+        """既有终态回归：真终态 status（published）→ SDK 被调（label 路径保持，无回归）。"""
+        _set_flags(shadow=True, injection=False, monkeypatch=monkeypatch)
+        monkeypatch.setattr(RD, "STATE_DIR", tmp_path)
+        _seed_journal(tmp_path, "proj-a", "20260726-0000", "test-prd",
+                      events=[{"event_type": "verifier_feedback", "payload": {"verdict": "pass"}}])
+        sdk_calls = []
+        rec = {"status": "published", "verify": {"pass": True}, "verify_verdict": "pass"}
+        RD._attach_learning_memory(rec, _profile(), _entry(),
+                                   stamp="20260726-0000",
+                                   sdk_query_fn=lambda p, o: (
+                                       sdk_calls.append(p), json.dumps({"candidates": []}))[1])
+        assert len(sdk_calls) == 1
+        assert rec["learning_memory"]["reflection"] == "ok"
+
+    @pytest.mark.parametrize("status, expected", [
+        # dispatch 终态出口集合（dispatch_one 已 return 的所有出口；spec L97 + loop_state 真终态 + grep 确认）
+        ("skip", True), ("fail", True), ("blocked_test_gate", True), ("blocked_evidence", True),
+        ("blocked_external_state", True), ("pr_open", True), ("pr_merged", True), ("pr_closed", True),
+        ("interrupted_pr", True), ("stalled", True), ("orphan_deleted", True),
+        ("retry_blocked", True), ("retry_budget_exhausted", True),
+        ("sandbox_blocked", True), ("state_corrupt", True),
+        ("published", True), ("aborted", True),
+        # 中间态（dispatch 还在跑；保守 degrade）
+        ("planned", False), ("running", False), ("agent_finished", False),
+        ("verifying", False), ("publish_ready", False),
+        ("test_blocked", False), ("external_blocked", False), ("revise", False),
+        # 未知/空（fail-safe：默认 False → degrade）
+        ("", False), ("some_unknown_status", False),
+    ])
+    def test_dispatch_is_terminal_outcome_set_membership(self, status, expected):
+        """``_dispatch_is_terminal_outcome`` 纯函数：dispatch 终态出口 → True；中间态/未知/空 → False。
+
+        fail-safe：未知 status 默认 False（degrade），绝不假阳。
+        """
+        rec = {"status": status}
+        assert RD._dispatch_is_terminal_outcome(rec) is expected
+
+    def test_dispatch_is_terminal_outcome_missing_status_key(self):
+        """rec 无 status 键 / status=None → False（fail-safe：保守 degrade）。"""
+        assert RD._dispatch_is_terminal_outcome({}) is False
+        assert RD._dispatch_is_terminal_outcome({"status": None}) is False

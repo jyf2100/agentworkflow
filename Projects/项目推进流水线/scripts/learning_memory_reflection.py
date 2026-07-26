@@ -330,12 +330,20 @@ def run_terminal_reflection(*, envelope: ENV.TerminalEnvelope,
                             iteration_id: str, timestamp: str,
                             sdk_query_fn: Callable[[str, dict], str] | None = None,
                             persist_callback: Callable | None = None,
+                            is_terminal_outcome: bool = False,
                             timeout_seconds: float = DEFAULT_REFLECTION_TIMEOUT_SECONDS) -> ReflectionResult:
     """task 4.2-4.5：跑 terminal reflection（design 决策#2 + #7 硬约束）。
 
     Pipeline：
-        1. **task 4.3 terminal guard**：envelope.terminal_status 必须 terminal（``loop_state.is_terminal``）；
-           非 terminal → ``degraded{class:not_terminal}``（不调 SDK，不写 candidate）。
+        1. **task 4.3 terminal guard（OR 逻辑，评审 #1 残留修复）**：放行条件 = 「envelope.terminal_status
+           是 ``loop_state`` 真终态」**或**「调用方声明 ``is_terminal_outcome=True``（dispatch-terminal
+           outcome）」。两者皆否 → ``degraded{class:not_terminal}``（不调 SDK，不写 candidate）。
+           Why（design L43）：「The terminal label alone never determines the evidence class; the journal
+           does」——loop_state.TERMINAL_STATUSES 是 state-machine 内部视角（不可复活），不覆盖
+           dispatch-terminal 语义（gate-blocked/revise-exhausted/blocked_external_state 在 dispatch_one
+           已 return = terminal outcome，但 loop_state 视角可中间）。spec L90「MUST NOT change terminal
+           predicates」禁止改 loop_state 终态集，故解耦：dispatch-terminal outcome 由调用方判定传入。
+           fail-safe：``is_terminal_outcome`` 默认 ``False``（不传 → 仅 label 路径判定）。
         2. **task 4.2 SDK 调用**：渲染 sanitized prompt → ``sdk_query_fn``（默认 ``_default_sdk_query``
            走真 SDK，asyncio.wait_for 硬超时）；timeout / sdk_error → degraded。
         3. **task 4.2 strict JSON parse**：解析 SDK response；invalid_json → degraded。
@@ -355,30 +363,43 @@ def run_terminal_reflection(*, envelope: ENV.TerminalEnvelope,
             测试注入固定 JSON 返回（mock-SDK 模式，参照 conftest.py 既定）。
         persist_callback: persist 注入（None → ``_default_persist``：artifact_store + append_candidate）；
             测试可注入故障桩模拟 persist 失败（task 4.5 persist_failure 反例）。
+        is_terminal_outcome: 调用方声明「dispatch 已 terminal outcome」（dispatch_one 已 return 的出口，
+            如 blocked_test_gate / blocked_external_state / interrupted_pr / retry_blocked /
+            retry_budget_exhausted / pr_* / stalled / failed / ...）。默认 ``False`` = fail-safe（调用方
+            不传 → 仅靠 envelope.terminal_status label 判定；中间态 label + 不传 flag → degrade，绝不假阳）。
+            run_daily 接线点传 ``_dispatch_is_terminal_outcome(rec)``。
         timeout_seconds: ``asyncio.wait_for`` 硬超时（SDK 内部 max_turns/max_budget 被 bypass，故用 wait_for 硬限）。
 
     Returns:
         immutable ``ReflectionResult``——字段集**只**暴露 reflection 自身产物，无 terminal mutation
         入口（fail-open by construction；调用方无法用此结果改 terminal outcome）。
     """
-    # ─── task 4.3：terminal guard（Stop hook / 中间 retry iteration 不生成 lesson）──
-    try:
-        status = IterationStatus(envelope.terminal_status)
-    except ValueError:
-        # envelope 给了未知 status（理论 envelope 由 terminal event 构造，应已 terminal）→ degraded
+    # ─── task 4.3：terminal guard（评审 #1 残留修复：OR 逻辑 = label-terminal OR dispatch-outcome）──
+    # loop_state.TERMINAL_STATUSES 是 state-machine 内部视角（published/aborted/failed/stalled/
+    # orphan_deleted/blocked_evidence/sandbox_blocked/state_corrupt）——不覆盖 dispatch-terminal 语义
+    # （gate-blocked/revise-exhausted/blocked_external_state 在 dispatch_one 已 return = terminal outcome，
+    # 但 loop_state 视角对应中间态 test_blocked/external_blocked/revise）。design L43 明确「terminal
+    # label alone never determines evidence class」——故触发门也不该绑死 loop_state.is_terminal(label)。
+    # spec L90「MUST NOT change terminal predicates」：绝不动 loop_state 终态集（那是 dispatch/verify/
+    # retry/publish 共用的 terminal predicate）。解耦：dispatch-terminal outcome 由调用方传入。
+    # fail-safe：is_terminal_outcome 默认 False（调用方不传 → 仅 label 路径；中间态 label + 不传 flag → degrade）。
+    label_terminal = False
+    if envelope.terminal_status:
+        try:
+            label_terminal = is_terminal(IterationStatus(envelope.terminal_status))
+        except ValueError:
+            # envelope 给了未知 status label（非 IterationStatus.value，如未映射的 dispatch status）→
+            # label 路径不放行；但 is_terminal_outcome=True 仍可放行（调用方判定 dispatch 已 terminal）。
+            label_terminal = False
+    if not (label_terminal or is_terminal_outcome):
         return _emit_degraded(
             state_dir=state_dir, project_id=project_id, run_id=run_id, prd_id=prd_id,
             iteration_id=iteration_id, timestamp=timestamp,
             envelope_evidence_class=envelope.evidence_class,
             degraded_class="not_terminal",
-            reason=f"unknown terminal_status={envelope.terminal_status!r}")
-    if not is_terminal(status):
-        return _emit_degraded(
-            state_dir=state_dir, project_id=project_id, run_id=run_id, prd_id=prd_id,
-            iteration_id=iteration_id, timestamp=timestamp,
-            envelope_evidence_class=envelope.evidence_class,
-            degraded_class="not_terminal",
-            reason=f"terminal_status={envelope.terminal_status!r} 不是终态（Stop/retry iteration 不是 reflection 边界）")
+            reason=(f"terminal_status={envelope.terminal_status!r} 非 loop_state 终态且"
+                    f"调用方未声明 dispatch-terminal outcome（is_terminal_outcome=False）"
+                    f"——Stop/retry iteration 不是 reflection 边界"))
 
     # ─── task 4.2：渲染 sanitized prompt + 调 SDK ───
     prompt = _render_sdk_prompt(envelope, project_id=project_id, prd_id=prd_id)

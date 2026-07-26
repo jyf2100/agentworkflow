@@ -25,6 +25,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 import learning_memory_schema as LM  # noqa: E402
 import learning_memory_envelope as ENV  # noqa: E402
@@ -582,3 +584,102 @@ class TestResultMessageFieldContract:
         raw = REFL._default_sdk_query("p", {"timeout_seconds": 5.0})
         # 空 result → 返回空串（fail-open：上层 json.loads 触 invalid_json degraded）
         assert raw == ""
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 外部评审 #1 残留修复：dispatch-terminal outcome 解耦 reflection terminal 守护
+# ════════════════════════════════════════════════════════════════════════
+class TestTerminalGuardDispatchOutcome:
+    """评审 #1 残留修复：解耦 reflection terminal 守护——dispatch-terminal outcome 信号
+    （``is_terminal_outcome=True``）独立于 envelope.terminal_status label。
+
+    冻结契约（spec L97 + design L43）：stalled/gate-blocked/verifier-revise-exhausted/failed 等
+    dispatch-terminal 出口（即便 loop_state label 是中间态 ``test_blocked`` / ``external_blocked`` /
+    ``revise`` / ``""``）必须能贡献候选——design L43「**The terminal label alone never determines
+    the evidence class**; the journal does」。
+
+    守护逻辑（OR）：``label 是 loop_state 真终态`` **或** ``调用方声明 dispatch-terminal outcome``
+    → 放行。fail-safe：``is_terminal_outcome`` 默认 ``False``（调用方不传 → 仅 label 路径判定；
+    中间态 label + 不传 flag → 仍 degrade，绝不假阳）。
+
+    bug 复现（修复前）：envelope.terminal_status 是 loop_state 中间态（test_blocked/external_blocked/
+    revise）或未映射（""）→ ``is_terminal(IterationStatus(label))`` 返 False 或抛 ValueError →
+    degrade{class:not_terminal}（不生成候选）。修复后：``is_terminal_outcome=True`` 解锁。
+    """
+
+    @pytest.mark.parametrize("label", [
+        "test_blocked",      # blocked_test_gate 映射（loop_state 中间态）
+        "external_blocked",  # blocked_external_state 映射（loop_state 中间态）
+        "revise",            # interrupted_pr + verify 不双绿 映射（loop_state 中间态）
+        "",                  # retry_blocked / retry_budget_exhausted 未映射兜底
+    ])
+    def test_dispatch_terminal_outcome_overrides_intermediate_label(self, tmp_path, label):
+        """``is_terminal_outcome=True`` + 中间态 label → reflection 进 SDK 路径（不 not_terminal degraded）。
+
+        评审方 5 场景中 retry_blocked / retry_budget_exhausted 都映射到 label=""，故 4 label 覆盖
+        5 dispatch status（wiring test 单独覆盖 5 status）。
+        """
+        env = _envelope(terminal_status=label)
+        sdk_called = []
+
+        def _sdk(p, o):
+            sdk_called.append(p); return json.dumps({"candidates": [], "audit_summary": ""})
+
+        result = REFL.run_terminal_reflection(
+            envelope=env, state_dir=str(tmp_path), project_id="proj-a",
+            run_id="r1", prd_id="p1", iteration_id="i1", timestamp="t",
+            sdk_query_fn=_sdk, is_terminal_outcome=True)
+        assert result.outcome == "ok", f"label={label!r} + is_terminal_outcome=True 应触发 reflection"
+        assert result.degraded_class is None
+        assert len(sdk_called) == 1, "SDK 必须被调（未在 not_terminal 拦）"
+
+    def test_intermediate_label_without_dispatch_outcome_still_degrades(self, tmp_path):
+        """守护回归：中间态 label（test_blocked）+ 不传 ``is_terminal_outcome``（默认 False）→ degrade。
+
+        fail-safe：调用方必须显式声明 dispatch-terminal outcome 才能解锁中间态 label。
+        """
+        env = _envelope(terminal_status="test_blocked")   # 中间态 label
+        sdk_called = []
+        result = REFL.run_terminal_reflection(
+            envelope=env, state_dir=str(tmp_path), project_id="proj-a",
+            run_id="r1", prd_id="p1", iteration_id="i1", timestamp="t",
+            sdk_query_fn=lambda p, o: (sdk_called.append(p),
+                                       json.dumps({"candidates": [_valid_candidate_dict()]}))[1])
+        assert result.outcome == "degraded"
+        assert result.degraded_class == "not_terminal"
+        assert result.candidates == ()
+        assert sdk_called == [], "not_terminal 应在 SDK 调用前拦"
+
+    def test_real_terminal_label_passes_without_dispatch_outcome(self, tmp_path):
+        """既有终态回归：真终态 label（published）+ 不传 ``is_terminal_outcome`` → 仍 ok（label 路径保持）。
+
+        向后兼容保障：现有用 ``terminal_status="published"`` 不传 flag 的 reflection 单测零改动。
+        证明守护用 OR 逻辑（label-terminal OR dispatch-outcome），而非完全替换（集成者推荐完全替换
+        会破坏现有 ~25 个 published envelope 单测——本修复校正为 OR）。
+        """
+        env = _envelope(terminal_status="published")   # 真终态 label
+        result = REFL.run_terminal_reflection(
+            envelope=env, state_dir=str(tmp_path), project_id="proj-a",
+            run_id="r1", prd_id="p1", iteration_id="i1", timestamp="t",
+            sdk_query_fn=lambda p, o: json.dumps({"candidates": [], "audit_summary": ""}))
+        assert result.outcome == "ok"
+        assert result.degraded_class is None
+
+    def test_unknown_label_with_dispatch_outcome_triggers_reflection(self, tmp_path):
+        """``is_terminal_outcome=True`` + 未知 label（非 IterationStatus.value）→ reflection ok。
+
+        覆盖 retry_blocked/retry_budget_exhausted label="" 场景之外的「未来未知 status」健壮性：
+        label 解析 ValueError 时，``is_terminal_outcome=True`` 仍放行（OR 逻辑 + try/except 保护）。
+        """
+        env = _envelope(terminal_status="some_future_unmapped_status")
+        sdk_called = []
+
+        def _sdk(p, o):
+            sdk_called.append(p); return json.dumps({"candidates": []})
+
+        result = REFL.run_terminal_reflection(
+            envelope=env, state_dir=str(tmp_path), project_id="proj-a",
+            run_id="r1", prd_id="p1", iteration_id="i1", timestamp="t",
+            sdk_query_fn=_sdk, is_terminal_outcome=True)
+        assert result.outcome == "ok"
+        assert len(sdk_called) == 1
