@@ -133,13 +133,17 @@ def _default_sdk_query(prompt: str, options: dict) -> str:
                 result_msg = msg
         if result_msg is None:
             raise RuntimeError("SDK returned no ResultMessage")
-        # 抽 ResultMessage 文本（content blocks 的 text 拼接）
-        text_parts: list[str] = []
-        for block in getattr(result_msg, "content", []) or []:
-            t = getattr(block, "text", None)
-            if isinstance(t, str):
-                text_parts.append(t)
-        return "\n".join(text_parts)
+        # 抽 ResultMessage 文本：读 .result（string）。
+        # SDK 0.2.121 契约（pa 钉版 >=0.2.121,<0.2.123）：ResultMessage 字段 =
+        # ['subtype','duration_ms','duration_api_ms','is_error','num_turns','session_id',
+        #  'stop_reason','total_cost_usd','usage','result','structured_output','model_usage',
+        #  'permission_denials','deferred_tool_use','errors','api_error_status','uuid']
+        # —— **无 content 字段**（旧实现 getattr(result_msg, "content", []) 永远返回 [] → 吞文本 →
+        # reflection 必然 degraded）。result 是 string（不是 content blocks list），直接用。
+        # fail-open：result 缺失/非 str → 返回空串（上层 json.loads 触 invalid_json degraded，
+        # 不改 terminal outcome，design 决策#7 fail-open for delivery 不变量保持）。
+        result_text = getattr(result_msg, "result", None)
+        return result_text if isinstance(result_text, str) else ""
 
     # asyncio.wait_for 是硬限（spec「bounded time budget」）；SDK 内部 max_turns/max_budget 不可靠
     return asyncio.run(_with_timeout(_run(), timeout))

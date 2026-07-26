@@ -1477,8 +1477,11 @@ def _attach_learning_memory(rec: dict, prof: dict, entry: dict, stamp: str, *,
                 run_id_for_usage = _coord2.run_id
                 prd_id_for_usage = _coord2.prd_id
                 loader = _make_artifact_loader(_coord2.run_id)
+                # 外部评审 P1 #1 修复：dispatch rec.status（pr_open/fail/skip/...）不在 IterationStatus
+                # 合法 value 集合 → 直传会让 reflection.IterationStatus() 抛 ValueError → degraded{not_terminal}。
+                # 经 _dispatch_status_to_envelope_terminal 映射到受控词表（fail-open：未知→""→degraded，不改 terminal）。
                 envelope = LME.build_terminal_envelope(
-                    terminal_status=rec.get("status") or "",
+                    terminal_status=_dispatch_status_to_envelope_terminal(rec),
                     events=events, artifact_loader=loader,
                     run_id=_coord2.run_id, prd_id=_coord2.prd_id,
                     iteration_id=_coord2.iteration_id, project_id=proj)
@@ -1628,6 +1631,92 @@ def _record_usage_outcomes(*, state_dir: str, project_id: str, run_id: str, prd_
         except Exception:
             continue   # 单 lesson 故障不拖垮其他 lesson 的评估（fail-open）
     return recorded
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 外部评审 P1 #1 修复：dispatch rec.status → envelope.terminal_status 映射
+# ════════════════════════════════════════════════════════════════════════
+# dispatch_one 出口 ``rec["status"]`` 用 dispatch 词汇（``pr_open`` / ``fail`` / ``skip`` /
+# ``blocked_external_state`` / ``pr_merged`` / ...），与 ``loop_state.IterationStatus`` 受控 value 集合
+# （``published`` / ``failed`` / ``aborted`` / ``external_blocked`` / ...）不完全一致。修复前 envelope 接线点
+# L1481 直传 ``rec.get("status") or ""`` → ``learning_memory_reflection.py`` L362
+# ``IterationStatus(envelope.terminal_status)`` 抛 ValueError → degraded{class:not_terminal}
+# → **不生成候选**（learning memory 失效，但不改 terminal outcome——fail-open by construction）。
+#
+# 修复：在 run_daily 做映射，**不改** reflection.py 的 ``IterationStatus()`` 守护契约（那是正确的边界
+# ——loop_state 的合法 value 集合是 state machine 真源）。映射表对齐 ``_SJ_TERMINAL_MAP``（dispatch
+# status → terminal event）+ ``_sj_terminal`` 的 pr_open/interrupted_pr 双门分流逻辑（机械绿 + 语义
+# pass → published，否则 revise）。
+#
+# **fail-open**：映射不到的 status → 返回 ``""``（让 reflection 走 not_terminal degraded，**不崩**
+# envelope 构造，**不改** terminal outcome）。
+#
+# ``_ITERATION_STATUS_VALUES`` 是 ``loop_state.IterationStatus.value`` 合法集合的镜像（state machine
+# 真源——硬编码 enum 的同款硬编码 frozenset；任何 state machine 演化需同步二者）。用于 identity
+# pass-through：若 dispatch status 本身已是合法 IterationStatus.value（如 loop_state 终态名直传场景），
+# 原样返回，无需映射。
+_ITERATION_STATUS_VALUES: frozenset[str] = frozenset({
+    "planned", "running", "agent_finished", "test_blocked", "verifying", "revise",
+    "external_blocked", "publish_ready", "published", "aborted", "failed", "stalled",
+    "orphan_deleted", "blocked_evidence", "sandbox_blocked", "state_corrupt",
+})
+
+_DISPATCH_STATUS_TO_ENVELOPE_TERMINAL: dict[str, str] = {
+    # 直接对齐 _SJ_TERMINAL_MAP（同源 status 词汇）
+    "skip": "aborted",
+    "blocked_external_state": "external_blocked",   # loop_state 视角非 terminal；envelope 保守传，reflection 诚实 not_terminal degraded
+    "blocked_test_gate": "test_blocked",
+    "blocked_evidence": "blocked_evidence",
+    "fail": "failed",
+    "stalled": "stalled",
+    "orphan_deleted": "orphan_deleted",
+    # pr_* 系列需配合 verify 双门决定 published/revise（见 _dispatch_status_to_envelope_terminal 函数体）
+}
+
+
+def _dispatch_status_to_envelope_terminal(rec: dict) -> str:
+    """dispatch rec.status → ``loop_state.IterationStatus.value`` 映射（envelope.terminal_status 受控词表）。
+
+    Why（外部评审 P1 #1）：dispatch status 词汇（pr_open/fail/skip/...）不在 ``IterationStatus`` 合法
+    value 集合，直传会让 ``learning_memory_reflection.IterationStatus()`` 抛 ValueError → degraded
+    {not_terminal}（不生成候选）。本函数做受控映射，让 envelope.terminal_status 落在合法 value 集合。
+
+    Map rules（对齐 ``_SJ_TERMINAL_MAP`` + ``_sj_terminal`` 双门分流）：
+        * **identity pass-through**：dispatch status 本身已是合法 ``IterationStatus.value``（如
+          ``published`` / ``failed`` / ``aborted`` 直传场景）→ 原样返回（无需映射）；
+        * 直接映射表覆盖的 dispatch status → 对应 IterationStatus.value（与 _sj_terminal emit 的
+          终态事件一致：skip→aborted、fail→failed、blocked_evidence→blocked_evidence 等）；
+        * ``pr_open`` / ``interrupted_pr`` → 看 verify 双门（``mechanical_green = verify.pass`` 且
+          ``semantic_pass = verify_verdict == "pass"``）：双绿 → ``published``（_sj_terminal 已 emit
+          published）；否则 → ``revise``（中间态，reflection 会 not_terminal degraded，但这是诚实记录
+          「dispatch 已 return 但 loop_state 视角非终态」——绝不在 envelope 层假 terminal）；
+        * 其他 ``pr_*`` 前缀（``pr_merged`` / ``pr_closed``）：``pr_merged`` → ``published``（reconcile
+          看到 merged 即等价成功交付）；其余保守 → ``revise``；
+        * 未映射/空 → ``""``（fail-open：让 reflection 走 not_terminal degraded，不改 terminal outcome）。
+
+    Fail-open by construction：未知 status 绝不让 envelope 构造崩；rec 仍保留 dispatch 设置的全部字段。
+    """
+    status = rec.get("status") or ""
+    # 0. identity pass-through：已是合法 IterationStatus.value（loop_state 终态名/中间态名直传场景）
+    if status in _ITERATION_STATUS_VALUES:
+        return status
+    # 1. 直接映射表
+    direct = _DISPATCH_STATUS_TO_ENVELOPE_TERMINAL.get(status)
+    if direct is not None:
+        return direct
+    # 2. pr_open / interrupted_pr：看 verify 双门（与 _sj_terminal L1665-1685 同款分流）
+    if status in ("pr_open", "interrupted_pr"):
+        verify = rec.get("verify") or {}
+        mechanical_green = bool(verify.get("pass"))
+        semantic_pass = rec.get("verify_verdict") == "pass"
+        if mechanical_green and semantic_pass:
+            return "published"
+        return "revise"
+    # 3. 其他 pr_* 前缀（pr_merged/pr_closed/...）：merged → published；其余保守 revise
+    if status.startswith("pr_"):
+        return "published" if "merged" in status else "revise"
+    # 4. 兜底：未知/空 status → ""（fail-open：reflection 走 not_terminal degraded，不改 terminal outcome）
+    return ""
 
 
 # dispatch record status → journal 终态 event（task 3.2 + 3.5）。

@@ -34,6 +34,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import learning_memory_catalog as LMCat   # noqa: E402
@@ -603,3 +605,121 @@ class TestDevAgentBuildPromptInjection:
         # --lessons-artifact 出现在 cmd 里，后跟 path
         idx = cmd_on.index("--lessons-artifact")
         assert cmd_on[idx + 1] == "/tmp/lb.txt"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 外部评审 P1 #1 复现：dispatch status → envelope.terminal_status 映射
+# ════════════════════════════════════════════════════════════════════════
+class TestEnvelopeTerminalStatusMapping:
+    """spec P1 #1 修复：dispatch rec.status 词汇（pr_open/fail/skip/...）与
+    ``loop_state.IterationStatus`` 受控 value 集合不一致 → envelope.terminal_status 直传会让
+    ``learning_memory_reflection.py`` L362 ``IterationStatus(...)`` 抛 ValueError →
+    degraded{class:not_terminal}（**不生成候选**）。
+
+    修复：run_daily 加 ``_dispatch_status_to_envelope_terminal`` 做映射，**不改** reflection.py 的
+    ``IterationStatus()`` 守护契约。映射表对齐 ``_SJ_TERMINAL_MAP`` + ``_sj_terminal`` 双门分流逻辑。
+
+    测试策略：纯函数单测（不进 envelope 构造）+ 1 个 integration 验证完整链路（rec → envelope →
+    reflection）——避免依赖 SDK 桩被调用（not_terminal 时 SDK 不调）。
+    """
+
+    @pytest.mark.parametrize("status, verify_pass, verify_verdict, expected", [
+        # identity pass-through：已是合法 IterationStatus.value（loop_state 终态名/中间态名直传场景）
+        ("published", True, "pass", "published"),
+        ("failed", None, None, "failed"),
+        ("aborted", None, None, "aborted"),
+        ("stalled", None, None, "stalled"),
+        ("blocked_evidence", None, None, "blocked_evidence"),
+        ("external_blocked", None, None, "external_blocked"),
+        ("sandbox_blocked", None, None, "sandbox_blocked"),
+        # 直接映射表（对齐 _SJ_TERMINAL_MAP）
+        ("skip", None, None, "aborted"),
+        ("blocked_external_state", None, None, "external_blocked"),
+        ("blocked_test_gate", None, None, "test_blocked"),
+        ("fail", None, None, "failed"),
+        # pr_open/interrupted_pr 双门分流（与 _sj_terminal L1665-1685 同款）
+        ("pr_open", True, "pass", "published"),         # 机械绿 + 语义 pass → published
+        ("pr_open", True, "revise", "revise"),          # 机械绿但语义红 → revise
+        ("pr_open", False, "pass", "revise"),           # 机械不绿（即使语义 pass）→ revise
+        ("interrupted_pr", True, "pass", "published"),
+        ("interrupted_pr", True, "revise", "revise"),
+        # 其他 pr_* 前缀（pr_merged/pr_closed/...）
+        ("pr_merged", None, None, "published"),         # merged → published（reconcile 看到 merged 即等价成功交付）
+        ("pr_closed", None, None, "revise"),            # 其余保守 revise
+        # 未知/空 → ""（fail-open：让 reflection 走 not_terminal degraded，不崩 envelope 构造）
+        ("some_unmapped_status", None, None, ""),
+        ("", None, None, ""),
+    ])
+    def test_dispatch_status_maps_to_iteration_status_value(self, status, verify_pass,
+                                                             verify_verdict, expected):
+        """_dispatch_status_to_envelope_terminal(rec) → 返回合法 IterationStatus.value（或 ""）。
+
+        覆盖：identity pass-through / 直接映射表 / pr_* 双门分流 / pr_merged / fail-open 兜底。
+        """
+        rec = {"status": status}
+        if verify_pass is not None:
+            rec["verify"] = {"pass": verify_pass}
+        if verify_verdict is not None:
+            rec["verify_verdict"] = verify_verdict
+        assert RD._dispatch_status_to_envelope_terminal(rec) == expected
+
+    def test_envelope_link_does_not_degrade_on_pr_open_double_green(self, tmp_path, monkeypatch):
+        """integration：dispatch rec.status=pr_open + verify 双绿 → envelope.terminal_status=published
+        → reflection 进 SDK 路径（**未**在 not_terminal degraded）→ reflection ok。
+
+        bug 复现（修复前）：pr_open 直传 → IterationStatus("pr_open") ValueError → SDK 不调 →
+        rec["learning_memory"].reflection=degraded{not_terminal}。
+        """
+        _set_flags(shadow=True, injection=False, monkeypatch=monkeypatch)
+        monkeypatch.setattr(RD, "STATE_DIR", tmp_path)
+        _seed_journal(tmp_path, "proj-a", "20260726-0000", "test-prd",
+                      events=[{"event_type": "verifier_feedback", "payload": {"verdict": "pass"}}])
+        sdk_calls = []
+
+        def _sdk(prompt, options):
+            sdk_calls.append(prompt)
+            # 反向断言：prompt 内 metadata.terminal_status 已映射为 published
+            payload = json.loads(prompt)
+            assert payload["metadata"]["terminal_status"] == "published"
+            return json.dumps({"candidates": [], "audit_summary": ""})
+
+        rec = {"status": "pr_open", "verify": {"pass": True}, "verify_verdict": "pass",
+               "pr_url": "https://x"}
+        RD._attach_learning_memory(rec, _profile(learning_enabled=True), _entry(),
+                                   stamp="20260726-0000", sdk_query_fn=_sdk)
+        # SDK 被调（envelope.terminal_status=published → reflection 进 SDK 路径，未在 not_terminal degraded）
+        assert len(sdk_calls) == 1, "envelope.terminal_status 非法 → reflection 在 not_terminal degraded 不调 SDK"
+        assert rec["learning_memory"]["reflection"] == "ok"
+        assert rec["learning_memory"].get("class") is None    # not_terminal 不发生
+        # fail-open：terminal outcome 不变
+        assert rec["status"] == "pr_open"
+        assert rec["pr_url"] == "https://x"
+
+    def test_envelope_link_fail_open_on_unmapped_status(self, tmp_path, monkeypatch):
+        """integration：未知 dispatch status → envelope.terminal_status="" → reflection degraded{not_terminal}
+        → **不改** terminal outcome（fail-open by construction）。
+
+        rec 保留 dispatch 设置的全部字段；只 reflection 失效（degraded side-channel）。
+        """
+        _set_flags(shadow=True, injection=False, monkeypatch=monkeypatch)
+        monkeypatch.setattr(RD, "STATE_DIR", tmp_path)
+        _seed_journal(tmp_path, "proj-a", "20260726-0000", "test-prd",
+                      events=[{"event_type": "verifier_feedback", "payload": {"verdict": "pass"}}])
+        sdk_calls = []
+
+        def _sdk(prompt, options):
+            sdk_calls.append(prompt)
+            return "{}"
+
+        rec = {"status": "some_unmapped_status", "skip_reason": "??",
+               "verify": {"pass": True}, "pr_url": "https://x"}
+        RD._attach_learning_memory(rec, _profile(learning_enabled=True), _entry(),
+                                   stamp="20260726-0000", sdk_query_fn=_sdk)
+        # SDK 不被调（not_terminal degraded 在调 SDK 前返回）
+        assert sdk_calls == []
+        assert rec["learning_memory"]["reflection"] == "degraded"
+        assert rec["learning_memory"]["class"] == "not_terminal"
+        # fail-open：terminal outcome 字段全部保留（dispatch 字段不被 envelope/reflection 污染）
+        assert rec["status"] == "some_unmapped_status"
+        assert rec["skip_reason"] == "??"
+        assert rec["pr_url"] == "https://x"

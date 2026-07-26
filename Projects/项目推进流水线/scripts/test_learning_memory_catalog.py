@@ -893,3 +893,124 @@ def test_catalog_file_entries_contain_all_section6_fields(tmp_path):
     assert isinstance(entry["applies_when_tags"], list)
     assert isinstance(entry["effectiveness_history"], list)
     assert isinstance(entry["usage_count"], int)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# P1 #4：聚合保留所有等价候选的 non_applicability_when（合并 + 去重 + deterministic）
+# ════════════════════════════════════════════════════════════════════════
+class TestNonApplicabilityWhenAggregation:
+    """P1 #4：_aggregate_candidates 必须合并所有等价候选的 non_applicability_when。
+
+    spec task 2.2/3.2「Merges preserve every source candidate and evidence lineages」——
+    non_applicability_when 是 applicability 的关键 boundary；丢失后续 PRD 的 boundary
+    会让 lesson 被错误注入到本应排除的场景（retrieval._matches_non_applicability 用
+    子串匹配，丢失的 boundary 不会命中 → 不该注入时反而注入）。
+
+    对照 applies_when_tags（L149-151 走 set union 合并，正确）—— non_applicability_when
+    在旧实现只在 group 创建时取 first candidate 的值，subsequent candidate 的 boundary
+    全部丢失（reviewer 报告「last overwrites」，实际更糟：first wins, rest silently dropped）。
+    """
+
+    def test_merges_non_applicability_when_across_equivalent_candidates(self, tmp_path):
+        """两条等效 candidate（不同 non_applicability_when）→ catalog entry 保留两条 boundary。"""
+        state = tmp_path / "s"
+        kw_a = _valid_candidate_kwargs(
+            prd_id="prd-1",
+            non_applicability_when="skip when stage=post_terminal")
+        c1 = LM.LessonCandidate(**kw_a)
+        kw_b = _valid_candidate_kwargs(
+            prd_id="prd-2",
+            non_applicability_when="skip for path src/legacy",
+            evidence_refs=({"digest": "sha256:bb", "kind": "test_output", "path": "sha256/bb"},))
+        c2 = LM.LessonCandidate(**kw_b)
+        # 前置断言：两 candidate 同 enum + 同 canonical tags → 同 equivalence_key（被聚合到一组）
+        assert LM.derive_equivalence_key(c1) == LM.derive_equivalence_key(c2)
+
+        LMS.append_candidate(str(state), "proj-a", c1, run_id="r", timestamp="t1")
+        LMS.append_candidate(str(state), "proj-a", c2, run_id="r", timestamp="t2")
+        result = LMC.rebuild_catalog(str(state), "proj-a")
+        assert result.ok
+        assert len(result.snapshot.entries) == 1   # 聚合为一条
+        entry = result.snapshot.entries[0]
+        merged = entry["non_applicability_when"]
+        # 两条 boundary 都必须保留（旧实现只保留 first=prd-1 的 "stage=post_terminal"）
+        assert "stage=post_terminal" in merged, f"丢失 prd-1 的 boundary；merged={merged!r}"
+        assert "src/legacy" in merged, f"丢失 prd-2 的 boundary；merged={merged!r}"
+
+    def test_non_applicability_when_merge_is_deterministic_regardless_of_order(self, tmp_path):
+        """合并必须 deterministic：append 顺序不同 → catalog byte-identical（sorted join）。
+
+        spec design 决策#3「catalog 是 atomic, rebuildable projection」+ 现有契约
+        test_catalog_replay_order_independent：append 顺序不影响最终 projection。
+        non_applicability_when 合并也必须保持此契约（sorted 后 join，不依赖 append 顺序）。
+        """
+        kw_a = _valid_candidate_kwargs(
+            prd_id="prd-1",
+            non_applicability_when="skip when stage=post_terminal")
+        kw_b = _valid_candidate_kwargs(
+            prd_id="prd-2",
+            non_applicability_when="skip for path src/legacy",
+            evidence_refs=({"digest": "sha256:bb", "kind": "test_output", "path": "sha256/bb"},))
+        c1 = LM.LessonCandidate(**kw_a)
+        c2 = LM.LessonCandidate(**kw_b)
+
+        state_a = tmp_path / "sa"   # c1 first, c2 second
+        state_b = tmp_path / "sb"   # c2 first, c1 second
+        LMS.append_candidate(str(state_a), "proj-a", c1, run_id="r", timestamp="t1")
+        LMS.append_candidate(str(state_a), "proj-a", c2, run_id="r", timestamp="t2")
+        LMS.append_candidate(str(state_b), "proj-a", c2, run_id="r", timestamp="t2")
+        LMS.append_candidate(str(state_b), "proj-a", c1, run_id="r", timestamp="t1")
+        LMC.rebuild_catalog(str(state_a), "proj-a")
+        LMC.rebuild_catalog(str(state_b), "proj-a")
+        bytes_a = (state_a / "lessons" / "catalog" / "proj-a.json").read_bytes()
+        bytes_b = (state_b / "lessons" / "catalog" / "proj-a.json").read_bytes()
+        assert bytes_a == bytes_b, "non_applicability_when 合并不依赖 append 顺序（deterministic）"
+
+    def test_non_applicability_when_merge_is_idempotent_on_replay(self, tmp_path):
+        """合并必须幂等：相同 candidate record 重放（reconcile 重复 append）→ boundary 不膨胀。
+
+        spec task 7.2 idempotency：crash-recovery reconcile 重放同一 event 不重复应用。
+        相同 non_applicability_when 文本多次出现 → 合并后只算一次（set 去重）。
+        """
+        state = tmp_path / "s"
+        # 同一 candidate 重复 append 两次（模拟 reconcile replay；store 允许，catalog 层去重）
+        kw = _valid_candidate_kwargs(
+            prd_id="prd-1",
+            non_applicability_when="skip when stage=post_terminal")
+        # 第二条要等效但不同 prd_id 才能进 active projection（≥2 distinct PRD）
+        kw2 = _valid_candidate_kwargs(
+            prd_id="prd-2",
+            non_applicability_when="skip when stage=post_terminal",   # 同文本（测去重）
+            evidence_refs=({"digest": "sha256:bb", "kind": "test_output", "path": "sha256/bb"},))
+        c1 = LM.LessonCandidate(**kw)
+        c2 = LM.LessonCandidate(**kw2)
+        LMS.append_candidate(str(state), "proj-a", c1, run_id="r", timestamp="t1")
+        LMS.append_candidate(str(state), "proj-a", c2, run_id="r", timestamp="t2")
+        result = LMC.rebuild_catalog(str(state), "proj-a")
+        entry = result.snapshot.entries[0]
+        merged = entry["non_applicability_when"]
+        # 同文本去重：merged 中 "stage=post_terminal" 只出现一次（set 天然去重）
+        assert merged.count("stage=post_terminal") == 1, (
+            f"合并必须去重；merged={merged!r}")
+
+    def test_non_applicability_when_renders_as_string_in_catalog_file(self, tmp_path):
+        """合并后的 non_applicability_when 仍是 string（schema 契约：ActiveCatalogEntry
+        .non_applicability_when: str；retrieval._matches_non_applicability 接 str 做子串匹配）。"""
+        state = tmp_path / "s"
+        kw_a = _valid_candidate_kwargs(
+            prd_id="prd-1",
+            non_applicability_when="skip when stage=post_terminal")
+        kw_b = _valid_candidate_kwargs(
+            prd_id="prd-2",
+            non_applicability_when="skip for path src/legacy",
+            evidence_refs=({"digest": "sha256:bb", "kind": "test_output", "path": "sha256/bb"},))
+        LMS.append_candidate(str(state), "proj-a", LM.LessonCandidate(**kw_a),
+                             run_id="r", timestamp="t1")
+        LMS.append_candidate(str(state), "proj-a", LM.LessonCandidate(**kw_b),
+                             run_id="r", timestamp="t2")
+        LMC.rebuild_catalog(str(state), "proj-a")
+        cat = json.loads((state / "lessons" / "catalog" / "proj-a.json").read_text(encoding="utf-8"))
+        entry = cat["entries"][0]
+        # JSON 序列化后仍是 string（不是 list/array）
+        assert isinstance(entry["non_applicability_when"], str), (
+            "catalog entry.non_applicability_when 必须是 string（schema 契约 + retrieval 子串匹配）")

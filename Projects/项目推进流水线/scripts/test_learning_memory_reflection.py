@@ -496,3 +496,89 @@ class TestDegradedSideChannel:
         assert rec["project_id"] == "proj-a"
         assert rec["degraded_class"] == "sdk_error"
         assert "reason" in rec
+
+
+# ════════════════════════════════════════════════════════════════════════
+# P1 #3：_default_sdk_query 必须读 ResultMessage.result（SDK 0.2.121 契约）
+# ════════════════════════════════════════════════════════════════════════
+class TestResultMessageFieldContract:
+    """P1 #3：claude_agent_sdk.ResultMessage 没有 content 字段；文本在 .result（string）。
+
+    SDK 0.2.121（pa 钉版约束 >=0.2.121,<0.2.123）的 ResultMessage 实测字段：
+    ['subtype','duration_ms','duration_api_ms','is_error','num_turns','session_id',
+     'stop_reason','total_cost_usd','usage','result','structured_output','model_usage',
+     'permission_denials','deferred_tool_use','errors','api_error_status','uuid']
+    —— **没有 content 字段**。旧实现 getattr(result_msg, "content", []) 永远返回 []，
+    text_parts 永远为空 → SDK 返回文本被吞 → reflection 无有效输出。
+    """
+
+    def test_result_message_has_no_content_field(self):
+        """前置事实：SDK ResultMessage 实测无 content 字段（钉版 SDK 0.2.121 契约）。"""
+        import claude_agent_sdk as CAS
+        # 用所有 required args 构造 ResultMessage（subtype 等无默认值的 6 个 positional）
+        msg = CAS.ResultMessage(
+            subtype="result", duration_ms=1.0, duration_api_ms=1.0,
+            is_error=False, num_turns=1, session_id="s1",
+            result='{"candidates": []}')
+        # 契约断言：ResultMessage 没有 content 字段（若未来 SDK 加了，此测试会提醒重新评估）
+        assert not hasattr(msg, "content"), (
+            "SDK ResultMessage 不应有 content 字段（P1 #3 修复的前提）；若 SDK 升级引入 "
+            "content 字段，需重新评估 _default_sdk_query 文本抽取逻辑")
+        # 契约断言：result 字段是 string
+        assert isinstance(msg.result, str)
+        # 旧 bug 复现：getattr(msg, "content", []) 必须返回 [] —— 证明旧代码读错字段
+        assert getattr(msg, "content", []) == []
+
+    def test_default_sdk_query_reads_result_field(self, tmp_path, monkeypatch):
+        """P1 #3：_default_sdk_query 必须读 ResultMessage.result（string），不读 .content。
+
+        旧实现 getattr(result_msg, "content", []) 永远返回 []（SDK 无 content 字段）→
+        text_parts 永远为空 → _default_sdk_query 返回空串 → 上层 json.loads("") 触
+        invalid_json degraded → reflection 永远 fail（fail-open 不改 terminal 但丢 lesson）。
+        """
+        import claude_agent_sdk as CAS
+
+        expected_payload = json.dumps({
+            "candidates": [_valid_candidate_dict()],
+            "audit_summary": "ok",
+        })
+        # 构造 real ResultMessage（result 是 string；无 content 属性——契约保障）
+        fake_msg = CAS.ResultMessage(
+            subtype="result", duration_ms=1.0, duration_api_ms=1.0,
+            is_error=False, num_turns=1, session_id="s1",
+            result=expected_payload)
+        assert not hasattr(fake_msg, "content"), "fixture 必须反映 SDK 真实契约（无 content）"
+
+        # monkeypatch SDK.query：返回仅 yield 一个 ResultMessage 的 async gen
+        async def _fake_query(*, prompt, options):
+            yield fake_msg
+        monkeypatch.setattr(CAS, "query", _fake_query)
+        # ClaudeAgentOptions 不动（dataclass 真构造；不传 model）
+
+        raw = REFL._default_sdk_query(
+            "prompt",
+            {"tools": ["Read", "Grep"], "timeout_seconds": 5.0,
+             "max_turns": 1, "max_budget_usd": 0.01, "permission_mode": "default"})
+        # 必须读到 result 字段文本（旧实现返回空串——证明 bug）
+        assert raw == expected_payload, (
+            f"_default_sdk_query 必须读 ResultMessage.result；got {raw!r}")
+
+    def test_default_sdk_query_fail_open_on_empty_result(self, tmp_path, monkeypatch):
+        """P1 #3 fail-open 不变量：result 字段为空/None → 返回空串（上层 degraded，不改 terminal）。
+
+        design 决策#7：SDK 调用是 fail-open（超时/错误/空结果 → degraded，不改 terminal outcome）。
+        修复字段读取不应破坏该不变量——若 ResultMessage.result 为空/None，仍走 degraded 路径。
+        """
+        import claude_agent_sdk as CAS
+
+        # Case 1: result 为空串
+        empty_msg = CAS.ResultMessage(
+            subtype="result", duration_ms=1.0, duration_api_ms=1.0,
+            is_error=False, num_turns=1, session_id="s1",
+            result="")
+        async def _fake_query_empty(*, prompt, options):
+            yield empty_msg
+        monkeypatch.setattr(CAS, "query", _fake_query_empty)
+        raw = REFL._default_sdk_query("p", {"timeout_seconds": 5.0})
+        # 空 result → 返回空串（fail-open：上层 json.loads 触 invalid_json degraded）
+        assert raw == ""

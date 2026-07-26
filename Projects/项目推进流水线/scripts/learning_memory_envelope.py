@@ -77,10 +77,23 @@ MAX_ARTIFACT_EXCERPT_BYTES: int = 4096   # 单 artifact excerpt 上限（足够�
 # ════════════════════════════════════════════════════════════════════════
 # journal event_type ∈ 此集合 → 视为权威 verifier 事件（判定 verifier_history 用）。
 # spec design 决策#1 表：「journal records a verifier event that passed」——权威 verifier 事件 = 带显式
-# verdict 的 ``verifier_feedback`` 工件落盘事件（payload.verdict ∈ pass/revise）。``verifying``/``revise``
-# 仅是状态迁移（state machine transition），无 verdict 字段——不计入权威 verifier_history（避免
-# 把单纯的状态迁移信号误读为「verifier 已下裁决」）。
-_VERIFIER_EVENT_TYPES: frozenset[str] = frozenset({"verifier_feedback"})
+# verdict 的 ``verifier`` 判决观测事件（payload.verdict ∈ pass/revise）或 ``verifier_feedback`` 反馈工件
+# 落盘事件（payload.digest/path/size）。
+#
+# **外部评审 P1 #2 修复**：生产 ``run_daily.py`` 有**两处** verifier 相关 emit：
+#   * L1208 ``sj.emit("verifier_feedback", payload={round, digest, path, size})`` —— 反馈**内容**事件，
+#     **无 verdict 字段**（工件落盘记录，digest 用于 evidence_refs）；
+#   * L1948 ``_sj.emit("verifier", payload={round, verdict})`` —— 判决**观测**事件，**有 verdict 字段**
+#     （verifier 的 pass/revise 判决）。
+# 修复前只收 ``verifier_feedback`` → ``_has_verifier_pass`` / ``_count_revise_verdicts`` 永远查不到
+# verdict（payload 无该字段）→ evidence_class 永远误判为 PRE_VERIFIER_SHORT_CIRCUIT（违反 state machine
+# 不变量：published 必经 verifier pass）。
+# 现加入 ``verifier`` 让判决观测事件参与 evidence_class 决策；``verifier_feedback`` 仍保留（digest/path
+# 用于 evidence_refs 关联——生产 emit 用裸字段，artifact_ref 抽取另见 ``_extract_artifact_refs``）。
+#
+# ``verifying``/``revise`` 仅是状态迁移（state machine transition），无 verdict 字段——不计入权威
+# verifier_history（避免把单纯的状态迁移信号误读为「verifier 已下裁决」）。
+_VERIFIER_EVENT_TYPES: frozenset[str] = frozenset({"verifier_feedback", "verifier"})
 
 # verdict 取值（payload.verdict）
 _VERDICT_PASS = "pass"
@@ -131,11 +144,15 @@ def _event_type(ev: Any) -> str:
 
 
 def _collect_verifier_history(events: Iterable[Any]) -> list[dict]:
-    """从 journal events 抽 verifier transition 序列（保留时序；含 verifying/revise/feedback）。
+    """从 journal events 抽 verifier transition 序列（保留时序；含 verifier/verifier_feedback）。
 
     输出每条形如 ``{"event_type": ..., "verdict": .../"none", "artifact_ref": {...}}`` —— 仅取结构性
-    字段（不收 payload 里的 raw transcript / 错误堆栈）。verdict 在 ``verifier_feedback`` 事件中显式给；
-    ``verifying``/``revise`` 是状态迁移事件（无 verdict 字段，记 ``"none"``）。
+    字段（不收 payload 里的 raw transcript / 错误堆栈）。verdict 在 ``verifier`` 判决事件中显式给
+    （生产 L1948 emit），亦可出现在 ``verifier_feedback`` 反馈事件中（旧式/测试用 shape）；``verifying``/
+    ``revise`` 是状态迁移事件（无 verdict 字段，记 ``"none"``——且它们不在 ``_VERIFIER_EVENT_TYPES``）。
+
+    **外部评审 P1 #2 修复**：``verifier`` 事件加入 _VERIFIER_EVENT_TYPES 后，本函数从其 payload 抽
+    ``verdict``（生产 emit shape ``{round, verdict}``）；``verifier_feedback`` 仍抽 verdict + artifact_ref。
     """
     history: list[dict] = []
     for ev in events:
@@ -145,10 +162,14 @@ def _collect_verifier_history(events: Iterable[Any]) -> list[dict]:
         payload = _event_payload(ev)
         verdict = "none"
         artifact_ref = None
+        # verdict 在两类事件里都可能存在（生产 verifier emit 带 verdict；生产 verifier_feedback emit
+        # 无 verdict，但旧式/测试 shape 可能带）。统一从 payload.get("verdict") 抽。
+        v = payload.get("verdict")
+        if isinstance(v, str):
+            verdict = v
+        # artifact_ref 仅 verifier_feedback 反馈工件事件可能有（生产 L1208 用裸 digest/path/size——
+        # 此处不强收裸字段；旧式 ArtifactRef dict shape 仍兼容）。
         if etype == "verifier_feedback":
-            v = payload.get("verdict")
-            if isinstance(v, str):
-                verdict = v
             ref = payload.get("artifact_ref") or payload.get("ref")
             if isinstance(ref, dict):
                 artifact_ref = ref
@@ -166,12 +187,16 @@ def _has_verifier_pass(verifier_history: list[dict], *, terminal_status: str) ->
     post-verifier short-circuit after pass)」。
 
     pass 信号（任一即可）：
-        * ``verifier_feedback`` 事件带 ``verdict == "pass"``（显式）；
+        * 任一 ``_VERIFIER_EVENT_TYPES`` 事件（``verifier`` / ``verifier_feedback``）带
+          ``verdict == "pass"``（显式）；
         * terminal == ``published`` **且** verifier_history 非空（state machine 保证：PUBLISHED 前必经
           VERIFYING/REVISE/PUBLISH_READY，故 journal 有 verifier transition）。
+
+    **外部评审 P1 #2 修复**：不再写死 ``event_type == "verifier_feedback"``——生产 ``verifier`` 事件
+    才是带 verdict 的判决观测，旧实现因只看 verifier_feedback 永远查不到 verdict==pass。
     """
     for ev in verifier_history:
-        if ev.get("event_type") == "verifier_feedback" and ev.get("verdict") == _VERDICT_PASS:
+        if ev.get("verdict") == _VERDICT_PASS:
             return True
     # terminal=PUBLISHED 且 journal 有 verifier transition → state machine 保证发生过 pass
     if terminal_status == "published" and verifier_history:
@@ -180,13 +205,13 @@ def _has_verifier_pass(verifier_history: list[dict], *, terminal_status: str) ->
 
 
 def _count_revise_verdicts(verifier_history: list[dict]) -> int:
-    """统计 verifier_feedback 事件中 ``verdict == "revise"`` 的次数（推断 revise-exhaustion 用）。
+    """统计权威 verifier 事件中 ``verdict == "revise"`` 的次数（推断 revise-exhaustion 用）。
 
-    仅 ``verifier_feedback`` 事件带 verdict（``revise`` 状态迁移事件本身不带 verdict——它已经是 revise 的
-    体现）。本函数计 ``verifier_feedback{verdict:revise}`` 次数 = verifier 显式判红次数。
+    **外部评审 P1 #2 修复**：不再写死 ``event_type == "verifier_feedback"``——``verifier_history``
+    已经过 ``_VERIFIER_EVENT_TYPES`` 过滤（只含 ``verifier`` / ``verifier_feedback``），其他状态迁移事件
+    早已被排除；本函数计其中 verdict==revise 次数 = verifier 显式判红次数。
     """
-    return sum(1 for ev in verifier_history
-               if ev.get("event_type") == "verifier_feedback" and ev.get("verdict") == _VERDICT_REVISE)
+    return sum(1 for ev in verifier_history if ev.get("verdict") == _VERDICT_REVISE)
 
 
 # ════════════════════════════════════════════════════════════════════════

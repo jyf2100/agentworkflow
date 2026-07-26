@@ -449,3 +449,122 @@ class TestSanitizedMetadata:
             run_id="r", prd_id="p", iteration_id="i", project_id="proj")
         assert env.evidence_class == ENV.EvidenceClass.VERIFIER_REVISE_EXHAUSTED.value
         assert env.sanitized_metadata.get("revise_count") == 2
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 外部评审 P1 #2 复现：生产 emit 的 ``verifier`` event（带 verdict）必须被识别
+# ════════════════════════════════════════════════════════════════════════
+class TestProductionVerifierEmitCollected:
+    """spec P1 #2 修复：envelope 必须收生产 emit 的 ``verifier`` event（带 verdict），不能只认
+    ``verifier_feedback``。
+
+    生产 emit（run_daily.py）：
+        * L1208 ``sj.emit("verifier_feedback", ..., payload={"round", "digest", "path", "size"})``
+          —— 反馈**内容**事件，**无 verdict 字段**
+        * L1948 ``_sj.emit("verifier", ..., payload={"round", "verdict"})`` —— 判决**观测**事件，
+          **有 verdict**
+
+    bug 复现（修复前）：``_VERIFIER_EVENT_TYPES`` 只含 ``"verifier_feedback"`` →
+    ``_collect_verifier_history`` 收到的 verifier_feedback 事件 payload 无 verdict → entry verdict="none" →
+    ``_has_verifier_pass`` / ``_count_revise_verdicts`` 永远查不到 pass / revise verdict →
+    evidence_class 误判为 PRE_VERIFIER_SHORT_CIRCUIT（即使 journal 实际走过 verifier pass）。
+
+    修复后：``_VERIFIER_EVENT_TYPES = frozenset({"verifier_feedback", "verifier"})``；verifier 事件
+    的 verdict 字段被正确抽出来参与 evidence_class 决策。
+    """
+
+    def test_verifier_event_with_pass_verdict_recognized_as_verifier_pass(self):
+        """生产 emit ``verifier{round:1, verdict:"pass"}`` —— envelope 必须识别为 pass。
+
+        修复前 bug：verifier event 不在 _VERIFIER_EVENT_TYPES → history 空（只有 verifying 这种 transition
+        也被忽略）→ _has_verifier_pass=False → 即使 terminal=published 也判 PRE_VERIFIER_SHORT_CIRCUIT
+        （违反 state machine 不变量：published 必经 verifier pass）。
+        """
+        # Arrange: 模拟生产 emit 序列（verifying → verifier{verdict:pass} → publish_ready → published）
+        events = [
+            _Ev("verifying", {"round": 1}),
+            _Ev("verifier", {"round": 1, "verdict": "pass"}),    # 生产真实 shape（run_daily L1948）
+            _Ev("publish_ready", {"round": 1}),
+            _Ev("published", {}),
+        ]
+        loader = _artifact_loader_factory({})
+        # Act
+        env = ENV.build_terminal_envelope(
+            terminal_status="published",
+            events=events, artifact_loader=loader,
+            run_id="r", prd_id="p", iteration_id="i", project_id="proj")
+        # Assert：verifier event 的 pass verdict 被识别 → VERIFIER_PASS
+        assert env.evidence_class == ENV.EvidenceClass.VERIFIER_PASS.value
+        # verifier_events 收到至少 1 条带 verdict=pass 的 entry
+        assert any(ev.get("verdict") == "pass" for ev in env.verifier_events), \
+            f"verifier pass 事件未被收集: {env.verifier_events}"
+
+    def test_verifier_event_revise_counted_for_revise_exhausted(self):
+        """生产 emit ``verifier{verdict:"revise"}`` 多次 + 无 pass + terminal=failed →
+        evidence_class=VERIFIER_REVISE_EXHAUSTED，revise_count 正确。
+
+        修复前 bug：verifier 事件被忽略 → revise_count=0 → 落 PRE_VERIFIER_SHORT_CIRCUIT（错判）。
+        """
+        events = [
+            _Ev("verifying", {"round": 1}),
+            _Ev("verifier", {"round": 1, "verdict": "revise"}),
+            _Ev("revise", {}),
+            _Ev("verifying", {"round": 2}),
+            _Ev("verifier", {"round": 2, "verdict": "revise"}),
+            _Ev("revise", {}),
+            _Ev("failed", {"reason": "revise_exhausted"}),
+        ]
+        loader = _artifact_loader_factory({})
+        env = ENV.build_terminal_envelope(
+            terminal_status="failed",
+            events=events, artifact_loader=loader,
+            run_id="r", prd_id="p", iteration_id="i", project_id="proj")
+        assert env.evidence_class == ENV.EvidenceClass.VERIFIER_REVISE_EXHAUSTED.value
+        assert env.sanitized_metadata.get("revise_count") == 2
+
+    def test_verifier_event_pass_prevents_short_circuit_on_terminal_failed(self):
+        """反例：terminal=failed 但 journal 有 verifier pass（罕见，post-pass reconcile failed 等）→
+        VERIFIER_PASS（不是 PRE_VERIFIER_SHORT_CIRCUIT；verifier pass 是权威证据）。
+
+        修复前 bug：verifier event 被忽略 → 即使有 verifier{verdict:pass} 也判 PRE_VERIFIER_SHORT_CIRCUIT。
+        """
+        events = [
+            _Ev("verifying", {"round": 1}),
+            _Ev("verifier", {"round": 1, "verdict": "pass"}),
+            _Ev("publish_ready", {}),
+            _Ev("failed", {"reason": "post_pass_reconcile_failed"}),
+        ]
+        loader = _artifact_loader_factory({})
+        env = ENV.build_terminal_envelope(
+            terminal_status="failed",
+            events=events, artifact_loader=loader,
+            run_id="r", prd_id="p", iteration_id="i", project_id="proj")
+        assert env.evidence_class == ENV.EvidenceClass.VERIFIER_PASS.value
+
+    def test_mixed_verifier_and_verifier_feedback_both_collected(self):
+        """verifier（verdict）+ verifier_feedback（digest/path）并存 → 都进 verifier_history。
+
+        生产 emit 同时有：
+            * ``verifier`` 带 verdict（判决观测）
+            * ``verifier_feedback`` 带 digest/path（反馈内容工件）
+        envelope 应同时收两者——verifier 用于 verdict 判定，verifier_feedback 用于 evidence_refs（如果
+        带 ArtifactRef-like dict；生产 L1208 emit 用裸 digest/path/size——不在 _extract_artifact_refs 范围
+        内，与本测试无关，本测试只验 history 收集）。
+        """
+        events = [
+            _Ev("verifier_feedback", {"round": 1, "digest": "sha256:abc", "path": "p", "size": 10}),
+            _Ev("verifier", {"round": 1, "verdict": "pass"}),
+            _Ev("published", {}),
+        ]
+        loader = _artifact_loader_factory({})
+        env = ENV.build_terminal_envelope(
+            terminal_status="published",
+            events=events, artifact_loader=loader,
+            run_id="r", prd_id="p", iteration_id="i", project_id="proj")
+        # 两类事件都进 verifier_history（保时序）
+        etypes = [ev.get("event_type") for ev in env.verifier_events]
+        assert "verifier_feedback" in etypes
+        assert "verifier" in etypes
+        # verifier 事件带 verdict=pass
+        assert any(ev.get("event_type") == "verifier" and ev.get("verdict") == "pass"
+                   for ev in env.verifier_events)

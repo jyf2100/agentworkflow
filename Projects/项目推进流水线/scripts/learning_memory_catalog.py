@@ -123,7 +123,11 @@ def _aggregate_candidates(candidate_records: list[dict], project_id: str) -> dic
                 "supporting_prd_ids": set(),
                 "corrective_action": cand.get("corrective_action", ""),
                 "trigger": cand.get("applicability_when", ""),
-                "non_applicability_when": cand.get("non_applicability_when", ""),
+                # P1 #4：non_applicability_when 合并所有等价候选的 boundary（set 内部累加 →
+                # projection 时 sorted + "; " join 为 string）。旧实现只在 group 创建时取 first
+                # candidate 的值，subsequent candidate 的 boundary 全部丢失（违反 spec task 2.2/3.2
+                # 「Merges preserve every source candidate and evidence lineages」）。
+                "non_applicability_when": set(),
                 "state": "active",   # 默认；Section 3 promotion policy 收紧（conflict/<2 PRD 过滤）
                 "confidence": float(cand.get("confidence", 0.0)),
                 "schema_version": CATALOG_SCHEMA_VERSION,
@@ -145,6 +149,13 @@ def _aggregate_candidates(candidate_records: list[dict], project_id: str) -> dic
         action_text = str(cand.get("corrective_action", "")).strip()
         if action_text:
             entry["_audit_corrective_actions"].add(action_text)
+        # P1 #4：合并所有等价候选的 non_applicability_when（非空 + strip 后去重）。
+        # 对照 applies_when_tags 的 union 模式（去重 set）；schema 保证 candidate 字段非空
+        # （LearningMemorySchema.LessonCandidate.__post_init__ L222），但 strip 后空值仍跳过
+        # （防数据腐化时把空字符串当合法 boundary 累加）。
+        non_app_boundary = str(cand.get("non_applicability_when", "")).strip()
+        if non_app_boundary:
+            entry["non_applicability_when"].add(non_app_boundary)
         # Section 6 task A：aggregate applies_when_tags（union，去重）
         for tag in (cand.get("applies_when_tags") or []):
             if isinstance(tag, str) and tag:
@@ -353,12 +364,20 @@ def _entry_for_projection(entry: dict) -> dict:
 
     Section 3 在 ``_aggregate_candidates`` 注入 ``_audit_corrective_actions`` 做 conflict 检测；
     projection 输出不可带内部字段（byte-stable + schema 清晰）。set 全转 sorted tuple（确定性）。
+
+    P1 #4 例外：``non_applicability_when`` 是 set 内部累加（合并所有等价候选的 boundary），
+    但 schema 契约（``ActiveCatalogEntry.non_applicability_when: str``）+ retrieval 子串匹配
+    （``_matches_non_applicability`` 接 str）要求 projection 输出是 string。故此处 sorted 后
+    ``"; "`` join 为 string（deterministic；空 set → ""，与 schema「candidate 必须非空」契合）。
     """
     out: dict = {}
     for k, v in entry.items():
         if k.startswith("_audit_"):
             continue
-        if isinstance(v, (set, frozenset)):
+        if k == "non_applicability_when":
+            # P1 #4：sorted join 为 string（deterministic + 去重 + schema 契约保持）
+            out[k] = "; ".join(sorted(v)) if isinstance(v, (set, frozenset)) else str(v)
+        elif isinstance(v, (set, frozenset)):
             out[k] = tuple(sorted(v))
         else:
             out[k] = v
