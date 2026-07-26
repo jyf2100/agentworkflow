@@ -8,11 +8,11 @@
 
 ## 2. Append-Only Memory State
 
-- [ ] 2.1 Implement per-project append-only candidate and lifecycle event writers under `.project-auto/state/lessons/` with versioning, file locking, fsync/atomicity behavior, and concurrent append tests.
-- [ ] 2.2 Implement strict candidate validation for reusable trigger, executable corrective action, applicability and non-applicability boundaries, project/PRD/iteration identity, bounded field sizes, and integrity-checked evidence references.
-- [ ] 2.3 Implement a deterministic `equivalence_key = project_id + ':' + sha256(json.dumps((canonical(phase), canonical(failure_class), canonical(corrective_action_class), applicability_signature), separators=(',',':'), sort_keys=True))[:16]` where `canonical(t) = lower(t).replace('-','_').strip()` and `applicability_signature = sorted(set(canonical(t) for t in applies_when_tags)) or '__unscoped__'`; equivalence is byte-equal `equivalence_key`; reject out-of-vocabulary enum values and redact any model-authored `pattern_key`/`equivalence_key`/`invariant_class`/`project_id`/promotion-count/storage-path fields at the schema boundary.
-- [ ] 2.4 Implement catalog projection and atomic replacement from append-only facts, including deterministic replay, duplicate-event idempotency, malformed-middle-record fail-closed behavior, and incomplete-trailing-record recovery.
-- [ ] 2.5 Add tests proving all memory state remains in ignored control-plane paths and never appears in target worktrees, commits, pull requests, or immutable PRDs.
+- [x] 2.1 Implement per-project append-only candidate and lifecycle event writers under `.project-auto/state/lessons/` with versioning, file locking, fsync/atomicity behavior, and concurrent append tests.
+- [x] 2.2 Implement strict candidate validation for reusable trigger, executable corrective action, applicability and non-applicability boundaries, project/PRD/iteration identity, bounded field sizes, and integrity-checked evidence references.
+- [x] 2.3 Implement a deterministic `equivalence_key = project_id + ':' + sha256(json.dumps((canonical(phase), canonical(failure_class), canonical(corrective_action_class), applicability_signature), separators=(',',':'), sort_keys=True))[:16]` where `canonical(t) = lower(t).replace('-','_').strip()` and `applicability_signature = sorted(set(canonical(t) for t in applies_when_tags)) or '__unscoped__'`; equivalence is byte-equal `equivalence_key`; reject out-of-vocabulary enum values and redact any model-authored `pattern_key`/`equivalence_key`/`invariant_class`/`project_id`/promotion-count/storage-path fields at the schema boundary.
+- [x] 2.4 Implement catalog projection and atomic replacement from append-only facts, including deterministic replay, duplicate-event idempotency, malformed-middle-record fail-closed behavior, and incomplete-trailing-record recovery.
+- [x] 2.5 Add tests proving all memory state remains in ignored control-plane paths and never appears in target worktrees, commits, pull requests, or immutable PRDs.
 
 ## 3. Cross-PRD Promotion
 
