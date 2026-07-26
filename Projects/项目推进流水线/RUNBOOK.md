@@ -48,3 +48,67 @@ ev = CT.run_shadow_parity_evidence(state_dir=<state_dir>, stamp_fn=<stamp_fn>)
 python quality_evidence.py
 # exit 0 + readiness=True ⇔ compile + tests + ruff 全过，归档证据 digest（design 决策#6）
 ```
+
+## 5. Learning memory（add-cross-prd-learning-memory）
+
+### 5.1 开 canary（单项目）
+
+1. profile yaml 加 ``learning_memory.enabled: True``（V1 项目级 allowlist 标记）。
+2. 环境变量或 profile.loop 开 ``PA_LEARNING_SHADOW=1``（先单跑 shadow：candidate generation + catalog projection，不改 dev prompt）。
+3. 观察 shadow 跑 N 次 dispatch 后，``.project-auto/state/lessons/catalog/<project>.json`` 有 active entries（cross-PRD 等价 recurrence ≥2 自动 promote）。
+4. 准备开 injection：profile 显式标 ``learning_memory.parity_passed: True`` + ``quality_passed: True``（V1 evidence 流尚未自动化；canary 阶段人工签发）。设 ``PA_LEARNING_INJECTION=1`` → 四重 gate 全过后开仓注入 lesson block。
+
+```yaml
+# .project-auto/profiles/<project>.yaml 片段
+learning_memory:
+  enabled: true
+  parity_passed: true
+  quality_passed: true
+loop:
+  cross_prd_learning_shadow: true
+  cross_prd_learning_injection: true
+```
+
+### 5.2 读 degraded records
+
+reflection / injection / effectiveness 任一故障 → side-channel ``.project-auto/state/lessons/degraded/<project>.jsonl`` 一行一记录。运维查：
+
+```python
+import learning_memory_reflection as LMRefl
+for rec in LMRefl.read_degraded_records(".project-auto/state", "<project>"):
+    print(rec["timestamp"], rec["degraded_class"], rec["reason"])
+# 常见 class：timeout / sdk_error / invalid_json / schema_reject / persist_failure /
+#   evidence_history_mismatch / injection_not_gated / injection_parity_failed /
+#   injection_quality_failed / injection_not_allowlisted / catalog_read_error / reflection_attach_error
+```
+
+> degraded 不阻断 dispatch（fail-open by construction）；只在 canary 项目需要 triage。非 allowlist 项目静默跳过（无 degraded 记录）。
+
+### 5.3 重建 catalog（append-only 幂等）
+
+catalog 是 rebuildable projection；删了可从 append-only facts 重建：
+
+```python
+import learning_memory_catalog as LMCat
+result = LMCat.rebuild_catalog(".project-auto/state", "<project>")
+# result.ok=True ⇔ replay 成功 + atomic write；ok=False ⇔ 中部损坏 fail-closed（旧 catalog 未被覆盖）
+```
+
+append-only 真源：``candidates/<project>.jsonl`` + ``events/<project>.jsonl`` + ``usage/<project>.jsonl``。``_replay`` 幂等（同输入 → 同 catalog）；中部 malformed record → fail-closed（绝不部分信任）；末尾截断容忍（崩溃只截最后一条 append）。
+
+### 5.4 完全禁用（两级 rollback）
+
+| 级别 | 操作 | 效果 |
+|---|---|---|
+| Level 1 | 删 profile.loop.cross_prd_learning_injection（或 PA_LEARNING_INJECTION=0） | candidate generation 继续；dev prompt baseline（无 lesson block）；selected_lesson_ids=() |
+| Level 2 | 删 profile.loop.cross_prd_learning_shadow（或 PA_LEARNING_SHADOW=0） | reflection 完全不调（零 SDK 调用）；existing candidate facts inert + 可重建 |
+
+两条 flag 都 off + profile 无 ``learning_memory.enabled`` → 整个子系统零副作用（不读 catalog、不调 SDK、不改 prompt）。
+
+### 5.5 crash 后 reconcile
+
+learning memory state 是 append-only（flock + O_APPEND + fsync），崩溃只可能丢「正在写的最后一条」。重启后：
+- catalog 重建（``rebuild_catalog``）从 append-only facts 重新 projection——幂等，无 duplicate promotion（promotion 是确定性投影）。
+- 已 append 的 candidate/event/usage record 100% 保留（fsync 已落盘）。
+- 在 reflection 中途崩（candidate 已 append 但 catalog 未替换）→ 下次 ``rebuild_catalog`` 收尾。
+- 在 usage append 中途崩（usage record 半行）→ ``read_usage_records`` 把末尾半行当 truncated 容忍。

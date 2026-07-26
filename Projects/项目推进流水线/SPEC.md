@@ -413,3 +413,41 @@ match_surface:                     # 喂 pa-radar 做"贴合"判断
 
 *本 Spec 由 grilling + grill-with-docs 共识于 2026-07-15 生成。修订史：pass #1 回写 7 处共识（大脑角色/dev 目标/v1 目标/信号模型/开发 agent 归属/隔离原则/GitNexus 移除）；pass #2 回写"薄投递 + 项目自治 + 独立验证闸"（ADR-0002）；pass #3 回写"PRD 质量闸(critic B) + PR mechanics + 今日新判定(consumed-marker A)"；pass #4 回写「Agent SDK grill：dev agent 仓自带 SDK 脚本(A) + acceptEdits + 刹车平台兜底(b) + dispatch↔dev 契约，控制面留 CLI（ADR-0003）」；**pass #5 回写「branch protection 运行时实查（dispatch 投递前 `gh api` 校验、不加静态字段）」+「commit 身份=仓本地 roc-noreply（选项 A），dev-agent.mjs 启动断言」+「ADR-0004：dispatch↔dev 真源=GitHub + 部分失败对账恢复（有 PR 录入/无 PR 有 commit 补开中断 PR/无 commit 删孤儿分支）」+「独立验证=PR 分支全新 checkout + `npm ci` 干净依赖（非 dev 热乎树）；承认测试篡改盲区 + 报告加 📝 改测试文件 标记交人 review」+「幂等真源=GitHub 去重 + run 锁；date-marker 降为快路径（并进 ADR-0004）」+「报告投递=本地 Foxmail GUI 直发（复用其账号免 SMTP 凭据），仅有活触发，收件 juyf@newland.com.cn；Phase-5 自测 + 新建 GUI-send helper」+「pa-radar 输入薄抽象=source set 配置（v1 仅 wechat，日后加 deep-research 不重写 radar）」**。pass #5 针对 spec↔真实仓缝隙 + 运行时失败模式追问。**pass #6 回写「报告投递反转：pass#5 原定 Foxmail GUI 真自动发 → 改 SMTP 直发（`smtp.newland.com.cn:587` + starttls + Keychain 密码）；依据=vault 内发现既有 `发送邮件.py` 已跑通，证明 SMTP 凭据已存在、'免 SMTP 凭据'优势不成立；SMTP 无 GUI 会话/3am 登录依赖、更可靠；foxmail-send 保留作审阅闸」**。状态：spec-draft。*
 *下一步：用户 review 整份 spec → 说"开建" → 从 Phase 0 起执行。*
+
+## 12. 学习记忆子系统（add-cross-prd-learning-memory）
+
+控制面在 terminal PRD 之后做的「经验沉淀 + 跨 PRD 复用」闭环。**state 全在 ``.project-auto/state/lessons/``**（candidates/events/usage JSONL append-only 真源 + catalog 可重建 projection），**绝不入目标仓 / commit / PR / immutable PRD**（ADR-0001 控制/目标面隔离）。
+
+### 12.1 Pipeline（5 段）
+
+1. **terminal reflection**（``learning_memory_reflection.run_terminal_reflection``）：dispatch record 达 terminal 后，从 journal events 构造 sanitized envelope → 独立 read-only SDK 调用（``tools=Read,Grep``，无 mutable；model 省略走 roc LiteLLM 代理默认；``asyncio.wait_for`` 硬超时）→ strict JSON schema 校验 → append candidate。绝不 resume / fork 主 dev session。
+2. **cross-PRD promotion**（``learning_memory_promotion``）：等价 candidate（``equivalence_key`` byte-equal）来自 **≥2 distinct PRD IDs** → promote 到 active；同 PRD 多 iteration 只算 1 个 distinct；unknown enum 值永不 promote。
+3. **dispatch-entry retrieval & injection**（``learning_memory_retrieval``）：相关 PRD dispatch 时，从 profile + PRD 确定性派生 task metadata（零 LLM）→ filter（state=active + project scope + applicability）+ rank（applicability_overlap > verified_support > effectiveness > confidence > recency > lesson_id）+ cap=5 → 渲染 lesson block markdown checklist → 写 content-addressed artifact（``kind=lessons_block``，绝对路径）→ 经 ``--lessons-artifact`` 透传 dev-agent（与 ``--feedback-artifact`` 对称；dev-agent 不读控制面 state）。
+4. **terminal effectiveness**（``learning_memory_effectiveness``）：每个 injected lesson 对照 terminal evidence → ``detect_action_observed`` → ``classify_outcome`` → **``if outcome != "unknown"``** 才 ``build_usage_outcome`` + append usage（Section 6 偏差 #3 红线：``UsageOutcome.__post_init__`` 拒绝 unknown；catalog 也跳过 unknown）。followed → confidence +0.1；contradicted → −0.2；2 次 contradicted → retire。
+5. **catalog projection**（``learning_memory_catalog``）：append-only facts 派生的可重建 projection（``_replay`` 幂等；``rebuild_catalog`` atomic replace，fail-closed for memory）。中部损坏 fail-closed；末尾截断容忍。
+
+### 12.2 Fail-open 不变量（贯穿硬约束）
+
+任何 reflection / injection / effectiveness / catalog 故障（timeout / SDK error / invalid JSON / schema reject / persist failure / evidence mismatch / catalog 不可达 / unknown outcome）→ ``learning_memory_degraded`` side-channel 记录，**绝不改** PRD 结果 / dispatch terminal outcome / verify verdict / publish gate / retry 计数（``ReflectionResult`` 字段集无 terminal mutation 入口；``_attach_learning_memory`` 全函数 try/except 兜底）。
+
+### 12.3 双 flag + 两级 rollback（design 决策#8）
+
+| Flag | 作用 | default |
+|---|---|---|
+| ``PA_LEARNING_SHADOW`` / ``profile.loop.cross_prd_learning_shadow`` | 开 terminal reflection + catalog projection（read-only，不改 dev prompt） | off |
+| ``PA_LEARNING_INJECTION`` / ``profile.loop.cross_prd_learning_injection`` | 开 dispatch-entry lesson injection（gated on shadow + parity + quality + allowlist） | off |
+
+profile ``learning_memory.enabled=True`` 是 V1 项目级 canary 标记（缺字段 → 整个 subsystem 零副作用）。``parity_passed`` / ``quality_passed`` 缺省 ``False``（V1 fail-safe：无 evidence 流时绝不假阳 injection=on）。
+
+**两级 rollback**：
+- **Level 1**（关 injection，shadow on）：candidate generation 继续；dev prompt byte-identical baseline（无 lesson block）；selected_lesson_ids=()。
+- **Level 2**（关 shadow，both off）：reflection 完全不调（零 SDK 调用）；catalog append-only facts 保留 inert（不参与检索但 ``_replay`` 可重建）。
+
+### 12.4 接线点
+
+| 接线点 | 位置 | 流程 |
+|---|---|---|
+| 1 terminal reflection | ``_run_one`` → ``_attach_learning_memory``（dispatch_one 后） | shadow on → envelope + SDK → ``rec["learning_memory"]`` |
+| 2 injection | ``dispatch_one`` verify loop → ``_build_lessons_pkg`` → ``_dev_cmd --lessons-artifact`` | injection on → catalog retrieval → artifact → dev-agent build_prompt inject |
+| 3 memory_mode | ``_attach_learning_memory`` → ``rec["memory_mode"]`` | per-record 附加字段（不改 status/success/failure 语义） |
+| B effectiveness | ``_attach_learning_memory`` 内 reflection 后 → ``_record_usage_outcomes`` | injection on + selected IDs → detect→classify→build→append（unknown 跳过） |

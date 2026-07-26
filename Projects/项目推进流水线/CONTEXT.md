@@ -79,3 +79,7 @@ _Avoid_: 原文、reference、引用（太泛）。
 **PR**:
 [[开发 agent]] 在项目自己的 GitHub 仓（其自身 main）上开的真实 pull request，绝不是回上游的贡献。
 _Avoid_: merge request、patch、diff、变更说明。
+
+**学习记忆 (Learning Memory)**:
+控制面在 terminal PRD 之后做的「经验沉淀 + 跨 PRD 复用」子系统。terminal 后跑 read-only SDK reflection 抽 candidate lesson → cross-PRD 等价 recurrence ≥2 后 promote → 之后相关 PRD dispatch 时注入 ≤5 条 lesson 进 dev prompt → terminal 后用 effectiveness loop 评估（followed/contradicted/unknown）→ 据此调整 confidence 与 active/retired 状态。**state 全在 ``.project-auto/state/lessons/``（candidates/events/usage JSONL + catalog projection），绝不入目标仓/commit/PR/immutable PRD**（ADR-0001 控制/目标面隔离）。**fail-open by construction**：任何 reflection/injection/catalog/effectiveness 故障都不改 PRD 结果/dispatch terminal outcome/verify verdict/publish gate。两个 disabled-by-default flag（``PA_LEARNING_SHADOW`` / ``PA_LEARNING_INJECTION``）+ profile ``learning_memory.enabled`` 项目级 canary 标记共同 gate（V1 project-only scope）。两级 rollback：关 injection 保留 shadow candidate generation；关 shadow 停 reflection（existing candidate facts inert + rebuildable）。
+_Avoid_: memory、cache、knowledge base（太泛）、RAG（V1 明确 Non-Goal）。

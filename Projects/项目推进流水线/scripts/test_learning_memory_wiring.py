@@ -66,12 +66,19 @@ def _seed_journal(state_dir: Path, proj: str, stamp: str, slug: str,
 # ════════════════════════════════════════════════════════════════════════
 # fixture helpers
 # ════════════════════════════════════════════════════════════════════════
-def _profile(*, learning_enabled: bool = True, name: str = "proj-a", **extra) -> dict:
-    """造一个项目 profile（learning_memory.enabled 标记控制 V1 allowlist）。"""
+def _profile(*, learning_enabled: bool = True, name: str = "proj-a",
+             parity_passed: bool = True, quality_passed: bool = True, **extra) -> dict:
+    """造一个项目 profile（learning_memory.enabled 标记控制 V1 allowlist）。
+
+    批次 2 升级 A：``parity_passed`` + ``quality_passed`` 是 injection 四重 gate 的 V1 evidence 信号
+    （default True 便于多数 canary 测试；gate 失败的反例测试可显式传 False）。
+    """
     prof = {"name": name, "admission": True, "dev_agent_ready": True, "type": "code",
             "repo": "/tmp/fake-repo", "default_branch": "main"}
     if learning_enabled:
-        prof["learning_memory"] = {"enabled": True}
+        prof["learning_memory"] = {"enabled": True,
+                                   "parity_passed": parity_passed,
+                                   "quality_passed": quality_passed}
     prof.update(extra)
     return prof
 

@@ -53,6 +53,7 @@ import recovery_context as RC              # task 3.4：driven retry prompt 从 
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
 import reconcile                           # task 4.4：ArtifactEvidenceResolver（publication 前 reconcile test evidence）
 import retry_policy as RP                  # task 3.3 P0-3：run_daily 驱动 retry（decide/recover_iteration/budget/session 参数生成）
+import cutover                             # add-cross-prd-learning-memory 批次 2 升级 A：injection 四重 gate（shadow+parity+quality+allowlist）
 # add-cross-prd-learning-memory Section 7 接线（控制面纯 stdlib 模块，cron 隔离不变）：
 #   envelope 构造（journal events → sanitized TerminalEnvelope）+ reflection（read-only SDK，mock-SDK 可注入）+
 #   retrieval（dispatch-entry catalog 检索 + lesson block 渲染）+ effectiveness（memory_mode record）。
@@ -61,6 +62,8 @@ import learning_memory_envelope as LME
 import learning_memory_reflection as LMRefl
 import learning_memory_retrieval as LMRet
 import learning_memory_effectiveness as LMEff
+import learning_memory_schema as LM     # UsageOutcomeKind 受控词表（unknown 跳过判定的真源）
+import learning_memory_store as LMS     # append_usage_outcome（Section 6 闭环持久化）
 
 try:
     import yaml
@@ -1251,21 +1254,34 @@ _LEARNING_MEMORY_PROFILE_KEY = "learning_memory"
 def _resolve_learning_enabled(prof: dict) -> tuple[bool, bool, str | None]:
     """解析 effective ``(shadow_on, injection_on, degraded_class)`` 用于本次 dispatch。
 
-    优先级（design 决策#8）：
+    批次 2 升级 A（spec task 1.3b）：injection 走 ``cutover.resolve_learning_injections_source`` 四重 gate
+    （shadow flag + parity + quality + allowlist），不再用批次 1 的简化 AND。design 决策#8：injection
+    cutover 必须先满足 shadow parity + quality evidence，防止跳过 shadow 直接注入未经验证的 prompt 内容。
+
+    优先级：
         * **V1 allowlist**（``prof["learning_memory"]["enabled"] is True``）未启用 → 整个 learning 子系统
-          零副作用（``shadow_on=False, injection_on=False``）；非 None 的 ``degraded_class`` 不发——非
-          allowlist 项目静默跳过，无降级事件可观测（运维只在 canary 项目上关心降级）。
+          零副作用（``shadow_on=False, injection_on=False``）；``degraded_class=None``——非 allowlist 项目
+          静默跳过（运维只在 canary 项目上关心降级）。
         * ``cross_prd_learning_shadow`` flag 关 → ``shadow_on=False``；injection 无前置 → ``injection_on=False``。
-        * ``cross_prd_learning_injection`` flag 关 → ``injection_on=False``；shadow 仍可独立开。
-        * invalid 组合 ``injection=on, shadow=off`` → runtime 降级（preflight 已注释该组合不进硬依赖链）：
-          ``injection_on=False`` + ``degraded_class="injection_not_gated"``（接线处 emit side-channel）。
+        * ``cross_prd_learning_injection`` 经四重 gate（cutover.resolve_learning_injections_source）：
+            * shadow off + injection on → fallback ``injection_not_gated``（invalid 组合，design 决策#8）
+            * parity 未过 → fallback ``injection_parity_failed``
+            * quality 未过 → fallback ``injection_quality_failed``
+            * project 不在 allowlist → fallback ``injection_not_allowlisted``
+            * injection flag 本身关 → 非 degraded（normal "off"）
+            * 全过 → ``injection_on=True``。
+
+    **parity_passed / quality_passed V1 取值**（fail-safe）：从 ``prof["learning_memory"]`` 显式标记读，
+        缺省 ``False``——**绝不假阳 injection=on 当 evidence 缺失**。canary profile 须显式标
+        ``parity_passed: True`` + ``quality_passed: True`` 才开 injection（design「evidence 流尚未自动化前
+        人工签发」）。批次 3+ 接 ``quality_evidence.readiness`` 自动化。
 
     Args:
         prof: 项目 profile dict（coordinator 已 resolve flag；本函数读 ``prof["learning_memory"]`` 项目标记）。
 
     Returns:
         ``(shadow_on, injection_on, degraded_class)``。``degraded_class`` 非 None 表示本次 dispatch 走
-        shadow-only 或 both-off（injection 因 invalid 组合降级）。
+        shadow-only 或 both-off（injection 因 gate 未过降级）。
     """
     lm_cfg = prof.get(_LEARNING_MEMORY_PROFILE_KEY) if isinstance(prof, dict) else None
     v1_allowed = isinstance(lm_cfg, dict) and lm_cfg.get("enabled") is True
@@ -1274,15 +1290,33 @@ def _resolve_learning_enabled(prof: dict) -> tuple[bool, bool, str | None]:
     flags = resolve_flags(env=os.environ, profile=prof)
     shadow_on = bool(flags.cross_prd_learning_shadow)
     injection_flag_on = bool(flags.cross_prd_learning_injection)
-    degraded_class: str | None = None
-    if injection_flag_on and not shadow_on:
-        # design 决策#8：invalid 组合 → 读时降级到 shadow-only（不注入）；emit learning_memory_degraded
-        # {class:injection_not_gated}（接线处 ``_attach_learning_memory`` 经 reflection side-channel 写）。
-        injection_on = False
-        degraded_class = "injection_not_gated"
-    else:
-        injection_on = injection_flag_on and shadow_on
-    return (shadow_on, injection_on, degraded_class)
+    # injection flag 本身关 → 不调 gate resolver（gate 是判断「injection 想开但前置不够」的降级路径；
+    # flag 关是 normal "off" 状态，非 degraded；shadow 仍可独立开 candidate generation）。
+    if not injection_flag_on:
+        return (shadow_on, False, None)
+    # V1 fail-safe：parity/quality 缺省 False（无 evidence 流时绝不假阳 injection=on）
+    parity_passed = bool(lm_cfg.get("parity_passed", False)) if isinstance(lm_cfg, dict) else False
+    quality_passed = bool(lm_cfg.get("quality_passed", False)) if isinstance(lm_cfg, dict) else False
+    # 四重 gate（cutover.resolve_learning_injections_source）：driven_by='learning_injection' = 全过开仓
+    gate = cutover.resolve_learning_injections_source(
+        injection_flag=injection_flag_on, shadow_flag=shadow_on,
+        project_id=prof.get("name", "?"), allowlist={prof.get("name", "?")},
+        parity_passed=parity_passed, quality_passed=quality_passed)
+    if gate.driven_by == "learning_injection":
+        return (shadow_on, True, None)
+    # injection flag 本身关不会走到这里（上方短路）；其他 fallback → injection 降级到 off
+    degraded_class = _INJECTION_GATE_DEGRADED_CLASS.get(gate.driven_by, gate.driven_by)
+    return (shadow_on, False, degraded_class)
+
+
+# cutover resolver ``driven_by`` fallback 值 → memory_mode.degraded_status 受控词表映射。
+# batch 1 既定 ``injection_not_gated``（invalid 组合）保留；新加 parity/quality/allowlist 维度。
+_INJECTION_GATE_DEGRADED_CLASS: dict[str, str] = {
+    "learning_injection_shadow_off": "injection_not_gated",
+    "learning_injection_parity_failed": "injection_parity_failed",
+    "learning_injection_quality_failed": "injection_quality_failed",
+    "learning_injection_not_allowlisted": "injection_not_allowlisted",
+}
 
 
 def _load_run_events(state_dir: Path, proj: str, stamp: str, slug: str) -> list:
@@ -1393,25 +1427,25 @@ def _build_lessons_pkg(prof: dict, prd_abs: str, *, project_id: str, run_id: str
 
 def _attach_learning_memory(rec: dict, prof: dict, entry: dict, stamp: str, *,
                             sdk_query_fn=None) -> None:
-    """add-cross-prd-learning-memory Section 7 terminal hook：reflection + memory_mode（fail-open）。
+    """add-cross-prd-learning-memory Section 7 terminal hook：reflection + usage outcomes + memory_mode。
 
-    **接线点 1 + 3**（接线点 2 在 dispatch_one 内 ``_dev_cmd`` 前）。在 ``_run_one`` 调用 ``dispatch_one``
-    返回后调用——所有 terminal 出口统一收尾（dispatch_one 内部多个 ``return rec`` 都到此）。
+    批次 2 升级 B（spec task 6.1/6.2 接线）：reflection 之后对每个 selected_lesson_id 做 detect→classify→
+    build→append usage outcome（Section 6 闭环）。**红线（Section 6 偏差 #3）**：``classify_outcome`` 可返
+    ``"unknown"``，但 ``UsageOutcome.__post_init__`` 拒绝 unknown outcome —— **必须先判 ``outcome != "unknown"``
+    再 build**（unknown 跳过持久化；catalog ``_apply_usage_outcomes`` 也跳过 unknown，design 决策#6「absent
+    evidence ≠ disobedience」）。
 
-    **fail-open 硬约束**（design 决策#7）：reflection 任何 timeout/sdk_error/invalid_json/schema_reject/
-    persist_failure/evidence_mismatch → ``rec["learning_memory"] = {reflection:"degraded", class:...}``，
-    **绝不改 record.status / verify verdict / publish outcome / retry 计数**（``ReflectionResult`` 无 terminal
-    mutation 入口）。
+    **接线点 1 + 3 + 升级 B**（接线点 2 在 dispatch_one 内 ``_dev_cmd`` 前）。在 ``_run_one`` 调用
+    ``dispatch_one`` 返回后调用——所有 terminal 出口统一收尾。
 
-    **shadow=off → 零 reflection 副作用**（design 决策#8）：不构造 envelope、不读 journal events、不调 SDK；
-    仅合并 ``memory_mode{shadow:False, injection:False}`` 到 rec。
+    **fail-open 硬约束**（design 决策#7）：reflection / usage outcome / catalog 任何故障 → side-channel
+    记录，**绝不改 record.status / verify verdict / publish outcome / retry 计数**。
 
-    memory_mode 字段（task 6.4）：附加字段——**绝不改现有 status/success/failure 语义**。selected_lesson_ids
-    来自 dispatch_one 在 injection 时记入的 ``rec["_learning_selected_ids"]``（接线点 2 留的桥）；
-    若 reflection step 未跑（shadow off），从 injection pkg 桥接（仍可能 selected IDs 已记）。
+    **shadow=off → 零 reflection + 零 usage outcome 副作用**（design 决策#8）。
+    **injection=off / selected_ids 空 → 零 usage outcome 写入**（无注入无从评估 effectiveness）。
 
     Args:
-        rec: dispatch_one 返回的 record dict（in-place 合并 ``learning_memory`` + ``memory_mode`` 子字段）。
+        rec: dispatch_one 返回的 record dict（in-place 合并 ``learning_memory`` + ``memory_mode``）。
         prof: 项目 profile（V1 allowlist 检查）。
         entry: candidate entry（取 prd_path 推 slug）。
         stamp: run 时间戳。
@@ -1430,6 +1464,9 @@ def _attach_learning_memory(rec: dict, prof: dict, entry: dict, stamp: str, *,
 
         # 接线点 1：terminal reflection（shadow=on 才跑）
         learning_rec: dict | None = None
+        envelope = None
+        run_id_for_usage = stamp
+        prd_id_for_usage = entry.get("prd_path") or ""
         if shadow_on:
             try:
                 events = _load_run_events(STATE_DIR, proj, stamp, slug)
@@ -1437,6 +1474,8 @@ def _attach_learning_memory(rec: dict, prof: dict, entry: dict, stamp: str, *,
                 _coord2 = build_coordinator(stamp=stamp, prd_path=entry.get("prd_path") or "",
                                             proj=proj, slug=slug, state_dir=STATE_DIR,
                                             profile=prof, stamp_fn=_now_iso)
+                run_id_for_usage = _coord2.run_id
+                prd_id_for_usage = _coord2.prd_id
                 loader = _make_artifact_loader(_coord2.run_id)
                 envelope = LME.build_terminal_envelope(
                     terminal_status=rec.get("status") or "",
@@ -1473,6 +1512,17 @@ def _attach_learning_memory(rec: dict, prof: dict, entry: dict, stamp: str, *,
                 learning_rec = {"reflection": "degraded",
                                 "class": "reflection_attach_error",
                                 "run_id": stamp, "prd_id": entry.get("prd_path") or ""}
+
+            # 升级 B（Section 6 闭环）：terminal effectiveness — 仅 injection_on + selected IDs + envelope 可用
+            # 时评估。fail-open：catalog 不可达 / lesson 缺 / detect 异常 → 跳过该 lesson，不改 terminal outcome。
+            if injection_on and sel_ids and envelope is not None:
+                usage_recorded = _record_usage_outcomes(
+                    state_dir=str(STATE_DIR), project_id=proj,
+                    run_id=run_id_for_usage, prd_id=prd_id_for_usage,
+                    selected_ids=sel_ids, envelope=envelope, timestamp=_now_iso())
+                if learning_rec is not None and usage_recorded:
+                    learning_rec["usage_outcomes"] = usage_recorded
+
         # invalid 组合 injection=on, shadow=off → emit injection_not_gated 降级（design 决策#8）
         eff_degraded = degraded_class or inj_degraded
         if learning_rec is not None:
@@ -1487,6 +1537,97 @@ def _attach_learning_memory(rec: dict, prof: dict, entry: dict, stamp: str, *,
         # 终极兜底：本函数自身意外故障也不能拖垮 dispatch（fail-open by construction）。
         # 不写 memory_mode / learning_memory 字段（rec 仍保留 dispatch_one 设的全部 terminal 字段）。
         log(f"  ⚠ learning_memory attach 异常（fail-open 兜底）: {e}")
+
+
+def _build_terminal_evidence_from_envelope(envelope) -> dict:
+    """从 envelope 抽 ``detect_action_observed`` 要的 ``terminal_evidence`` dict（零 LLM，纯结构字段）。
+
+    ``detect_action_observed`` 读这些字段（learning_memory_effectiveness.V1 启发式）：
+        * ``verifier_verdict``：verifier pass/revise（决定 failure_recurred 推断）
+        * ``test_log``：test_output artifact 内容（action_observed token 匹配 corpus）
+        * ``skip_reason``：terminal reason（failure_class token 匹配 corpus）
+        * ``diff``：可选（envelope 不直接含 diff；留空——多数 case test_log 已够 token 匹配）
+    """
+    meta = envelope.sanitized_metadata if isinstance(envelope.sanitized_metadata, dict) else {}
+    # verifier_verdict：取最后一条 verifier_feedback 的 verdict（pass / revise / none）
+    verdict = ""
+    for ev in envelope.verifier_events or ():
+        if isinstance(ev, dict) and ev.get("event_type") == "verifier_feedback":
+            v = ev.get("verdict")
+            if isinstance(v, str):
+                verdict = v
+    # test_log：拼 evidence_excerpts 的 content（test_output kind；bytes → str）
+    test_log_parts: list[str] = []
+    for ex in envelope.evidence_excerpts or ():
+        if isinstance(ex, dict) and ex.get("kind") == "test_output":
+            c = ex.get("content")
+            if isinstance(c, (bytes, bytearray)):
+                c = c.decode("utf-8", errors="replace")
+            if isinstance(c, str) and c:
+                test_log_parts.append(c)
+    return {
+        "verifier_verdict": verdict,
+        "test_log": "\n".join(test_log_parts),
+        "skip_reason": str(meta.get("terminal_reason", "")),
+    }
+
+
+def _record_usage_outcomes(*, state_dir: str, project_id: str, run_id: str, prd_id: str,
+                           selected_ids: tuple[str, ...], envelope, timestamp: str) -> list[tuple[str, str]]:
+    """Section 6 闭环：per-lesson detect→classify→build→append usage outcome。
+
+    **红线（Section 6 偏差 #3）**：``classify_outcome`` 可返 ``"unknown"``，但 ``UsageOutcome.__post_init__``
+    拒绝 unknown outcome——本函数**显式跳过 unknown**（不 build、不 append）。design 决策#6「absent evidence
+    ≠ disobedience」：unknown 是合法的「无法判定」结果，记入 catalog 只增加噪声。
+
+    **fail-open**：catalog 不可达 / lesson 缺 / detect 异常 → 跳过该 lesson（不崩，不改 terminal outcome，
+    不影响其他 lesson 的评估）。
+
+    Args:
+        selected_ids: 本次 dispatch 注入的 lesson IDs（来自 ``_build_lessons_pkg`` 的 retrieval 结果）。
+        envelope: terminal envelope（喂 ``detect_action_observed`` 的 terminal_evidence 来源）。
+
+    Returns:
+        ``[(lesson_id, outcome), ...]`` 实际持久化的 usage outcomes（已滤 unknown）。空 = 无注入 / 全 unknown /
+        catalog 不可达。
+    """
+    if not selected_ids:
+        return []
+    # 读 catalog 拿 lesson entries（按 selected_lesson_id 查 corrective_action/failure_class 喂 detect）
+    try:
+        import learning_memory_catalog as LMCat
+        catalog = LMCat.load_catalog_file(state_dir, project_id)
+    except Exception:
+        return []
+    if not isinstance(catalog, dict):
+        return []
+    entries = catalog.get("entries") if isinstance(catalog.get("entries"), list) else []
+    entries_by_id = {e.get("lesson_id"): e for e in entries
+                     if isinstance(e, dict) and isinstance(e.get("lesson_id"), str)}
+    terminal_ev = _build_terminal_evidence_from_envelope(envelope)
+    recorded: list[tuple[str, str]] = []
+    for lid in selected_ids:
+        entry = entries_by_id.get(lid)
+        if not entry:
+            continue   # lesson 不在 catalog（可能已 retire / 跨 project / catalog stale）→ 跳过
+        try:
+            action, failure, evidence_avail = LMEff.detect_action_observed(entry, terminal_ev)
+            outcome = LMEff.classify_outcome(
+                action_observed=action, failure_recurred=failure,
+                evidence_available=evidence_avail)
+            # 红线：unknown 不持久化（UsageOutcome.__post_init__ 拒绝；catalog 也跳过）
+            if outcome == LM.UsageOutcomeKind.UNKNOWN.value:
+                continue
+            usage = LMEff.build_usage_outcome(
+                event_id=f"usage_{run_id}_{lid}", timestamp=timestamp,
+                project_id=project_id, lesson_id=lid, prd_id=prd_id,
+                action_observed=action, failure_recurred=failure,
+                outcome=outcome, evidence_refs=())
+            LMS.append_usage_outcome(state_dir, project_id, usage, run_id=run_id)
+            recorded.append((lid, outcome))
+        except Exception:
+            continue   # 单 lesson 故障不拖垮其他 lesson 的评估（fail-open）
+    return recorded
 
 
 # dispatch record status → journal 终态 event（task 3.2 + 3.5）。
