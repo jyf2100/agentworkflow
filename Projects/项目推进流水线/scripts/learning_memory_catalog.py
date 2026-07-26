@@ -38,6 +38,7 @@ import tempfile
 from pathlib import Path
 from typing import ClassVar
 
+import learning_memory_promotion as LMP
 import learning_memory_store as LMS
 
 
@@ -62,6 +63,7 @@ class CatalogSnapshot:
     source_event_count: int = 0
     tail_truncated_candidates: bool = False
     tail_truncated_events: bool = False
+    promotion_decisions: tuple[dict, ...] = ()   # Section 3：promotion 判定 audit trail（spec 决策#4）
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,14 +117,19 @@ def _aggregate_candidates(candidate_records: list[dict], project_id: str) -> dic
                 "corrective_action": cand.get("corrective_action", ""),
                 "trigger": cand.get("applicability_when", ""),
                 "non_applicability_when": cand.get("non_applicability_when", ""),
-                "state": "active",   # 默认；Section 3 扩展 promotion/conflict/retire 状态机
+                "state": "active",   # 默认；Section 3 promotion policy 收紧（conflict/<2 PRD 过滤）
                 "confidence": float(cand.get("confidence", 0.0)),
                 "schema_version": CATALOG_SCHEMA_VERSION,
+                "_audit_corrective_actions": set(),   # Section 3 conflict 检测用（projection 时 strip）
             }
         entry = grouped[key]
         entry["source_candidate_ids"].add(cand_id)
         if prd_id:
             entry["supporting_prd_ids"].add(prd_id)
+        # Section 3.2 conflict 检测：收集所有 distinct corrective_action 文本（strip 后 exact 比较）
+        action_text = str(cand.get("corrective_action", "")).strip()
+        if action_text:
+            entry["_audit_corrective_actions"].add(action_text)
     return grouped
 
 
@@ -192,11 +199,14 @@ def _replay(state_dir: str | Path, project_id: str) -> CatalogSnapshot:
     grouped = _aggregate_candidates(candidate_records, project_id)
     applied = _apply_events_idempotent(grouped, event_records)
 
-    # 4. 稳定排序 → tuple（byte-stable serialization 前提）
+    # 4. Section 3 promotion policy（design 决策#4）：<2 PRD 过滤、冲突标 conflicted。
+    #    不改 Section 2 的 fail-closed/deterministic/atomic mechanic——纯 policy 层（spec：policy
+    #    异常由 fail-open wrapper 兜底，不抛主路径）。
+    grouped, decisions = LMP.apply_promotion_policy(grouped)
+
+    # 5. 稳定排序 → tuple（byte-stable serialization 前提）；strip 内部 _audit_* 字段
     entries = tuple(
-        {**entry,
-         "source_candidate_ids": tuple(sorted(entry["source_candidate_ids"])),
-         "supporting_prd_ids": tuple(sorted(entry["supporting_prd_ids"]))}
+        _entry_for_projection(entry)
         for entry in sorted(grouped.values(), key=lambda e: e["lesson_id"])
     )
     return CatalogSnapshot(
@@ -206,7 +216,25 @@ def _replay(state_dir: str | Path, project_id: str) -> CatalogSnapshot:
         source_event_count=applied,
         tail_truncated_candidates=cand_report.tail_truncated,
         tail_truncated_events=evt_report.tail_truncated,
+        promotion_decisions=tuple(dataclasses.asdict(d) for d in decisions),
     )
+
+
+def _entry_for_projection(entry: dict) -> dict:
+    """把内部 entry dict 规整为 projection-ready：strip ``_audit_*`` 内部字段 + set → sorted tuple。
+
+    Section 3 在 ``_aggregate_candidates`` 注入 ``_audit_corrective_actions`` 做 conflict 检测；
+    projection 输出不可带内部字段（byte-stable + schema 清晰）。set 全转 sorted tuple（确定性）。
+    """
+    out: dict = {}
+    for k, v in entry.items():
+        if k.startswith("_audit_"):
+            continue
+        if isinstance(v, (set, frozenset)):
+            out[k] = tuple(sorted(v))
+        else:
+            out[k] = v
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -222,6 +250,7 @@ def _serialize_catalog(snapshot: CatalogSnapshot) -> bytes:
         "source_event_count": snapshot.source_event_count,
         "tail_truncated_candidates": snapshot.tail_truncated_candidates,
         "tail_truncated_events": snapshot.tail_truncated_events,
+        "promotion_decisions": list(snapshot.promotion_decisions),   # Section 3 audit trail
     }
     return json.dumps(catalog, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 

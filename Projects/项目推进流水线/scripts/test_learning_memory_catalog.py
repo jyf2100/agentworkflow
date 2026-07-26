@@ -142,8 +142,12 @@ def test_catalog_aggregates_candidates_by_equivalence_key(tmp_path):
 def test_catalog_replay_includes_equivalence_key_in_entries(tmp_path):
     """task 2.4 + 2.3：catalog entry 含 equivalence_key（rebuildable，与 Section 1 派生值一致）。"""
     state = tmp_path / "s"
-    c = _candidate()
-    LMS.append_candidate(str(state), "proj-a", c, run_id="r", timestamp="t")
+    c = _candidate(prd_id="prd-1")
+    LMS.append_candidate(str(state), "proj-a", c, run_id="r", timestamp="t1")
+    # Section 3：≥2 distinct PRD 才进 active catalog projection（单 PRD 被 promotion gate 过滤）
+    c2 = _candidate(prd_id="prd-2",
+                    evidence_refs=({"digest": "sha256:bb", "kind": "test_output", "path": "sha256/bb"},))
+    LMS.append_candidate(str(state), "proj-a", c2, run_id="r", timestamp="t2")
     result = LMC.rebuild_catalog(str(state), "proj-a")
     snap = result.snapshot
     expected_key = LM.derive_equivalence_key(c)
@@ -402,8 +406,12 @@ def test_catalog_file_is_sorted_json_with_schema_version(tmp_path):
 def test_catalog_entry_has_required_projection_fields(tmp_path):
     """task 2.4：catalog entry 含 ActiveCatalogEntry 必填字段（lesson_id/equivalence_key/source_candidate_ids/...）."""
     state = tmp_path / "s"
-    c = _candidate()
-    LMS.append_candidate(str(state), "proj-a", c, run_id="r", timestamp="t")
+    c = _candidate(prd_id="prd-1")
+    LMS.append_candidate(str(state), "proj-a", c, run_id="r", timestamp="t1")
+    # Section 3：≥2 distinct PRD 才进 active catalog projection（单 PRD 被 promotion gate 过滤）
+    c2 = _candidate(prd_id="prd-2",
+                    evidence_refs=({"digest": "sha256:bb", "kind": "test_output", "path": "sha256/bb"},))
+    LMS.append_candidate(str(state), "proj-a", c2, run_id="r", timestamp="t2")
     LMC.rebuild_catalog(str(state), "proj-a")
     cat = json.loads((state / "lessons" / "catalog" / "proj-a.json").read_text(encoding="utf-8"))
     entry = cat["entries"][0]

@@ -16,10 +16,10 @@
 
 ## 3. Cross-PRD Promotion
 
-- [ ] 3.1 Implement ordinary promotion only after equivalent valid candidates reference at least two distinct PRD IDs in the same project; test that repeated iterations of one PRD count once.
-- [ ] 3.2 Implement merge behavior that preserves every source candidate and evidence lineage while keeping conflicting corrective actions inactive and auditable.
-- [ ] 3.3 Add counterexamples proving single-occurrence candidates are never promoted in V1 — including a verifier-confirmed critical invariant violation from one PRD, a model self-labeled critical, and any `unknown` enum value — even when cross-PRD recurrence would otherwise be the only missing condition.
-- [ ] 3.4 Implement active, conflicted, superseded, and retired catalog states as projections that never delete source facts.
+- [x] 3.1 Implement ordinary promotion only after equivalent valid candidates reference at least two distinct PRD IDs in the same project; test that repeated iterations of one PRD count once.
+- [x] 3.2 Implement merge behavior that preserves every source candidate and evidence lineage while keeping conflicting corrective actions inactive and auditable.
+- [x] 3.3 Add counterexamples proving single-occurrence candidates are never promoted in V1 — including a verifier-confirmed critical invariant violation from one PRD, a model self-labeled critical, and any `unknown` enum value — even when cross-PRD recurrence would otherwise be the only missing condition.
+- [x] 3.4 Implement active, conflicted, superseded, and retired catalog states as projections that never delete source facts.
 
 ## 4. Terminal Reflection
 
