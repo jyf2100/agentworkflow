@@ -383,29 +383,66 @@ def test_discover_window_days_zero_is_waterline(tmp_path, monkeypatch):
 
 
 def test_stage_radar_dedup_skips_candidate_with_existing_prd(tmp_path, monkeypatch, capsys):
-    # 窗口回溯去重：candidate 的 source_path 已有 PRD → 过滤（防重复 PRD/critic）
+    # 出口去重（兜底）：前置过滤挡住「flat 里已产 PRD 的文件」后，persona 若仍为某个已产 PRD 的
+    # source_path 产了 candidate（幻觉 / 该文件未在 flat），出口再拦一道。本用例专测这个兜底：
+    # 喂进去的文件是未产的 20260720_new，persona 却返回指向已产 PRD 的 20260719_done。
     sources = [{"name": "wechat", "kind": "directory", "root": "Knowledge/微信",
                 "content_glob": "**/[0-9]*.md", "target_projects": ["cc-web-control"],
                 "marker": "state/consumed_wechat"}]
     profiles = {"cc-web-control": {"name": "cc-web-control", "match_surface": {}}}
     state = _setup_radar(tmp_path, monkeypatch, sources, profiles)
-    _put("Knowledge/微信", "20260719_a.md", tmp_path)
-    # 手写一份已有 PRD，frontmatter source_path 指向同一 source（pa-prd 契约实证字段）
+    _put("Knowledge/微信", "20260720_new.md", tmp_path)   # 喂进去的（未产 PRD）
+    # 已有 PRD 指向另一个文件（不在 flat → 前置过滤挡不住 → 靠出口去重兜底）
     prd_dir = state / "prd" / "cc-web-control"
     prd_dir.mkdir(parents=True)
-    (prd_dir / "20260720_old.md").write_text(
-        "---\nproject: cc-web-control\nsource_path: Knowledge/微信/20260719_a.md\n---\n# old\n",
+    (prd_dir / "20260719_old.md").write_text(
+        "---\nproject: cc-web-control\nsource_path: Knowledge/微信/20260719_done.md\n---\n# old\n",
         encoding="utf-8")
-    SRC = "Knowledge/微信/20260719_a.md"
+    HALLUC = "Knowledge/微信/20260719_done.md"             # persona 幻觉返回的已产 PRD source_path
     monkeypatch.setattr(run_daily, "run_persona",
                         lambda n, p, s, lbl: ({"candidates": [{"project": "cc-web-control",
-                                                                "source_path": SRC}],
+                                                                "source_path": HALLUC}],
                                                "stats": {}}, {"cost": 0.0, "turns": 1}))
     monkeypatch.setattr(run_daily, "fetch_dedup_list", lambda profs: {})
 
     out = run_daily.stage_radar(
         SimpleNamespace(force=False, dry_run=True, limit=None), sources, profiles, "20260721")
 
-    assert out["candidates"] == []                          # source_path 已有 PRD → 去重
+    assert out["candidates"] == []                          # 幻觉的 source_path 已有 PRD → 出口去重
     captured = capsys.readouterr()
     assert "去重" in captured.out or "去重" in captured.err  # 产出去重日志
+
+
+def test_stage_radar_prefilter_excludes_already_prd_files_from_prompt(tmp_path, monkeypatch):
+    # 前置去重（省 LLM）：已产 PRD 的文件根本不进 radar_prompt，只喂未产的。
+    # 与出口去重（test_stage_radar_dedup_skips_candidate_with_existing_prd）互补：
+    #   出口去重在 candidate 层（防重复产 PRD）；前置在 prompt 层（防重复 Read 已处理文件）。
+    sources = [{"name": "wechat", "kind": "directory", "root": "Knowledge/微信",
+                "content_glob": "**/[0-9]*.md", "target_projects": ["cc-web-control"],
+                "marker": "state/consumed_wechat"}]
+    profiles = {"cc-web-control": {"name": "cc-web-control", "match_surface": {}}}
+    state = _setup_radar(tmp_path, monkeypatch, sources, profiles)
+    _put("Knowledge/微信", "20260719_done.md", tmp_path)   # 已产 PRD
+    _put("Knowledge/微信", "20260720_new.md", tmp_path)    # 未产
+    prd_dir = state / "prd" / "cc-web-control"
+    prd_dir.mkdir(parents=True)
+    (prd_dir / "20260719_old.md").write_text(
+        "---\nproject: cc-web-control\nsource_path: Knowledge/微信/20260719_done.md\n---\n# old\n",
+        encoding="utf-8")
+    seen_prompt = {}
+
+    def fake_persona(name, prompt, stage, label):
+        seen_prompt[label] = prompt
+        return ({"candidates": [{"project": "cc-web-control",
+                                 "source_path": "Knowledge/微信/20260720_new.md"}],
+                 "stats": {}}, {"cost": 0.0, "turns": 1})
+
+    monkeypatch.setattr(run_daily, "run_persona", fake_persona)
+    monkeypatch.setattr(run_daily, "fetch_dedup_list", lambda profs: {})
+
+    run_daily.stage_radar(
+        SimpleNamespace(force=False, dry_run=True, limit=None), sources, profiles, "20260721")
+
+    p = seen_prompt["radar-cc-web-control"]
+    assert "20260720_new.md" in p            # 未产的喂了
+    assert "20260719_done.md" not in p       # 已产 PRD 的被前置过滤，不进 prompt

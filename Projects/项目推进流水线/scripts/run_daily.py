@@ -661,6 +661,13 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
         flat = [f for _, fs in src_files for f in fs]
         if not flat:
             continue                                      # 无订阅文件 → 不调
+        # 前置去重（省 LLM）：已产 PRD 的文件不进 radar_prompt。done_sources = source_path 集合
+        # （vault 相对），与 flat 文件 relative_to(VAULT_ROOT) 同格式。与下方出口 candidate 去重
+        # （sp in done_sources）互补：出口防重复产 PRD，前置防重复 Read 已处理文件。
+        flat = [p for p in flat if str(p.relative_to(VAULT_ROOT)) not in done_sources]
+        if not flat:
+            log(f"[radar] ⏭ {proj}: 订阅文件均已产 PRD，跳过 radar 调用（省 LLM）")
+            continue
         payload, meta = run_persona(
             "pa-radar", radar_prompt(proj, flat, profiles[proj], dedup.get(proj, [])),
             "radar", f"radar-{proj}")
