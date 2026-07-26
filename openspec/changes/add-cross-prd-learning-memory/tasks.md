@@ -31,11 +31,11 @@
 
 ## 5. Retrieval and Prompt Injection
 
-- [ ] 5.1 Derive deterministic retrieval metadata from the current project profile and immutable PRD without an additional semantic classification call.
-- [ ] 5.2 Implement project-local filtering and ranking using applicability boundaries, verified support count, effectiveness history, confidence, and recency, with stable tie-breaking.
-- [ ] 5.3 Enforce a maximum of five injected lessons and render only lesson ID, trigger, corrective action, and non-applicability boundary; exclude evidence bodies and historical narratives.
-- [ ] 5.4 Inject the selected lesson block into the standard dev prompt and record selected lesson IDs for terminal effectiveness evaluation.
-- [ ] 5.5 Add counterexamples proving unrelated, conflicted, superseded, retired, cross-project, malformed, or unreconciled lessons are not injected and cause truthful degraded-memory reporting where applicable.
+- [x] 5.1 Derive deterministic retrieval metadata from the current project profile and immutable PRD without an additional semantic classification call.
+- [x] 5.2 Implement project-local filtering and ranking using applicability boundaries, verified support count, effectiveness history, confidence, and recency, with stable tie-breaking.
+- [x] 5.3 Enforce a maximum of five injected lessons and render only lesson ID, trigger, corrective action, and non-applicability boundary; exclude evidence bodies and historical narratives.
+- [x] 5.4 Inject the selected lesson block into the standard dev prompt and record selected lesson IDs for terminal effectiveness evaluation.
+- [x] 5.5 Add counterexamples proving unrelated, conflicted, superseded, retired, cross-project, malformed, or unreconciled lessons are not injected and cause truthful degraded-memory reporting where applicable.
 
 ## 6. Effectiveness and Lesson Lifecycle
 
