@@ -25,6 +25,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 import learning_memory_catalog as LMC  # noqa: E402
 import learning_memory_schema as LM  # noqa: E402
@@ -62,6 +64,29 @@ def _event(eid="evt-1", event_type="confirmed", lesson_id=None, **payload):
         event_id=eid, timestamp="2026-07-26T03:17:00Z",
         project_id="proj-a", lesson_id=lesson_id or "lesson-default",
         event_type=event_type, payload=payload, schema_version=1)
+
+
+def _usage(eid="u-1", lesson_id="lesson-1", prd_id="prd-x",
+           action_observed=True, failure_recurred=False, outcome="followed",
+           timestamp="2026-07-26T03:17:00Z"):
+    """构造 schema-valid UsageOutcome（Section 6 fixture）。"""
+    return LM.UsageOutcome(
+        event_id=eid, timestamp=timestamp,
+        project_id="proj-a", lesson_id=lesson_id, prd_id=prd_id,
+        action_observed=action_observed, failure_recurred=failure_recurred,
+        outcome=outcome, schema_version=1)
+
+
+def _seed_promoted_lesson(state, project_id="proj-a", *, prd_a="prd-1", prd_b="prd-2",
+                          candidate_kwargs=None):
+    """种两条等效 candidate（不同 prd_id，达标 promotion ≥2 PRD）→ 返回 lesson_id。"""
+    kw = candidate_kwargs or _valid_candidate_kwargs()
+    c1 = LM.LessonCandidate(**{**kw, "prd_id": prd_a})
+    c2 = LM.LessonCandidate(**{**kw, "prd_id": prd_b,
+                               "evidence_refs": ({"digest": "sha256:bb", "kind": "test_output", "path": "sha256/bb"},)})
+    LMS.append_candidate(str(state), project_id, c1, run_id="r", timestamp="t1")
+    LMS.append_candidate(str(state), project_id, c2, run_id="r", timestamp="t2")
+    return LMC.lesson_id_from_equivalence_key(LM.derive_equivalence_key(c1))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -420,3 +445,451 @@ def test_catalog_entry_has_required_projection_fields(tmp_path):
                   "corrective_action", "trigger", "non_applicability_when",
                   "state", "confidence", "schema_version"):
         assert field in entry, f"catalog entry 缺字段 {field}"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task A：catalog entry 字段扩展（Section 5 retrieval ranking 维度）
+# ════════════════════════════════════════════════════════════════════════
+def test_catalog_entry_includes_applies_when_tags_sorted_tuple(tmp_path):
+    """task A：catalog entry 含 applies_when_tags（sorted union tuple，from candidates）。
+
+    注：equivalence_key 由 (phase, failure_class, corrective_action_class, applicability_signature)
+    派生，故两条 candidate 同 equivalence_key ⟺ 同 applicability_signature ⟺ 同 canonical tag set。
+    即「union」在 cross-candidate 聚合时其实必然恒等——本测试主要验：sorted tuple 形态 +
+    candidate 自身的 applies_when_tags 透传到 catalog entry。
+    """
+    state = tmp_path / "s"
+    # 两条 candidate 同 enum 字段（含 applies_when_tags 顺序不同——canonical 归一）→ 同 equivalence_key
+    kw = _valid_candidate_kwargs(applies_when_tags=(LM.AppliesWhenTag.PYTHON, LM.AppliesWhenTag.CI_GATE))
+    c1 = LM.LessonCandidate(**{**kw, "prd_id": "prd-1"})
+    # tag 顺序不同，canonical 后等价 → 同 equivalence_key
+    kw2 = _valid_candidate_kwargs(applies_when_tags=(LM.AppliesWhenTag.CI_GATE, LM.AppliesWhenTag.PYTHON))
+    c2 = LM.LessonCandidate(**{**kw2, "prd_id": "prd-2",
+                                "evidence_refs": ({"digest": "sha256:bb", "kind": "test_output", "path": "p"},)})
+    LMS.append_candidate(str(state), "proj-a", c1, run_id="r", timestamp="t1")
+    LMS.append_candidate(str(state), "proj-a", c2, run_id="r", timestamp="t2")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    assert result.ok
+    assert len(result.snapshot.entries) == 1   # 聚合为一条
+    entry = result.snapshot.entries[0]
+    assert "applies_when_tags" in entry
+    # sorted tuple（canonical union = {ci_gate, python}）
+    assert entry["applies_when_tags"] == ("ci_gate", "python")
+
+
+def test_catalog_entry_includes_verified_support_count(tmp_path):
+    """task A：catalog entry.verified_support_count == len(supporting_prd_ids)。"""
+    state = tmp_path / "s"
+    _seed_promoted_lesson(state)
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["verified_support_count"] == 2   # prd-1 + prd-2
+    assert entry["verified_support_count"] == len(entry["supporting_prd_ids"])
+
+
+def test_catalog_entry_includes_empty_effectiveness_fields_when_no_usage(tmp_path):
+    """task A：无 usage outcome 时 effectiveness_history=() / usage_count=0 / contradiction_count=0 / last_outcome_ts=None。"""
+    state = tmp_path / "s"
+    _seed_promoted_lesson(state)
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["effectiveness_history"] == ()
+    assert entry["usage_count"] == 0
+    assert entry["contradiction_count"] == 0
+    assert entry["last_outcome_ts"] is None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.2：bounded deterministic confidence update
+# ════════════════════════════════════════════════════════════════════════
+def test_apply_usage_outcomes_confidence_up_on_followed(tmp_path):
+    """task 6.2：每个 followed → confidence += CONFIDENCE_UP_BOUND (0.1)，cap 1.0。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    action_observed=True, failure_recurred=False, outcome="followed"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["confidence"] == pytest.approx(0.6, abs=1e-9)
+    assert entry["usage_count"] == 1
+
+
+def test_apply_usage_outcomes_confidence_caps_at_1(tmp_path):
+    """task 6.2：多次 followed → confidence cap 在 1.0（bounded update）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.9))
+    for i in range(5):
+        LMS.append_usage_outcome(str(state), "proj-a",
+                                 _usage(eid=f"u-{i}", lesson_id=lesson_id, prd_id=f"prd-{i+3}",
+                                        outcome="followed", timestamp=f"2026-07-2{i+1}T03:00:00Z"),
+                                 run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["confidence"] == 1.0   # 0.9 + 5*0.1 = 1.4 → cap 1.0
+    assert entry["usage_count"] == 5
+
+
+def test_apply_usage_outcomes_confidence_down_on_contradicted(tmp_path):
+    """task 6.2：每个 contradicted → confidence -= CONFIDENCE_DOWN_BOUND (0.2)，floor 0.0。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.7))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    action_observed=True, failure_recurred=True, outcome="contradicted"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["confidence"] == pytest.approx(0.5, abs=1e-9)   # 0.7 - 0.2 = 0.5
+
+
+def test_apply_usage_outcomes_confidence_floors_at_0(tmp_path):
+    """task 6.2：多次 contradicted → confidence floor 在 0.0（bounded update）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.3))
+    for i in range(5):
+        LMS.append_usage_outcome(str(state), "proj-a",
+                                 _usage(eid=f"u-{i}", lesson_id=lesson_id, prd_id=f"prd-{i+3}",
+                                        outcome="contradicted", timestamp=f"2026-07-2{i+1}T03:00:00Z"),
+                                 run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["confidence"] == 0.0   # 0.3 - 5*0.2 = -0.7 → floor 0.0
+    assert entry["contradiction_count"] == 5
+
+
+def test_apply_usage_outcomes_recurrence_prevented_counts_as_up(tmp_path):
+    """task 6.2：recurrence_prevented 也走 +CONFIDENCE_UP_BOUND（与 followed 同）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    action_observed=True, failure_recurred=False,
+                                    outcome="recurrence_prevented"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["confidence"] == pytest.approx(0.6, abs=1e-9)
+
+
+def test_apply_usage_outcomes_recurrence_observed_counts_as_down(tmp_path):
+    """task 6.2：recurrence_observed 走 -CONFIDENCE_DOWN_BOUND（与 contradicted 同）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.7))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    action_observed=False, failure_recurred=True,
+                                    outcome="recurrence_observed"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["confidence"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_apply_usage_outcomes_not_observed_does_not_change_confidence(tmp_path):
+    """task 6.2：not_observed → confidence 不变（absent evidence ≠ disobedience）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    action_observed=False, failure_recurred=False,
+                                    outcome="not_observed"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["confidence"] == 0.5   # 不变
+    assert entry["usage_count"] == 1    # usage 仍记录
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.2：effectiveness_history / last_outcome_ts derivation
+# ════════════════════════════════════════════════════════════════════════
+def test_apply_usage_outcomes_derives_effectiveness_history(tmp_path):
+    """task 6.2：每条 usage → effectiveness_history 一条（含 outcome/prd_id/timestamp/action/failure）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="followed", timestamp="2026-07-26T01:00:00Z"),
+                             run_id="r")
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-2", lesson_id=lesson_id, prd_id="prd-4",
+                                    outcome="contradicted", timestamp="2026-07-27T01:00:00Z"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert len(entry["effectiveness_history"]) == 2
+    # 按 timestamp 排序（deterministic）
+    assert entry["effectiveness_history"][0]["timestamp"] == "2026-07-26T01:00:00Z"
+    assert entry["effectiveness_history"][0]["outcome"] == "followed"
+    assert entry["effectiveness_history"][1]["outcome"] == "contradicted"
+    assert entry["last_outcome_ts"] == "2026-07-27T01:00:00Z"
+    assert entry["usage_count"] == 2
+    assert entry["contradiction_count"] == 1
+
+
+def test_apply_usage_outcomes_dedupes_by_event_id(tmp_path):
+    """task 6.2 idempotency：相同 event_id 重放 → 只算一次（crash-recovery task 7.2）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    # 直接 append 同一 event_id 两次（模拟 reconcile 重放）
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-dupe", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="followed"),
+                             run_id="r")
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-dupe", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="followed"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["usage_count"] == 1   # dedupe
+    assert entry["confidence"] == pytest.approx(0.6, abs=1e-9)   # 只 +0.1 一次
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.3：contradiction-driven retire + terminal stickiness
+# ════════════════════════════════════════════════════════════════════════
+def test_apply_usage_outcomes_retires_on_repeated_contradiction(tmp_path):
+    """task 6.3：contradiction_count >= 2 → state=retired（active entry）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.7))
+    # 两次 contradicted（不同 PRD）
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="contradicted", timestamp="2026-07-26T01:00:00Z"),
+                             run_id="r")
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-2", lesson_id=lesson_id, prd_id="prd-4",
+                                    outcome="contradicted", timestamp="2026-07-27T01:00:00Z"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["state"] == "retired"
+    assert entry["contradiction_count"] == 2
+
+
+def test_apply_usage_outcomes_single_contradiction_does_not_retire(tmp_path):
+    """task 6.3 反例：单次 contradicted (<2) → 不 retire（state 仍 active）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.7))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="contradicted"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["state"] == "active"   # <2 不 retire
+    assert entry["contradiction_count"] == 1
+
+
+def test_apply_usage_outcomes_terminal_stickiness_lifecycle_retired(tmp_path):
+    """task 6.3 反例：lifecycle 显式 retired 优先——usage 不重激活（即使 followed 多次）。
+
+    spec design 决策#6：「Retirement only changes the projection and never deletes source facts」
+    + 决策#3：terminal 状态粘性。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    # 显式 retired lifecycle event
+    LMS.append_lifecycle_event(str(state), "proj-a",
+                               _event(eid="e-retire", lesson_id=lesson_id, event_type="retired"),
+                               run_id="r")
+    # usage 多次 followed（本应让 confidence 上升）+ contradiction 2 次（本应 retire）
+    for i in range(3):
+        LMS.append_usage_outcome(str(state), "proj-a",
+                                 _usage(eid=f"u-{i}", lesson_id=lesson_id, prd_id=f"prd-{i+3}",
+                                        outcome="followed", timestamp=f"2026-07-2{i+1}T00:00:00Z"),
+                                 run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    # terminal stickiness：state 保持 retired；confidence 不被 usage 改（lifecycle 优先）
+    assert entry["state"] == "retired"
+    assert entry["confidence"] == 0.5   # 不变（terminal 粘性）
+    # effectiveness_history 仍记录（observation facts 永远在）
+    assert entry["usage_count"] == 3
+
+
+def test_apply_usage_outcomes_terminal_stickiness_lifecycle_superseded(tmp_path):
+    """task 6.3 反例：lifecycle 显式 superseded 优先——usage 不改 state/confidence。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_lifecycle_event(str(state), "proj-a",
+                               _event(eid="e-super", lesson_id=lesson_id, event_type="superseded"),
+                               run_id="r")
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="contradicted"),
+                             run_id="r")
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-2", lesson_id=lesson_id, prd_id="prd-4",
+                                    outcome="contradicted"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    entry = result.snapshot.entries[0]
+    assert entry["state"] == "superseded"   # 不被 usage 重写为 retired
+    assert entry["confidence"] == 0.5       # terminal 粘性：usage 不改 confidence
+    # effectiveness_history 仍记录
+    assert entry["contradiction_count"] == 2
+
+
+def test_retired_lesson_remains_in_catalog_with_full_facts(tmp_path):
+    """task 6.3 反例：retired lesson 仍在 projection（state=retired）；source facts 不删。
+
+    spec design 决策#3：「retirement only changes the projection and never deletes source facts」
+    + 决策#6：「Retirement only changes the projection and never deletes source facts」。
+    """
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.7))
+    # 触发 retire
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="contradicted", timestamp="2026-07-26T00:00:00Z"),
+                             run_id="r")
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-2", lesson_id=lesson_id, prd_id="prd-4",
+                                    outcome="contradicted", timestamp="2026-07-27T00:00:00Z"),
+                             run_id="r")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    assert result.ok
+    # retired lesson 仍在 catalog（不删）
+    assert len(result.snapshot.entries) == 1
+    entry = result.snapshot.entries[0]
+    assert entry["state"] == "retired"
+    # source facts 完整保留（spec：never deletes source facts）
+    assert len(entry["source_candidate_ids"]) == 2
+    assert len(entry["supporting_prd_ids"]) == 2
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task 7.2：idempotency（crash-recovery）
+# ════════════════════════════════════════════════════════════════════════
+def test_apply_usage_outcomes_replay_is_byte_identical(tmp_path):
+    """task 7.2：相同 facts（含 usage）→ byte-identical catalog replay。
+
+    crash-recovery 要求：reconcile 重放同一 usage records，catalog projection 必须幂等。
+    """
+    state1 = tmp_path / "s1"
+    state2 = tmp_path / "s2"
+    for state in (state1, state2):
+        lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+        LMS.append_usage_outcome(str(state), "proj-a",
+                                 _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                        outcome="followed", timestamp="2026-07-26T00:00:00Z"),
+                                 run_id="r")
+        LMS.append_usage_outcome(str(state), "proj-a",
+                                 _usage(eid="u-2", lesson_id=lesson_id, prd_id="prd-4",
+                                        outcome="contradicted", timestamp="2026-07-27T00:00:00Z"),
+                                 run_id="r")
+    LMC.rebuild_catalog(str(state1), "proj-a")
+    LMC.rebuild_catalog(str(state2), "proj-a")
+    bytes1 = (state1 / "lessons" / "catalog" / "proj-a.json").read_bytes()
+    bytes2 = (state2 / "lessons" / "catalog" / "proj-a.json").read_bytes()
+    assert bytes1 == bytes2, "相同 facts（含 usage）→ catalog 必须 byte-identical"
+
+
+def test_apply_usage_outcomes_repeated_rebuild_byte_identical(tmp_path):
+    """task 7.2：同一 state 多次 rebuild → byte-identical（_apply_usage_outcomes 幂等）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="followed"),
+                             run_id="r")
+    LMC.rebuild_catalog(str(state), "proj-a")
+    bytes1 = (state / "lessons" / "catalog" / "proj-a.json").read_bytes()
+    LMC.rebuild_catalog(str(state), "proj-a")
+    bytes2 = (state / "lessons" / "catalog" / "proj-a.json").read_bytes()
+    assert bytes1 == bytes2
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.2：fail-closed for memory（usage middle corruption）
+# ════════════════════════════════════════════════════════════════════════
+def test_project_catalog_degraded_on_usage_middle_corruption(tmp_path):
+    """task 6.2 + design 决策#7：usage.jsonl 中部损坏 → project_catalog 返回 degraded_class
+    = ``middle_corruption``（fail-closed for memory；fail-open delivery）。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="followed"),
+                             run_id="r")
+    # 在 usage.jsonl 末尾追加：中部坏行 + 合法行（坏行非末尾 → middle corruption）
+    p = state / "lessons" / "usage" / "proj-a.jsonl"
+    good = json.dumps({
+        "schema_version": LMS.LESSONS_SCHEMA_VERSION, "kind": "usage", "run_id": "r",
+        "usage": {"event_id": "u-2", "timestamp": "t2", "project_id": "proj-a",
+                  "lesson_id": lesson_id, "prd_id": "prd-4",
+                  "action_observed": True, "failure_recurred": False,
+                  "outcome": "followed", "evidence_refs": [], "schema_version": 1},
+    })
+    with open(p, "a", encoding="utf-8") as f:
+        f.write("MIDDLE_GARBAGE_IN_USAGE\n")
+        f.write(good + "\n")
+    result = LMC.project_catalog(str(state), "proj-a")
+    assert result.ok is False
+    assert result.degraded_class == "middle_corruption"
+    assert result.snapshot is None
+
+
+def test_rebuild_catalog_on_usage_corruption_leaves_old_catalog_intact(tmp_path):
+    """task 6.2 + 决策#7：usage 损坏时 rebuild 不写 partial catalog（旧 catalog 保持原样）。"""
+    state = tmp_path / "s"
+    cat_p = state / "lessons" / "catalog" / "proj-a.json"
+    cat_p.parent.mkdir(parents=True, exist_ok=True)
+    cat_p.write_text('{"project_id": "proj-a", "preserved": true}', encoding="utf-8")
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="followed"),
+                             run_id="r")
+    # 制造真正的中部损坏
+    p = state / "lessons" / "usage" / "proj-a.jsonl"
+    good_after = json.dumps({
+        "schema_version": LMS.LESSONS_SCHEMA_VERSION, "kind": "usage", "run_id": "r",
+        "usage": {"event_id": "u-2", "timestamp": "t2", "project_id": "proj-a",
+                  "lesson_id": lesson_id, "prd_id": "prd-4",
+                  "action_observed": True, "failure_recurred": False,
+                  "outcome": "followed", "evidence_refs": [], "schema_version": 1},
+    })
+    with open(p, "a", encoding="utf-8") as f:
+        f.write("MIDDLE_GARBAGE\n")
+        f.write(good_after + "\n")
+    result = LMC.rebuild_catalog(str(state), "proj-a")
+    assert result.ok is False
+    # 旧 catalog 未被覆盖
+    assert cat_p.read_text(encoding="utf-8") == '{"project_id": "proj-a", "preserved": true}'
+
+
+def test_project_catalog_no_usage_file_returns_ok(tmp_path):
+    """task 6.2：无 usage 文件（未注入过 lesson）→ 正常 ok=True（不是 degraded）。"""
+    state = tmp_path / "s"
+    _seed_promoted_lesson(state)
+    result = LMC.project_catalog(str(state), "proj-a")
+    assert result.ok is True
+    assert result.snapshot is not None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.4：catalog 输出含 effectiveness 字段（rebuildable + byte-stable）
+# ════════════════════════════════════════════════════════════════════════
+def test_catalog_file_entries_contain_all_section6_fields(tmp_path):
+    """task A/6.2/6.3：catalog JSON entries 含全部 Section 6 扩展字段。"""
+    state = tmp_path / "s"
+    lesson_id = _seed_promoted_lesson(state, candidate_kwargs=_valid_candidate_kwargs(confidence=0.5))
+    LMS.append_usage_outcome(str(state), "proj-a",
+                             _usage(eid="u-1", lesson_id=lesson_id, prd_id="prd-3",
+                                    outcome="followed"),
+                             run_id="r")
+    LMC.rebuild_catalog(str(state), "proj-a")
+    cat = json.loads((state / "lessons" / "catalog" / "proj-a.json").read_text(encoding="utf-8"))
+    entry = cat["entries"][0]
+    for field in ("applies_when_tags", "verified_support_count",
+                  "effectiveness_history", "last_outcome_ts",
+                  "usage_count", "contradiction_count"):
+        assert field in entry, f"catalog entry 缺 Section 6 字段 {field}"
+    # applies_when_tags 必须是 list（JSON 序列化的 sorted tuple）
+    assert isinstance(entry["applies_when_tags"], list)
+    assert isinstance(entry["effectiveness_history"], list)
+    assert isinstance(entry["usage_count"], int)

@@ -38,6 +38,7 @@ import tempfile
 from pathlib import Path
 from typing import ClassVar
 
+import learning_memory_effectiveness as LME
 import learning_memory_promotion as LMP
 import learning_memory_store as LMS
 
@@ -100,6 +101,12 @@ def _aggregate_candidates(candidate_records: list[dict], project_id: str) -> dic
 
     每个 entry 保留所有 source candidate_ids + supporting_prd_ids（spec「Merges preserve all source
     candidate IDs and evidence lineages」）。聚合是确定性的（sorted tuple）。
+
+    Section 6 task A 扩展字段（供 Section 5 retrieval ranking + Section 6 effectiveness lifecycle）：
+        * ``applies_when_tags``：candidate.applies_when_tags 的 union（set，projection 时 → sorted tuple）；
+        * ``verified_support_count``：= len(supporting_prd_ids)（冗余但显式，ranking 维度）；
+        * ``effectiveness_history`` / ``last_outcome_ts`` / ``usage_count`` / ``contradiction_count``：
+          默认空值（_apply_usage_outcomes 派生）。
     """
     grouped: dict[str, dict] = {}
     for rec in candidate_records:
@@ -121,6 +128,14 @@ def _aggregate_candidates(candidate_records: list[dict], project_id: str) -> dic
                 "confidence": float(cand.get("confidence", 0.0)),
                 "schema_version": CATALOG_SCHEMA_VERSION,
                 "_audit_corrective_actions": set(),   # Section 3 conflict 检测用（projection 时 strip）
+                # Section 6 task A：catalog entry 字段扩展（design 决策#5 ranking 维度 + decision#6 lifecycle）
+                "applies_when_tags": set(),   # union of candidate tags；projection → sorted tuple
+                # effectiveness-derived 字段默认空值（_apply_usage_outcomes 在 _replay 后派生）
+                "effectiveness_history": (),
+                "last_outcome_ts": None,
+                "usage_count": 0,
+                "contradiction_count": 0,
+                "verified_support_count": 0,   # 占位；循环结束后由 len(supporting_prd_ids) 派生
             }
         entry = grouped[key]
         entry["source_candidate_ids"].add(cand_id)
@@ -130,6 +145,13 @@ def _aggregate_candidates(candidate_records: list[dict], project_id: str) -> dic
         action_text = str(cand.get("corrective_action", "")).strip()
         if action_text:
             entry["_audit_corrective_actions"].add(action_text)
+        # Section 6 task A：aggregate applies_when_tags（union，去重）
+        for tag in (cand.get("applies_when_tags") or []):
+            if isinstance(tag, str) and tag:
+                entry["applies_when_tags"].add(tag)
+    # Section 6 task A：派生 verified_support_count（len(supporting_prd_ids)）
+    for entry in grouped.values():
+        entry["verified_support_count"] = len(entry["supporting_prd_ids"])
     return grouped
 
 
@@ -181,11 +203,107 @@ def _apply_single_event(entry: dict, event_type: str, payload: dict) -> None:
         pass   # merge 在 _aggregate_candidates 已聚合 source_candidate_ids；无额外 state 变更
 
 
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.2/6.3：_apply_usage_outcomes（bounded confidence + contradiction retire）
+# ════════════════════════════════════════════════════════════════════════
+def _apply_usage_outcomes(grouped: dict[str, dict], usage_records: list[dict]) -> int:
+    """Section 6 task 6.2 + 6.3：把 usage outcome facts 派生到 entry 字段 + bounded confidence update。
+
+    spec design 决策#6 硬约束（机械判定 own every trust boundary）：
+        * **deterministic**：相同 usage_records → 相同 entry.confidence/state/effectiveness_history
+          （crash-recovery task 7.2 要求 byte-identical）；
+        * **bounded confidence update**：
+            - 每个 followed/recurrence_prevented → ``+= CONFIDENCE_UP_BOUND`` (cap 1.0)；
+            - 每个 contradicted/recurrence_observed → ``-= CONFIDENCE_DOWN_BOUND`` (floor 0.0)；
+            - not_observed/unknown → **不变**（spec「absent evidence ≠ disobedience」）；
+        * **contradiction-driven retire**（task 6.3）：``contradiction_count >= THRESHOLD`` → state=retired；
+        * **terminal stickiness**：仅 ``state=="active"`` 的 entry 应用 confidence/retire 迁移——
+          lifecycle 显式 retired/superseded 优先，usage 不覆盖（spec「retirement only changes the
+          projection and never deletes source facts」）。
+
+    **幂等**：相同 usage_records（按 event_id 去重 + 按 timestamp 排序）→ byte-identical 派生。
+    **fail-closed for memory**：usage 中部损坏 → ``LMS.read_usage_records`` raise → ``_replay`` 不捕获
+    → fail-open wrapper 返回 degraded_class=middle_corruption。
+
+    Returns:
+        实际应用的（去重后的）usage record 数（监控用）。
+    """
+    by_lesson_id = {e["lesson_id"]: e for e in grouped.values()}
+
+    # 1. dedupe by event_id + group by lesson_id（按 timestamp 排序保证 deterministic）
+    per_lesson: dict[str, list[dict]] = {}
+    seen_event_ids: set[str] = set()
+    for rec in usage_records:
+        u = rec.get("usage") or {}
+        eid = u.get("event_id")
+        if not isinstance(eid, str) or not eid or eid in seen_event_ids:
+            continue   # dedupe（task 7.2 idempotency：crash 后重放同一 event_id 不重复应用）
+        seen_event_ids.add(eid)
+        lid = u.get("lesson_id")
+        if not isinstance(lid, str) or not lid:
+            continue
+        per_lesson.setdefault(lid, []).append(u)
+
+    applied = 0
+    for lesson_id, usages in per_lesson.items():
+        entry = by_lesson_id.get(lesson_id)
+        if entry is None:
+            # usage 指向的 lesson 不在 catalog（candidate 未 promote 或 cross-section 状态机未就绪）
+            # 不创建 ghost entry（同 _apply_events_idempotent 既定语义）
+            continue
+        # deterministic sort by timestamp（稳定 → byte-identical replay）
+        usages_sorted = sorted(usages, key=lambda u: str(u.get("timestamp", "")))
+
+        # 2. 派生 effectiveness_history / usage_count / last_outcome_ts / contradiction_count
+        history = tuple(
+            {
+                "outcome": str(u.get("outcome", "")),
+                "prd_id": str(u.get("prd_id", "")),
+                "timestamp": str(u.get("timestamp", "")),
+                "action_observed": bool(u.get("action_observed", False)),
+                "failure_recurred": bool(u.get("failure_recurred", False)),
+            }
+            for u in usages_sorted
+        )
+        entry["effectiveness_history"] = history
+        entry["usage_count"] = len(usages_sorted)
+        entry["last_outcome_ts"] = (
+            str(usages_sorted[-1].get("timestamp", "")) if usages_sorted else None)
+        contradiction_count = sum(
+            1 for u in usages_sorted if u.get("outcome") == "contradicted")
+        entry["contradiction_count"] = contradiction_count
+        applied += len(usages_sorted)
+
+        # 3. terminal stickiness：仅 state=="active" 的 entry 应用 confidence/retire 迁移
+        #    lifecycle 显式 retired/superseded 优先——usage 不覆盖（spec design 决策#6 + 决策#3）
+        if entry.get("state") != "active":
+            continue
+
+        # 4. bounded deterministic confidence update（design 决策#6）
+        for u in usages_sorted:
+            outcome = u.get("outcome")
+            if outcome in ("followed", "recurrence_prevented"):
+                entry["confidence"] = min(1.0, entry["confidence"] + LME.CONFIDENCE_UP_BOUND)
+            elif outcome in ("contradicted", "recurrence_observed"):
+                entry["confidence"] = max(0.0, entry["confidence"] - LME.CONFIDENCE_DOWN_BOUND)
+            # not_observed / unknown → 不变（absent evidence ≠ disobedience）
+
+        # 5. contradiction-driven retire（task 6.3）
+        if contradiction_count >= LME.CONTRADICTION_RETIRE_THRESHOLD:
+            entry["state"] = "retired"
+
+    return applied
+
+
 def _replay(state_dir: str | Path, project_id: str) -> CatalogSnapshot:
     """task 2.4 核心：从 append-only facts 确定性 replay 派生 CatalogSnapshot。
 
-    **fail-closed for memory**（design 决策#7）：read_candidate_records / read_event_records 在
-    中部损坏时 raise LessonsCorruptionError——本函数不捕获，透传给 fail-open wrapper。
+    **fail-closed for memory**（design 决策#7）：read_candidate_records / read_event_records /
+    read_usage_records 在中部损坏时 raise LessonsCorruptionError——本函数不捕获，透传给 fail-open
+    wrapper。
+
+    Section 6 扩展：在 promotion policy 之后调用 ``_apply_usage_outcomes`` 派生 effectiveness
+    lifecycle（bounded confidence update + contradiction retire + effectiveness_history）。
     """
     # 1. 读 candidates（trailing 容忍 / middle fail-closed 由 store 负责）
     cand_report = LMS.validate_candidates(state_dir, project_id)
@@ -195,16 +313,26 @@ def _replay(state_dir: str | Path, project_id: str) -> CatalogSnapshot:
     evt_report = LMS.validate_events(state_dir, project_id)
     event_records = LMS.read_event_records(state_dir, project_id)
 
-    # 3. 确定性聚合
+    # 3. Section 6：读 usage outcome facts（trailing 容忍 / middle fail-closed）
+    #    注：不调 validate_usage 单独取 tail_truncated（CatalogSnapshot 不扩展该字段，避免改 dataclass）；
+    #    read_usage_records 内部已 scan，中部损坏 raise → fail-open wrapper 兜底。
+    usage_records = LMS.read_usage_records(state_dir, project_id)
+
+    # 4. 确定性聚合（task 2.4 + Section 6 task A 字段扩展）
     grouped = _aggregate_candidates(candidate_records, project_id)
     applied = _apply_events_idempotent(grouped, event_records)
 
-    # 4. Section 3 promotion policy（design 决策#4）：<2 PRD 过滤、冲突标 conflicted。
+    # 5. Section 3 promotion policy（design 决策#4）：<2 PRD 过滤、冲突标 conflicted。
     #    不改 Section 2 的 fail-closed/deterministic/atomic mechanic——纯 policy 层（spec：policy
     #    异常由 fail-open wrapper 兜底，不抛主路径）。
     grouped, decisions = LMP.apply_promotion_policy(grouped)
 
-    # 5. 稳定排序 → tuple（byte-stable serialization 前提）；strip 内部 _audit_* 字段
+    # 6. Section 6 task 6.2/6.3：usage outcome → effectiveness lifecycle（design 决策#6）
+    #    在 promotion 之后应用：active entry 接受 bounded confidence update + contradiction retire；
+    #    retired/superseded terminal 优先（lifecycle 显式标记不被 usage 覆盖）。
+    _apply_usage_outcomes(grouped, usage_records)
+
+    # 7. 稳定排序 → tuple（byte-stable serialization 前提）；strip 内部 _audit_* 字段
     entries = tuple(
         _entry_for_projection(entry)
         for entry in sorted(grouped.values(), key=lambda e: e["lesson_id"])

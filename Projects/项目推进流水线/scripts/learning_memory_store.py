@@ -50,6 +50,7 @@ LESSONS_SCHEMA_VERSION: int = 1   # candidates.jsonl / events.jsonl 的 record s
 
 _RECORD_KIND_CANDIDATE = "candidate"
 _RECORD_KIND_EVENT = "event"
+_RECORD_KIND_USAGE = "usage"   # Section 6：usage outcome facts（task 6.2 append）
 
 
 def lessons_dir(state_dir: str | Path) -> Path:
@@ -65,6 +66,16 @@ def candidate_path(state_dir: str | Path, project_id: str) -> Path:
 def event_path(state_dir: str | Path, project_id: str) -> Path:
     """events/<project>.jsonl 路径（append-only lifecycle events）。"""
     return lessons_dir(state_dir) / "events" / f"{project_id}.jsonl"
+
+
+def usage_path(state_dir: str | Path, project_id: str) -> Path:
+    """usage/<project>.jsonl 路径（Section 6 task 6.2：append-only usage outcome facts）。
+
+    design 决策#3 存储布局扩展：candidates/events 是 Section 2 真源；usage 是 Section 6 真源
+    （与 events 平行，append-only + flock + fsync + O_APPEND）。catalog 仍是 rebuildable
+    projection（learning_memory_catalog._replay 把 usage 派生进 effectiveness_history 等 entry 字段）。
+    """
+    return lessons_dir(state_dir) / "usage" / f"{project_id}.jsonl"
 
 
 def catalog_path(state_dir: str | Path, project_id: str) -> Path:
@@ -222,6 +233,32 @@ def _serialize_event_record(event: LM.LessonLifecycleEvent, *, run_id: str) -> d
     }
 
 
+def _serialize_usage_record(outcome: LM.UsageOutcome, *, run_id: str) -> dict:
+    """Section 6 task 6.2：序列化 usage outcome → versioned JSONL record dict。
+
+    与 candidate/event 同 schema 形状（``{schema_version, kind:"usage", run_id, usage:{...}}``）。
+    usage outcome 是 **append-only facts**（design 决策#3 + 决策#6）：每条记录一次 lesson 在
+    某 PRD 上的应用结果；catalog._apply_usage_outcomes 派生 effectiveness_history 等字段。
+    """
+    return {
+        "schema_version": LESSONS_SCHEMA_VERSION,
+        "kind": _RECORD_KIND_USAGE,
+        "run_id": run_id,
+        "usage": {
+            "event_id": outcome.event_id,
+            "timestamp": outcome.timestamp,
+            "project_id": outcome.project_id,
+            "lesson_id": outcome.lesson_id,
+            "prd_id": outcome.prd_id,
+            "action_observed": bool(outcome.action_observed),
+            "failure_recurred": bool(outcome.failure_recurred),
+            "outcome": outcome.outcome,
+            "evidence_refs": list(outcome.evidence_refs),
+            "schema_version": outcome.schema_version,
+        },
+    }
+
+
 # ════════════════════════════════════════════════════════════════════════
 # task 2.1：append-only writers（flock + O_APPEND + flush + fsync）
 # ════════════════════════════════════════════════════════════════════════
@@ -293,6 +330,36 @@ def append_lifecycle_event(state_dir: str | Path, project_id: str,
     record = _serialize_event_record(event, run_id=run_id)
     line = json.dumps(record, ensure_ascii=False, sort_keys=True)
     _atomic_append_line(event_path(state_dir, project_id), line)
+
+
+def append_usage_outcome(state_dir: str | Path, project_id: str,
+                         outcome: LM.UsageOutcome, *,
+                         run_id: str) -> None:
+    """Section 6 task 6.2：append 一条 usage outcome 到 ``usage/<project>.jsonl``。
+
+    与 ``append_candidate`` / ``append_lifecycle_event`` 同模式（design 决策#3 + 决策#6）：
+    flock + O_APPEND + flush + fsync。outcome 经 ``UsageOutcome.__post_init__`` enforce
+    （outcome 受控词表，action_observed/failure_recurred 是 bool）；本函数补 identity 校验。
+
+    **append-only facts**（spec design 决策#6）：usage 是 observation 事实——绝不删除/修改；
+    catalog 是 rebuildable projection（``_apply_usage_outcomes`` 派生 effectiveness_history 等）。
+    """
+    if outcome.project_id != project_id:
+        raise ValueError(
+            f"project_id mismatch：outcome.project_id={outcome.project_id!r} "
+            f"!= path project_id={project_id!r}")
+    # identity 校验（防 None / 空 / 类型错——防绕过 schema 灌 JSONL）
+    if not isinstance(outcome.event_id, str) or not outcome.event_id.strip():
+        raise ValueError("UsageOutcome.event_id 不可为空（usage record identity）")
+    if not isinstance(outcome.lesson_id, str) or not outcome.lesson_id.strip():
+        raise ValueError("UsageOutcome.lesson_id 不可为空（usage 必须关联 lesson）")
+    if not isinstance(outcome.prd_id, str) or not outcome.prd_id.strip():
+        raise ValueError("UsageOutcome.prd_id 不可为空（usage 必须关联 PRD）")
+    if not isinstance(outcome.timestamp, str) or not outcome.timestamp.strip():
+        raise ValueError("UsageOutcome.timestamp 不可为空")
+    record = _serialize_usage_record(outcome, run_id=run_id)
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    _atomic_append_line(usage_path(state_dir, project_id), line)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -412,6 +479,52 @@ def read_event_records(state_dir: str | Path, project_id: str) -> list[dict]:
     return records
 
 
+def _validate_usage_record(record: dict, *, line_number: int, source: str) -> None:
+    """Section 6 task 6.2 读端 defense-in-depth：对读出的 usage record 再校验。
+
+    spec design 决策#7「fail-closed for memory」：complete-JSON-but-schema-invalid → raise
+    ``LessonsCorruptionError``（绝不部分信任）。校验：
+        * kind == "usage"；
+        * usage 子字典存在 + 必填 identity 字段（event_id/timestamp/project_id/lesson_id/prd_id）；
+        * action_observed / failure_recurred 是 bool；
+        * outcome 在 ``LM._VALID_USAGE_OUTCOMES`` 受控词表（防手灌 unknown/超词表）。
+    """
+    if not isinstance(record, dict):
+        raise LessonsCorruptionError(source, line_number)
+    if record.get("kind") != _RECORD_KIND_USAGE:
+        raise LessonsCorruptionError(source, line_number)
+    u = record.get("usage")
+    if not isinstance(u, dict):
+        raise LessonsCorruptionError(source, line_number)
+    for field in ("event_id", "timestamp", "project_id", "lesson_id", "prd_id"):
+        v = u.get(field)
+        if not isinstance(v, str) or not v.strip():
+            raise LessonsCorruptionError(source, line_number)
+    if not isinstance(u.get("action_observed"), bool):
+        raise LessonsCorruptionError(source, line_number)
+    if not isinstance(u.get("failure_recurred"), bool):
+        raise LessonsCorruptionError(source, line_number)
+    if u.get("outcome") not in LM._VALID_USAGE_OUTCOMES:
+        raise LessonsCorruptionError(source, line_number)
+
+
+def read_usage_records(state_dir: str | Path, project_id: str) -> list[dict]:
+    """Section 6 task 6.2：读 usage/<project>.jsonl → list[record]。
+
+    末尾不完整容忍；中部损坏 → raise ``LessonsCorruptionError``（fail-closed）。
+    每条 record 经 ``_validate_usage_record`` defense-in-depth 再校验（防手灌绕过 schema）。
+    文件不存在 → 空列表（未注入过 lesson 是正常态）。
+    """
+    path = usage_path(state_dir, project_id)
+    records, report = _scan_jsonl(path, source=f"usage/{project_id}.jsonl")
+    if report.corrupted_line_numbers:
+        raise LessonsCorruptionError(
+            f"usage/{project_id}.jsonl", report.corrupted_line_numbers[0])
+    for i, rec in enumerate(records, start=1):
+        _validate_usage_record(rec, line_number=i, source=f"usage/{project_id}.jsonl")
+    return records
+
+
 def validate_candidates(state_dir: str | Path, project_id: str) -> CorruptionReport:
     """validate 不 raise——返回 CorruptionReport（运维探查 / degraded 决策用）。"""
     _, report = _scan_jsonl(candidate_path(state_dir, project_id),
@@ -423,4 +536,11 @@ def validate_events(state_dir: str | Path, project_id: str) -> CorruptionReport:
     """validate 不 raise——返回 CorruptionReport。"""
     _, report = _scan_jsonl(event_path(state_dir, project_id),
                             source=f"events/{project_id}.jsonl")
+    return report
+
+
+def validate_usage(state_dir: str | Path, project_id: str) -> CorruptionReport:
+    """Section 6 task 6.2：validate 不 raise——返回 CorruptionReport（运维探查 / degraded 决策用）。"""
+    _, report = _scan_jsonl(usage_path(state_dir, project_id),
+                           source=f"usage/{project_id}.jsonl")
     return report

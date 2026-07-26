@@ -39,10 +39,10 @@
 
 ## 6. Effectiveness and Lesson Lifecycle
 
-- [ ] 6.1 Evaluate each injected lesson against terminal test, journal, and verifier evidence, distinguishing followed, not observed, recurrence prevented, recurrence observed, contradicted, and unknown outcomes.
-- [ ] 6.2 Append usage and outcome facts and implement bounded deterministic confidence updates without treating absent evidence as agent disobedience.
-- [ ] 6.3 Implement contradiction-driven downgrade, supersession, and retirement rules, with tests proving retired lessons remain replayable but are excluded from retrieval.
-- [ ] 6.4 Extend dispatch/report records with memory mode as a `(shadow_on, injection_on)` boolean pair, selected lesson IDs, candidate counts, promotions, and degraded status while keeping existing success/failure semantics unchanged.
+- [x] 6.1 Evaluate each injected lesson against terminal test, journal, and verifier evidence, distinguishing followed, not observed, recurrence prevented, recurrence observed, contradicted, and unknown outcomes.
+- [x] 6.2 Append usage and outcome facts and implement bounded deterministic confidence updates without treating absent evidence as agent disobedience.
+- [x] 6.3 Implement contradiction-driven downgrade, supersession, and retirement rules, with tests proving retired lessons remain replayable but are excluded from retrieval.
+- [x] 6.4 Extend dispatch/report records with memory mode as a `(shadow_on, injection_on)` boolean pair, selected lesson IDs, candidate counts, promotions, and degraded status while keeping existing success/failure semantics unchanged.
 
 ## 7. Rollout, Recovery, and Verification
 

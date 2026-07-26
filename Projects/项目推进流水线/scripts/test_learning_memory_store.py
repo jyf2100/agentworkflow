@@ -71,6 +71,16 @@ def _event(eid="evt-1", event_type="confirmed", lesson_id="lesson-1", **payload)
         payload=payload, schema_version=1)
 
 
+def _usage(eid="u-1", lesson_id="lesson-1", prd_id="prd-001",
+           action_observed=True, failure_recurred=False, outcome="followed"):
+    """构造 schema-valid UsageOutcome（Section 6 fixture）。"""
+    return LM.UsageOutcome(
+        event_id=eid, timestamp="2026-07-26T03:17:00Z",
+        project_id="proj-a", lesson_id=lesson_id, prd_id=prd_id,
+        action_observed=action_observed, failure_recurred=failure_recurred,
+        outcome=outcome, schema_version=1)
+
+
 # ════════════════════════════════════════════════════════════════════════
 # task 2.5：路径隔离（先跑——锁定 ADR-0001 边界）
 # ════════════════════════════════════════════════════════════════════════
@@ -374,3 +384,206 @@ def test_validate_lessons_reports_tail_truncation(tmp_path):
     assert report.tail_truncated is True
     assert report.corrupted_line_numbers == ()
     assert report.is_fail_closed is False
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Section 6 task 6.2：append-only usage outcome writer
+# ════════════════════════════════════════════════════════════════════════
+def test_usage_path_under_lessons_dir(tmp_path):
+    """task 6.2 + design 决策#3：usage 文件在 ``state_dir/lessons/usage/`` 下。"""
+    p = LMS.usage_path(str(tmp_path / "state"), "proj-a")
+    assert "lessons" in p.parts
+    assert p.name == "proj-a.jsonl"
+    assert p.parent.name == "usage"
+
+
+def test_append_usage_outcome_creates_versioned_line(tmp_path):
+    """task 6.2：append 一条 usage outcome → usage/<project>.jsonl 含一行合法 JSON。"""
+    state = tmp_path / "state"
+    LMS.append_usage_outcome(str(state), "proj-a", _usage(eid="u-1"),
+                             run_id="r-1")
+    lines = (state / "lessons" / "usage" / "proj-a.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["schema_version"] == LMS.LESSONS_SCHEMA_VERSION
+    assert rec["kind"] == "usage"
+    assert rec["run_id"] == "r-1"
+    assert rec["usage"]["event_id"] == "u-1"
+    assert rec["usage"]["outcome"] == "followed"
+    assert rec["usage"]["action_observed"] is True
+    assert rec["usage"]["failure_recurred"] is False
+
+
+def test_append_usage_outcome_does_not_overwrite(tmp_path):
+    """task 6.2：O_APPEND——多次 append 累积（append-only facts，绝不丢已记录的 outcome）。"""
+    state = tmp_path / "state"
+    LMS.append_usage_outcome(str(state), "proj-a", _usage(eid="u-1", prd_id="prd-1"),
+                             run_id="r")
+    LMS.append_usage_outcome(str(state), "proj-a", _usage(eid="u-2", prd_id="prd-2"),
+                             run_id="r")
+    recs = LMS.read_usage_records(str(state), "proj-a")
+    assert len(recs) == 2
+    assert {r["usage"]["event_id"] for r in recs} == {"u-1", "u-2"}
+
+
+def test_append_usage_outcome_calls_fsync(tmp_path, monkeypatch):
+    """task 6.2：必须调 os.fsync（crash 后已 append 的 outcome 行落盘）。"""
+    calls: list[int] = []
+    monkeypatch.setattr(LMS.os, "fsync", lambda fd: calls.append(fd))
+    LMS.append_usage_outcome(str(tmp_path / "state"), "proj-a", _usage(),
+                             run_id="r-1")
+    assert len(calls) >= 1, "append_usage_outcome 未调 os.fsync"
+
+
+def test_append_usage_outcome_rejects_project_id_mismatch(tmp_path):
+    """task 6.2：outcome.project_id != path project_id → ValueError（per-project 文件隔离）。"""
+    state = tmp_path / "state"
+    bad = LM.UsageOutcome(
+        event_id="u-x", timestamp="t", project_id="proj-b",
+        lesson_id="l", prd_id="prd-1",
+        action_observed=True, failure_recurred=False,
+        outcome="followed", schema_version=1)
+    with pytest.raises(ValueError, match=r"project_id mismatch"):
+        LMS.append_usage_outcome(str(state), "proj-a", bad, run_id="r")
+
+
+def test_append_usage_outcome_rejects_empty_identity(tmp_path):
+    """task 6.2 defense-in-depth：空 event_id / lesson_id / prd_id / timestamp → 拒。"""
+    state = tmp_path / "state"
+    # 用 dataclasses.replace 绕过 __init__ 改 frozen field
+    import dataclasses
+    base_u = _usage()
+    for field in ("event_id", "lesson_id", "prd_id", "timestamp"):
+        u_bad = dataclasses.replace(base_u, **{field: ""})
+        with pytest.raises(ValueError, match=rf"{field}"):
+            LMS.append_usage_outcome(str(state), "proj-a", u_bad, run_id="r")
+
+
+def test_concurrent_append_usage_preserves_all_records(tmp_path):
+    """task 6.2：多线程并发 append usage——flock 保证无丢失、无交错。"""
+    state = tmp_path / "state"
+    N_THREADS = 6
+    N_PER_THREAD = 8
+
+    def worker(tid):
+        for i in range(N_PER_THREAD):
+            u = _usage(eid=f"u-{tid}-{i}", prd_id=f"prd-{tid}-{i}")
+            LMS.append_usage_outcome(str(state), "proj-a", u, run_id=f"r-{tid}")
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(N_THREADS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    recs = LMS.read_usage_records(str(state), "proj-a")
+    assert len(recs) == N_THREADS * N_PER_THREAD   # 无丢失
+    eids = {r["usage"]["event_id"] for r in recs}
+    assert len(eids) == N_THREADS * N_PER_THREAD   # 无覆盖
+
+
+# ════════════════════════════════════════════════════════════════════════
+# task 6.2：usage 损坏容错（trailing recoverable / middle fail-closed）
+# ════════════════════════════════════════════════════════════════════════
+def test_read_usage_tolerates_incomplete_trailing(tmp_path):
+    """spec：末尾半行（crash 截断最后一条 append）→ 容忍丢弃。"""
+    state = tmp_path / "state"
+    LMS.append_usage_outcome(str(state), "proj-a", _usage(eid="u-1"),
+                             run_id="r")
+    p = state / "lessons" / "usage" / "proj-a.jsonl"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write('{"schema_version": 1, "kind": "usage", "usa')   # 截断半行
+    recs = LMS.read_usage_records(str(state), "proj-a")
+    assert len(recs) == 1
+    assert recs[0]["usage"]["event_id"] == "u-1"
+
+
+def test_read_usage_fail_closed_on_middle_corruption(tmp_path):
+    """spec design 决策#7：usage 中部损坏 → fail-closed（绝不静默跳过坏行）。"""
+    state = tmp_path / "state"
+    p = state / "lessons" / "usage" / "proj-a.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    good = json.dumps({
+        "schema_version": LMS.LESSONS_SCHEMA_VERSION, "kind": "usage",
+        "run_id": "r",
+        "usage": {"event_id": "u-1", "timestamp": "t", "project_id": "proj-a",
+                  "lesson_id": "l", "prd_id": "prd", "action_observed": True,
+                  "failure_recurred": False, "outcome": "followed",
+                  "evidence_refs": [], "schema_version": 1},
+    })
+    p.write_text(good + "\n" + "MIDDLE_GARBAGE_IN_USAGE\n" + good + "\n", encoding="utf-8")
+    with pytest.raises(LMS.LessonsCorruptionError) as ei:
+        LMS.read_usage_records(str(state), "proj-a")
+    assert ei.value.line_number == 2
+
+
+def test_read_usage_rejects_complete_but_invalid_outcome(tmp_path):
+    """task 6.2 defense-in-depth：complete-JSON 但 outcome=unknown/超词表 → fail-closed。"""
+    state = tmp_path / "state"
+    p = state / "lessons" / "usage" / "proj-a.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    bad = json.dumps({
+        "schema_version": LMS.LESSONS_SCHEMA_VERSION, "kind": "usage",
+        "run_id": "r",
+        "usage": {"event_id": "u-1", "timestamp": "t", "project_id": "proj-a",
+                  "lesson_id": "l", "prd_id": "prd", "action_observed": True,
+                  "failure_recurred": False, "outcome": "totally_made_up",
+                  "evidence_refs": [], "schema_version": 1},
+    })
+    p.write_text(bad + "\n", encoding="utf-8")
+    with pytest.raises(LMS.LessonsCorruptionError):
+        LMS.read_usage_records(str(state), "proj-a")
+
+
+def test_read_usage_rejects_wrong_kind_field(tmp_path):
+    """task 6.2：kind != "usage" → fail-closed（防手灌 candidate/event 行进 usage 文件）。"""
+    state = tmp_path / "state"
+    p = state / "lessons" / "usage" / "proj-a.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    bad = json.dumps({
+        "schema_version": LMS.LESSONS_SCHEMA_VERSION, "kind": "candidate",
+        "run_id": "r",
+        "usage": {"event_id": "u-1", "timestamp": "t", "project_id": "proj-a",
+                  "lesson_id": "l", "prd_id": "prd", "action_observed": True,
+                  "failure_recurred": False, "outcome": "followed",
+                  "evidence_refs": [], "schema_version": 1},
+    })
+    p.write_text(bad + "\n", encoding="utf-8")
+    with pytest.raises(LMS.LessonsCorruptionError):
+        LMS.read_usage_records(str(state), "proj-a")
+
+
+def test_read_usage_rejects_non_bool_action_observed(tmp_path):
+    """task 6.2：action_observed 非 bool（如字符串 "true"）→ fail-closed（防 type confusion）。"""
+    state = tmp_path / "state"
+    p = state / "lessons" / "usage" / "proj-a.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    bad = json.dumps({
+        "schema_version": LMS.LESSONS_SCHEMA_VERSION, "kind": "usage",
+        "run_id": "r",
+        "usage": {"event_id": "u-1", "timestamp": "t", "project_id": "proj-a",
+                  "lesson_id": "l", "prd_id": "prd", "action_observed": "true",
+                  "failure_recurred": False, "outcome": "followed",
+                  "evidence_refs": [], "schema_version": 1},
+    })
+    p.write_text(bad + "\n", encoding="utf-8")
+    with pytest.raises(LMS.LessonsCorruptionError):
+        LMS.read_usage_records(str(state), "proj-a")
+
+
+def test_validate_usage_reports_tail_truncation(tmp_path):
+    """validate_usage（不 raise）——返回 CorruptionReport。"""
+    state = tmp_path / "state"
+    LMS.append_usage_outcome(str(state), "proj-a", _usage(), run_id="r")
+    p = state / "lessons" / "usage" / "proj-a.jsonl"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write('{"truncated')
+    report = LMS.validate_usage(str(state), "proj-a")
+    assert report.tail_truncated is True
+    assert report.corrupted_line_numbers == ()
+
+
+def test_read_usage_missing_file_returns_empty(tmp_path):
+    """首次运行未注入过 lesson → usage 文件不存在 → 空列表（正常态）。"""
+    state = tmp_path / "state"
+    recs = LMS.read_usage_records(str(state), "proj-a")
+    assert recs == []
