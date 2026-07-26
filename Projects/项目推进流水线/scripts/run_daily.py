@@ -46,12 +46,21 @@ from pathlib import Path
 from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（消解 ADR-0004 #4 shadow；无依赖模块，顶部 import 不触发 sdk 连带加载拖垮 cron）
 from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
 from coordinator import build_coordinator, preflight  # task 2.1/2.5：runtime coordinator 边界 + flag 组合 preflight（design 决策#1；纯 stdlib，cron 安全）
+from feature_flags import resolve_flags  # add-cross-prd-learning-memory Section 7：learning flag 解析（V1 allowlist + env/profile 三态）
 from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写入器（类型注解用；纯 stdlib，cron 安全）
 import journal as J                        # task 3.4：driven retry 读 journal events → recovery context（纯 stdlib）
 import recovery_context as RC              # task 3.4：driven retry prompt 从 immutable PRD + journal artifacts（纯函数）
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
 import reconcile                           # task 4.4：ArtifactEvidenceResolver（publication 前 reconcile test evidence）
 import retry_policy as RP                  # task 3.3 P0-3：run_daily 驱动 retry（decide/recover_iteration/budget/session 参数生成）
+# add-cross-prd-learning-memory Section 7 接线（控制面纯 stdlib 模块，cron 隔离不变）：
+#   envelope 构造（journal events → sanitized TerminalEnvelope）+ reflection（read-only SDK，mock-SDK 可注入）+
+#   retrieval（dispatch-entry catalog 检索 + lesson block 渲染）+ effectiveness（memory_mode record）。
+#   均零模块级 SDK 导入；本接线层 fail-open：shadow=off / profile 未启用 → 零副作用（design 决策#7/#8）。
+import learning_memory_envelope as LME
+import learning_memory_reflection as LMRefl
+import learning_memory_retrieval as LMRet
+import learning_memory_effectiveness as LMEff
 
 try:
     import yaml
@@ -1058,7 +1067,8 @@ def _run_capture(cmd: list[str], cwd: str, timeout: int, label: str,
 def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
              feedback_artifact: str | None = None, *,
              state_dir: str | None = None, iteration_seq: int = 0,
-             resume_session: str | None = None, fork_session: bool = False) -> list[str] | None:
+             resume_session: str | None = None, fork_session: bool = False,
+             lessons_artifact: str | None = None) -> list[str] | None:
     """构造 dev-agent 触发命令（ADR-0006：控制面标准执行器为唯一源）。
 
     始终调用控制面 ``scripts/dev-agent.py``（DEV_AGENT_PY）——执行器贴目标仓跑（cwd=调用方传入的
@@ -1071,6 +1081,10 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
     --feedback-artifact（task 3.4）：driven（``journal_driven_dispatch``）模式 retry（round≥2）从 immutable
         PRD + journal feedback artifact 构 prompt——传 round_n 的 ``verifier_feedback`` artifact path
         （``build_recovery_context`` 从 journal 抽），dev-agent 读它 inject prompt（baseline 照旧读 PRD 反馈节）。
+    --lessons-artifact（add-cross-prd-learning-memory Section 5 接线）：cross_prd_learning_injection 开仓时，
+        控制面在 dispatch-entry 把检索出的 lesson block 写成 content-addressed artifact，path 透传给目标面
+        dev-agent（与 ``--feedback-artifact`` 完全对称的模式；ADR-0001 控制面/目标面隔离：dev-agent 只读
+        传入的 path，**不读控制面 state**）。baseline / injection=off → None（dev-agent build_prompt 跳过注入）。
     控制面 dev-agent.py 缺失（DEV_AGENT_PY 不存在）→ None（dispatch_one 判 fail：控制面安装异常）。"""
     if not DEV_AGENT_PY.exists():
         return None
@@ -1080,6 +1094,8 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
         cmd += ["--source", src_abs]
     if feedback_artifact:    # task 3.4：driven retry prompt 从 feedback artifact（PRD 不可变，反馈在 artifact）
         cmd += ["--feedback-artifact", feedback_artifact]
+    if lessons_artifact:     # Section 5 接线：lesson block artifact path（None=不注入，dev-agent baseline prompt）
+        cmd += ["--lessons-artifact", lessons_artifact]
     # task 3.3 P0-3：session-aware retry 参数（run_daily 据 RetryPolicy.decide 生成 → dev-agent 透传 SDK）。
     #   state_dir=控制面 STATE_DIR → dev-agent session_store 与控制面同一（retry 读 dev-agent 持久化 session_id）。
     if state_dir:
@@ -1218,6 +1234,261 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ════════════════════════════════════════════════════════════════════════
+# add-cross-prd-learning-memory Section 7 接线（控制面侧）
+# ════════════════════════════════════════════════════════════════════════
+# 三个接线点（design 决策#7 fail-open by construction；spec tasks 7.1 shadow parity + 7.7 两级 rollback）：
+#   ① terminal reflection hook（dispatch 出口 → envelope + read-only SDK → rec["learning_memory"]）；
+#   ② injection（dispatch-entry → load catalog → render lesson block → --lessons-artifact 透传 dev-agent）；
+#   ③ memory_mode report（per-record 合并 ``rec["memory_mode"]``，不改 status/success/failure 语义）。
+#
+# **V1 project-only scope**：``prof["learning_memory"]["enabled"] is True`` 是项目级 canary 标记。缺字段 /
+# 非 True → 整个 learning memory 子系统零副作用（不读 catalog、不调 SDK、不改 prompt）。default 状态下
+# 即使用户误开环境变量 flag，非 allowlist 项目仍跳过（fail-safe 防误启用）。
+_LEARNING_MEMORY_PROFILE_KEY = "learning_memory"
+
+
+def _resolve_learning_enabled(prof: dict) -> tuple[bool, bool, str | None]:
+    """解析 effective ``(shadow_on, injection_on, degraded_class)`` 用于本次 dispatch。
+
+    优先级（design 决策#8）：
+        * **V1 allowlist**（``prof["learning_memory"]["enabled"] is True``）未启用 → 整个 learning 子系统
+          零副作用（``shadow_on=False, injection_on=False``）；非 None 的 ``degraded_class`` 不发——非
+          allowlist 项目静默跳过，无降级事件可观测（运维只在 canary 项目上关心降级）。
+        * ``cross_prd_learning_shadow`` flag 关 → ``shadow_on=False``；injection 无前置 → ``injection_on=False``。
+        * ``cross_prd_learning_injection`` flag 关 → ``injection_on=False``；shadow 仍可独立开。
+        * invalid 组合 ``injection=on, shadow=off`` → runtime 降级（preflight 已注释该组合不进硬依赖链）：
+          ``injection_on=False`` + ``degraded_class="injection_not_gated"``（接线处 emit side-channel）。
+
+    Args:
+        prof: 项目 profile dict（coordinator 已 resolve flag；本函数读 ``prof["learning_memory"]`` 项目标记）。
+
+    Returns:
+        ``(shadow_on, injection_on, degraded_class)``。``degraded_class`` 非 None 表示本次 dispatch 走
+        shadow-only 或 both-off（injection 因 invalid 组合降级）。
+    """
+    lm_cfg = prof.get(_LEARNING_MEMORY_PROFILE_KEY) if isinstance(prof, dict) else None
+    v1_allowed = isinstance(lm_cfg, dict) and lm_cfg.get("enabled") is True
+    if not v1_allowed:
+        return (False, False, None)
+    flags = resolve_flags(env=os.environ, profile=prof)
+    shadow_on = bool(flags.cross_prd_learning_shadow)
+    injection_flag_on = bool(flags.cross_prd_learning_injection)
+    degraded_class: str | None = None
+    if injection_flag_on and not shadow_on:
+        # design 决策#8：invalid 组合 → 读时降级到 shadow-only（不注入）；emit learning_memory_degraded
+        # {class:injection_not_gated}（接线处 ``_attach_learning_memory`` 经 reflection side-channel 写）。
+        injection_on = False
+        degraded_class = "injection_not_gated"
+    else:
+        injection_on = injection_flag_on and shadow_on
+    return (shadow_on, injection_on, degraded_class)
+
+
+def _load_run_events(state_dir: Path, proj: str, stamp: str, slug: str) -> list:
+    """读本次 run 的 journal events（dispatch_one 已 emit 终态事件；envelope 据 verifier_history 选 evidence）。
+
+    无 journal 文件 / 读失败 → 空列表（fail-open：reflection 在 envelope 构造时若 evidence_refs 缺失会
+    走 evidence_class=PRE_VERIFIER_SHORT_CIRCUIT 路径或后续 schema reject，仍 fail-open）。
+    """
+    jpath = state_dir / "runs" / proj / f"{stamp}_{slug}.journal.jsonl"
+    try:
+        return J.read_events(jpath)
+    except Exception:
+        return []
+
+
+def _make_artifact_loader(run_id: str):
+    """构造 envelope artifact_loader callable（ArtifactRef dict → bytes 内容）。
+
+    生产用 ``artifact_store.load``；找不到则返回空 bytes（envelope 兜底为 missing_content）。
+    """
+    root = STATE_DIR / "artifacts" / run_id
+
+    def _loader(ref: dict) -> bytes:
+        try:
+            from artifact_store import ArtifactRef
+            return artifact_store.load(str(root), ArtifactRef(**ref))
+        except Exception:
+            return b""
+    return _loader
+
+
+def _build_lessons_pkg(prof: dict, prd_abs: str, *, project_id: str, run_id: str,
+                       timestamp: str, injection_on: bool) -> dict:
+    """add-cross-prd-learning-memory Section 5 接线：dispatch-entry 检索 + lesson block artifact 写盘。
+
+    **fail-open by construction**（design 决策#7）：任一步骤失败 → ``artifact_path=None``，dev-agent 不收
+    ``--lessons-artifact``（build_prompt baseline，identity no-op）+ ``degraded_class`` 非 None 供 memory_mode
+    记录。selected_lesson_ids 永远是 tuple（[] 表示无注入或 retrieval 空）。
+
+    Pipeline（spec design 决策#5）：
+        1. ``injection_on=False`` → 直接返 ``{artifact_path:None, selected_lesson_ids:(), ...}``（零 catalog 读）。
+        2. ``load_catalog_for_retrieval`` fail-open：catalog 缺/损坏 → 空 entries + degraded_class。
+        3. ``derive_task_metadata`` 从 profile + PRD 确定性派生（零 LLM）。
+        4. ``retrieve_from_source`` filter+rank+cap=5。
+        5. ``render_lesson_block`` 渲染 ≤5 lessons（严格排除 evidence/叙事）。
+        6. 非空 lesson_block → ``artifact_store.store`` 写 content-addressed artifact（kind=lessons_block；
+           sensitivity=sanitized），返回 path 透传 dev-agent。
+        7. ``candidate_count`` / ``promotion_count`` 从 catalog 投影读（监控用；retrieval 失败时省略）。
+
+    Returns:
+        ``{"artifact_path": str|None, "selected_lesson_ids": tuple[str, ...],
+        "degraded_class": str|None, "candidate_count": int, "promotion_count": int}``。
+    """
+    pkg: dict = {"artifact_path": None, "selected_lesson_ids": (),
+                 "degraded_class": None, "candidate_count": 0, "promotion_count": 0}
+    if not injection_on:
+        return pkg
+    try:
+        source = LMRet.load_catalog_for_retrieval(str(STATE_DIR), project_id)
+        if source.degraded_class is not None:
+            pkg["degraded_class"] = source.degraded_class
+            return pkg
+        # 投影统计（监控用，失败容忍）
+        try:
+            import learning_memory_catalog as LMCat
+            catalog = LMCat.load_catalog_file(str(STATE_DIR), project_id)
+            if isinstance(catalog, dict):
+                entries = catalog.get("entries") or []
+                pkg["candidate_count"] = len(entries)
+                pkg["promotion_count"] = sum(1 for e in entries
+                                             if isinstance(e, dict) and e.get("state") == "active")
+        except Exception:
+            pass
+        # task_metadata：从 profile + PRD 确定性派生（保守：缺字段不加 tag，防假阳性）
+        prof_dict = prof if isinstance(prof, dict) else {}
+        try:
+            prd_text = Path(prd_abs).read_text(encoding="utf-8")
+        except Exception:
+            prd_text = ""
+        prd_dict = _split_frontmatter(prd_text)[0] if prd_text else {}
+        task_metadata = LMRet.derive_task_metadata(
+            project_profile=prof_dict, prd=prd_dict, project_id=project_id)
+        result = LMRet.retrieve_from_source(source, task_metadata)
+        if result.degraded_class is not None:
+            pkg["degraded_class"] = result.degraded_class
+        pkg["selected_lesson_ids"] = tuple(result.selected_lesson_ids)
+        if not result.selected:
+            return pkg   # 无 applicable lessons → 无注入（baseline prompt）；非 degraded
+        lesson_block = LMRet.render_lesson_block(result.selected)
+        if not lesson_block.strip():
+            return pkg
+        # 写 content-addressed artifact（kind=lessons_block；与 feedback_artifact 对称的模式）。
+        # **绝对路径**：dev-agent 的 cwd 是目标仓 worktree，相对路径找不到——必须传 absolute path
+        # （与现有 --feedback-artifact 的相对路径模式不同；后者 driven 模式尚未 cutover，路径解析问题待
+        # 接线时一并修；lessons_block 新接线一开始就走绝对路径，避免同类问题）。
+        root = STATE_DIR / "artifacts" / run_id
+        ref = artifact_store.store(str(root), lesson_block,
+                                   kind="lessons_block", sensitivity="sanitized")
+        pkg["artifact_path"] = str(root / ref.path)
+        return pkg
+    except Exception:
+        # 任一意外失败 → 不注入（dev-agent baseline prompt）；记 degraded_class 供 memory_mode。
+        pkg["degraded_class"] = "injection_internal_error"
+        pkg["selected_lesson_ids"] = ()
+        pkg["artifact_path"] = None
+        return pkg
+
+
+def _attach_learning_memory(rec: dict, prof: dict, entry: dict, stamp: str, *,
+                            sdk_query_fn=None) -> None:
+    """add-cross-prd-learning-memory Section 7 terminal hook：reflection + memory_mode（fail-open）。
+
+    **接线点 1 + 3**（接线点 2 在 dispatch_one 内 ``_dev_cmd`` 前）。在 ``_run_one`` 调用 ``dispatch_one``
+    返回后调用——所有 terminal 出口统一收尾（dispatch_one 内部多个 ``return rec`` 都到此）。
+
+    **fail-open 硬约束**（design 决策#7）：reflection 任何 timeout/sdk_error/invalid_json/schema_reject/
+    persist_failure/evidence_mismatch → ``rec["learning_memory"] = {reflection:"degraded", class:...}``，
+    **绝不改 record.status / verify verdict / publish outcome / retry 计数**（``ReflectionResult`` 无 terminal
+    mutation 入口）。
+
+    **shadow=off → 零 reflection 副作用**（design 决策#8）：不构造 envelope、不读 journal events、不调 SDK；
+    仅合并 ``memory_mode{shadow:False, injection:False}`` 到 rec。
+
+    memory_mode 字段（task 6.4）：附加字段——**绝不改现有 status/success/failure 语义**。selected_lesson_ids
+    来自 dispatch_one 在 injection 时记入的 ``rec["_learning_selected_ids"]``（接线点 2 留的桥）；
+    若 reflection step 未跑（shadow off），从 injection pkg 桥接（仍可能 selected IDs 已记）。
+
+    Args:
+        rec: dispatch_one 返回的 record dict（in-place 合并 ``learning_memory`` + ``memory_mode`` 子字段）。
+        prof: 项目 profile（V1 allowlist 检查）。
+        entry: candidate entry（取 prd_path 推 slug）。
+        stamp: run 时间戳。
+        sdk_query_fn: 测试注入 mock-SDK（生产 None → reflection 走真 SDK + asyncio.wait_for 硬超时）。
+    """
+    # fail-open 兜底：本函数任何意外异常都不能改 terminal outcome（design 决策#7）。
+    try:
+        shadow_on, injection_on, degraded_class = _resolve_learning_enabled(prof)
+        proj = prof.get("name", "?") if isinstance(prof, dict) else "?"
+        slug = Path(entry.get("prd_path", "") or "").stem or "unknown"
+        # 接线点 2 桥接：dispatch_one 在 injection 时记入的 selected IDs（injection pkg 已写盘）
+        sel_ids = tuple(rec.pop("_learning_selected_ids", ()) or ())
+        inj_degraded = rec.pop("_learning_injection_degraded", None)
+        cand_count = int(rec.pop("_learning_candidate_count", 0) or 0)
+        prom_count = int(rec.pop("_learning_promotion_count", 0) or 0)
+
+        # 接线点 1：terminal reflection（shadow=on 才跑）
+        learning_rec: dict | None = None
+        if shadow_on:
+            try:
+                events = _load_run_events(STATE_DIR, proj, stamp, slug)
+                # run_id / prd_id 复用 coordinator 公式（同 dispatch_one 内 build_coordinator 输入 → 同 IDs）
+                _coord2 = build_coordinator(stamp=stamp, prd_path=entry.get("prd_path") or "",
+                                            proj=proj, slug=slug, state_dir=STATE_DIR,
+                                            profile=prof, stamp_fn=_now_iso)
+                loader = _make_artifact_loader(_coord2.run_id)
+                envelope = LME.build_terminal_envelope(
+                    terminal_status=rec.get("status") or "",
+                    events=events, artifact_loader=loader,
+                    run_id=_coord2.run_id, prd_id=_coord2.prd_id,
+                    iteration_id=_coord2.iteration_id, project_id=proj)
+                refl_kwargs = {}
+                if sdk_query_fn is not None:
+                    refl_kwargs["sdk_query_fn"] = sdk_query_fn
+                result = LMRefl.run_terminal_reflection(
+                    envelope=envelope, state_dir=str(STATE_DIR),
+                    project_id=proj, run_id=_coord2.run_id, prd_id=_coord2.prd_id,
+                    iteration_id=_coord2.iteration_id, timestamp=_now_iso(),
+                    **refl_kwargs)
+                learning_rec = {
+                    "reflection": result.outcome,   # "ok" / "degraded"
+                    "class": result.degraded_class,
+                    "run_id": _coord2.run_id, "prd_id": _coord2.prd_id,
+                    "evidence_class": result.evidence_class,
+                    "candidate_count": len(result.candidates),
+                }
+            except Exception as e:
+                # reflection 全链路意外故障（envelope 构造崩等）→ fail-open side-channel，不改 terminal outcome
+                try:
+                    LMRefl._append_degraded_record(
+                        str(STATE_DIR), proj,
+                        {"schema_version": LMRefl.DEGRADED_SCHEMA_VERSION,
+                         "timestamp": _now_iso(), "project_id": proj,
+                         "run_id": stamp, "prd_id": entry.get("prd_path") or "",
+                         "degraded_class": "reflection_attach_error",
+                         "reason": f"attach_learning_memory: {str(e)[:180]}"})
+                except Exception:
+                    pass
+                learning_rec = {"reflection": "degraded",
+                                "class": "reflection_attach_error",
+                                "run_id": stamp, "prd_id": entry.get("prd_path") or ""}
+        # invalid 组合 injection=on, shadow=off → emit injection_not_gated 降级（design 决策#8）
+        eff_degraded = degraded_class or inj_degraded
+        if learning_rec is not None:
+            rec["learning_memory"] = learning_rec
+        # 接线点 3：memory_mode（附加字段，不改现有 status/success/failure 语义）
+        rec["memory_mode"] = LMEff.build_memory_mode_record(
+            shadow_on, injection_on,
+            selected_lesson_ids=sel_ids,
+            candidate_count=cand_count, promotion_count=prom_count,
+            degraded_status=eff_degraded)
+    except Exception as e:
+        # 终极兜底：本函数自身意外故障也不能拖垮 dispatch（fail-open by construction）。
+        # 不写 memory_mode / learning_memory 字段（rec 仍保留 dispatch_one 设的全部 terminal 字段）。
+        log(f"  ⚠ learning_memory attach 异常（fail-open 兜底）: {e}")
+
+
 # dispatch record status → journal 终态 event（task 3.2 + 3.5）。
 # 映射对齐 ``compat_readers.legacy_status`` 保 shadow parity（task 3.4 / spec scenario 19）：pr_open/interrupted_pr
 # 叠 verify.pass（绿→published，红→revise）；blocked→external/test_blocked；fail→failed；skip→aborted；
@@ -1326,6 +1597,9 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
     if _coord.prd_digest is not None:    # task 3.1：PRD 可读→initial event 锚定内容版本（不可读省略）
         _planned_payload["prd_digest"] = _coord.prd_digest
     _sj.emit("planned", _iter, _prd, payload=_planned_payload)
+    # add-cross-prd-learning-memory Section 7：learning flag resolve 一次（接线点 2 injection + 接线点 1 reflection 消费）。
+    #   V1 allowlist（prof["learning_memory"]["enabled"]）未启用 → 整个 learning 子系统零副作用（design 决策#8）。
+    _learning_shadow_on, _learning_injection_on, _learning_degraded_class = _resolve_learning_enabled(prof)
     # task 3.5：running emit 推迟到「确认投递 dev loop」后（见下方 skip-dev 检查之后）——admission 阶段终态
     #   与 skip-dev smoke 均未投递，不应 RUNNING；否则 planned smoke reduce RUNNING ≠ legacy PLANNED
     #   （spec scenario 19 terminal-class parity 断裂）。admission 终态从 PLANNED 迁移（含 EXTERNAL_BLOCKED）。
@@ -1413,12 +1687,28 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                 _fb_artifact = _ctx.last_verifier_feedback_path
             except Exception:
                 _fb_artifact = None    # 容错：recovery 抽取失败 → 退回 baseline 读 PRD，不崩 verify 闭环
+        # add-cross-prd-learning-memory Section 5 接线（接线点 2）：dispatch-entry 检索 + lesson block
+        # artifact。``_build_lessons_pkg`` fail-open：injection=off / catalog 故障 / retrieval 空 → artifact_path=None
+        # （dev-agent baseline prompt，identity no-op）。selected_lesson_ids 记入 rec 桥接 terminal memory_mode
+        # （接线点 3 在 ``_attach_learning_memory`` 消费）。每轮重算（catalog append-only；fresh retrieval）。
+        _lessons_pkg = _build_lessons_pkg(prof, prd_abs, project_id=proj, run_id=_run,
+                                          timestamp=_now_iso(), injection_on=_learning_injection_on)
+        _lessons_artifact: str | None = _lessons_pkg["artifact_path"]
+        if round_n == 1 or _lessons_pkg["selected_lesson_ids"]:
+            # round 1 是 canonical injection 信号；后续 round 若仍有注入则覆盖（terminal effectiveness 用最新）
+            rec["_learning_selected_ids"] = _lessons_pkg["selected_lesson_ids"]
+            rec["_learning_candidate_count"] = _lessons_pkg["candidate_count"]
+            rec["_learning_promotion_count"] = _lessons_pkg["promotion_count"]
+            if _lessons_pkg["degraded_class"]:
+                rec["_learning_injection_degraded"] = _lessons_pkg["degraded_class"]
         if _coord.flags.session_aware_retry:   # task 3.3 P0-3：retry 模式注入 state_dir+session 参数（baseline flag 关→原 cmd 零变化）
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
                            state_dir=str(STATE_DIR), iteration_seq=round_n,
-                           resume_session=cur_resume_session, fork_session=cur_fork_session)
+                           resume_session=cur_resume_session, fork_session=cur_fork_session,
+                           lessons_artifact=_lessons_artifact)
         else:
-            cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact)
+            cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
+                           lessons_artifact=_lessons_artifact)
         if cmd is None:
             rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
             _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
@@ -1763,7 +2053,11 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
 
 def _run_one(entry: dict, prof: dict | None, stamp: str, args) -> dict:
     """ThreadPoolExecutor worker：取 per-owner_repo 串行锁后调 dispatch_one（同仓串行、跨仓并行）。
-    锁由 stage_dispatch 按 owner_repo 预建（避免并发 lazy 创建竞态）。仓无 remote（无锁）→ nullcontext 不串行。"""
+    锁由 stage_dispatch 按 owner_repo 预建（避免并发 lazy 创建竞态）。仓无 remote（无锁）→ nullcontext 不串行。
+
+    add-cross-prd-learning-memory Section 7 接线点 1+3：``dispatch_one`` 返回后调 ``_attach_learning_memory``
+    做 terminal reflection + memory_mode 聚合（fail-open；shadow=off 零副作用）。所有 dispatch_one 内部
+    ``return rec`` 路径统一经此 chokepoint（无需在 dispatch_one 内多处插桩）。"""
     if not prof:
         return {"project": entry.get("project"), "prd_path": entry.get("prd_path"),
                 "status": "skip", "skip_reason": "profile 不存在"}
@@ -1771,7 +2065,10 @@ def _run_one(entry: dict, prof: dict | None, stamp: str, args) -> dict:
     owner_repo = repo_owner_repo(repo) if repo else ""
     lock = DISPATCH_LOCKS.get(owner_repo) if owner_repo else None
     with lock if lock else contextlib.nullcontext():
-        return dispatch_one(entry, prof, stamp, args)
+        rec = dispatch_one(entry, prof, stamp, args)
+        _attach_learning_memory(rec, prof, entry, stamp,
+                                sdk_query_fn=getattr(args, "_learning_sdk_query_fn", None))
+        return rec
 
 
 def acquire_run_lock(break_lock: bool) -> bool:

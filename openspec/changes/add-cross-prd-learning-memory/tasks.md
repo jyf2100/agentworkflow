@@ -46,10 +46,10 @@
 
 ## 7. Rollout, Recovery, and Verification
 
-- [ ] 7.1 Add shadow mode that performs candidate extraction and catalog projection but never changes development prompts; produce parity evidence for existing dispatch terminal outcomes.
+- [x] 7.1 Add shadow mode that performs candidate extraction and catalog projection but never changes development prompts; produce parity evidence for existing dispatch terminal outcomes.
 - [ ] 7.2 Add crash-recovery tests for failure before and after candidate append and before and after catalog replacement, proving idempotent replay and no duplicate promotion.
 - [ ] 7.3 Add one allowlisted-project canary covering two distinct PRDs with an equivalent evidence-backed pattern, promotion after the second PRD, relevant injection into a third PRD, and terminal effectiveness feedback.
 - [ ] 7.4 Add negative canaries for a one-PRD repeated pattern, corrupt evidence, reflection outage, malformed catalog, irrelevant lesson, and contradicted lesson.
 - [ ] 7.5 Update `CONTEXT.md`, `SPEC.md`, and `RUNBOOK.md` with the learning-memory boundary, state locations, degradation semantics, rebuild/disable procedure, and V1 project-only scope.
 - [ ] 7.6 Run `bash scripts/quality.sh` from `Projects/项目推进流水线`, record total/passed/failed counts separately, and archive focused evidence that existing publication and retry predicates are unchanged.
-- [ ] 7.7 Document and test two-level rollback: disabling `cross_prd_learning_injection` keeps shadow candidate generation running with no prompt change; disabling `cross_prd_learning_shadow` stops reflection entirely while existing candidate facts remain inert and rebuildable.
+- [x] 7.7 Document and test two-level rollback: disabling `cross_prd_learning_injection` keeps shadow candidate generation running with no prompt change; disabling `cross_prd_learning_shadow` stops reflection entirely while existing candidate facts remain inert and rebuildable.

@@ -155,6 +155,7 @@ class ArtifactKind(str, Enum):
     TRANSCRIPT = "transcript"
     CUTOVER_SUITE = "cutover_suite"        # task 7.6：完整 cutover 套件通过 summary 归档（immutable passing evidence）
     REFLECTION = "reflection"              # add-cross-prd-learning-memory task 1.2：终态反思全量输出（sanitized）
+    LESSONS_BLOCK = "lessons_block"        # add-cross-prd-learning-memory Section 5 接线：dispatch-entry 注入 dev-agent 的 lesson block（sanitized checklist；ADR-0001 控制面/目标面边界）
 
 
 class AssuranceTier(str, Enum):

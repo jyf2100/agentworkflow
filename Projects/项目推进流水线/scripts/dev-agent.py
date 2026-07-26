@@ -84,7 +84,11 @@ def parse_args(argv: list[str]) -> dict:
            "iteration_seq": 0, "resume_session": None, "fork_session": False,
            # task 3.3 P0-3：state_dir 由控制面 run_daily 注入（=STATE_DIR）→ dev-agent session_store 与
            #   控制面 coordinator 同一 SessionStore（retry 读 dev-agent 持久化的 session_id）；缺省=worktree/state
-           "state_dir": None}
+           "state_dir": None,
+           # add-cross-prd-learning-memory Section 5 接线：控制面在 dispatch-entry 把检索出的 lesson block
+           #   写成 content-addressed artifact，path 透传给目标面 dev-agent（与 --feedback-artifact 完全对称）。
+           #   baseline / injection=off → None（build_prompt 跳过注入，prompt byte-identical baseline）。
+           "lessons_artifact": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -93,6 +97,7 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--base": out["base"] = argv[i + 1]; i += 1
         elif a == "--branch-prefix": out["branch_prefix"] = argv[i + 1]; i += 1
         elif a == "--feedback-artifact": out["feedback_artifact"] = argv[i + 1]; i += 1   # task 3.4：driven retry 反馈源
+        elif a == "--lessons-artifact": out["lessons_artifact"] = argv[i + 1]; i += 1     # Section 5：learning memory lesson block 源
         elif a == "--iteration-seq": out["iteration_seq"] = int(argv[i + 1]); i += 1     # task 3.3：revise/resume/fork/new-session 衍生 iteration
         elif a == "--resume-session": out["resume_session"] = argv[i + 1]; i += 1        # task 3.3：retry 同 session resume（SDK ResultMessage.session_id）
         elif a == "--fork-session": out["fork_session"] = True                           # task 3.3：fork 新 session（context 污染/compaction）
@@ -109,6 +114,8 @@ HELP = """dev-agent.py — 项目推进流水线·控制面标准执行器（ADR
   --prd            PRD 文件路径（必填，来自控制面 pa-prd）
   --source         触发该任务的信号文件（可选，附给 dev agent 做上下文）
   --base           分支基点（默认 main；branch protection 下永不直推主干）
+  --feedback-artifact  上轮 verify 反馈 artifact path（driven 模式 retry 用；baseline 不传）
+  --lessons-artifact   prior-PRD 经验 lesson block path（learning memory injection；baseline 不传）
   --dry-run        只跑到"改完代码 + 本地 test"，不 commit/push/开 PR
 退出码: 0 OK | 10 无/读不到 PRD | 11 SDK 失败 | 12 stalled | 13 git/PR 失败 | 99 未捕获"""
 
@@ -310,7 +317,18 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     if args.get("feedback_artifact"):
         fb = read_text(args["feedback_artifact"]) or "(读不到 feedback artifact)"
         feedback_block = f"\n\n## ⚠️ 上轮 verify 反馈（journal artifact；driven 模式 PRD 不可变，按此落实后重做）\n```\n{fb}\n```"
-    return "\n".join([
+    # add-cross-prd-learning-memory Section 5 接线：lesson block（控制面检索的 prior-PRD 经验）经
+    # ``--lessons-artifact`` path 传入（与 feedback_artifact 完全对称）。ADR-0001 控制面/目标面隔离：
+    # dev-agent **只读传入的 path**，不读控制面 state；lesson_block 是 sanitized markdown checklist
+    # （仅 trigger/action/boundary，无 evidence/叙事）。baseline / 读不到 → 空（inject_into_prompt no-op）。
+    lessons_block = ""
+    if args.get("lessons_artifact"):
+        lb = read_text(args["lessons_artifact"])
+        if lb and lb.strip():
+            lessons_block = lb
+    # inject_into_prompt（learning_memory_retrieval）：lesson_block 非空 → append 到 prompt 末尾；
+    # 空 → identity no-op（baseline prompt byte-identical，design 决策#7 fail-open）。
+    base_prompt = "\n".join([
         head,
         prot,
         "",
@@ -342,6 +360,17 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
         "现在：读 CLAUDE.md → 读 PRD → 规划 → 改代码 → 跑本仓测试 → 到「可提交且 test 绿」即停。",
         "停下前用一段话总结：改了什么 / test 结果 / 遗留风险。",
     ])
+    # add-cross-prd-learning-memory Section 5：lesson_block append（空=identity no-op，baseline prompt）
+    #   控制面/目标面隔离（ADR-0001）：lesson_block 来自控制面 ``--lessons-artifact``，仅 sanitized
+    #   markdown checklist（trigger/action/boundary）。dev-agent 不读控制面 state，不改 dispatch 主路径语义。
+    if lessons_block:
+        try:
+            from learning_memory_retrieval import inject_into_prompt as _inject
+            return _inject(base_prompt, lessons_block)
+        except Exception:
+            # 兜底：learning_memory_retrieval 不可用（不应发生——纯 stdlib）→ 原样返 baseline（fail-open）
+            return f"{base_prompt}\n\n{lessons_block}"
+    return base_prompt
 
 
 async def _can_use_tool(
