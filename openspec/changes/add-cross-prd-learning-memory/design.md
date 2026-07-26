@@ -32,6 +32,18 @@ The design must preserve the repository's existing boundaries: PRDs remain immut
 
 After the terminal event is durably recorded, a side-channel learning step builds a curated evidence envelope and invokes reflection. This step cannot alter the already-recorded terminal outcome.
 
+The curated envelope varies by terminal class, so a terminal that never ran the verifier is not forced to cite a verifier verdict. Verifier evidence is required only for terminals that transited `VERIFYING` (`published`, or `failed` within the verify loop); gate/stall/SDK/session/journal/external-state evidence is authoritative for terminals the state machine short-circuits before verifying:
+
+| Terminal class | Transit VERIFYING? | Matching authoritative evidence |
+|---|---|---|
+| `published` / verify-loop `failed` | yes | verifier verdict + fresh-green TestEvidence + reconcile result |
+| `blocked_test_gate` | no | dev-agent exit-14 gate JSON + `agent_finished` journal (`gate_blocked=true`) |
+| `stalled` | no | SDK/session meta + no-progress journal sequence |
+| `blocked_external_state` | no | external-state query record (FOUND/NOT_FOUND/UNKNOWN) + reconcile report |
+| `sandbox_blocked` / `aborted` / `state_corrupt` | no | sandbox violation / skip_reason / `CorruptionReport` |
+
+A candidate whose cited evidence class does not match its recorded terminal status is rejected with a `learning_memory_degraded` event of class `evidence_class_mismatch`.
+
 Alternative considered: add reflection instructions to the primary dev prompt. Rejected because the output precedes independent verification, is not structurally guaranteed, and conflates delivery summary with durable learning.
 
 ### 2. Use a separate read-only SDK synthesis call
@@ -57,15 +69,15 @@ Candidate and lifecycle event records are append-only, versioned, and correlated
 
 Alternative considered: update one Markdown memory file in place. Rejected because concurrent dispatches would lose updates, provenance would be weak, and retirement or correction would destroy history.
 
-### 4. Separate semantic normalization from mechanical promotion
+### 4. Mechanical equivalence keys over model-authored pattern keys
 
-The reflection output proposes a normalized `pattern_key`, applicability tags, boundaries, corrective action, and evidence references. Mechanical validation rejects missing evidence, invalid schema, task-local summaries, unsafe text, and unknown policy values.
+The reflection output supplies schema-constrained enum fields (`phase`, `failure_class`, `corrective_action_class`, `applies_when_tags`), applicability boundaries, a free-text pattern description for audit only, and evidence references. The mechanical layer derives a deterministic `equivalence_key` from `(canonical(phase), canonical(failure_class), canonical(corrective_action_class), applicability_signature)` under a `project_id` scope, where `applicability_signature = sorted(set(canonical(t) for t in applies_when_tags)) or '__unscoped__'` and `canonical(t) = lower(t).replace('-', '_').strip()`. Two candidates are equivalent if and only if their `equivalence_key` values are byte-equal; ordering of `applies_when_tags` is the only model-permitted freedom and does not affect equivalence. Mechanical validation rejects missing evidence, invalid schema, out-of-vocabulary enum values, task-local summaries, unsafe text, and unknown policy values.
 
-Ordinary promotion requires supporting candidates from at least two distinct PRD IDs in the same project. Repeated iterations of one PRD count once. A one-occurrence fast path exists only for a code-owned allowlist of critical invariant classes and requires matching independent verifier evidence; an LLM-provided severity cannot activate it.
+Promotion requires `equivalence_key`-equal candidates supported by at least two distinct PRD IDs in the same project. Repeated iterations of one PRD count once. No single-occurrence fast path exists in V1; even a verifier-confirmed critical invariant violation must recur across two distinct PRDs before promotion. An `invariant_class` asserted by the verifier is retained as an audit-only label for human triage and MUST NOT select equivalence or trigger promotion. Any enum value of `unknown` keeps the candidate unpromoted regardless of recurrence, preventing a model from batching uncertain classifications into promotion.
 
 Merges preserve all source candidate IDs and evidence lineages. Conflicting corrective actions create a conflict event and remain inactive until later evidence resolves them.
 
-Alternative considered: promote every high-confidence model response. Rejected because confidence is self-reported and would turn model mistakes into persistent prompt poisoning.
+Alternative considered: let the model author the `pattern_key`. Rejected because semantically equivalent mistakes would receive different keys, the cross-PRD recurrence test could never fire, and the injection cap could be bypassed. Semantic judgment is confined to enum selection; equivalence itself is mechanical.
 
 ### 5. Retrieve with bounded deterministic metadata matching
 
@@ -87,11 +99,14 @@ Reflection timeout, invalid JSON, corrupt candidate history, or catalog write fa
 
 The same failures do block candidate promotion and lesson injection. A malformed catalog is skipped rather than partially trusted. This gives memory lower authority than tests and verifier gates while preventing corrupt advice from entering a later prompt.
 
-### 8. Roll out behind one disabled-by-default flag
+### 8. Roll out behind two disabled-by-default flags
 
-A single coordinator-resolved `cross_prd_learning` flag controls candidate generation, projection, retrieval, and injection as one coherent capability. Disabled mode performs no SDK reflection call and preserves the current prompt and state behavior. Shadow mode may generate and project candidates without injecting lessons; enabled mode adds bounded injection after parity and quality evidence pass.
+Rollout uses two coordinator-resolved flags matching the existing `journal_shadow` / `journal_driven_dispatch` pattern in `feature_flags.py`, resolved by the same env-var > profile.loop > default-False priority:
 
-Using one capability flag avoids partial states where lessons are injected without provenance or candidates accumulate without lifecycle accounting.
+- `cross_prd_learning_shadow`: when on, the terminal learning step runs the bounded read-only reflection, appends candidates, and projects the catalog. When off, no reflection SDK call is made and prompt/state behavior is identical to today.
+- `cross_prd_learning_injection`: when on, dispatch entry injects bounded lessons into the dev prompt. Injection is gated on `cross_prd_learning_shadow=on` and on parity plus quality evidence passing, mirroring `cutover.resolve_dispatch_source`'s flag + parity + allowlist three-gate. The invalid combination `injection=on, shadow=off` resolves at read time to `shadow=on, injection=off` and emits a `learning_memory_degraded` event of class `injection_not_gated`.
+
+Two flags keep shadow candidate generation observable before any prompt is touched, avoid a partial state where lessons are injected without provenance, and stay consistent with `LoopFlags`'s all-bool contract rather than introducing an enum resolution path.
 
 ## Risks / Trade-offs
 
@@ -102,7 +117,6 @@ Using one capability flag avoids partial states where lessons are injected witho
 - [Evidence contains secrets or excessive transcripts] -> Use sanitized content-addressed artifacts, safe excerpts, schema length limits, and no raw evidence in prompts or catalogs.
 - [A memory outage becomes confused with delivery failure] -> Keep separate status fields and ensure existing terminal predicates never consume memory status.
 - [Deterministic retrieval misses semantically related lessons] -> Record retrieval outcomes first; consider embeddings only after measured misses justify a new design.
-- [Critical fast path grows into a bypass] -> Keep invariant classes code-owned and narrow; require independent verifier evidence and explicit tests per class.
 
 ## Migration Plan
 
@@ -116,6 +130,5 @@ Using one capability flag avoids partial states where lessons are injected witho
 
 ## Open Questions
 
-- Which mechanically allowlisted critical invariant classes are justified for the one-occurrence promotion exception in V1?
 - Which existing PRD/profile fields are reliable enough for initial applicability tags without adding a new semantic classification call at dispatch time?
 - What bounded timeout and cost ceiling should the terminal reflection call use after measuring the current proxy's real usage reporting?
