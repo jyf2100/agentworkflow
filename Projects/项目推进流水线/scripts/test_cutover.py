@@ -1922,3 +1922,97 @@ def test_r10_b3_known_hole_nested_unknown_leaky_field_name():
     # 洞：ai_response 不在 14 leaky 名表 + 顶层 callback_invocations 合法 → violations 空
     assert violations, (
         "若 GREEN：P2 已升嵌套覆盖扫描，移除本 xfail")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# add-cross-prd-learning-memory task 1.3b：learning injection 四重 gate 纯函数
+# design 决策#8：injection cutover 镜像 resolve_dispatch_source 的 flag + parity + allowlist 三重 gate，
+# 再追加 shadow 前置 + quality 门。任一不过 → learning_memory_degraded fallback（reason 指明未过维度）。
+# 纯函数零 IO（cutover.py:19 约束）——不在内 emit 事件。
+# ════════════════════════════════════════════════════════════════════════════
+def test_learning_injection_driven_when_all_four_gates_pass():
+    """task 1.3b：flag + shadow + parity + quality + allowlist 全过 → driven_by='learning_injection'。"""
+    r = CT.resolve_learning_injections_source(
+        injection_flag=True, shadow_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True, quality_passed=True)
+    assert r.driven_by == "learning_injection"
+    assert r.fallback_reason == ""
+
+
+def test_learning_injection_fallback_when_shadow_off():
+    """task 1.3b 门控①：shadow_flag=False → fallback（injection gated on shadow）。"""
+    r = CT.resolve_learning_injections_source(
+        injection_flag=True, shadow_flag=False, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True, quality_passed=True)
+    assert r.driven_by != "learning_injection"
+    assert "shadow" in r.fallback_reason.lower()
+
+
+def test_learning_injection_fallback_when_parity_not_passed():
+    """task 1.3b 门控②：parity_passed=False → fallback（learning parity 未过）。"""
+    r = CT.resolve_learning_injections_source(
+        injection_flag=True, shadow_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=False, quality_passed=True)
+    assert r.driven_by != "learning_injection"
+    assert "parity" in r.fallback_reason.lower()
+
+
+def test_learning_injection_fallback_when_quality_not_passed():
+    """task 1.3b 门控③：quality_passed=False → fallback（learning quality gate 未过）。"""
+    r = CT.resolve_learning_injections_source(
+        injection_flag=True, shadow_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True, quality_passed=False)
+    assert r.driven_by != "learning_injection"
+    assert "quality" in r.fallback_reason.lower()
+
+
+def test_learning_injection_fallback_when_project_not_allowlisted():
+    """task 1.3b 门控④：project_id 不在 allowlist → fallback（单项目 rollout）。"""
+    r = CT.resolve_learning_injections_source(
+        injection_flag=True, shadow_flag=True, project_id="proj-beta",
+        allowlist=("proj-alpha",), parity_passed=True, quality_passed=True)
+    assert r.driven_by != "learning_injection"
+    assert "allowlist" in r.fallback_reason.lower()
+
+
+def test_learning_injection_fallback_when_injection_flag_off():
+    """task 1.3b：injection_flag=False → fallback（不开仓，无注入；调用方查 reason 后 emit degraded）。"""
+    r = CT.resolve_learning_injections_source(
+        injection_flag=False, shadow_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True, quality_passed=True)
+    assert r.driven_by != "learning_injection"
+
+
+def test_learning_injection_result_is_dispatch_cutover_result_dataclass():
+    """task 1.3b：返回类型是 DispatchCutoverResult（与 resolve_dispatch_source 同 envelope，便于上层统一处理）。"""
+    r = CT.resolve_learning_injections_source(
+        injection_flag=True, shadow_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True, quality_passed=True)
+    assert isinstance(r, CT.DispatchCutoverResult)
+    # 三字段：driven_by / terminal_state / fallback_reason（同 dispatch cutover 契约）
+    assert hasattr(r, "driven_by")
+    assert hasattr(r, "fallback_reason")
+    assert hasattr(r, "terminal_state")
+
+
+def test_learning_injection_gate_priority_shadow_before_parity():
+    """task 1.3b：四门控按序短路——shadow 不过 + parity 不过 → fallback_reason 是 shadow（更前置的 gate）。
+    spec/design 决策#8：shadow 是 injection 的前置依赖，必须最先查。"""
+    r = CT.resolve_learning_injections_source(
+        injection_flag=True, shadow_flag=False, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=False, quality_passed=False)
+    # shadow gate 优先短路——reason 必须是 shadow，不报 parity/quality
+    assert "shadow" in r.fallback_reason.lower()
+    assert "parity" not in r.fallback_reason.lower()
+
+
+def test_learning_injection_pure_function_no_io():
+    """task 1.3b：纯函数零 IO（cutover.py:19 约束）——不在内 emit 事件、不读文件、不调 SDK。
+
+    journal_events/legacy_records 参数为 None 时函数仍正常返（参数仅为对称 resolve_dispatch_source 签名，
+    留待 section 4/5 接线学习侧 reducer 时使用；本 section 只锁定 gate 判定纯函数）。"""
+    # 不传 journal_events/legacy_records，仍正常返回（纯 gate 判定）
+    r = CT.resolve_learning_injections_source(
+        injection_flag=True, shadow_flag=True, project_id="proj-alpha",
+        allowlist=("proj-alpha",), parity_passed=True, quality_passed=True)
+    assert r.driven_by == "learning_injection"

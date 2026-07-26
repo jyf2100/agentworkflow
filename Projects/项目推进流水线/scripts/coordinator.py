@@ -79,11 +79,17 @@ class Coordinator:
 
     @property
     def is_baseline(self) -> bool:
-        """flags 全关 → True（第一阶段 baseline，dispatch 决策零变化；spec「Disabled runtime」）。"""
+        """flags 全关 → True（第一阶段 baseline，dispatch 决策零变化；spec「Disabled runtime」）。
+
+        add-cross-prd-learning-memory task 1.3a/1.3b：cross_prd_learning_shadow / cross_prd_learning_injection
+        开 → is_baseline=False（learning memory shadow/injection 是非常规 baseline；shadow 开后 terminal 学习
+        步骤会跑 read-only reflection + 投射 catalog）。
+        """
         return not any((
             self.flags.journal_shadow, self.flags.journal_driven_dispatch,
             self.flags.session_aware_retry, self.flags.lifecycle_hooks,
             self.flags.container_sandbox, self.flags.telemetry_export,
+            self.flags.cross_prd_learning_shadow, self.flags.cross_prd_learning_injection,
         ))
 
     @property
@@ -311,10 +317,15 @@ class PreflightResult:
         return self.ok
 
 
-# flag 依赖链（design 决策#1 防 impossible partial 组合 + 决策#2 cutover + 决策#8 渐进）：
+# flag 依赖链（design 决策#1 防 impossible partial 组合 + 决策#2 cutover）：
 #   journal_driven_dispatch ⇒ journal_shadow   driven 必须先 shadow（cutover 前置 shadow parity）
 #   session_aware_retry     ⇒ journal_shadow   retry 需 journal 持久化 session（无 journal = 无 session 可 resume）
 #   lifecycle_hooks         ⇒ journal_shadow   hooks 需 journal 落盘事件（无 journal = hook 事件丢失）
+# 注：cross_prd_learning_injection **不进**此硬依赖链——injection 对 shadow 的依赖是 advisory（provenance
+# 安全策略），不是功能硬依赖（shadow off 时 injection 仍可基于历史 catalog 工作）。invalid 组合
+# injection=on, shadow=off 走**运行时降级**：resolve_learning_injections_source 返 fallback
+# （driven_by='learning_injection_shadow_off'），调用方 emit learning_memory_degraded{class:injection_not_gated}
+# （接线 section 4/5），dispatch 继续不阻断——design 决策#7 fail-open for delivery + 决策#8 读时降级语义。
 # 形式：(flag, depends_on, violation_desc)
 _FLAG_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
     ("journal_driven_dispatch", "journal_shadow",

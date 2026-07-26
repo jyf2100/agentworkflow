@@ -186,3 +186,64 @@ def test_compute_digest_stable_format():
     d = A.compute_digest(b"")
     assert d.startswith("sha256:")
     assert len(d) == len("sha256:") + 64   # SHA-256 = 64 hex chars
+
+
+# ════════════════════════════════════════════════════════════════════════
+# add-cross-prd-learning-memory task 1.2：reflection 工件类别（终态反思全量输出 sanitized）
+# ════════════════════════════════════════════════════════════════════════
+def test_reflection_kind_in_allowed_kinds():
+    """task 1.2：``reflection`` 在 ArtifactKind 枚举 + ALLOWED_KINDS 派生集合（store 接受）。
+
+    终态反思全量输出（sanitized）落内容寻址工件存储——design 决策#3「Full reflection output is
+    stored as a new content-addressed ``reflection`` artifact」。ALLOWED_KINDS 由 ArtifactKind 派生，
+    加枚举值后自动生效，artifact_store.py 本身不改。"""
+    from loop_state import ArtifactKind
+    assert "reflection" in {k.value for k in ArtifactKind}
+    assert "reflection" in A.ALLOWED_KINDS
+
+
+def test_store_reflection_kind_round_trip(tmp_path):
+    """task 1.2：reflection 工件可存 + load 往返 + digest 校验通过（同其他 kind 契约）。
+
+    reflection 是终态反思的全量 sanitized 输出（含 pattern_description、evidence refs、schema 字段），
+    走与其他 kind 同样的内容寻址存储 + digest 校验链路。"""
+    # Arrange — reflection 通常是结构化 JSON sanitized 后的文本
+    content = '{"phase":"verify","failure_class":"gate_blocked","corrective_action":"add test"}'
+    # Act
+    ref = A.store(tmp_path, content, kind="reflection", sensitivity="sanitized")
+    got = A.load(tmp_path, ref)
+    # Assert — 往返一致，digest 校验通过（load 内 verify）
+    assert ref.kind == "reflection"
+    assert ref.sensitivity == "sanitized"
+    assert got == content.encode("utf-8")
+    ok, _ = A.verify_digest(content, ref)
+    assert ok is True
+
+
+def test_store_reflection_sanitized_redacts_secrets(tmp_path):
+    """task 1.2：reflection sensitivity=sanitized 抹密钥后再算 digest（design 决策#5 + #3）。
+
+    反思输出可能引用 token/path 等敏感串——sanitized 存储前消毒，digest 绑定消毒后内容，落盘内容无密钥。"""
+    # Arrange
+    content = "reflection output\ntoken=ghp_supersecretvalue1234\nmore"
+    # Act
+    ref = A.store(tmp_path, content, kind="reflection", sensitivity="sanitized")
+    got = A.load(tmp_path, ref).decode("utf-8")
+    # Assert
+    assert "ghp_supersecretvalue1234" not in got
+    assert "reflection output" in got and "more" in got
+
+
+def test_load_reflection_raises_on_integrity_failure(tmp_path):
+    """task 1.2：reflection 工件篡改后 load fail-closed（同 test_load_raises_on_integrity_failure）。
+
+    reflection 是 lesson candidate 的 evidence 来源——内容被篡改 → 校验失败 → 绝不进 catalog（design「corrupt
+    or unverified memory MUST fail closed」）。"""
+    # Arrange
+    content = b'{"reflection":"original"}'
+    ref = A.store(tmp_path, content, kind="reflection", sensitivity="sanitized")
+    # 篡改
+    (tmp_path / ref.path).write_bytes(b'{"reflection":"TAMPERED"}')
+    # Act / Assert
+    with pytest.raises(A.ArtifactIntegrityError):
+        A.load(tmp_path, ref)

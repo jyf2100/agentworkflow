@@ -154,6 +154,7 @@ class ArtifactKind(str, Enum):
     RECOVERY_SNAPSHOT = "recovery_snapshot"
     TRANSCRIPT = "transcript"
     CUTOVER_SUITE = "cutover_suite"        # task 7.6：完整 cutover 套件通过 summary 归档（immutable passing evidence）
+    REFLECTION = "reflection"              # add-cross-prd-learning-memory task 1.2：终态反思全量输出（sanitized）
 
 
 class AssuranceTier(str, Enum):

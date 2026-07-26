@@ -31,6 +31,12 @@ class LoopFlags:
         ``lifecycle_hooks``         — 接入 SDK hook adapter（PreToolUse/Stop/PreCompact/...）。
         ``container_sandbox``       — 用 container sandbox（否则 local-worktree 低保证 tier）。
         ``telemetry_export``        — OTLP export 启用（后端不可用时本地降级，不转失败）。
+
+    add-cross-prd-learning-memory task 1.3a/1.3b：
+        ``cross_prd_learning_shadow``    — terminal 学习步骤跑 read-only reflection + 投射 catalog（shadow，
+                                          不改 prompt）；off → 无 reflection SDK 调用、无 prompt/state 变化。
+        ``cross_prd_learning_injection`` — dispatch 注入 bounded lessons 进 dev prompt。gated on shadow +
+                                          parity + quality（cutover 三门控，镜像 journal_driven_dispatch）。
     """
     __test__ = False   # 显式声明非测试类，免 pytest 收集告警（与 evidence.TestEvidence 一致；名 Loop* 不命中但保持一致）
 
@@ -40,6 +46,8 @@ class LoopFlags:
     lifecycle_hooks: bool = False
     container_sandbox: bool = False
     telemetry_export: bool = False
+    cross_prd_learning_shadow: bool = False       # task 1.3a
+    cross_prd_learning_injection: bool = False    # task 1.3b（gated on shadow；preflight 静态阻断 invalid 组合）
 
 
 # flag 名 → 环境变量名（运维/CI 文档化的稳定开关名）。改这些 = 改对外契约。
@@ -50,6 +58,11 @@ FLAGS_ENV_MAP: dict[str, str] = {
     "lifecycle_hooks": "PA_LOOP_LIFECYCLE_HOOKS",
     "container_sandbox": "PA_LOOP_CONTAINER_SANDBOX",
     "telemetry_export": "PA_LOOP_TELEMETRY_EXPORT",
+    # add-cross-prd-learning-memory task 1.3a/1.3b：**不带 PA_LOOP_ prefix，有意域切割**——
+    # learning memory 是独立能力域（跨 PRD 反思 + 注入），不属于 loop runtime 6 大渐进启用面。
+    # env 名稳定（运维/CI 文档化的开关名），改这些 = 改对外契约。
+    "cross_prd_learning_shadow": "PA_LEARNING_SHADOW",
+    "cross_prd_learning_injection": "PA_LEARNING_INJECTION",
 }
 
 # 真值集合（strip + lower 后判定）。其余一律 False（保守：未知字符串不开）。

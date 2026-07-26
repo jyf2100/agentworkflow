@@ -207,6 +207,59 @@ def test_preflight_records_all_violations_structured():
     assert "journal_shadow" in r.blocked.reason
 
 
+# ════════════════════════════════════════════════════════════════════════
+# add-cross-prd-learning-memory task 1.3a/1.3b：learning flag 接入 is_baseline + preflight 依赖链
+# ════════════════════════════════════════════════════════════════════════
+def test_is_baseline_false_when_learning_shadow_on():
+    """task 1.3a：cross_prd_learning_shadow 开 → is_baseline=False（learning shadow 是非常规 baseline）。
+
+    design 决策#8：shadow 开后 terminal 学习步骤会跑 read-only reflection + 投射 catalog——不再是 baseline。"""
+    flags = LoopFlags(cross_prd_learning_shadow=True)
+    coord = CO.Coordinator(
+        flags=flags, run_id="r", prd_id="p", iteration_id="i",
+        journal=None, artifact_root="/tmp/x", trace=None, telemetry_sink=None)
+    assert coord.is_baseline is False
+
+
+def test_is_baseline_false_when_learning_injection_on():
+    """task 1.3b：cross_prd_learning_injection 开 → is_baseline=False（无论 shadow 开关；injection 单开即非 baseline）。"""
+    flags = LoopFlags(cross_prd_learning_injection=True, cross_prd_learning_shadow=False)
+    coord = CO.Coordinator(
+        flags=flags, run_id="r", prd_id="p", iteration_id="i",
+        journal=None, artifact_root="/tmp/x", trace=None, telemetry_sink=None)
+    assert coord.is_baseline is False
+
+
+def test_preflight_does_not_block_learning_injection_shadow_mismatch():
+    """task 1.3b：invalid 组合 injection=on, shadow=off → preflight **不**阻断 dispatch（fail-open for delivery）。
+
+    design 决策#7 fail-open for delivery + 决策#8 读时降级：injection 对 shadow 的依赖是 advisory
+    （provenance 安全策略），非功能硬依赖。invalid 组合不阻断 dev loop，而是走运行时降级——
+    cutover.resolve_learning_injections_source 返 fallback（driven_by='learning_injection_shadow_off'，
+    fallback_reason 含 shadow off），调用方 emit learning_memory_degraded{class:injection_not_gated}
+    （接线 section 4/5）。故 cross_prd_learning_injection 不进 _FLAG_DEPENDENCIES 硬依赖链。"""
+    flags = LoopFlags(cross_prd_learning_injection=True, cross_prd_learning_shadow=False)
+    r = CO.preflight(flags)
+    # preflight 放行（降级留运行时 gate，不阻断 dispatch）
+    assert r.is_ok
+    assert r.blocked is None
+
+
+def test_preflight_accepts_learning_injection_with_shadow():
+    """task 1.3b：合法组合 injection=on, shadow=on → preflight 放行（依赖满足）。"""
+    flags = LoopFlags(cross_prd_learning_injection=True, cross_prd_learning_shadow=True)
+    r = CO.preflight(flags)
+    assert r.is_ok
+    assert r.blocked is None
+
+
+def test_preflight_accepts_shadow_alone():
+    """task 1.3a：shadow 单开（injection 关）→ 自洽，preflight 放行。"""
+    flags = LoopFlags(cross_prd_learning_shadow=True)
+    r = CO.preflight(flags)
+    assert r.is_ok
+
+
 # ─── task 3.1：immutable PRD content digest（content-addressed prd_id + planned event 真源）──
 def test_build_with_prd_content_captures_digest_and_content_addresses_prd_id(tmp_path):
     """spec「Immutable new-run input」+ task 3.1：build_coordinator(prd_content=...) 在 dispatch entry

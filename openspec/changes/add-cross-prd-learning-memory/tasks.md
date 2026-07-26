@@ -1,10 +1,10 @@
 ## 1. Contracts and Feature Boundary
 
-- [ ] 1.1 Add versioned dataclasses/enums for lesson candidates, lesson lifecycle events, active catalog entries, applicability boundaries, evidence lineage, and usage outcomes, with round-trip and invalid-schema tests.
-- [ ] 1.2 Add `reflection` to the content-addressed artifact kind allowlist and test sanitized storage, digest verification, and corrupt-artifact rejection.
-- [ ] 1.3a Add a disabled-by-default coordinator-resolved `cross_prd_learning_shadow` feature flag (env `PA_LEARNING_SHADOW`, profile.loop, default False) that, when on, runs read-only reflection and projects the catalog; when off performs no reflection call and no prompt or state change. Add baseline and shadow behavior tests.
-- [ ] 1.3b Add a disabled-by-default coordinator-resolved `cross_prd_learning_injection` feature flag (env `PA_LEARNING_INJECTION`, profile.loop, default False), gated on `cross_prd_learning_shadow=on` plus parity and quality evidence; add tests that the invalid `injection=on, shadow=off` combination degrades to shadow-only and emits `learning_memory_degraded` of class `injection_not_gated`.
-- [ ] 1.4 Add tests proving a model-authored `pattern_key`, `equivalence_key`, `invariant_class`, `project_id`, promotion count, or storage path is redacted at the schema boundary and cannot influence equivalence or promotion.
+- [x] 1.1 Add versioned dataclasses/enums for lesson candidates, lesson lifecycle events, active catalog entries, applicability boundaries, evidence lineage, and usage outcomes, with round-trip and invalid-schema tests.
+- [x] 1.2 Add `reflection` to the content-addressed artifact kind allowlist and test sanitized storage, digest verification, and corrupt-artifact rejection.
+- [x] 1.3a Add a disabled-by-default coordinator-resolved `cross_prd_learning_shadow` feature flag (env `PA_LEARNING_SHADOW`, profile.loop, default False) that, when on, runs read-only reflection and projects the catalog; when off performs no reflection call and no prompt or state change. Add baseline and shadow behavior tests.
+- [x] 1.3b Add a disabled-by-default coordinator-resolved `cross_prd_learning_injection` feature flag (env `PA_LEARNING_INJECTION`, profile.loop, default False), gated on `cross_prd_learning_shadow=on` plus parity and quality evidence; add tests that the invalid `injection=on, shadow=off` combination degrades to shadow-only and emits `learning_memory_degraded` of class `injection_not_gated`.
+- [x] 1.4 Add tests proving a model-authored `pattern_key`, `equivalence_key`, `invariant_class`, `project_id`, promotion count, or storage path is redacted at the schema boundary and cannot influence equivalence or promotion.
 
 ## 2. Append-Only Memory State
 

@@ -689,6 +689,74 @@ def resolve_dispatch_source(*, journal_driven_flag, project_id, allowlist,
         journal_driven=True, journal_events=journal_events, legacy_records=legacy_records)
 
 
+def resolve_learning_injections_source(*, injection_flag, shadow_flag, project_id, allowlist,
+                                       parity_passed, quality_passed,
+                                       journal_events=None, legacy_records=None) -> DispatchCutoverResult:
+    """add-cross-prd-learning-memory task 1.3b：learning injection 四重 gate 纯函数。
+
+    镜像 ``resolve_dispatch_source`` 的 flag + parity + allowlist 三重 gate，再追加 ``shadow`` 前置
+    与 ``quality`` 门。design 决策#8：injection cutover 必须先满足 shadow parity + quality evidence，
+    防止跳过 shadow 直接注入未经验证的 prompt 内容。
+
+    四重 gate 按序短路（任一不过即 fallback，理由指明未过维度）：
+        ① ``shadow_flag`` off → fallback ``cross_prd_learning_shadow off (injection gated on shadow)``
+        ② ``parity_passed`` False → fallback ``learning parity not passed``
+        ③ ``quality_passed`` False → fallback ``learning quality gate not passed``
+        ④ ``project_id`` 不在 ``allowlist`` → fallback ``project not in learning injection allowlist``
+
+    全过 → ``driven_by='learning_injection'``。fallback 时 ``driven_by`` 非 ``'learning_injection'``，
+    调用方查 ``fallback_reason`` 后 emit ``learning_memory_degraded`` 事件（class 见 spec；接线留 section 4/5）。
+
+    **纯函数零 IO**（cutover.py:19 约束）：不在内 emit 事件、不读文件、不调 SDK。
+
+    Args:
+        injection_flag: ``cross_prd_learning_injection`` 解析值。
+        shadow_flag: ``cross_prd_learning_shadow`` 解析值（injection 的前置依赖）。
+        project_id: 当前 dispatch 项目 ID（allowlist 单项目 rollout）。
+        allowlist: 学习注入白名单（单项目 rollout，与 dispatch allowlist 解耦）。
+        parity_passed: 学习 parity 证据是否通过（shadow→injection cutover 前置）。
+        quality_passed: 学习 quality gate 是否通过。
+        journal_events/legacy_records: 占位参数，对称 ``resolve_dispatch_source`` 签名，留待 section 4/5
+            接线学习侧 reducer 时使用；本 section gate 判定不消费。
+
+    Returns:
+        ``DispatchCutoverResult``：``driven_by='learning_injection'`` 全过；否则 ``driven_by`` 为 fallback
+        值，``fallback_reason`` 指明未过维度。
+    """
+    allow = set(allowlist or ())
+    terminal_state = ""      # gate 判定阶段无 terminal state；reducer 驱动在 section 4/5 接线时填
+    # ① shadow 前置（design 决策#8：injection gated on shadow）
+    if not shadow_flag:
+        return DispatchCutoverResult(
+            driven_by="learning_injection_shadow_off", terminal_state=terminal_state,
+            fallback_reason="cross_prd_learning_shadow off (injection gated on shadow)")
+    # ② parity（cutover 前置）
+    if not parity_passed:
+        return DispatchCutoverResult(
+            driven_by="learning_injection_parity_failed", terminal_state=terminal_state,
+            fallback_reason="learning parity not passed")
+    # ③ quality gate
+    if not quality_passed:
+        return DispatchCutoverResult(
+            driven_by="learning_injection_quality_failed", terminal_state=terminal_state,
+            fallback_reason="learning quality gate not passed")
+    # ④ allowlist（单项目 rollout）
+    if project_id not in allow:
+        return DispatchCutoverResult(
+            driven_by="learning_injection_not_allowlisted", terminal_state=terminal_state,
+            fallback_reason=f"project {project_id!r} not in learning injection allowlist")
+    # injection_flag 关：所有前置 gate 过但 injection 仍关 → fallback（spec scenario「Only unrelated lessons exist」
+    # 等价契约：injection 不开仓 = 无 prompt 改动）。注：检查挪到末位，因 shadow/parity/quality/allowlist 是
+    # 开仓的硬前置，injection_flag 是「是否启用」的开关，二者维度不同——preflight 已静态阻断 injection=on,shadow=off。
+    if not injection_flag:
+        return DispatchCutoverResult(
+            driven_by="learning_injection_flag_off", terminal_state=terminal_state,
+            fallback_reason="cross_prd_learning_injection flag off (shadow retains candidate generation)")
+    # 全过 → learning injection 开仓
+    return DispatchCutoverResult(
+        driven_by="learning_injection", terminal_state=terminal_state, fallback_reason="")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 8.8 full repository quality gate + archive passing evidence
 # ════════════════════════════════════════════════════════════════════════════

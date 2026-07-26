@@ -61,8 +61,11 @@ def test_env_truthy_falsy_variants():
         assert resolve_flags(env={"PA_LOOP_LIFECYCLE_HOOKS": v}).lifecycle_hooks is False, f"{v!r} 应为 falsy"
 
 
-def test_all_six_env_names_mapped():
-    """FLAGS_ENV_MAP 覆盖 6 个 flag，且 env 名稳定（运维/CI 文档化的开关名）。"""
+def test_all_env_names_mapped():
+    """FLAGS_ENV_MAP 覆盖所有 flag，且 env 名稳定（运维/CI 文档化的开关名）。
+
+    add-cross-prd-learning-memory task 1.3a/1.3b 追加 cross_prd_learning_shadow / cross_prd_learning_injection，
+    **不带 PA_LOOP_ prefix，有意域切割**（learning memory 是独立能力域）。"""
     assert FLAGS_ENV_MAP == {
         "journal_shadow": "PA_LOOP_JOURNAL_SHADOW",
         "journal_driven_dispatch": "PA_LOOP_JOURNAL_DRIVEN_DISPATCH",
@@ -70,6 +73,9 @@ def test_all_six_env_names_mapped():
         "lifecycle_hooks": "PA_LOOP_LIFECYCLE_HOOKS",
         "container_sandbox": "PA_LOOP_CONTAINER_SANDBOX",
         "telemetry_export": "PA_LOOP_TELEMETRY_EXPORT",
+        # task 1.3a/1.3b：learning memory 双 flag（域切割，不带 PA_LOOP_ prefix）
+        "cross_prd_learning_shadow": "PA_LEARNING_SHADOW",
+        "cross_prd_learning_injection": "PA_LEARNING_INJECTION",
     }
 
 
@@ -119,3 +125,56 @@ def test_loop_flags_is_frozen():
     except dataclasses.FrozenInstanceError:
         return
     raise AssertionError("LoopFlags 应为 frozen——flag 解析结果不可被调用方改写")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# add-cross-prd-learning-memory task 1.3a / 1.3b：learning memory 双 flag（默认关）
+# design 决策#8：两 flag 镜像 journal_shadow / journal_driven_dispatch 模式——shadow 先旁路生成 candidate，
+# injection 经 parity + quality + allowlist 三门控才注入 prompt。两 flag 默认 False = baseline 不变。
+# 不带 PA_LOOP_ prefix（PA_LEARNING_SHADOW / PA_LEARNING_INJECTION）——有意域切割，learning memory 是独立能力域。
+# ════════════════════════════════════════════════════════════════════════
+def test_learning_flags_default_false():
+    """task 1.3a/1.3b：两 flag 默认 False——第一阶段行为零变化（design 决策#8）。"""
+    flags = resolve_flags(env={})
+    assert flags.cross_prd_learning_shadow is False
+    assert flags.cross_prd_learning_injection is False
+
+
+def test_learning_flags_env_names_mapped_without_loop_prefix():
+    """task 1.3a/1.3b：FLAGS_ENV_MAP 含两 flag，env 名是 PA_LEARNING_SHADOW / PA_LEARNING_INJECTION
+    （**不带 PA_LOOP_ prefix，有意域切割**）。"""
+    assert FLAGS_ENV_MAP["cross_prd_learning_shadow"] == "PA_LEARNING_SHADOW"
+    assert FLAGS_ENV_MAP["cross_prd_learning_injection"] == "PA_LEARNING_INJECTION"
+    # 域切割：确认不是 PA_LOOP_* 前缀（防误归类为 loop runtime flag）
+    assert "PA_LOOP_LEARNING" not in " ".join(FLAGS_ENV_MAP.values())
+
+
+def test_learning_shadow_env_truthy_enables():
+    """task 1.3a：PA_LEARNING_SHADOW=1/on/true → cross_prd_learning_shadow=True。"""
+    for v in ["1", "true", "TRUE", "yes", "on"]:
+        assert resolve_flags(env={"PA_LEARNING_SHADOW": v}).cross_prd_learning_shadow is True, f"{v} 应 truthy"
+
+
+def test_learning_shadow_env_falsy_disables():
+    """task 1.3a：PA_LEARNING_SHADOW=0/false/no/off/空/乱串 → False。"""
+    for v in ["0", "false", "no", "off", "", "random"]:
+        assert resolve_flags(env={"PA_LEARNING_SHADOW": v}).cross_prd_learning_shadow is False, f"{v} 应 falsy"
+
+
+def test_learning_injection_env_truthy_enables():
+    """task 1.3b：PA_LEARNING_INJECTION=1 → cross_prd_learning_injection=True。"""
+    assert resolve_flags(env={"PA_LEARNING_INJECTION": "1"}).cross_prd_learning_injection is True
+
+
+def test_learning_shadow_via_profile_loop():
+    """task 1.3a：profile.loop.cross_prd_learning_shadow=True → 开（per-project canary）。"""
+    flags = resolve_flags(env={}, profile={"loop": {"cross_prd_learning_shadow": True}})
+    assert flags.cross_prd_learning_shadow is True
+    assert flags.cross_prd_learning_injection is False
+
+
+def test_learning_env_overrides_profile():
+    """task 1.3a：env 显式设置压过 profile（运维 kill switch 一键关回旧逻辑）。"""
+    flags = resolve_flags(env={"PA_LEARNING_SHADOW": "false"},
+                          profile={"loop": {"cross_prd_learning_shadow": True}})
+    assert flags.cross_prd_learning_shadow is False
