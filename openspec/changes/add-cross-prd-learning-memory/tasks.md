@@ -23,11 +23,11 @@
 
 ## 4. Terminal Reflection
 
-- [ ] 4.1 Build a curated terminal evidence envelope selected by terminal status class: reference verifier verdict + fresh-green TestEvidence + reconcile result for terminals that transited `VERIFYING` (`published` / verify-loop `failed`); reference the matching mechanical gate / stall / SDK-session / journal / external-state evidence for short-circuit terminals (`blocked_test_gate` / `stalled` / `blocked_external_state` / `sandbox_blocked` / `aborted` / `state_corrupt`). Exclude raw secrets and unbounded transcripts.
+- [ ] 4.1 Build a curated terminal evidence envelope selected by the journal's actual verifier transition history, not the terminal status label: reference verifier verdict (or revise sequence + exhaustion record) when the journal contains any verifier event, including post-verifier short-circuits such as publication reconcile UNKNOWN after a verifier pass; reference matching mechanical gate / stall / SDK-session / external-state evidence only when the journal records no verifier event (pre-verifier short-circuit). Add counterexamples for pre-verifier `blocked_external_state`, post-verifier `blocked_external_state`, `verifier-revise-exhausted`, and pre/post-verifier `blocked_evidence`. Exclude raw secrets and unbounded transcripts.
 - [ ] 4.2 Implement a separate bounded read-only Agent SDK reflection call with model omitted, no mutable tools, strict JSON parsing, timeout handling, and no writes to primary development session metadata.
 - [ ] 4.3 Invoke reflection only after the PRD terminal event is durably recorded; prove repeated Stop hooks and intermediate retry iterations cannot generate or promote cross-PRD lessons.
 - [ ] 4.4 Persist valid full reflection output as a sanitized content-addressed artifact and append accepted candidates with evidence references.
-- [ ] 4.5 Record `learning_memory_degraded` on timeout, SDK error, invalid JSON, schema rejection, persistence failure, or evidence class mismatch with the recorded terminal status (e.g., a `blocked_test_gate` candidate citing a verifier verdict, or a `published` candidate lacking verifier evidence), without changing test, verify, retry, publication, or terminal outcomes.
+- [ ] 4.5 Record `learning_memory_degraded` on timeout, SDK error, invalid JSON, schema rejection, persistence failure, or evidence history mismatch with the journal's verifier transition (e.g., a pre-verifier short-circuit candidate citing a verifier verdict, or a post-verifier terminal lacking verifier evidence), without changing test, verify, retry, publication, or terminal outcomes.
 
 ## 5. Retrieval and Prompt Injection
 

@@ -32,17 +32,15 @@ The design must preserve the repository's existing boundaries: PRDs remain immut
 
 After the terminal event is durably recorded, a side-channel learning step builds a curated evidence envelope and invokes reflection. This step cannot alter the already-recorded terminal outcome.
 
-The curated envelope varies by terminal class, so a terminal that never ran the verifier is not forced to cite a verifier verdict. Verifier evidence is required only for terminals that transited `VERIFYING` (`published`, or `failed` within the verify loop); gate/stall/SDK/session/journal/external-state evidence is authoritative for terminals the state machine short-circuits before verifying:
+The curated envelope is selected by the journal's actual transition history, not by the terminal status label. A given terminal status can be reached via different paths — `blocked_external_state`, for example, arises both before the verifier (an early remote-state UNKNOWN) and after it (verifier passed, then publication reconcile returned UNKNOWN) — so the presence of verifier events in the journal decides which evidence is authoritative:
 
-| Terminal class | Transit VERIFYING? | Matching authoritative evidence |
+| Journal transition history | Verifier evidence required? | Matching authoritative evidence |
 |---|---|---|
-| `published` / verify-loop `failed` | yes | verifier verdict + fresh-green TestEvidence + reconcile result |
-| `blocked_test_gate` | no | dev-agent exit-14 gate JSON + `agent_finished` journal (`gate_blocked=true`) |
-| `stalled` | no | SDK/session meta + no-progress journal sequence |
-| `blocked_external_state` | no | external-state query record (FOUND/NOT_FOUND/UNKNOWN) + reconcile report |
-| `sandbox_blocked` / `aborted` / `state_corrupt` | no | sandbox violation / skip_reason / `CorruptionReport` |
+| journal records a verifier event that passed (terminal `published`, or post-verifier short-circuit after pass) | yes | verifier pass verdict + fresh-green TestEvidence + reconcile/short-circuit record |
+| journal records verifier revise events ending in revise-exhaustion (terminal `verifier-revise-exhausted`) | yes | verifier revise verdict sequence + revise-exhaustion record + `independent_verify` test_log |
+| journal records no verifier event — pre-verifier short-circuit (`blocked_test_gate`, `stalled`, pre-verifier `blocked_external_state`, `sandbox_blocked`, `aborted`, `state_corrupt`) | no | matching mechanical evidence: dev-agent exit-14 gate JSON / SDK-session meta + no-progress sequence / external-state query (FOUND/NOT_FOUND/UNKNOWN) / sandbox violation / skip_reason / `CorruptionReport` |
 
-A candidate whose cited evidence class does not match its recorded terminal status is rejected with a `learning_memory_degraded` event of class `evidence_class_mismatch`.
+A candidate whose cited evidence does not match the journal's actual verifier transition history is rejected with a `learning_memory_degraded` event of class `evidence_history_mismatch`. The terminal label alone never determines the evidence class; the journal does.
 
 Alternative considered: add reflection instructions to the primary dev prompt. Rejected because the output precedes independent verification, is not structurally guaranteed, and conflates delivery summary with durable learning.
 
@@ -71,7 +69,7 @@ Alternative considered: update one Markdown memory file in place. Rejected becau
 
 ### 4. Mechanical equivalence keys over model-authored pattern keys
 
-The reflection output supplies schema-constrained enum fields (`phase`, `failure_class`, `corrective_action_class`, `applies_when_tags`), applicability boundaries, a free-text pattern description for audit only, and evidence references. The mechanical layer derives a deterministic `equivalence_key` from `(canonical(phase), canonical(failure_class), canonical(corrective_action_class), applicability_signature)` under a `project_id` scope, where `applicability_signature = sorted(set(canonical(t) for t in applies_when_tags)) or '__unscoped__'` and `canonical(t) = lower(t).replace('-', '_').strip()`. Two candidates are equivalent if and only if their `equivalence_key` values are byte-equal; ordering of `applies_when_tags` is the only model-permitted freedom and does not affect equivalence. Mechanical validation rejects missing evidence, invalid schema, out-of-vocabulary enum values, task-local summaries, unsafe text, and unknown policy values.
+The reflection output supplies schema-constrained enum fields (`phase`, `failure_class`, `corrective_action_class`, `applies_when_tags`), a bounded free-text `corrective_action` describing the executable corrective step (used for audit and prompt injection), applicability boundaries, a free-text pattern description for audit only, and evidence references. The `corrective_action_class` enum participates only in the equivalence key; the `corrective_action` text carries the executable content injected into later PRD prompts under a schema length limit. The mechanical layer derives a deterministic `equivalence_key` from `(canonical(phase), canonical(failure_class), canonical(corrective_action_class), applicability_signature)` under a `project_id` scope, where `applicability_signature = sorted(set(canonical(t) for t in applies_when_tags)) or '__unscoped__'` and `canonical(t) = lower(t).replace('-', '_').strip()`. Two candidates are equivalent if and only if their `equivalence_key` values are byte-equal; ordering of `applies_when_tags` is the only model-permitted freedom and does not affect equivalence. Mechanical validation rejects missing evidence, invalid schema, out-of-vocabulary enum values, task-local summaries, unsafe text, and unknown policy values.
 
 Promotion requires `equivalence_key`-equal candidates supported by at least two distinct PRD IDs in the same project. Repeated iterations of one PRD count once. No single-occurrence fast path exists in V1; even a verifier-confirmed critical invariant violation must recur across two distinct PRDs before promotion. An `invariant_class` asserted by the verifier is retained as an audit-only label for human triage and MUST NOT select equivalence or trigger promotion. Any enum value of `unknown` keeps the candidate unpromoted regardless of recurrence, preventing a model from batching uncertain classifications into promotion.
 
@@ -104,7 +102,7 @@ The same failures do block candidate promotion and lesson injection. A malformed
 Rollout uses two coordinator-resolved flags matching the existing `journal_shadow` / `journal_driven_dispatch` pattern in `feature_flags.py`, resolved by the same env-var > profile.loop > default-False priority:
 
 - `cross_prd_learning_shadow`: when on, the terminal learning step runs the bounded read-only reflection, appends candidates, and projects the catalog. When off, no reflection SDK call is made and prompt/state behavior is identical to today.
-- `cross_prd_learning_injection`: when on, dispatch entry injects bounded lessons into the dev prompt. Injection is gated on `cross_prd_learning_shadow=on` and on parity plus quality evidence passing, mirroring `cutover.resolve_dispatch_source`'s flag + parity + allowlist three-gate. The invalid combination `injection=on, shadow=off` resolves at read time to `shadow=on, injection=off` and emits a `learning_memory_degraded` event of class `injection_not_gated`.
+- `cross_prd_learning_injection`: when on, dispatch entry injects bounded lessons into the dev prompt. Injection is gated on `cross_prd_learning_shadow=on` and on parity plus quality evidence passing, mirroring `cutover.resolve_dispatch_source`'s flag + parity + allowlist three-gate. The invalid combination `injection=on, shadow=off` resolves at read time to `shadow=off, injection=off` — never silently enabling reflection — and emits a `learning_memory_degraded` event of class `injection_not_gated`.
 
 Two flags keep shadow candidate generation observable before any prompt is touched, avoid a partial state where lessons are injected without provenance, and stay consistent with `LoopFlags`'s all-bool contract rather than introducing an enum resolution path.
 
@@ -126,7 +124,7 @@ Two flags keep shadow candidate generation observable before any prompt is touch
 4. Enable project-level catalog projection and verify deterministic rebuild under crash/concurrency tests.
 5. Enable retrieval in report-only mode and compare selected lessons with manual review.
 6. Enable bounded prompt injection for one allowlisted project, then expand after no regression in existing quality and publication outcomes.
-7. Roll back by disabling `cross_prd_learning`; existing candidate facts remain inert and no target repository cleanup is required.
+7. Roll back in two levels: disable `cross_prd_learning_injection` first (keeps shadow candidate generation, no prompt change), then disable `cross_prd_learning_shadow` to stop reflection entirely; existing candidate facts remain inert and no target repository cleanup is required.
 
 ## Open Questions
 
