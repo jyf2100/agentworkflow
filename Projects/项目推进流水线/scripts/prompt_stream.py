@@ -18,14 +18,22 @@ dict 结构对齐 SDK 字符串路径（``_internal/client.py:214-219``：``type
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, AsyncIterator
 
 
 async def prompt_stream(prompt: str) -> AsyncIterator[dict[str, Any]]:
-    """单 yield 的 user 消息异步流（SDK streaming 模式）。
+    """yield 首条 user 消息后保持 pending，直到 stream_input 被取消（SDK streaming 模式）。
 
-    产出一个 dict，结构对齐 SDK 字符串路径（``_internal/client.py:214-219``）。
+    产出 dict 结构对齐 SDK 字符串路径（``_internal/client.py:214-219``）。
     用法：``query(prompt=prompt_stream(p), options=options)``。
+
+    yield 后 ``await asyncio.Event().wait()`` 永不返回（无 set），保持 input iterable
+    pending 直到 query 结束、stream_input 任务被 cancel。这避免 SDK 0.2.121
+    ``stream_input`` 在正常耗尽后调 ``wait_for_result_and_end_input()``——其保活条件
+    ``sdk_mcp_servers or hooks`` 遗漏 ``can_use_tool``，无 hooks 时立即 ``end_input()``
+    关 stdin，后续轮次 ``can_use_tool`` 的 permission response 写不回（``AbortError:
+    Stream closed``）。见 change ``fix-dev-agent-stream-aclose-race``。
     """
     yield {
         "type": "user",
@@ -33,3 +41,5 @@ async def prompt_stream(prompt: str) -> AsyncIterator[dict[str, Any]]:
         "message": {"role": "user", "content": prompt},
         "parent_tool_use_id": None,
     }
+    # 保持 pending 到 result/cancel；stream_input cancel 时本 await 抛 CancelledError 正常退出
+    await asyncio.Event().wait()

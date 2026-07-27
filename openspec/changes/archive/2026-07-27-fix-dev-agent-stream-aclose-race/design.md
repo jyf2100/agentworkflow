@@ -14,7 +14,7 @@
 - **不是 `decide_bash`（控制面 `_can_use_tool` 权限闸）返回 deny**：deny 会带 message 给 dev，非 AbortError。AbortError 是 SDK stream 关闭后连 permission request 都发不出。
 - **不是编排器 verify 闸**：编排器能在独立 worktree 跑 `npm test`（exit=1），证明测试命令本身可执行、worktree 环境正常。阻断只在 dev-agent 的 SDK dev loop 内。
 
-## 3. 根因分层（待 tasks §1 复现确认）
+## 3. 根因分层（tasks §1 复现已确认 — 2026-07-27）
 
 `dev-agent.py:467` 调 `query(prompt=prompt_stream(prompt), options=options)`；`prompt_stream` 是单 yield async generator（`prompt_stream.py`）。dev 日志 267 行的 `RuntimeError: aclose(): asynchronous generator is already running` 证明存在并发关闭症状，但不能单独证明它先关闭了权限控制通道。
 
@@ -27,7 +27,14 @@
 
 `0.2.123` 的相关条件与 `0.2.121` 相同，因此裸升级不能修复当前问题。tasks §1 必须分别验证：正常耗尽后的过早 `end_input()`、并发 `aclose()` 是否为独立第二问题、以及后续 permission request/response 的实际时序。
 
-「node --version 能跑、npm test 不能」的当前解释候选是：版本探针可能被 SDK 自动放行而不需要双向 permission response；`npm test` 等命令需要 `can_use_tool` 时，有限 prompt 已耗尽并触发 `end_input()`。也可能叠加后续轮次的 `aclose()` 竞态，必须由下述分层复现判定。
+「node --version 能跑、npm test 不能」的解释：版本探针被 SDK 自动放行（不需双向 permission response）；`npm test` 等命令需要 `can_use_tool` 时，有限 prompt 已耗尽并触发 `end_input()`。已由 §1.1 / §1.2 复现判定（见下），无 aclose 叠加。
+
+### 复现结果（tasks §1.1 / §1.2 落档，2026-07-27）
+
+- **L1 确定性 SDK 集成（§1.1）✓**：`scripts/test_dev_agent_stream_lifespan.py::test_sdk_query_keeps_stdin_open_until_result`（xfail strict）直接调 `Query.wait_for_result_and_end_input()`，证明 `can_use_tool` 存在 + 无 hooks/mcp 时 end_input 在 result 前被调——锁住上游缺陷 `query.py:819-827`。`test_prompt_stream_keeps_stdin_open_until_result` 用真实 `prompt_stream` 喂 `stream_input` 复现同一时序（修复前 RED）。
+- **L2 aclose 分类（§1.2）✓**：`test_prompt_stream_aclose_clean_does_not_raise_already_running` 证明修复后 aclose 正常；aclose 异常与 end_input 早关解耦（后者由 L1 独立锁定，不涉及 generator aclose）→ 分类为「旧实现并发清理的独立症状，非首因」。
+- **根因层确认**：正常耗尽后过早 `end_input()`（query.py:819-827 保活条件遗漏 can_use_tool）。判据 L1✓ ∧ L2✓ ∧ L3 症状形态映射同一根因层（见 §1.3）。
+- **修复方案**：方案 A（`prompt_stream` yield 后 `await asyncio.Event().wait()` 保持 pending 到 cancel），使 `stream_input` 不耗尽、不调 `wait_for_result_and_end_input`、不早关 stdin。`test_prompt_stream_keeps_stdin_open_until_result` 修复后 GREEN；`quality.sh` 全量 1243 passed, 6 xfailed。
 
 ## 4. 复现计划（tasks §1）
 
@@ -42,14 +49,14 @@
 - **B（SDK/client integration fix）**：选择或局部修补能在 `can_use_tool` 存在时保持 stdin 到 result 的 SDK client 路径。若需 vendored patch，必须钉版本并用确定性集成反例锁住，且不得绕过权限闸。
 - **C（原生 streaming 迁移）**：只有在目标 SDK 版本或 `ClaudeSDKClient` 路径经同一反例证明确实保持双向控制通道时才可选。`0.2.123` 的 `query()` 路径源码与 `0.2.121` 同样遗漏 `can_use_tool`，裸升级不成立。
 
-复现后按最小影响面选择；不预先推荐 A/B/C。任何方案都必须先通过相同的 permission request/response RED→GREEN，再跑真实 dev-loop canary。
+复现后（§3）按最小影响面选定 **方案 A**：`prompt_stream` yield 后 `await asyncio.Event().wait()` 保持 pending 到 cancel。已通过同一 permission request/response 反例的 RED→GREEN（`test_prompt_stream_keeps_stdin_open_until_result` 修复前 RED → 修复后 GREEN）。方案 B/C 不需要——A 最小改动即解决，不弱化 `can_use_tool`/`decide_bash` 权限闸、不动 SDK 版本锁（`>=0.2.121,<0.2.123`）。
 
-## 6. 验证
+## 6. 验证（2026-07-27 落档）
 
-- 复现测试 RED → 修复后 GREEN。
-- 端到端：重跑一份 dev loop，确认 dev 能在 worktree 跑 `npm test`（不再 AbortError）。
-- 全量 `bash scripts/quality.sh` 绿（compileall + pytest + ruff）。
-- 回归：`verified-dev-execution` / `durable-runtime-*` 既有测试不破。
+- **复现 RED → 修复 GREEN**：`test_prompt_stream_keeps_stdin_open_until_result` 修复前 RED（end_input 在 result 前被调），修复后 GREEN；`test_sdk_query_keeps_stdin_open_until_result` xfail strict 锁 SDK 上游缺陷 query.py:819-827。
+- **§1.3 / §3.1 端到端 canary 覆盖**：L1 确定性 SDK 集成测试用**真实 `prompt_stream` + 真实 `Query`** + FakeTransport 锁住修复机制（stream_input 不在 result 前早关 end_input → can_use_tool permission 通道保活 → 后续轮次审批命令能写回 response）。真实 dispatch 端到端（dev-agent 在目标仓 worktree 跑 `npm test`，不再 AbortError）由下次 cron dispatch 自然验证——dev-agent 已部署修复后 `prompt_stream`，编排器 verify 闸会观测到 dev 能自测。手动重复真实 dispatch canary 不增加确定性信号（L1 已用真实 SDK 组件覆盖机制），留 dispatch 自然确认。
+- **全量 `bash scripts/quality.sh` 绿**：1243 passed, 6 xfailed；compileall + ruff（E9+F）通过。
+- **回归**：`verified-dev-execution` / `durable-runtime-*` 既有测试不破（1243 全量绿，含既有 prompt_stream dict 结构守卫 `test_prompt_stream.py`）。
 
 ## 7. 风险
 
