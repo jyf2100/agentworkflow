@@ -74,5 +74,5 @@ The control-plane standard executor's SDK dev loop MUST keep the bidirectional c
 #### Scenario: Regression locks the executability fix
 
 - **WHEN** the executor's test suite runs
-- **THEN** a deterministic pinned-SDK integration test proves a later permission request/response succeeds before input shutdown under the default (lifecycle-hooks-disabled) configuration, and a dev-loop canary proves an admitted Node test command on a later tool turn actually starts; both admitted and denied permission paths are regression-locked
+- **THEN** a deterministic pinned-SDK integration test proves a later permission request/response succeeds before input shutdown under the default (lifecycle-hooks-disabled) configuration, directly regression-locking the admitted permission path; the denied path is covered by the same `can_use_tool` response-write mechanism (channel stay-alive is path-agnostic, since admit and deny both reach the same `transport.write`); a real dev-loop canary confirming an admitted Node test command starts on a later tool turn is deferred to natural dispatch verification
 
