@@ -559,6 +559,18 @@ class TestDevAgentBuildPromptInjection:
         assert prompt_off == prompt_empty
         assert "Applicable lessons from prior PRDs" not in prompt_off
 
+    def test_build_prompt_includes_clean_test_cmd_rule(self, tmp_path):
+        """守则 2 含「测试命令须纯净」规约——防回归（层2证据采集缺陷修复：dev 须被告知
+        只有裸测试命令（无 |>&;）才被采为发布证据，否则用管道读长输出会 test_not_run）。"""
+        da = self._import_dev_agent()
+        prd = "# PRD\n"
+        args = {"base": "main", "dry_run": True, "source": None, "feedback_artifact": None,
+                "lessons_artifact": None}
+        prompt = da.build_prompt(args, prd, None)
+        assert "测试命令须纯净" in prompt
+        assert "裸测试命令" in prompt
+        assert "先纯净跑一次" in prompt
+
     def test_lessons_artifact_passed_through_to_prompt(self, tmp_path):
         """有 --lessons-artifact → build_prompt 读 artifact + lesson_block append 到 prompt 末尾。"""
         da = self._import_dev_agent()
