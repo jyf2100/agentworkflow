@@ -50,6 +50,10 @@ _Avoid_: 审批（暗示人介入）、value-gate、review（太泛，且与项�
 一个项目同时允许存在的所有未关闭 PR 数上限，不区分人工或流水线创建；达到上限时，新 PRD 暂不投递。它限制评审积压，不是每日产量配额。
 _Avoid_: 每日 PR 上限、每日配额、PR/日。
 
+**stage 输出契约 (stage_contracts)**:
+所有走 `run_persona` 的 persona 输出的机械契约层。`scripts/stage_contracts.py`（纯 stdlib）维护 `CONTRACTS[stage]` 注册表 + `validate(payload)→[Issue]`：第一版硬契约 critic（`verdict∈{pass,drop,revise}` + `prd_path`）与 prd（`prds[i].path`），其余字段 warning。`run_persona` 语法 parse 成功后校验：`error`→带诊断 `render_repair_hint` 重试一轮，`warning`→记 log 不改行为，契约层故障→fail-open 降级（不改 stage 终态，对齐 [[学习记忆]] design 决策#7）。与 [[学习记忆]]（跨 PRD 领域经验，慢回路）是两个不同对象——契约是当轮可验机械事实，无需 recurrence。
+_Avoid_: schema 校验（太泛）、learning memory（对象不同）。
+
 ## 流水线产物
 
 **技术信号 (Signal)**:

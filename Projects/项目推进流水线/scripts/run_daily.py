@@ -44,6 +44,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（消解 ADR-0004 #4 shadow；无依赖模块，顶部 import 不触发 sdk 连带加载拖垮 cron）
+from stage_contracts import validate_stage, render_repair_hint  # change 2026-07-28：stage 输出契约层（fail-open 校验 + 诊断重试提示；纯 stdlib，cron 安全）
 from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
 from coordinator import build_coordinator, preflight  # task 2.1/2.5：runtime coordinator 边界 + flag 组合 preflight（design 决策#1；纯 stdlib，cron 安全）
 from feature_flags import resolve_flags  # add-cross-prd-learning-memory Section 7：learning flag 解析（V1 allowlist + env/profile 三态）
@@ -404,6 +405,21 @@ def run_persona(name: str, prompt: str, stage: str, label: str,
                 "duration_ms": outer.get("duration_ms"),
                 "model": (outer.get("modelUsage") or {}),
             }
+            # 语义契约层（change 2026-07-28 治本）：fail-open 校验；error→带诊断重试，warning→记 log 不改行为
+            # 与语法层共享 for attempt (1,2) 预算（cap=2，满足 spec「有上限预算」）；与 dev-agent --feedback-artifact 范式对称
+            issues = validate_stage(stage, payload)
+            err_issues = [i for i in issues if i.severity == "error"]
+            if err_issues:
+                last_err = "语义契约违反: " + "; ".join(f"{i.field}({i.diagnosis})" for i in err_issues)
+                if attempt < 2:   # 还有重试预算：带诊断重试一轮
+                    log(f"[{label}] {last_err} → 带诊断重试（attempt {attempt}/2）")
+                    cur_prompt = prompt + render_repair_hint(err_issues, json.dumps(payload, ensure_ascii=False)[:300], attempt=attempt)
+                    continue
+                log(f"[{label}] {last_err}（重试预算用尽，fail-open 降级返回现状 payload）")
+                return payload, meta
+            warn_issues = [i for i in issues if i.severity == "warning"]
+            if warn_issues:
+                log(f"[{label}] 契约 warning（不改行为）: " + ", ".join(i.field for i in warn_issues))
             return payload, meta
         # 本轮非 JSON：加强 JSON-only 指令重试一轮
         log(f"[{label}] persona result 非 JSON（attempt {attempt}/2，容错抽取仍失败）→ 重试并加强 JSON-only 契约")
@@ -765,7 +781,17 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
         prof = profiles.get(proj, {})
         path = prd.get("path")
         src = prd.get("source_path", "")
+        # Phase 0 止血（change 2026-07-28）：prd 缺 path → 降级跳过，不 Path(None).stem TypeError 穿透 abort
+        if not path:
+            log(f"[critic] ⚠ prd 缺 path（project={proj}）→ 降级 drop")
+            entries.append({"prd_path": path, "project": proj, "verdict": "drop",
+                            "summary": "prd manifest 缺 path，无法过闸"}); continue
         entry = _critic_one(path, src, prof)
+        # Phase 0 止血：critic 漏吐 verdict → 降级 drop，不 entry["verdict"] KeyError 穿透 _run_pipeline except
+        if "verdict" not in entry:
+            log(f"[critic] ⚠ critic 漏吐 verdict（{path}）→ 降级 drop")
+            entry.setdefault("prd_path", path); entry.setdefault("project", proj)
+            entry["verdict"] = "drop"; entry.setdefault("summary", "critic 输出缺 verdict 字段，降级")
         entries.append(entry)
 
         # revise 回环：1 次修订机会（SPEC §4.3）

@@ -153,3 +153,32 @@ canary 目标抽象：cc-web-control 两 PRD（`custom-mcp-server-url` / `hub-ro
 
 若 cutover 后发现问题：revert 摘 xfail 的提交 + 移除 `sdk_compat_patch.apply()` 调用（patch 纯叠加，
 移除即恢复原 SDK 行为，#1105 重现但 fail-safe 阻断仍在）。版本锁可独立回退（`>=0.2.128,<0.2.130` → 旧锁）。
+
+## 7. Persona 输出契约违反（stage_contracts，change 2026-07-28）
+
+`run_persona` 语法 parse 成功后对已注册 stage（critic / prd）跑 `stage_contracts.validate_stage`：
+机械校验硬契约字段（critic 的 `verdict∈{pass,drop,revise}`+`prd_path`、prd 的 `prds[i].path`）。
+`error` → 带诊断 `render_repair_hint` 重试一轮；`warning` → 记 log 不改行为；契约层自身故障 → fail-open 降级。
+与语法层共享 `for attempt (1,2)` 预算（cap=2）。
+
+### 7.1 识别（log 关键词）
+
+```bash
+# 范例：[critic:a] 语义契约违反: verdict(缺 verdict 字段...) → 带诊断重试（attempt 1/2）
+grep -E '语义契约违反|契约 warning|fail-open 降级' <cron/run log>
+```
+
+### 7.2 Degraded 路径（不阻断流水线）
+
+- 单次违反 + 重试成功 → 该 PRD 正常推进（log 一笔「带诊断重试」）。
+- 连续违反（预算尽）→ payload 仍按现状返回（fail-open），下游宽容 `.get()` 处理；critic 段另有 Phase 0 止血（`run_daily.py:766-781`）：`verdict`/`path` 缺失降级 drop，不穿透 `except RuntimeError` 屏障。
+- 契约层抛异常 → `validate_stage` 返 `[]`（fail-open），等同于该 stage 未注册契约。
+
+### 7.3 反复违反的运营动作
+
+某 persona 反复漏吐同一字段（log 高频同一 diagnosis）= persona 定义（`.claude/agents/pa-*.md`）的输出契约描述不够明确：
+
+1. 查 `prd_gate_<stamp>.json` / `prd_manifest_<project>.json` 看实际漏吐字段。
+2. 收紧对应 persona 定义的输出 schema（列 MUST 字段 + 受控值）。
+3. **Non-goal**：stage_contracts 不自动改 persona 定义——谁改 `.claude/agents/pa-*.md` 是独立治理问题。
+4. 无需人工干预 cron：dispatch 段不会因 critic 违反崩（Phase 0 止血已防）。
