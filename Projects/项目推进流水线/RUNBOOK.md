@@ -112,3 +112,44 @@ learning memory state 是 append-only（flock + O_APPEND + fsync），崩溃只�
 - 已 append 的 candidate/event/usage record 100% 保留（fsync 已落盘）。
 - 在 reflection 中途崩（candidate 已 append 但 catalog 未替换）→ 下次 ``rebuild_catalog`` 收尾。
 - 在 usage append 中途崩（usage record 半行）→ ``read_usage_records`` 把末尾半行当 truncated 容忍。
+
+---
+
+## 6. Canary 发布门（#1105 根治 cutover）
+
+`migrate-dev-agent-streaming-with-1106-patch` D5：堵掉 C3「deferred to natural dispatch」空头承诺。
+单测层（FakeTransport）锁 channel-availability precondition，但证明不了真实 Node CLI + 真实 GitHub
+凭证下 dev-agent 真能跑 `npm test`。canary 落 `.github/workflows/canary-real-node-cli.yml`，
+branch protection 列为 required check（摘 xfail 的 PR 必带一次 green canary）。
+
+### 6.1 自动段（无 secrets，CI/schedule 自动跑）
+
+CI 真实 SDK 下 `sdk_compat_patch.apply()` detection 命中 + ast 变异成功 + `test_dev_agent_stream_lifespan`
+三重锁（行为 + 结构 `count("or self.can_use_tool")==1` + identity）。
+
+```bash
+python -m pytest scripts/test_dev_agent_stream_lifespan.py -q   # 真实 SDK 行为绿（含结构 + identity 断言）
+```
+
+### 6.2 dispatch 段（需 secrets，运维手动启用）
+
+canary 目标抽象：cc-web-control 两 PRD（`custom-mcp-server-url` / `hub-role-pair-view`）是当前实例。
+迁移到其他等价目标仓须更新本节 + workflow。
+
+启用步骤：
+
+1. 仓库 Settings → Secrets 配 `PA_GITHUB_TOKEN`（目标仓写权限）。
+2. CI runner 装好 roc 代理 claude CLI（见 cron 链路 PATH 约定）。
+3. workflow dispatch 段接入真实 dispatch（`run_daily.py --limit 1 --project cc-web-control`），tee 到 `canary.log`。
+4. grep `canary.log` 无 `AbortError: Stream closed` ⇔ #1105 根治生效。
+
+### 6.3 Cutover 证据（发布门前必过）
+
+- (a) `canary-real-node-cli` workflow green（自动段至少必过；dispatch 段 green 优先）；
+- (b) `python quality_evidence.py` readiness=True；
+- (c) `bash scripts/quality.sh` 全绿（compileall + pytest + ruff E9+F）。
+
+### 6.4 Rollback
+
+若 cutover 后发现问题：revert 摘 xfail 的提交 + 移除 `sdk_compat_patch.apply()` 调用（patch 纯叠加，
+移除即恢复原 SDK 行为，#1105 重现但 fail-safe 阻断仍在）。版本锁可独立回退（`>=0.2.128,<0.2.130` → 旧锁）。

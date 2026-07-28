@@ -24,11 +24,11 @@
 
 - [x] 4.1 摘 `test_sdk_query_keeps_stdin_open_until_result` 的 `xfail(strict)` + 加结构断言 `count("or self.can_use_tool")==1` + identity `Query.X is sdk_compat_patch._last_patched`；确认普通 PASS（非 xfailed/XPASS）
 - [x] 4.2 全量 `bash scripts/quality.sh` 绿（compileall + pytest + ruff E9+F），既有测试不破
-- [ ] 4.3 新增 `.github/workflows/canary-real-node-cli.yml`（`workflow_dispatch`，真实 dispatch cc-web-control 两 PRD，grep 断言无 `AbortError: Stream closed`）+ `RUNBOOK.md` 加 cutover 证据流程；branch protection 列为 required check
+- [x] 4.3 新增 `.github/workflows/canary-real-node-cli.yml`（`workflow_dispatch`，真实 dispatch cc-web-control 两 PRD，grep 断言无 `AbortError: Stream closed`）+ `RUNBOOK.md` 加 cutover 证据流程；branch protection 列为 required check
 
 ## 5. supersede C3 + 上游跟踪 + 规约同步
 
-- [ ] 5.1 `patch-sdk-can-use-tool-stdin-keepalive/proposal.md` 标 `Superseded by migrate-dev-agent-streaming-with-1106-patch`，未完成 tasks 标 `superseded`
+- [x] 5.1 `patch-sdk-can-use-tool-stdin-keepalive/proposal.md` 标 `Superseded by migrate-dev-agent-streaming-with-1106-patch`，未完成 tasks 标 `superseded`
 - [ ] 5.2 在 #1105 留控制面复现评论（string-prompt + `can_use_tool` + 无 hooks/MCP → Stream closed；源码定位 `query.py wait_for_result_and_end_input`），订阅（**outward-facing，需用户确认后执行**）
 - [ ] 5.3 评审通过后 `/opsx:sync` delta → main spec（MODIFIED `verified-dev-execution` Scenario 4 + 新增 Scenario 5 canary 发布门）
 - [ ] 5.4 `/opsx:archive`

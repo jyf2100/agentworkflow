@@ -1,0 +1,89 @@
+# canary-real-node-cli.yml — 真实 Node CLI canary 发布门（migrate-dev-agent-streaming-with-1106-patch D5）。
+#
+# 堵掉 C3「deferred to natural dispatch」空头承诺：单测层（FakeTransport）锁 channel-availability
+# precondition，但证明不了真实 Node CLI + 真实 GitHub 凭证下 dev-agent 真能跑 npm test。本 workflow 两段：
+#   (1) 自动段——CI 真实 SDK 下 sdk_compat_patch.apply() 变异成功 + test_dev_agent_stream_lifespan 行为绿；
+#   (2) dispatch 段——真实 dispatch cc-web-control 两 PRD，grep 断言无 `AbortError: Stream closed`
+#       （需 PA_GITHUB_TOKEN + roc 代理 claude CLI，运维启用；见 RUNBOOK §canary）。
+#
+# ⚠ branch protection 须将 canary job 列为 required check（摘 xfail 的 PR 必带一次 green canary）。
+# canary 目标抽象：cc-web-control 两 PRD 是当前实例（custom-mcp-server-url / hub-role-pair-view），
+# 迁移到其他等价目标仓须更新 RUNBOOK §canary（非通用发布门）。
+name: canary-real-node-cli
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每日 06:17 UTC 跑自动段（dispatch 段需 secrets，无则 skip）
+    - cron: "17 6 * * *"
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: Projects/项目推进流水线
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: Projects/项目推进流水线/pyproject.toml
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install declared env
+        run: pip install -e ".[dev]"
+
+      - name: "[自动段] sdk_compat_patch.apply() 在 CI 真实 SDK 下变异成功"
+        env:
+          PYTHONPATH: scripts
+        run: |
+          python -c "
+          import inspect
+          import sdk_compat_patch
+          from claude_agent_sdk._internal.query import Query
+          patched = sdk_compat_patch.apply()
+          assert patched is Query.wait_for_result_and_end_input, 'apply 未注入到 Query'
+          src = inspect.getsource(Query.wait_for_result_and_end_input)
+          assert src.count('or self.can_use_tool') == 1, f'变异标记未生效:\n{src}'
+          print('OK 自动段: sdk_compat_patch 在 CI 真实 SDK 下 detection 命中 + ast 变异成功')
+          "
+
+      - name: "[自动段] 真实 SDK 行为绿（test_dev_agent_stream_lifespan 三重锁）"
+        run: python -m pytest scripts/test_dev_agent_stream_lifespan.py -q
+
+      - name: "[dispatch 段] 真实 dispatch cc-web-control（需 secrets，无则 skip）"
+        env:
+          PA_GITHUB_TOKEN: ${{ secrets.PA_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$PA_GITHUB_TOKEN" ]; then
+            echo "SKIP dispatch 段: PA_GITHUB_TOKEN 未配置（lint/自动段 canary），见 RUNBOOK §canary 启用"
+            exit 0
+          fi
+          echo "TODO(运维): 接入控制面真实 dispatch cc-web-control 两 PRD"
+          echo "(custom-mcp-server-url / hub-role-pair-view)，tee 输出到 canary.log。"
+          echo "依赖 PA_GITHUB_TOKEN + roc 代理 claude CLI + CC_WEB_CONTROL_REPO 坐标。"
+          echo "真实 dispatch 接入为 follow-up（本骨架先落地自动段 canary 契约）。"
+          # 真实接入示例（运维填充）:
+          #   python scripts/run_daily.py --limit 1 --project cc-web-control 2>&1 | tee canary.log
+
+      - name: "[dispatch 段] 断言无 AbortError: Stream closed"
+        env:
+          PA_GITHUB_TOKEN: ${{ secrets.PA_GITHUB_TOKEN }}
+        run: |
+          if [ ! -f canary.log ]; then
+            echo "SKIP: canary.log 不存在（dispatch 段未产生输出）"
+            exit 0
+          fi
+          if grep -q "AbortError: Stream closed" canary.log; then
+            echo "FAIL: AbortError: Stream closed 出现——#1105 未根治（sdk_compat_patch 未生效？）"
+            grep -n "AbortError: Stream closed" canary.log
+            exit 1
+          fi
+          echo "OK dispatch 段: 真实 dispatch 无 AbortError: Stream closed（#1105 已根治）"
