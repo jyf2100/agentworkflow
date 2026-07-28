@@ -17,12 +17,13 @@ dev-agent.py 用单 yield async generator `prompt_stream` 喂 `query()`，prompt
 """
 
 import asyncio
+import inspect
 
-import pytest
 from claude_agent_sdk import PermissionResultAllow
 from claude_agent_sdk._internal.query import Query
 from claude_agent_sdk._internal.transport import Transport
 
+import sdk_compat_patch  # H3-patch（conftest session fixture 已 apply；此处仅结构/identity 断言用）
 from prompt_stream import prompt_stream  # 真实 dev-agent prompt 源
 
 
@@ -65,20 +66,21 @@ async def _admit(_tool_name, _tool_input, _context):  # noqa: D401
     return PermissionResultAllow()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "锁 SDK 0.2.121 上游缺陷：_internal/query.py:819-827 wait_for_result_and_end_input "
-        "保活条件 `sdk_mcp_servers or hooks` 遗漏 can_use_tool。dev-agent 层修复"
-        "（prompt_stream 保持 pending）不改 SDK，本测试仍 RED。SDK 升级修复后 XPASS → "
-        "strict fail → 提醒移除本标记并复盘 prompt_stream workaround 是否可简化。"
-    ),
-)
 def test_sdk_query_keeps_stdin_open_until_result() -> None:
-    """直接锁 SDK query.py:819-827 缺陷：can_use_tool 存在时 result 前 end_input 不应被调。
+    """H3-patch 生效后：can_use_tool 存在时 result 前 end_input 不应被调（#1105 已根治）。
 
-    当前 RED（SDK 缺陷，dev-agent 修复不改动它）→ xfail 标记。
+    sdk_compat_patch.apply() 经 conftest session fixture 在真实 Query 上 ast 变异
+    wait_for_result_and_end_input 保活条件末位加 can_use_tool；本测试三重锁定：
+    (1) 行为——result 前 end_input 不调；(2) 结构——源码 ``count("or self.can_use_tool")==1``；
+    (3) identity——``Query.X is sdk_compat_patch._last_patched``（anti-mock，证实 patch 真打上）。
     """
+    # 结构 + identity 断言（D6 三方交叉确认）：patched 源码含 ``or self.can_use_tool`` 仅一次，
+    # 且 = conftest session fixture 打的 patched（防 XPASS 来自 mock 污染/偶然 pass）。
+    src = inspect.getsource(Query.wait_for_result_and_end_input)
+    assert src.count("or self.can_use_tool") == 1, f"keep-alive 条件未被 H3-patch 变异:\n{src}"
+    assert Query.wait_for_result_and_end_input is sdk_compat_patch._last_patched, (
+        "Query.wait_for_result_and_end_input 应 = session patched（H3-patch 未生效？）"
+    )
 
     async def run() -> None:
         fake = _FakeTransport()
@@ -94,7 +96,7 @@ def test_sdk_query_keeps_stdin_open_until_result() -> None:
         await asyncio.sleep(0.1)
         assert not fake.end_input_called, (
             "end_input 在 result 到达前被调：can_use_tool 的 permission response 双向"
-            "通道在首个 result 前即关闭"
+            "通道在首个 result 前即关闭（#1105 回归——sdk_compat_patch 未生效？）"
         )
         task.cancel()
         try:
@@ -140,19 +142,21 @@ def test_prompt_stream_keeps_stdin_open_until_result() -> None:
     asyncio.run(run())
 
 
-def test_prompt_stream_aclose_clean_does_not_raise_already_running() -> None:
-    """§1.2 aclose 分类：修复后 prompt_stream 在 aclose 时正常完成，不产生
-    'aclose(): asynchronous generator is already running'。
+def test_prompt_stream_single_yield_then_stopasynciteration() -> None:
+    """prompt_stream 单 yield 后正常耗尽（回归最小 AsyncIterable 契约）。
 
-    该异常是旧实现（单 yield 正常耗尽）下并发清理的独立症状，非首因——首因（end_input
-    早关）由 ``test_sdk_query_keeps_stdin_open_until_result`` 独立锁定（直接调
-    wait_for_result_and_end_input，不涉及 generator aclose），二者解耦。
+    历史 ``await asyncio.Event().wait()`` 的「输入侧冗余对冲」已 conscious 移除（虚假对冲：
+    早关根因在 SDK 方法侧，输入 pending 救不了）；真实根治交给 sdk_compat_patch ast 变异。
+    本测试锁定移除后 prompt_stream 仅 yield 一条 user 消息即结束。
     """
 
     async def run() -> None:
         gen = prompt_stream("x")
-        await gen.__anext__()  # generator 现在挂在 await Event.wait()
-        # aclose 应在挂起点正常注入 GeneratorExit 并清理，不抛 'already running'
-        await gen.aclose()
+        msgs = []
+        async for msg in gen:
+            msgs.append(msg)
+        assert len(msgs) == 1, "prompt_stream 应单 yield 后耗尽（Event.wait 已移除）"
+        assert msgs[0]["type"] == "user"
+        assert msgs[0]["message"]["content"] == "x"
 
     asyncio.run(run())

@@ -91,3 +91,19 @@ def stub_externals(monkeypatch):
     monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
     monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
     return run_daily
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _apply_sdk_compat_patch():
+    """session 级应用 #1106 keep-alive H3-patch（migrate-dev-agent-streaming-with-1106-patch，根治 #1105）。
+
+    ``sdk_compat_patch.apply()`` 在真实 SDK ``Query`` 上 ast 变异 ``wait_for_result_and_end_input``
+    保活条件末位加 ``can_use_tool``（#1106 未合前的定向补丁），使 can_use_tool 存在时不早关 stdin。
+    **严禁吞 RuntimeError**：detection 偏离即 raise（fail-loud，优于盲打），须冒泡暴露——故窄
+    ``except ImportError`` 仅放行 lint-only CI（无 SDK）场景，RuntimeError 不在捕获列。
+    """
+    import sdk_compat_patch
+    try:
+        return sdk_compat_patch.apply()
+    except ImportError:
+        return None  # lint-only CI 无 SDK：跳过 patch（依赖 SDK 的测试自己 import 时已崩）

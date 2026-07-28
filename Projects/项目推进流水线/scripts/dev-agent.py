@@ -60,6 +60,7 @@ from slug_utils import dev_slugify   # ADR-0006 #5：dev_slugify 单一源头（
 from bash_allowlist import decide_bash   # ADR-0006 #7：Bash 命令放行判定（无依赖模块，同上）
 from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # OpenSpec verified-dev-execution：结构化测试证据 + 发布硬门（无依赖模块，同上）
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
+import sdk_compat_patch                   # ADR-0006 #7（migrate-dev-agent-streaming-with-1106-patch）：#1106 keep-alive 定向 patch，根治 #1105（零依赖模块，apply 内延迟 import SDK）
 from external_state import sanitize   # C2 脱敏：git()/gh() stderr 进 JSON error 前抹 token（无依赖模块，同上）
 from coordinator import build_coordinator   # task 2.3b：coordinator 边界（design 决策#1：一次解析 loop flag + own journal/artifacts/IDs）
 from hook_bridge import build_dev_hooks      # task 2.3b：lifecycle_hooks 开 → 注册真实 SDK lifecycle hooks（ClaudeAgentOptions.hooks）
@@ -438,6 +439,12 @@ async def main() -> int:
     _dev_adapter, sdk_hooks = build_dev_hooks(_coord)
     result_msg: ResultMessage | None = None
     try:
+        # ADR-0006 #7（migrate-dev-agent-streaming-with-1106-patch）：本地 ast 变异根治 #1105。
+        # sdk_compat_patch.apply() 在真实 Query.wait_for_result_and_end_input 保活条件末位加
+        # can_use_tool（#1106 未合前的定向补丁）；detection 偏离即 raise RuntimeError → 被 main 的
+        # except 捕获 → exit 11（fail-loud：dispatch 标红→人介入），严禁单独 try/except 吞掉。
+        # apply 幂等 + conftest session fixture 已在测试 session 打过，此处生产路径再打是 no-op。
+        sdk_compat_patch.apply()
         options = ClaudeAgentOptions(
             cwd=str(REPO_ROOT),
             # model 刻意省略 → 走 roc 代理默认（glm-5.2）；勿传裸 Anthropic model id

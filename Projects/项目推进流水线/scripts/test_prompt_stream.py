@@ -3,9 +3,9 @@
 """test_prompt_stream.py — prompt_stream 单测（ADR-0006 #7 streaming 修复回归守卫）。
 
 锁定 prompt_stream 产出首条 user 消息的 dict 结构对齐 SDK 字符串路径
-（``_internal/client.py:214-219``），并锁 yield 后保持 pending 的生命周期行为
-（fix-dev-agent-stream-aclose-race 方案 A：避免 SDK 0.2.121 在正常耗尽后立即
-``end_input()`` 关闭 ``can_use_tool`` permission 通道）。
+（``_internal/client.py:214-219``），并锁单 yield 后正常耗尽的最小 AsyncIterable 契约
+（migrate-dev-agent-streaming-with-1106-patch D4：Event.wait 输入侧冗余对冲已 conscious
+移除——早关根因由 sdk_compat_patch ast 变异根治，输入 pending 是虚假对冲）。
 
 跑：python3 -m pytest scripts/test_prompt_stream.py -q
 AAA 结构（Arrange / Act / Assert）。零 SDK 依赖（prompt_stream 纯 stdlib）。
@@ -23,7 +23,7 @@ import prompt_stream  # noqa: E402
 
 
 async def _first(gen):
-    """取首条消息（不耗尽 generator——yield 后 prompt_stream 保持 pending）。"""
+    """取首条消息（prompt_stream 单 yield 后即耗尽）。"""
     return await gen.__anext__()
 
 
@@ -49,15 +49,14 @@ def test_preserves_multiline_prompt_verbatim():
     assert m["message"]["content"] == p
 
 
-def test_stays_pending_after_first_yield():
-    # Arrange / Act / Assert —— yield 首条后应保持 pending，不立即 StopAsyncIteration
-    # （fix-dev-agent-stream-aclose-race 方案 A；第二条 __anext__ 应挂起而非抛 StopAsyncIteration）
+def test_single_yield_then_stopasynciteration():
+    # Arrange / Act / Assert —— 单 yield 后正常耗尽（D4：Event.wait 已 conscious 移除，
+    # 回归最小 AsyncIterable；第二条 __anext__ 应抛 StopAsyncIteration 而非挂起）
     async def run() -> None:
         gen = prompt_stream.prompt_stream("x")
         first = await gen.__anext__()
         assert first["type"] == "user"
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(gen.__anext__(), timeout=0.05)
-        await gen.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
 
     asyncio.run(run())

@@ -19,11 +19,13 @@ dependencies = [
     "PyYAML>=6.0",
     # stage_inject 的 _pinyin_slug（惰性 import；缺则 inject 段 sys.exit）
     "pypinyin>=0.50",
-    # dev-agent.py 控制面标准执行器（ADR-0006）：在目标仓 worktree 内驱动 SDK dev loop
-    # 上界 <0.2.123：0.2.123 起 can_use_tool 回调要求 streaming 模式（AsyncIterable prompt），
-    # 本执行器用 string-prompt query() → 触 "can_use_tool callback requires streaming mode"。
-    # 0.2.121 实证可用（ashare env 跑完 84-turn dev loop）。streaming 迁移为 follow-up。
-    "claude-agent-sdk>=0.2.121,<0.2.123",
+    # dev-agent.py 控制面标准执行器（ADR-0006）：在目标仓 worktree 内驱动 SDK dev loop。
+    # streaming 模式要求已由 prompt_stream.py 满足（prompt 包成 AsyncIterable，非 string-prompt）。
+    # 0.2.128 + 本地 sdk_compat_patch.py（#1106 keep-alive 定向 patch）：0.2.128 的
+    # wait_for_result_and_end_input 保活条件 `sdk_mcp_servers or hooks` 仍遗漏 can_use_tool
+    # （与 0.2.121 一字不差），上游 PR #1106 OPEN 未合，故本地 ast 变异补丁根治 #1105。
+    # #1106 合并后移除 sdk_compat_patch.py 并放宽上界（独立 follow-up change）。
+    "claude-agent-sdk>=0.2.128,<0.2.130",
 ]
 
 [project.optional-dependencies]
