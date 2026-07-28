@@ -30,6 +30,6 @@
 
 - [x] 5.1 `patch-sdk-can-use-tool-stdin-keepalive/proposal.md` 标 `Superseded by migrate-dev-agent-streaming-with-1106-patch`，未完成 tasks 标 `superseded`
 - [ ] 5.2 在 #1105 留控制面复现评论（string-prompt + `can_use_tool` + 无 hooks/MCP → Stream closed；源码定位 `query.py wait_for_result_and_end_input`），订阅（**outward-facing，需用户确认后执行**）
-- [ ] 5.3 评审通过后 `/opsx:sync` delta → main spec（MODIFIED `verified-dev-execution` Scenario 4 + 新增 Scenario 5 canary 发布门）
-- [ ] 5.4 `/opsx:archive`
+- [x] 5.3 评审通过后 `/opsx:sync` delta → main spec（MODIFIED `verified-dev-execution` Scenario 4 + 新增 Scenario 5 canary 发布门）
+- [x] 5.4 `/opsx:archive`
 - [ ] 5.5 follow-up（独立 change）：#1106 合并后移除 `sdk_compat_patch.py` + 放宽版本锁上界 + 原生 streaming 迁移（ADR-0006 #7）
