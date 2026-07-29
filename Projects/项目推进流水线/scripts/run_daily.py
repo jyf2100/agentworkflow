@@ -2434,10 +2434,31 @@ def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str) -> list[d
         log(f"[dispatch] 复用已有 {disp_file.name}（--force 重跑）")
         return json.loads(disp_file.read_text(encoding="utf-8"))
     passed = [e for e in gate if e.get("verdict") == "pass"]
+    # 临时降噪：DISPATCH_SKIP_PROJECTS（逗号分隔）临时跳过指定项目的 dispatch。
+    # 背景 #1105（memory pa-target-plane-dev-exec-lock）：claude CLI 子进程 stdio can_use_tool
+    # 权限协议 bug，致 node 项目（cc-web-control 等）dispatch 反复 test_failed（AbortError: Stream
+    # closed）。Python 端 workaround 均证伪（方案A 堵 end_input / C3 patch 方法），等 SDK/CLI 上游修。
+    # env 空集 = no-op；上游修后清 env 即恢复，代码无残留分支。
+    _skip_set = {p.strip() for p in os.environ.get("DISPATCH_SKIP_PROJECTS", "").split(",") if p.strip()}
+    skip_records: list[dict] = []
+    if _skip_set:
+        _skipped = [e for e in passed if e.get("project") in _skip_set]
+        passed = [e for e in passed if e.get("project") not in _skip_set]
+        for e in _skipped:
+            log(f"[dispatch] ⏭ {e.get('project')}: DISPATCH_SKIP_PROJECTS 临时跳过（#1105 stream-closed 降噪）")
+            skip_records.append({"project": e.get("project"), "prd_path": e.get("prd_path"),
+                                 "slug": Path(e.get("prd_path") or "").stem or None, "status": "skip",
+                                 "skip_reason": "#1105 DISPATCH_SKIP_PROJECTS 临时跳过"})
+        if _skipped:
+            log(f"[dispatch] DISPATCH_SKIP_PROJECTS 跳过 {len(_skipped)} 份，剩 {len(passed)} 份待投")
     if getattr(args, "dispatch_limit", None):
         passed = passed[:args.dispatch_limit]
         log(f"[dispatch] --dispatch-limit={args.dispatch_limit}，只投前 {len(passed)} 份")
     if not passed:
+        if skip_records:
+            log(f"[dispatch] 过闸 PRD 全被临时跳过（{len(skip_records)} 份），无投递")
+            disp_file.write_text(json.dumps(skip_records, ensure_ascii=False, indent=2), encoding="utf-8")
+            return skip_records
         log("[dispatch] 无过闸 PRD，跳过")
         disp_file.write_text("[]", encoding="utf-8"); return []
     log(f"[dispatch] 过闸 PRD {len(passed)} 份，投递（max-concurrent={args.max_concurrent}）"
@@ -2466,6 +2487,8 @@ def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str) -> list[d
                 log(f"  ✗ {e.get('prd_path')}: dispatch 异常 {ex}")
                 records.append({"project": e.get("project"), "prd_path": e.get("prd_path"),
                                 "status": "fail", "skip_reason": f"异常: {ex}"})
+    # 临时跳过的项目也落 disp_file（status=skip），让 report 段可见，避免 silent drop
+    records.extend(skip_records)
     # records 按 project+slug 排序保 diff 稳定（并行下完成序不确定）
     records.sort(key=lambda r: (r.get("project") or "", r.get("slug") or ""))
     disp_file.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
