@@ -76,6 +76,9 @@ def test_all_env_names_mapped():
         # task 1.3a/1.3b：learning memory 双 flag（域切割，不带 PA_LOOP_ prefix）
         "cross_prd_learning_shadow": "PA_LEARNING_SHADOW",
         "cross_prd_learning_injection": "PA_LEARNING_INJECTION",
+        # single-flight-auto-merge task 1.1：dispatch 串行单飞 + auto-merge 双 flag（域切割，PA_SINGLE_FLIGHT_ 前缀）
+        "single_flight_serial_shadow": "PA_SINGLE_FLIGHT_SERIAL_SHADOW",
+        "single_flight_auto_merge": "PA_SINGLE_FLIGHT_AUTO_MERGE",
     }
 
 
@@ -178,3 +181,49 @@ def test_learning_env_overrides_profile():
     flags = resolve_flags(env={"PA_LEARNING_SHADOW": "false"},
                           profile={"loop": {"cross_prd_learning_shadow": True}})
     assert flags.cross_prd_learning_shadow is False
+
+
+# ════════════════════════════════════════════════════════════════════════
+# single-flight-auto-merge task 1.1：dispatch 串行单飞 + auto-merge 双 flag（默认关）
+# design 决策#8 + D9/Migration：两 flag 镜像 journal_shadow/driven、learning_shadow/injection 模式——
+# serial_shadow 先走串行消费但 merge/revert 只 log（shadow，不改 main）；auto_merge 经 shadow + parity +
+# canary 门控后才真 merge/push/revert（破坏性副作用，改目标仓 main）。两 flag 默认 False = baseline 不变
+# （仍并发投递 + 兜底开 PR 待 review）。域切割：PA_SINGLE_FLIGHT_* 前缀（dispatch 串行+auto-merge 是独立能力域）。
+# ════════════════════════════════════════════════════════════════════════
+def test_single_flight_flags_default_false():
+    """task 1.1：两 flag 默认 False——并发投递 + 兜底开 PR 旧行为零变化（design 决策#8）。"""
+    flags = resolve_flags(env={})
+    assert flags.single_flight_serial_shadow is False
+    assert flags.single_flight_auto_merge is False
+
+
+def test_single_flight_flags_env_names_mapped():
+    """task 1.1：FLAGS_ENV_MAP 含两 flag，env 名 PA_SINGLE_FLIGHT_SERIAL_SHADOW / PA_SINGLE_FLIGHT_AUTO_MERGE
+    （域切割，非 PA_LOOP_ 前缀）。"""
+    assert FLAGS_ENV_MAP["single_flight_serial_shadow"] == "PA_SINGLE_FLIGHT_SERIAL_SHADOW"
+    assert FLAGS_ENV_MAP["single_flight_auto_merge"] == "PA_SINGLE_FLIGHT_AUTO_MERGE"
+
+
+def test_single_flight_serial_shadow_env_truthy():
+    """task 1.1：PA_SINGLE_FLIGHT_SERIAL_SHADOW=1/on/true → serial_shadow=True（shadow 串行消费）。"""
+    for v in ["1", "true", "TRUE", "yes", "on"]:
+        assert resolve_flags(env={"PA_SINGLE_FLIGHT_SERIAL_SHADOW": v}).single_flight_serial_shadow is True, f"{v} 应 truthy"
+
+
+def test_single_flight_auto_merge_env_truthy():
+    """task 1.1：PA_SINGLE_FLIGHT_AUTO_MERGE=1 → auto_merge=True（真实 merge/revert 闭环）。"""
+    assert resolve_flags(env={"PA_SINGLE_FLIGHT_AUTO_MERGE": "1"}).single_flight_auto_merge is True
+
+
+def test_single_flight_serial_shadow_via_profile():
+    """task 1.1：profile.loop.single_flight_serial_shadow=True → 开（per-project canary）。"""
+    flags = resolve_flags(env={}, profile={"loop": {"single_flight_serial_shadow": True}})
+    assert flags.single_flight_serial_shadow is True
+    assert flags.single_flight_auto_merge is False
+
+
+def test_single_flight_env_overrides_profile():
+    """task 1.1：env 显式设置压过 profile（运维 kill switch 一键关回旧逻辑）。"""
+    flags = resolve_flags(env={"PA_SINGLE_FLIGHT_AUTO_MERGE": "false"},
+                          profile={"loop": {"single_flight_auto_merge": True}})
+    assert flags.single_flight_auto_merge is False

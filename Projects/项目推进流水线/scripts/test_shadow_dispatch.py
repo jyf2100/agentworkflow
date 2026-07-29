@@ -309,3 +309,71 @@ def test_publication_targets_handles_missing_fields():
     no_owner = run_daily._publication_targets("", {"branch": "b"}, {})
     assert next(t for t in no_owner if t.kind == "pr").target == "b"   # owner_repo 空 → pr target=branch
 
+
+# ─── single-flight-auto-merge task 1.2：dispatch_one rec schema 扩展（向后兼容）──────────
+def test_dispatch_one_rec_has_single_flight_schema_fields(tmp_path, monkeypatch):
+    """task 1.2：dispatch_one 返回的 rec 含 single-flight-auto-merge 新增的 4 字段（merge_commit /
+    reverted / triage_reason / post_merge_verdict），默认值保持 baseline 语义（未 merge / 未 revert /
+    未进 triage / 未跑 post-merge 验证）。向后兼容：旧字段全保留（rec 仍是完整 dispatch record）。
+
+    复用 preflight 阻断短路（prof 违规→dispatch_one 早退 return rec），验证 rec schema 在最早构造点
+    （run_daily rec 初始化）即含新字段——后续 dev→verify→merge 闭环（task 3/4/5）填这些字段，本测钉死 schema。
+    """
+    from types import SimpleNamespace
+    # Arrange — 违规 profile（preflight 阻断短路，不起 dev loop）
+    prof = {"name": "p", "loop": {"lifecycle_hooks": True}}
+    entry = {"prd_path": "x.md"}
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
+    # Act
+    rec = run_daily.dispatch_one(entry, prof, "20260722", SimpleNamespace())
+    # Assert — single-flight-auto-merge 4 新字段存在 + baseline 默认值
+    assert rec["merge_commit"] is None        # 未 merge → 无 commit sha
+    assert rec["reverted"] is False            # 未 auto-revert
+    assert rec["triage_reason"] is None        # 未进 triage 池
+    assert rec["post_merge_verdict"] is None   # 未跑 post-merge main 全量测试
+    # 向后兼容：旧字段全保留（rec schema 扩展非破坏）
+    for legacy in ["project", "prd_path", "slug", "base", "status", "pr_url", "branch",
+                   "dev_killed", "stalled", "run_log", "dev_cost", "dev_turns", "verify",
+                   "skip_reason", "dev_test_cmd", "verify_verdict", "verify_round"]:
+        assert legacy in rec, f"rec 缺旧字段 {legacy}（向后兼容破坏）"
+
+
+# ─── single-flight-auto-merge task 2.4：max_prs_in_flight 退化为同项目恒 1（flag gated）─────────
+def test_serial_shadow_degrades_inflight_ceiling_to_one(stub_externals, tmp_path, monkeypatch):
+    """task 2.4：serial_shadow on → max_prs_in_flight 退化为恒 1（inflight≥1 即超额 skip）；
+    count_inflight_prs 保留为独立「OPEN PR 上限」门（D5/D9，≠ slot——slot 是 journal+flock，task 2.2）。
+
+    dispatch_skip_dev smoke：避免跑到真实 dev-agent（RED 时 max 未退化→过门4→smoke 返回 planned；
+    GREEN 时 max=1→1≥1 超额 skip，不到 smoke）。"""
+    from external_state import found
+    from types import SimpleNamespace
+    monkeypatch.setattr(stub_externals, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(stub_externals, "VAULT_ROOT", tmp_path)
+    monkeypatch.setattr(stub_externals, "count_inflight_prs", lambda *a, **k: found(1))   # 已有 1 OPEN PR
+    prof = {"name": "p", "repo": str(tmp_path / "r"), "default_branch": "main",
+            "admission": True, "dev_agent_ready": True, "type": "code",
+            "loop": {"single_flight_serial_shadow": True}}
+    entry = {"prd_path": "p.md"}
+    # Act
+    rec = stub_externals.dispatch_one(entry, prof, "20260728", SimpleNamespace(dispatch_skip_dev=True))
+    # Assert — 上限退化为 1，inflight=1 ≥ 1 → 超额 skip
+    assert rec["status"] == "skip"
+    assert "超额" in rec["skip_reason"] and "≥ 1" in rec["skip_reason"]
+
+
+def test_serial_shadow_off_keeps_baseline_inflight_ceiling(stub_externals, tmp_path, monkeypatch):
+    """task 2.4：serial_shadow off → max_prs_in_flight 维持 baseline（默认 2），inflight=1 不超额（1<2），
+    过准入门 4（dispatch_skip_dev smoke 返回 planned，证门 4 未 skip）。baseline 不变（design 决策#8）。"""
+    from external_state import found
+    from types import SimpleNamespace
+    monkeypatch.setattr(stub_externals, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(stub_externals, "VAULT_ROOT", tmp_path)
+    monkeypatch.setattr(stub_externals, "count_inflight_prs", lambda *a, **k: found(1))
+    prof = {"name": "p", "repo": str(tmp_path / "r"), "default_branch": "main",
+            "admission": True, "dev_agent_ready": True, "type": "code"}   # 无 serial_shadow → off
+    entry = {"prd_path": "p.md"}
+    # Act
+    rec = stub_externals.dispatch_one(entry, prof, "20260728", SimpleNamespace(dispatch_skip_dev=True))
+    # Assert — 过门 4（1<2 不超额）→ skip-dev smoke 返回 planned
+    assert rec["status"] == "planned"
+

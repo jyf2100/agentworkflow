@@ -37,6 +37,11 @@ class LoopFlags:
                                           不改 prompt）；off → 无 reflection SDK 调用、无 prompt/state 变化。
         ``cross_prd_learning_injection`` — dispatch 注入 bounded lessons 进 dev prompt。gated on shadow +
                                           parity + quality（cutover 三门控，镜像 journal_driven_dispatch）。
+
+    single-flight-auto-merge task 1.1（双 flag，镜像 shadow→driven 模式）：
+        ``single_flight_serial_shadow`` — 同目标仓 dispatch 串行单飞消费，但 merge/revert 只 log 不改 main（shadow）。
+        ``single_flight_auto_merge``    — 真实 merge/revert 闭环（改目标仓 main，破坏性）。gated on serial_shadow +
+                                          parity + canary。off → 仍并发投递 + 兜底开 PR 待 review（baseline 不变）。
     """
     __test__ = False   # 显式声明非测试类，免 pytest 收集告警（与 evidence.TestEvidence 一致；名 Loop* 不命中但保持一致）
 
@@ -48,6 +53,8 @@ class LoopFlags:
     telemetry_export: bool = False
     cross_prd_learning_shadow: bool = False       # task 1.3a
     cross_prd_learning_injection: bool = False    # task 1.3b（gated on shadow；preflight 静态阻断 invalid 组合）
+    single_flight_serial_shadow: bool = False     # single-flight-auto-merge task 1.1：串行单飞消费（shadow：merge/revert 只 log 不改 main）
+    single_flight_auto_merge: bool = False        # single-flight-auto-merge task 1.1：真实 merge/revert 闭环（gated on shadow+parity+canary；破坏性，改目标仓 main）
 
 
 # flag 名 → 环境变量名（运维/CI 文档化的稳定开关名）。改这些 = 改对外契约。
@@ -63,6 +70,10 @@ FLAGS_ENV_MAP: dict[str, str] = {
     # env 名稳定（运维/CI 文档化的开关名），改这些 = 改对外契约。
     "cross_prd_learning_shadow": "PA_LEARNING_SHADOW",
     "cross_prd_learning_injection": "PA_LEARNING_INJECTION",
+    # single-flight-auto-merge task 1.1：dispatch 串行单飞 + auto-merge 双 flag（域切割，PA_SINGLE_FLIGHT_ 前缀，
+    # 非 PA_LOOP_——dispatch 串行+auto-merge 是独立能力域，不属于 loop runtime 6 大渐进启用面）。
+    "single_flight_serial_shadow": "PA_SINGLE_FLIGHT_SERIAL_SHADOW",
+    "single_flight_auto_merge": "PA_SINGLE_FLIGHT_AUTO_MERGE",
 }
 
 # 真值集合（strip + lower 后判定）。其余一律 False（保守：未知字符串不开）。

@@ -93,3 +93,88 @@ def test_all_passed_skipped_returns_skip_records(tmp_path, monkeypatch):
     assert len(recs) == 1 and recs[0]["status"] == "skip"
     disp = json.loads((tmp_path / "dispatch_20260727.json").read_text(encoding="utf-8"))
     assert disp == recs                                     # 落盘 = 返回一致
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# single-flight-auto-merge task 2.1：串行单飞投递（flag gated，同 owner_repo 串行 / 跨 owner_repo 并行）
+# D1/D9：消灭「merge 时 main 被并发动过」冲突前提——同仓 PRD 顺序投递不重叠。跨进程 flock（task 2.2）
+# 在此分组结构上加。flag off → 现有全并行 baseline 不变（design 决策#8）。
+# ════════════════════════════════════════════════════════════════════════════
+def test_serial_shadow_on_routes_to_serial_dispatch_path(tmp_path, monkeypatch):
+    """task 2.1：single_flight_serial_shadow=on → stage_dispatch 走 _dispatch_serial_by_repo（按 owner_repo
+    分组串行单飞）；off → 现有全并行 ThreadPoolExecutor（baseline，design 决策#8 不变）。"""
+    import feature_flags as FF
+    called = {"serial": False}
+
+    def _fake_serial(passed, profiles, stamp, args):
+        called["serial"] = True
+        return [{"project": e.get("project"), "prd_path": e.get("prd_path"), "status": "pr_open"} for e in passed]
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
+    monkeypatch.delenv("DISPATCH_SKIP_PROJECTS", raising=False)
+    monkeypatch.setattr(run_daily, "_dispatch_serial_by_repo", _fake_serial)
+    monkeypatch.setattr(run_daily, "resolve_flags",
+                        lambda env=None, profile=None: FF.LoopFlags(single_flight_serial_shadow=True))
+    gate = [{"verdict": "pass", "project": "p1", "prd_path": "p1.md", "slug": "s1"}]
+    # Act
+    run_daily.stage_dispatch(_args(), gate, {}, "20260728")
+    # Assert
+    assert called["serial"] is True                         # on → 走串行路径
+
+
+def test_serial_shadow_off_uses_baseline_parallel_path(tmp_path, monkeypatch):
+    """task 2.1：serial_shadow=off → 不走串行路径（_dispatch_serial_by_repo 不被调），维持现有全并行 baseline。"""
+    import feature_flags as FF
+    called = {"serial": False}
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
+    monkeypatch.delenv("DISPATCH_SKIP_PROJECTS", raising=False)
+    monkeypatch.setattr(run_daily, "_dispatch_serial_by_repo",
+                        lambda *a, **k: called.__setitem__("serial", True) or [])
+    monkeypatch.setattr(run_daily, "resolve_flags", lambda env=None, profile=None: FF.LoopFlags())  # 全 False
+    monkeypatch.setattr(run_daily, "_run_one",
+                        lambda e, p, s, a: {"project": e["project"], "status": "pr_open"})
+    gate = [{"verdict": "pass", "project": "p1", "prd_path": "p1.md", "slug": "s1"}]
+    # Act
+    run_daily.stage_dispatch(_args(), gate, {}, "20260728")
+    # Assert
+    assert called["serial"] is False                        # baseline：未走串行路径
+
+
+def test_dispatch_serial_by_repo_serializes_same_owner_repo(monkeypatch):
+    """task 2.1：_dispatch_serial_by_repo 同 owner_repo 的 entry 顺序不重叠（single-flight：前一个 _run_one
+    完成才下一个）；跨 owner_repo 可重叠（并行）。用带耗时的 _run_one stub 记录时间窗，断言同组不重叠。"""
+    import re
+    import time
+    import threading
+    # repo_owner_repo 实跑 `git -C <repo> remote get-url`（需本地 git 仓）；单测隔离为纯 URL 解析 fake，
+    # 让分组 key 可控（o/r、o/other），聚焦 task 2.1 的串行分组属性（repo_owner_repo 解析正确性归各自单测）。
+    def _owner_of(repo):
+        m = re.search(r"/([^/]+/[^/]+?)(?:\.git)?$", repo or "")
+        return m.group(1) if m else None
+    monkeypatch.setattr(run_daily, "repo_owner_repo", _owner_of)
+    spans: dict[str, list] = {}
+    lock = threading.Lock()
+
+    def _slow_run_one(entry, prof, stamp, args):
+        owner = run_daily.repo_owner_repo((prof or {}).get("repo", "")) or ""
+        t0 = time.monotonic(); time.sleep(0.03); t1 = time.monotonic()
+        with lock:
+            spans.setdefault(owner, []).append((t0, t1))
+        return {"project": entry["project"], "prd_path": entry["prd_path"], "status": "pr_open"}
+    monkeypatch.setattr(run_daily, "_run_one", _slow_run_one)
+    passed = [
+        {"project": "p1", "prd_path": "p1.md", "slug": "s1"},
+        {"project": "p1b", "prd_path": "p2.md", "slug": "s2"},   # 同 owner_repo（o/r）
+        {"project": "p2", "prd_path": "p3.md", "slug": "s3"},    # 不同 owner_repo（o/other）
+    ]
+    profiles = {
+        "p1": {"name": "p1", "repo": "https://github.com/o/r.git"},
+        "p1b": {"name": "p1b", "repo": "https://github.com/o/r.git"},
+        "p2": {"name": "p2", "repo": "https://github.com/o/other.git"},
+    }
+    # Act
+    run_daily._dispatch_serial_by_repo(passed, profiles, "20260728", _args())
+    # Assert — 同 owner_repo（o/r）2 个 span 不重叠（single-flight）
+    r_spans = sorted(spans["o/r"])
+    assert len(r_spans) == 2
+    assert r_spans[0][1] <= r_spans[1][0], "同 owner_repo 的 PRD 应串行不重叠（single-flight）"
+    assert len(spans["o/other"]) == 1                         # 跨组各自独立（并行不重叠验证留集成测）

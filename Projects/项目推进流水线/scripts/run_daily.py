@@ -1868,7 +1868,13 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                  "status": "pending", "pr_url": None, "branch": None, "dev_killed": False,
                  "stalled": False, "run_log": None,
                  "dev_cost": None, "dev_turns": None, "verify": None, "skip_reason": None,
-                 "dev_test_cmd": None, "verify_verdict": None, "verify_round": None}   # verify 闭环字段
+                 "dev_test_cmd": None, "verify_verdict": None, "verify_round": None,   # verify 闭环字段
+                 # single-flight-auto-merge task 1.2：merge 闭环 schema 扩展（向后兼容，默认 = baseline 语义）。
+                 #   merge_commit：--no-ff merge 产出的单一 merge commit sha（merge 时记，revert/对账锚点）。
+                 #   reverted：post-merge 测试红→auto-revert 是否已执行（revert commit sha 另由 reconcile 记录）。
+                 #   triage_reason：PRD 出队进 triage 池的固定枚举原因（task 5.1）。
+                 #   post_merge_verdict：merge 后 main 全量测试三态判决（PASS/FAIL/UNKNOWN，task 4.2）。
+                 "merge_commit": None, "reverted": False, "triage_reason": None, "post_merge_verdict": None}
 
     # ── task 2.1：coordinator 集中 own 运行时设施（design 决策#1；替代散建 _run/_prd/_iter/_sj）。
     #    一次解析所有 loop flag + 建 IDs/journal/artifact_root；flag 全关→baseline no-op（dispatch 决策零变化）。
@@ -1934,8 +1940,12 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                    skip_reason=f"阻断-在途PR数不明: {inflight_res.reason}")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⛔ {slug}: {rec['skip_reason']}"); return rec
     inflight = inflight_res.value
-    if inflight >= int(prof.get("max_prs_in_flight", 2)):
-        rec.update(status="skip", skip_reason=f"跳过-超额（在途 {inflight} ≥ {prof.get('max_prs_in_flight', 2)}）")
+    # single-flight-auto-merge task 2.4：serial_shadow on → max_prs_in_flight 退化为恒 1（D5：不再是「分支总数」
+    #   语义；count_inflight_prs 保留为独立「OPEN PR 上限」门，≠ slot——slot 是 journal+flock，task 2.2）。
+    #   off → 维持 baseline（prof 上限，默认 2，design 决策#8 不变）。
+    _max_inflight = 1 if _coord.flags.single_flight_serial_shadow else int(prof.get("max_prs_in_flight", 2))
+    if inflight >= _max_inflight:
+        rec.update(status="skip", skip_reason=f"跳过-超额（在途 {inflight} ≥ {_max_inflight}）")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
 
     # ── 零成本 smoke：过准入但不触发 dev loop（不花钱、不开 PR）
@@ -2369,6 +2379,39 @@ def _run_one(entry: dict, prof: dict | None, stamp: str, args) -> dict:
         return rec
 
 
+def _dispatch_serial_by_repo(passed: list[dict], profiles: dict, stamp: str, args) -> list[dict]:
+    """single-flight-auto-merge task 2.1：同 owner_repo 串行单飞投递（一次一个 PRD 走完 _run_one 闭环才下一个）、
+    跨 owner_repo 并行。flag gated（serial_shadow on → stage_dispatch 走此路径；off → 现有全并行 baseline）。
+
+    D1/D9：消灭「merge 时 main 被并发动过」冲突前提——同仓 PRD 顺序投递不重叠。跨进程 flock（task 2.2）
+    在此分组结构上加，slot = journal + flock（D9）；当前阶段（无 merge/revert 闭环）= dev→verify。
+    DISPATCH_LOCKS（threading.Lock）仍由 _run_one 内取，兜底防 in-process TOCTOU（task 2.2 flock 前的串行保证）。"""
+    # 按 owner_repo 分组（保提交序；无 remote 的归 "" 组，彼此并行）
+    groups: dict[str, list[dict]] = {}
+    for e in passed:
+        prof = profiles.get(e.get("project")) or {}
+        repo = prof.get("repo", "")
+        owner_repo = repo_owner_repo(repo) if repo else ""
+        groups.setdefault(owner_repo or "", []).append(e)
+
+    def _run_group_serial(entries: list[dict]) -> list[dict]:
+        recs: list[dict] = []
+        for e in entries:   # 同组顺序：前一个 _run_one return 才下一个（single-flight，不重叠）
+            try:
+                recs.append(_run_one(e, profiles.get(e.get("project")), stamp, args))
+            except Exception as ex:
+                log(f"  ✗ {e.get('prd_path')}: dispatch 异常 {ex}")
+                recs.append({"project": e.get("project"), "prd_path": e.get("prd_path"),
+                             "status": "fail", "skip_reason": f"异常: {ex}"})
+        return recs
+
+    records: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(groups) or 1) as exe:
+        for recs in exe.map(_run_group_serial, groups.values()):   # 跨组并行、同组顺序
+            records.extend(recs)
+    return records
+
+
 def acquire_run_lock(break_lock: bool) -> bool:
     """获取 run 级互斥锁（SPEC #30 ③ / ADR-0004 §4）。
     O_CREAT+O_EXCL 原子获取；已存在则判陈旧（PID 失活 OR 锁龄>MAX_RUN_WALL）→ 自动接管（删+重建）；
@@ -2474,19 +2517,26 @@ def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str) -> list[d
         if owner_repo and owner_repo not in DISPATCH_LOCKS:
             DISPATCH_LOCKS[owner_repo] = threading.Lock()
 
-    # 并行投递（ThreadPoolExecutor，sync subprocess.run 释放 GIL）；dict 保提交序、per-future 异常隔离（#26）
+    # single-flight-auto-merge task 2.1：串行单飞投递（flag gated）。on → 同 owner_repo 顺序、跨 owner_repo
+    #   并行（_dispatch_serial_by_repo）；off → 现有全并行 ThreadPoolExecutor（baseline 不变，design 决策#8）。
+    _serial_shadow = resolve_flags(env=os.environ).single_flight_serial_shadow
     records: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max(1, args.max_concurrent)) as exe:
-        fut_to_entry = {exe.submit(_run_one, e, profiles.get(e.get("project")), stamp, args): e
-                        for e in passed}
-        for fut in fut_to_entry:          # 按提交序收集（.result() 阻塞到该 future 完，其余仍并行）
-            e = fut_to_entry[fut]
-            try:
-                records.append(fut.result())
-            except Exception as ex:
-                log(f"  ✗ {e.get('prd_path')}: dispatch 异常 {ex}")
-                records.append({"project": e.get("project"), "prd_path": e.get("prd_path"),
-                                "status": "fail", "skip_reason": f"异常: {ex}"})
+    if _serial_shadow:
+        log(f"[dispatch] single-flight 串行单飞：{len(passed)} 份按 owner_repo 分组串行投递")
+        records = _dispatch_serial_by_repo(passed, profiles, stamp, args)
+    else:
+        # 并行投递（ThreadPoolExecutor，sync subprocess.run 释放 GIL）；dict 保提交序、per-future 异常隔离（#26）
+        with ThreadPoolExecutor(max_workers=max(1, args.max_concurrent)) as exe:
+            fut_to_entry = {exe.submit(_run_one, e, profiles.get(e.get("project")), stamp, args): e
+                            for e in passed}
+            for fut in fut_to_entry:          # 按提交序收集（.result() 阻塞到该 future 完，其余仍并行）
+                e = fut_to_entry[fut]
+                try:
+                    records.append(fut.result())
+                except Exception as ex:
+                    log(f"  ✗ {e.get('prd_path')}: dispatch 异常 {ex}")
+                    records.append({"project": e.get("project"), "prd_path": e.get("prd_path"),
+                                    "status": "fail", "skip_reason": f"异常: {ex}"})
     # 临时跳过的项目也落 disp_file（status=skip），让 report 段可见，避免 silent drop
     records.extend(skip_records)
     # records 按 project+slug 排序保 diff 稳定（并行下完成序不确定）
