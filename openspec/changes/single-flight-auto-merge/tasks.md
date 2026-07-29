@@ -13,10 +13,10 @@
 
 ## 3. 自动 merge 阶段（D2 / D6 / D7）
 
-- [ ] 3.1 dev+verify 双绿 → fetch main HEAD + rebase 分支到当前 main，产出三态 `CLEAN` / `CONFLICT` / `UNKNOWN`（CLEAN 须**正向证据**：fetch 成功 + exit0 + 干净工作树 + 无冲突标记；缺证 = UNKNOWN）
-- [ ] 3.2 `CLEAN` → 经 dev-agent SDK loop 在 worktree 内 `--no-ff` merge + push（ff-only，禁 `--force*`），记录 `merge_commit`（替换现「兜底开 PR 待 review」）
-- [ ] 3.3 `CONFLICT` / `UNKNOWN` → 转 triage 池，**不强合**（对齐 fail-safe UNKNOWN 不变式）
-- [ ] 3.4 给 merge commit 打稳定 marker（footer `Pipeline-Merge: <prd_id>`）供回滚后机械找出（`git log --grep`）
+- [x] 3.1 dev+verify 双绿 → fetch main HEAD + rebase 分支到当前 main，产出三态 `CLEAN` / `CONFLICT` / `UNKNOWN`（CLEAN 须**正向证据**：fetch 成功 + exit0 + 干净工作树 + 无冲突标记；缺证 = UNKNOWN） — 判定层 + rebase 执行均 ✓（`merge_phase.classify_rebase` + dev-agent `run_merge_phase` fetch→checkout branch→rebase（D10 timeout 120s）→收证→classify，quality 1328 passed）；dev+verify 双绿**触发接线**随 task #5 dispatch
+- [x] 3.2 `CLEAN` → 在 worktree 内 `--no-ff` merge + push（ff-only，禁 `--force*`），记录 `merge_commit`（替换现「兜底开 PR 待 review」） — ✓ dev-agent `run_merge_phase`；**用机械层（``git()`` subprocess）非 SDK loop**：合并是确定性机械活，走机械层更稳/可测/不引入 agent 非确定性，符合 ADR-0001 机械 vs 语义切分（D6「在 dev-agent 内执行」已守——在 dev-agent 进程内跑 git，控制面只发 ``--phase merge`` cmd）；push reject→reset 本地 main + UNKNOWN（main unchanged）；dispatch 接线（替换兜底开 PR）随 task #5
+- [ ] 3.3 `CONFLICT` / `UNKNOWN` → 转 triage 池，**不强合**（对齐 fail-safe UNKNOWN 不变式） — dev-agent 层已保：merge_commit=None + main 未碰 + ``triage_reason`` 给出 rebase_conflict/rebase_unknown；**triage 池落池机制**（枚举/不阻塞/成段）在 task 5.1
+- [x] 3.4 给 merge commit 打稳定 marker（footer `Pipeline-Merge: <prd_id>`）供回滚后机械找出（`git log --grep`） — ✓ `run_merge_phase` 双 ``-m``（标题 + footer 段 ``Pipeline-Merge: <prd_id>``），可 ``git log --grep "Pipeline-Merge: <prd_id>"`` 找出
 
 ## 4. post-merge 验证 + auto-revert 兜底（D3 / D8 / D11）
 
@@ -44,6 +44,6 @@
 ## 7. 验证 + 灰度上线
 
 - [ ] 7.1a shadow 模式：串行消费器全跑但只 log、不真 merge/push，对齐 shadow parity（`cutover.py` 产出证据）
-- [ ] 7.1b **离线 merge drill**（canary 前必做）：fixture 真实 git tmp repo（注入故意红 commit），跑 merge→push→post-merge-test→revert 全链路，断言 main 回干净 + revert commit 干净 + marker 可 grep——补 shadow 测不到的核心链路
+- [ ] 7.1b **离线 merge drill**（canary 前必做）：fixture 真实 git tmp repo（注入故意红 commit），跑 merge→push→post-merge-test→revert 全链路，断言 main 回干净 + revert commit 干净 + marker 可 grep——补 shadow 测不到的核心链路 — **merge 阶段 ✓**（`test_dev_agent_merge.py` 3 测，subprocess 真实 git tmp repo，1331 passed）：CLEAN[--no-ff+ff-only push+marker footer 可 grep+双 parent 历史] / CONFLICT[main 未碰+rebase --abort 后工作树清干净] / UNKNOWN[fetch 失败 main 未碰]；**post-merge-test→revert 全链路 drill 待 task 4.x**（auto-revert 未实现）
 - [ ] 7.2 canary：cc-web-control 单项目开真实自动 merge，观察 N 次闭环（含一次故意红的 auto-revert + 一次熔断触发）
 - [ ] 7.3 回滚验证：`single_flight_auto_merge` 关 → 回到并发 + 开 PR 待 review 旧行为（已合 main 的 commit **不**自动撤回，靠 marker `git log --grep` 找出人工 revert）

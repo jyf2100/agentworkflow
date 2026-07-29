@@ -62,6 +62,7 @@ from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # O
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
 import sdk_compat_patch                   # ADR-0006 #7（migrate-dev-agent-streaming-with-1106-patch）：#1106 keep-alive 定向 patch，根治 #1105（零依赖模块，apply 内延迟 import SDK）
 from external_state import sanitize   # C2 脱敏：git()/gh() stderr 进 JSON error 前抹 token（无依赖模块，同上）
+from merge_phase import classify_rebase, RebaseEvidence, RebaseOutcome   # task 3.2：merge phase 三态判定（纯 stdlib 无依赖模块，同上避免顶部 SDK 连带加载拖垮 cron）
 from coordinator import build_coordinator   # task 2.3b：coordinator 边界（design 决策#1：一次解析 loop flag + own journal/artifacts/IDs）
 from hook_bridge import build_dev_hooks      # task 2.3b：lifecycle_hooks 开 → 注册真实 SDK lifecycle hooks（ClaudeAgentOptions.hooks）
 
@@ -89,7 +90,9 @@ def parse_args(argv: list[str]) -> dict:
            # add-cross-prd-learning-memory Section 5 接线：控制面在 dispatch-entry 把检索出的 lesson block
            #   写成 content-addressed artifact，path 透传给目标面 dev-agent（与 --feedback-artifact 完全对称）。
            #   baseline / injection=off → None（build_prompt 跳过注入，prompt byte-identical baseline）。
-           "lessons_artifact": None}
+           "lessons_artifact": None,
+           # task 3.2：merge phase 参数（--phase merge 时用；默认 phase=dev = 原 dev loop 路径零变化，design 决策#8）
+           "phase": "dev", "branch": None, "main_ref": "main", "prd_id": ""}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -104,6 +107,10 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--fork-session": out["fork_session"] = True                           # task 3.3：fork 新 session（context 污染/compaction）
         elif a == "--state-dir": out["state_dir"] = argv[i + 1]; i += 1                  # task 3.3 P0-3：控制面注入 state_dir（SessionStore 统一）
         elif a == "--dry-run": out["dry_run"] = True
+        elif a == "--phase": out["phase"] = argv[i + 1]; i += 1                       # task 3.2：merge phase 模式（dev|merge）
+        elif a == "--branch": out["branch"] = argv[i + 1]; i += 1                    # task 3.2：merge 目标 feature 分支
+        elif a == "--main": out["main_ref"] = argv[i + 1]; i += 1                    # task 3.2：目标仓主干（默认 main）
+        elif a == "--prd-id": out["prd_id"] = argv[i + 1]; i += 1                    # task 3.2：merge commit marker 幂等键
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
     return out
@@ -402,10 +409,136 @@ async def _can_use_tool(
     return PermissionResultDeny(message=f"[dev-agent 权限闸] {reason}")
 
 
+# ─── task 3.2：merge phase（机械执行 rebase→merge→push，不经 SDK loop）──────────────
+# 守 D6/ADR-0001：在目标仓 worktree（REPO_ROOT）经 git() 机械层执行；控制面只发 --phase merge cmd，
+#   dev-agent 在目标仓内执行（控制面不直接持 git 写句柄）。三态经 merge_phase.classify_rebase；
+#   CLEAN→--no-ff merge + ff-only push + 记 merge_commit；CONFLICT/UNKNOWN→不碰 main；
+#   push reject→reset 本地 main + UNKNOWN（spec「Push fails → main unchanged」）。
+REBASE_TIMEOUT = 120   # D10：rebase wall-clock 上界（秒）
+
+
+def _run_rebase(main_ref: str) -> tuple[int | None, bool]:
+    """跑 ``git rebase origin/<main>``，返回 ``(exit_code, timed_out)``。非 raise（收证用）。
+
+    exit0=干净；非0=冲突/错误（配合冲突标记判定）；None=未取到（超时/异常）。
+    """
+    try:
+        r = subprocess.run(["git", "rebase", f"origin/{main_ref}"], cwd=REPO_ROOT,
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=REBASE_TIMEOUT)
+        return r.returncode, False
+    except subprocess.TimeoutExpired:
+        return None, True
+    except Exception:
+        return None, False
+
+
+def _count_conflict_files() -> int:
+    """``git diff --name-only --diff-filter=U`` 行数（unmerged 文件 = 冲突标记）。非 raise。"""
+    try:
+        r = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=REPO_ROOT,
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+        return len([ln for ln in (r.stdout or "").splitlines() if ln.strip()])
+    except Exception:
+        return 0
+
+
+def _worktree_clean() -> bool:
+    """``git status --porcelain`` 为空 → 工作树干净。非 raise（查询失败→False，配合其他证据判 UNKNOWN）。"""
+    try:
+        r = subprocess.run(["git", "status", "--porcelain"], cwd=REPO_ROOT,
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+        return (r.stdout or "").strip() == ""
+    except Exception:
+        return False
+
+
+def _safe_git(git_args: list[str]) -> None:
+    """git 但吞异常（清理用：rebase --abort / reset；失败不掩判定结果）。"""
+    try:
+        git(git_args)
+    except Exception:
+        pass
+
+
+def _safe_revparse(ref: str) -> str | None:
+    try:
+        return git(["rev-parse", ref])
+    except Exception:
+        return None
+
+
+def _emit_merge(rebase_outcome, merge_commit=None, push_failed=False,
+                evidence=None, error=None) -> int:
+    """merge phase 末行 JSON（控制面 ``parse_merge_result`` 消费）。CLEAN+push 成功=exit0；其余非0。"""
+    ev = ({"fetch_ok": evidence.fetch_ok, "rebase_rc": evidence.rebase_rc,
+           "worktree_clean": evidence.worktree_clean, "conflict_files": evidence.conflict_files,
+           "timed_out": evidence.timed_out} if evidence else {})
+    ok = rebase_outcome is RebaseOutcome.CLEAN and not push_failed and bool(merge_commit)
+    print(json.dumps({"phase": "merge", "rebase_outcome": rebase_outcome.value,
+                      "merge_commit": merge_commit, "push_failed": push_failed,
+                      "rebase": ev, "error": error}, ensure_ascii=False))
+    return 0 if ok else 13
+
+
+def run_merge_phase(args: dict) -> int:
+    """merge phase 主编排：fetch→checkout branch→rebase→收证→classify→（CLEAN）merge+push。
+
+    非 CLEAN 不碰 main（rebase 残留 abort 清干净）；CLEAN 则 ``--no-ff`` merge 进 main + ff-only push +
+    记 merge_commit（带 ``Pipeline-Merge: <prd_id>`` marker footer，task 3.4）；push reject 回退本地 main
+    （spec「main unchanged」）。任一未预期异常 → UNKNOWN（fail-safe，不当 merged）。
+    """
+    branch, main_ref, prd_id = args["branch"], args["main_ref"], args["prd_id"]
+    try:
+        # 1. fetch origin <main>（失败=base 过时 → evidence.fetch_ok=False → UNKNOWN）
+        try:
+            git(["fetch", "origin", main_ref])
+            fetch_ok = True
+        except Exception:
+            fetch_ok = False
+        # 2. checkout feature 分支（rebase 目标；失败→UNKNOWN，不动 main）
+        try:
+            git(["checkout", branch])
+        except Exception as e:
+            ev = RebaseEvidence(fetch_ok, None, False, 0, False)
+            return _emit_merge(RebaseOutcome.UNKNOWN, evidence=ev, error=f"checkout {branch} 失败: {e}")
+        # 3. rebase origin/<main>（带 timeout 收证）+ 超时清半完成
+        rebase_rc, timed_out = _run_rebase(main_ref)
+        if timed_out:
+            _safe_git(["rebase", "--abort"])
+        # 4. 收工作树/冲突证据 → classify 三态
+        evidence = RebaseEvidence(fetch_ok, rebase_rc, _worktree_clean(), _count_conflict_files(), timed_out)
+        outcome = classify_rebase(evidence)
+        if outcome is not RebaseOutcome.CLEAN:
+            _safe_git(["rebase", "--abort"])   # CONFLICT/UNKNOWN：清 rebase 残留，main 未碰
+            return _emit_merge(outcome, evidence=evidence)
+        # 5. CLEAN：--no-ff merge <branch> into main + ff-only push + 记 merge_commit
+        try:
+            git(["checkout", main_ref])
+            git(["merge", "--no-ff", branch, "-m", f"pa-merge: {prd_id}",
+                 "-m", f"项目推进流水线自动合入（Pipeline-Merge: {prd_id}）。"])   # task 3.4：稳定 marker footer
+        except Exception as e:
+            _safe_git(["merge", "--abort"]); _safe_git(["checkout", branch])
+            return _emit_merge(RebaseOutcome.UNKNOWN, evidence=evidence, error=f"merge 失败: {e}")
+        merge_commit = _safe_revparse("HEAD")
+        try:
+            git(["push", "origin", main_ref])   # 非 ff 自动 reject（禁 --force*）；spec「Push fails→UNKNOWN」
+        except Exception:
+            _safe_git(["reset", "--hard", f"origin/{main_ref}"])   # 回退本地 main（main unchanged）
+            return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, push_failed=True,
+                               evidence=evidence, error="push rejected（非 ff/auth/network）")
+        return _emit_merge(RebaseOutcome.CLEAN, merge_commit=merge_commit, evidence=evidence)
+    except Exception as e:
+        return _emit_merge(RebaseOutcome.UNKNOWN, error=f"merge phase 未预期异常: {e}")
+
+
 async def main() -> int:
     args = parse_args(sys.argv[1:])
     if args["help"]:
         print(HELP); return 0
+    # task 3.2：merge phase 早期分叉——机械执行 rebase→merge→push（不经建分支/prompt/SDK loop），
+    #   dev loop 路径零回归（phase 默认 dev = 原 main 逻辑）。守 D6：控制面只发 --phase merge cmd。
+    if args.get("phase") == "merge":
+        return run_merge_phase(args)
     if not args["prd"]:
         sys.stderr.write("✗ 缺 --prd（控制面投递的 PRD）\n" + HELP + "\n"); return 10
 

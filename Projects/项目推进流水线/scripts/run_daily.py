@@ -56,6 +56,7 @@ import reconcile                           # task 4.4：ArtifactEvidenceResolver
 import retry_policy as RP                  # task 3.3 P0-3：run_daily 驱动 retry（decide/recover_iteration/budget/session 参数生成）
 import cutover                             # add-cross-prd-learning-memory 批次 2 升级 A：injection 四重 gate（shadow+parity+quality+allowlist）
 import ids as loop_ids                     # single-flight-auto-merge task 2.2：slot 事件审计归属 IDs（run_id/prd_id/iteration_id，纯 stdlib）
+import merge_phase as MP                   # single-flight-auto-merge task 3.2：merge phase 机械判定（classify_rebase/MergeResult/parse_merge_result/build_merge_cmd；纯 stdlib 零 git/SDK，cron 安全）
 import single_flight as SF                 # single-flight-auto-merge task 2.2/2.3：per-owner_repo 跨进程 slot（flock + journal；Linux fcntl，cron 安全）
 # add-cross-prd-learning-memory Section 7 接线（控制面纯 stdlib 模块，cron 隔离不变）：
 #   envelope 构造（journal events → sanitized TerminalEnvelope）+ reflection（read-only SDK，mock-SDK 可注入）+
@@ -1699,6 +1700,10 @@ _DISPATCH_STATUS_TO_ENVELOPE_TERMINAL: dict[str, str] = {
     "fail": "failed",
     "stalled": "stalled",
     "orphan_deleted": "orphan_deleted",
+    # single-flight-auto-merge task #5：merge phase 出口 → envelope terminal label（保 reflection 不 degraded）。
+    #   merged=已合 main（≈ published，已交付；task 6.1a 引 MERGED 非终态允许 revert 时再调）；triaged=待人工（≈ external_blocked）。
+    "merged": "published",
+    "triaged": "external_blocked",
     # pr_* 系列需配合 verify 双门决定 published/revise（见 _dispatch_status_to_envelope_terminal 函数体）
 }
 
@@ -1767,6 +1772,9 @@ _DISPATCH_TERMINAL_OUTCOMES: frozenset[str] = frozenset({
     "retry_blocked", "retry_budget_exhausted",
     # loop_state 真终态名直传场景（identity pass-through；这些 label 也在 loop_state.TERMINAL_STATUSES）
     "sandbox_blocked", "state_corrupt", "published", "aborted", "failed",
+    # single-flight-auto-merge task #5：merge phase 出口（dispatch 已 return = terminal outcome；merged=已合 main，
+    #   triaged=进 triage 池不强合）。缺之则 _dispatch_is_terminal_outcome 判 False → reflection degrade 漏候选。
+    "merged", "triaged",
 })
 
 
@@ -1802,6 +1810,8 @@ _SJ_TERMINAL_MAP: dict[str, str] = {
     "stalled": "stalled",
     "orphan_deleted": "orphan_deleted",
     "blocked_evidence": "blocked_evidence",   # task 4.2：green evidence artifact 持久化失败（不当 fresh green evidence）
+    "merged": "published",            # single-flight-auto-merge task #5：已合 main → published（for 外 _sj_terminal 统一 emit）
+    "triaged": "external_blocked",    # single-flight-auto-merge task #5：进 triage 池待人工 → external_blocked
 }
 
 
@@ -2147,9 +2157,32 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                     rec.update(status="blocked_external_state", blocked_check="publication_reconcile",
                                skip_reason="阻断-publication reconcile 有 unknown 副作用（不盲目 publish）")
                     break   # 不进 reconcile_pr；for 外 _sj_terminal 统一收尾
-            # 判绿：兜底开正常 PR 收尾（治 baostock 式 interrupted_pr；reconcile 查到 dev 自开 PR 则保持 pr_open）
-            log(f"  ✅ {slug}: verify 绿（r{round_n}）→ 兜底开 PR 收尾")
-            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=False); break
+            # single-flight-auto-merge task #5 接线（D2/D6/D7）：verify 绿 + auto_merge flag 开 → 真实自动合 main
+            #   （dev-agent --phase merge 机械执行 fetch→rebase→收证→classify→CLEAN 则 --no-ff merge + ff-only push，
+            #   守 D6：控制面只发 cmd，在目标仓 worktree 内经 git() 机械层跑，不直接持 git 写句柄）。flag 关 → baseline
+            #   兜底开 PR 待 review（dispatch 决策零变化，design 决策#8）。merged→记 merge_commit + status=merged；
+            #   CONFLICT/UNKNOWN/push_failed→不强合（main 未碰），triage_reason 进 triage 池（task 5.1）。
+            #   ⚠️ post-merge 验证 + auto-revert 兜底在 task 4.x（此阶段 merged 路径已通但缺 post-merge 闸；
+            #   flag 默认关→baseline 不真合，待 task 4.x 补齐 + canary 后再开）。
+            if _coord.flags.single_flight_auto_merge:
+                _merge_cmd = MP.build_merge_cmd(
+                    python=_env_python(prof.get("conda_env", "")), dev_agent_py=DEV_AGENT_PY,
+                    branch=branch, main_ref=base, prd_id=_prd, state_dir=str(STATE_DIR))
+                _merge_json = _run_dev_agent(_merge_cmd, wt, slug, log_file)   # 复用末行 JSON 解析（同 dev loop）
+                _mr = MP.parse_merge_result(_merge_json)
+                if _mr.merged:
+                    rec["merge_commit"] = _mr.merge_commit
+                    rec["status"] = "merged"            # task 5.3 report 桶；post-merge 闸 task 4.x 升级
+                    log(f"  🎉 {slug}: verify 绿 + rebase CLEAN → 已合 main（merge {_mr.merge_commit[:8]}）")
+                else:
+                    rec["triage_reason"] = _mr.triage_reason    # 固定枚举：rebase_conflict/rebase_unknown/push_failed
+                    rec["status"] = "triaged"            # task 5.1 triage 池（不阻塞，不强合，main 未碰）
+                    log(f"  🧪 {slug}: merge 进 triage（{_mr.triage_reason}，rebase={_mr.rebase_outcome.value}）→ 不强合")
+            else:
+                # baseline：兜底开正常 PR 收尾（治 baostock 式 interrupted_pr；reconcile 查到 dev 自开 PR 则保持 pr_open）
+                log(f"  ✅ {slug}: verify 绿（r{round_n}）→ 兜底开 PR 收尾")
+                reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=False)
+            break
         if vinfo and vinfo.get("verdict") == "revise" and round_n < VERIFY_MAX_ROUNDS:
             # 判红（机会未用满）：保留分支做下次 base + 反馈追加进 PRD + 增量 --base=<上次分支> 重投
             log(f"  🔴 {slug}: verify 红（r{round_n}）→ 保留 {branch} 做下次 base，反馈进 PRD，增量重投 r{round_n + 1}")
