@@ -55,6 +55,8 @@ import artifact_store                      # task 3.3：内容寻址工件存储
 import reconcile                           # task 4.4：ArtifactEvidenceResolver（publication 前 reconcile test evidence）
 import retry_policy as RP                  # task 3.3 P0-3：run_daily 驱动 retry（decide/recover_iteration/budget/session 参数生成）
 import cutover                             # add-cross-prd-learning-memory 批次 2 升级 A：injection 四重 gate（shadow+parity+quality+allowlist）
+import ids as loop_ids                     # single-flight-auto-merge task 2.2：slot 事件审计归属 IDs（run_id/prd_id/iteration_id，纯 stdlib）
+import single_flight as SF                 # single-flight-auto-merge task 2.2/2.3：per-owner_repo 跨进程 slot（flock + journal；Linux fcntl，cron 安全）
 # add-cross-prd-learning-memory Section 7 接线（控制面纯 stdlib 模块，cron 隔离不变）：
 #   envelope 构造（journal events → sanitized TerminalEnvelope）+ reflection（read-only SDK，mock-SDK 可注入）+
 #   retrieval（dispatch-entry catalog 检索 + lesson block 渲染）+ effectiveness（memory_mode record）。
@@ -2359,24 +2361,70 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
                        capture_output=True, text=True, timeout=60)
 
 
+def _slot_now() -> datetime:
+    """slot lease 算术用的「当前时间」（datetime）。独立成函数便于测试 monkeypatch（同 ``_now_iso``）。"""
+    return datetime.now(timezone.utc)
+
+
+def _slot_blocked_record(entry: dict, owner_repo: str, slot_res) -> dict:
+    """single-flight slot 准入 blocked 时 ``_run_one`` 构造的等价 rec（不调 dispatch_one）。
+
+    ``unknown``（slot journal 损坏/读失败）→ ``blocked_external_state``（fail-safe，spec「Single-flight slot
+    is unknown → blocked_external_state」）；``inflight``/``flock_busy`` → ``skip``（让位，下轮 cron 再投）。
+    rec schema 对齐 ``dispatch_one`` 初始 rec（含 task 1.2 single-flight 字段），保 report 段兼容。"""
+    slug = Path(entry.get("prd_path", "")).stem or "unknown"
+    rec: dict = {"project": entry.get("project"), "prd_path": entry.get("prd_path"), "slug": slug,
+                 "base": None, "status": "pending", "pr_url": None, "branch": None, "dev_killed": False,
+                 "stalled": False, "run_log": None, "dev_cost": None, "dev_turns": None, "verify": None,
+                 "skip_reason": None, "dev_test_cmd": None, "verify_verdict": None, "verify_round": None,
+                 "merge_commit": None, "reverted": False, "triage_reason": None, "post_merge_verdict": None}
+    qreason = slot_res.query.reason
+    if slot_res.blocked_reason == "unknown":
+        rec.update(status="blocked_external_state", blocked_check="single_flight_slot",
+                   skip_reason=f"阻断-single-flight slot 状态不明: {qreason}")
+    else:   # inflight / flock_busy
+        rec.update(status="skip",
+                   skip_reason=f"跳过-single-flight slot 占用({slot_res.blocked_reason}): {qreason}")
+    return rec
+
+
 def _run_one(entry: dict, prof: dict | None, stamp: str, args) -> dict:
-    """ThreadPoolExecutor worker：取 per-owner_repo 串行锁后调 dispatch_one（同仓串行、跨仓并行）。
-    锁由 stage_dispatch 按 owner_repo 预建（避免并发 lazy 创建竞态）。仓无 remote（无锁）→ nullcontext 不串行。
+    """ThreadPoolExecutor worker：取 per-owner_repo 串行互斥后调 dispatch_one（同仓串行、跨仓并行）。
+
+    single-flight-auto-merge task 2.2/2.3：``serial_shadow`` on → ``slot_scope`` 包 dispatch_one（跨进程 flock
+    + journal 持久化 slot 态，跨 cron 存活；``threading.Lock`` 进程内不可见，D9 审核一致 F5）。slot lifecycle
+    在此 chokepoint 用 ``with`` 包裹——所有 dispatch_one 出口（含异常）统一经 ``__exit__`` release，flock 不泄漏。
+    off → baseline ``threading.Lock``（design 决策#8 不变）。仓无 remote（无 owner_repo）→ 不串行。
 
     add-cross-prd-learning-memory Section 7 接线点 1+3：``dispatch_one`` 返回后调 ``_attach_learning_memory``
-    做 terminal reflection + memory_mode 聚合（fail-open；shadow=off 零副作用）。所有 dispatch_one 内部
-    ``return rec`` 路径统一经此 chokepoint（无需在 dispatch_one 内多处插桩）。"""
+    做 terminal reflection + memory_mode 聚合（fail-open；shadow=off 零副作用）。"""
     if not prof:
         return {"project": entry.get("project"), "prd_path": entry.get("prd_path"),
                 "status": "skip", "skip_reason": "profile 不存在"}
     repo = prof.get("repo", "")
     owner_repo = repo_owner_repo(repo) if repo else ""
+
+    def _learn(rec: dict) -> None:
+        _attach_learning_memory(rec, prof, entry, stamp,
+                                sdk_query_fn=getattr(args, "_learning_sdk_query_fn", None))
+
+    # serial_shadow on → 跨进程 single-flight slot（task 2.2/2.3：flock + journal，跨 cron 存活）
+    if owner_repo and resolve_flags(env=os.environ).single_flight_serial_shadow:
+        _run = loop_ids.run_id(stamp)
+        _prd = loop_ids.prd_id(entry.get("prd_path", ""), None)
+        _iter = loop_ids.iteration_id(_run, _prd, 0)
+        with SF.slot_scope(STATE_DIR, owner_repo, run_id=_run, prd_id=_prd, iteration_id=_iter,
+                           now_fn=_slot_now, stamp_fn=_now_iso) as _slot:
+            if not _slot.acquired:                 # inflight/unknown/flock_busy → 不投递（让位/fail-safe）
+                rec = _slot_blocked_record(entry, owner_repo, _slot)
+                _learn(rec); return rec
+            rec = dispatch_one(entry, prof, stamp, args)
+            _learn(rec); return rec
+    # off → baseline：进程内 threading.Lock（同仓串行、跨仓并行；design 决策#8 不变）
     lock = DISPATCH_LOCKS.get(owner_repo) if owner_repo else None
     with lock if lock else contextlib.nullcontext():
         rec = dispatch_one(entry, prof, stamp, args)
-        _attach_learning_memory(rec, prof, entry, stamp,
-                                sdk_query_fn=getattr(args, "_learning_sdk_query_fn", None))
-        return rec
+        _learn(rec); return rec
 
 
 def _dispatch_serial_by_repo(passed: list[dict], profiles: dict, stamp: str, args) -> list[dict]:

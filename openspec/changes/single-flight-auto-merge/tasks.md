@@ -7,8 +7,8 @@
 ## 2. 串行单飞消费器（D1 / D5 / D9）
 
 - [x] 2.1 改 dispatch 投递为同 `owner_repo` 串行消费（一次一个 PRD 走完 dev→verify→merge 闭环才下一个），跨 `owner_repo` 并行；复用并扩展现有 `DISPATCH_LOCKS`（已是整段闭环串行，本项是**显式化 + 跨进程化**，非全新实现）；新增 `_dispatch_serial_by_repo`（按 owner_repo 分组、同组顺序 _run_one、跨组 ThreadPoolExecutor 并行）+ stage_dispatch flag gated 路由；TDD RED→GREEN(27 测)+ruff
-- [ ] 2.2 改准入门为 per-repo single-flight slot 检查：slot 状态 = journal 在途闭环状态 + 跨进程 flock（**非** GitHub OPEN PR `count_inflight_prs`、非进程内 `threading.Lock`）；slot `UNKNOWN` → `blocked_external_state`，不当代空闲
-- [ ] 2.3 slot crash 恢复：journal 重放 + lease TTL 重建为 known（free 或 in-flight-with-lease），**不**默认 free
+- [x] 2.2 改准入门为 per-repo single-flight slot 检查：slot 状态 = journal 在途闭环状态 + 跨进程 flock（**非** GitHub OPEN PR `count_inflight_prs`、非进程内 `threading.Lock`）；slot `UNKNOWN` → `blocked_external_state`，不当代空闲
+- [x] 2.3 slot crash 恢复：journal 重放 + lease TTL 重建为 known（free 或 in-flight-with-lease），**不**默认 free
 - [x] 2.4 `max_prs_in_flight` 退化为同项目恒 1（保留作 bug 安全阀）；`count_inflight_prs` 语义独立为「OPEN PR 上限」门（≠ slot），去留见 design Open Questions；dispatch_one 准入门 4 serial_shadow on→`_max_inflight=1`、off→baseline(prof 默认 2)；TDD RED(planned≠skip)→GREEN(36 测)+ruff
 
 ## 3. 自动 merge 阶段（D2 / D6 / D7）
