@@ -2,6 +2,7 @@
 
 > 自动化 R&D 编排器的**控制面大脑** —— 一个 Obsidian vault，托管 **pa**（项目推进流水线）：全自动研发流水线编排器 + 控制面标准执行器。
 
+[![license](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![pa-pipeline](https://img.shields.io/badge/pa--pipeline-v1.0.0-blue)](Projects/项目推进流水线/CHANGELOG.md)
 [![tests](https://img.shields.io/badge/quality.sh-passing-brightgreen)](Projects/项目推进流水线/scripts/quality.sh)
 [![python](https://img.shields.io/badge/python-%E2%89%A53.11-3776AB)](Projects/项目推进流水线/pyproject.toml)
@@ -103,4 +104,4 @@ cron 每日 03:17 经 [`run_cron.sh`](Projects/项目推进流水线/scripts/run
 
 ---
 
-**pa-pipeline v1.0.0** · Python ≥3.11 · [CHANGELOG](Projects/项目推进流水线/CHANGELOG.md)
+**pa-pipeline v1.0.0** · Python ≥3.11 · [MIT](LICENSE) · [CHANGELOG](Projects/项目推进流水线/CHANGELOG.md)
