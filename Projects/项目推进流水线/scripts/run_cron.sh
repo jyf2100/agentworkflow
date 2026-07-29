@@ -23,12 +23,23 @@ export NVM_DIR="$HOME/.nvm"
 # （2026-07-26 修：0722-0726 连挂于「✗ 找不到 claude CLI」）
 export PATH="$HOME/.local/bin:$PATH"
 
+# miniconda python：dev-agent.py 直接 import claude_agent_sdk（SDK 模式，非 CLI 子进程），
+# 该包只装在 miniconda site-packages；cron 极简 PATH 解析到 /usr/bin/python3 → ModuleNotFoundError。
+# （2026-07-29 修：0729 cron dev r1 崩于 dev-agent.py:46 import；persona 走 claude CLI 子进程不受影响）
+export PATH="$HOME/miniconda3/bin:$PATH"
+
 CLAUDE_BIN="$(command -v claude || true)"
 [ -n "$CLAUDE_BIN" ] && export PA_CLAUDE_BIN="$CLAUDE_BIN"
 
 # 心跳模式：report 段全绿也发一封状态邮件（无头服务器上「邮件断了 = 流水线挂了」）。
 # 手动跑 run_daily.py 不设此 env，行为不变（全绿不发）。
 export PA_HEARTBEAT=1
+
+# 临时降噪（#1105，memory pa-target-plane-dev-exec-lock）：claude CLI 子进程 stdio
+# can_use_tool 权限协议 bug，致 cc-web-control 等 node 项目 dispatch 反复 test_failed。
+# 此 env 命中项目跳过 dispatch 段（过闸 PRD 落 status=skip，report 段可见，非静默丢弃）。
+# ⚠️ 临时：上游 SDK/CLI 修 #1105 或 streaming 迁移后删此行即恢复全量 dispatch。
+# export DISPATCH_SKIP_PROJECTS=cc-web-control
 
 # SMTP 默认走 sina 通道（smtp_send.py 默认 profile=sina：dvs@vip.sina.com:465 SSL 直连）。
 # 欲改走公司 Exchange/DavMail：export PA_PROFILE=newland
