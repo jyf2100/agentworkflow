@@ -3187,6 +3187,8 @@ def main():
                     help="只跑指定项目（可重复 / 逗号分隔多仓）；canary 隔离用，如 --project cc-web-control")
     ap.add_argument("--state-dir", default=None, metavar="PATH",
                     help="覆盖 state 落盘根（默认 .project-auto/state）；canary/演练用，与真实 cron state 物理隔离")
+    ap.add_argument("--skip-critic", action="store_true",
+                    help="跳过 critic 质量闸，manifest 全 PRD 直 pass（canary/演练用——canary 载体正交于项目 goal 会被 critic drop）")
     args = ap.parse_args()
     args.project = _normalize_projects(args.project)          # append+逗号 归一为 list（None=不过滤）
     _apply_state_dir(args.state_dir)                          # 须在 STATE_DIR.mkdir / acquire_run_lock 之前：重绑 STATE_DIR+RUN_LOCK
@@ -3233,7 +3235,15 @@ def _run_pipeline(args) -> None:
         if lo <= 3 <= hi and getattr(args, "inject_prd", None):
             manifest, stamp = stage_inject(args, profiles, stamp)   # 手动注入 PRD（替 radar→prd）
         if lo <= 4 <= hi:
-            gate = stage_critic(args, manifest, profiles, stamp)
+            if getattr(args, "skip_critic", False):
+                gate = [{"prd_path": e.get("path", ""), "project": e.get("project", ""),
+                         "verdict": "pass", "summary": "--skip-critic 直 pass（canary/演练）",
+                         "round": 1, "revised": False, "issues": []} for e in manifest.get("prds", [])]
+                (STATE_DIR / f"prd_gate_{stamp}.json").write_text(
+                    json.dumps(gate, ensure_ascii=False, indent=2), encoding="utf-8")
+                log(f"[critic] ⏭ skip（--skip-critic）：{len(gate)} 条 PRD 直 pass（canary/演练，绕质量闸）")
+            else:
+                gate = stage_critic(args, manifest, profiles, stamp)
         if lo <= 5 <= hi:
             if not gate:   # --from-stage dispatch：critic 未跑，从盘读 prd_gate
                 gf = STATE_DIR / f"prd_gate_{stamp}.json"

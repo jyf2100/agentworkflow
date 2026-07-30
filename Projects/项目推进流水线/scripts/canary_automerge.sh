@@ -178,7 +178,7 @@ run-a() {
   unset PA_HEARTBEAT || true
   cd "$VAULT"
   python3 "$RUN_DAILY" --from-stage inject --to-stage dispatch \
-    --inject-prd "$GREEN_PRD" --project cc-web-control --state-dir "$CANARY_STATE" --no-notify \
+    --inject-prd "$GREEN_PRD" --project cc-web-control --state-dir "$CANARY_STATE" --no-notify --skip-critic \
     2>&1 | tee "$CANARY_LOG"
   log "  判据 a 完成——跑 \`$0 verify\` 检查 (a) merge+post-merge PASS"
 }
@@ -262,7 +262,7 @@ PY
   unset PA_HEARTBEAT || true
   cd "$VAULT"
   python3 "$RUN_DAILY" --from-stage inject --to-stage dispatch \
-    --inject-prd "$RED_PRD" --project cc-web-control --state-dir "$CANARY_STATE" --no-notify \
+    --inject-prd "$RED_PRD" --project cc-web-control --state-dir "$CANARY_STATE" --no-notify --skip-critic \
     2>&1 | tee -a "$CANARY_LOG"
   log "  判据 c 完成——跑 \`$0 verify\` 检查 (c) 熔断命中 cooldown_revert_loop"
 }
