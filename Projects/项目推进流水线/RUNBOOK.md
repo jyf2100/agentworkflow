@@ -270,3 +270,46 @@ git -C <cc-web-control> log origin/main --grep='Pipeline-Merge: '      # 确认 
 
 **通过判据**（全过才扩全量）：(a)(b)(c) 各至少出现一次且无 (d)；merge_loop/main_status/alerts journal 事件自洽
 （merge_started→completed / revert_started→completed 闭合无 open intent）；目标仓 main 最终绿（无残留红 commit）。
+
+### 8.3.1 canary 一键脚本（`scripts/canary_automerge.sh`，推荐）
+
+上面 §8.3 的手动流程已封装成 `canary_automerge.sh`（隔离 state + 临时 log + unset PA_HEARTBEAT，
+守 `pa-test-no-dirty-data`）。**outward 子命令必须显式 `--go`**（否则 dry-run 只打印命令）：
+
+```bash
+cd Projects/项目推进流水线
+bash scripts/canary_automerge.sh prep                       # 无害前置检查（默认；rc=0 = 前置就绪）
+bash scripts/canary_automerge.sh branch-protect save --go    # ① 备份 main 保护 + 临时移除（outward）
+bash scripts/canary_automerge.sh run-a --go                  # ② 判据 a：绿 smoke → merge + post-merge PASS
+bash scripts/canary_automerge.sh inject-red --go             # ③ 判据 b：注入红 merge → post-merge FAIL → revert REVERTED
+bash scripts/canary_automerge.sh check-c --go                # ④ 判据 c：注入 cooldown → 再投 → 熔断
+bash scripts/canary_automerge.sh verify                      # 无害判据 grep + journal 闭合检查
+bash scripts/canary_automerge.sh branch-protect restore --go # ⑤ 恢复 main 保护（canary 后必做）
+```
+
+**前置就绪（prep 核对，2026-07-30）**：§8.1 step 1-2 绿（shadow task 7.1a + 离线 drill 12 测）+ flag env +
+CLI 参数（`--project`/`--state-dir`/`--no-notify`/`--inject-prd` 均真实存在）+ cc-web-control profile/本地仓/
+remote + gh 认证（jyf2100）+ main 双检出 bug 已修（detached checkout，commit 59e780a）。
+
+**分支保护（实测不拦，§8.3.1 ① 为可选保险）**：cc-web-control main 虽有 `required_pull_request_reviews` +
+`enforce_admins=true`，但 **direct push 实测可过**——origin/main 已有自动合入 marker（`7b35bb6 pa-merge:
+20260729_effort-cache-lockdown`，#50 经 dev loop 绿→merge→post-merge pass 真实合入，2026-07-30）。GitHub
+PR-review 保护不阻 owner/admin 的 direct push。故 `branch-protect save/restore` 是**可选保险**（万一某仓配置
+不同真拦了），非 cc-web-control canary 的必需前置。**判据 a 已实质验证**：#50 effort-cache-lockdown 闭环 PASS
+（merge `7b35bb6` 带 `Pipeline-Merge` marker + post-merge pass + main 绿），只是用真实 PRD 而非 smoke 载体。
+
+**故意红（判据 b，§8.3.1 ③ inject-red）**：dispatch 前置是「dev+verify 双绿 → 才 merge」，故 PRD 经 dev loop
+**无法自然产生 post-merge 红**（红测试会被 verify 先拦，到不了 post-merge）。判据 b 因此**绕 dev loop**：
+`inject-red` 在独立 worktree（detached at main，不碰主工作区）建红 merge commit（`--no-ff` + `Pipeline-Merge`
+marker，复刻 dispatch 形态，可被 `revert -m 1`）push 到 main → 触发 `dev-agent --phase post-merge-test`（FAIL）
+→ `--phase revert`（REVERTED）→ main 回绿。对齐离线 drill `test_post_merge_fail_then_revert_restores_green`
+的 fixture 模式。`canary-red.prd.md` 文档化了此双绿约束边界。
+
+**熔断（判据 c，§8.3.1 ④ check-c）**：同判据 b 根因，「经 dispatch 的 post-merge FAIL→record_revert」难自然触发。
+`check-c` 直接 `circuit_breaker.record_revert` 注入 cooldown 记录 → 再投同 slug PRD → 验 dispatch merge 前
+`is_in_cooldown` 命中 → triage(cooldown_revert_loop)。完整 record→cooldown 闭环由 `test_circuit_breaker.py`
+11 测覆盖；此处验熔断门在 dispatch 真实路径生效。
+
+**工作区（无需清）**：cc-web-control 主工作区当前有 effort 功能删除重构（16 文件，并行真实工作，**勿 stash/
+discard**）。canary 全程用 dispatch 独立 worktree（`.worktrees/` 或 `inject-red` 的 mktemp worktree），不碰主工作区。
+唯一注意：main 在主工作目录检出 + 脏，但 merge/revert phase 的 detached/ref 级操作（59e780a/0437031）已避开双检出。
