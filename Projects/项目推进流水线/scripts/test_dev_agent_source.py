@@ -28,7 +28,11 @@ def test_dev_slugify_known_inputs():
     assert slug_utils.dev_slugify("feat-branch-name") == "feat-branch-name"
     assert slug_utils.dev_slugify("--Hello World--") == "hello-world"
     assert slug_utils.dev_slugify("测试-ABC 123!@#") == "abc-123"        # 非 [a-z0-9] 规整为 -，去首尾
-    assert slug_utils.dev_slugify("A" * 30) == "a" * 24                  # 截断 24
+    assert slug_utils.dev_slugify("A" * 60) == "a" * 48                  # 截断 48
+    # canary 判据 c 回归（2026-07-30）：同日同 project 不同 desc 的 slug，devslug 须保留区分性，
+    # 否则幂等闸子串匹配误判「已投递」→ 静默跳过（[:24] 会把两者都截成 20260730-cc-web-control-）。
+    assert slug_utils.dev_slugify("20260730_cc-web-control-canary-red") != \
+        slug_utils.dev_slugify("20260730_cc-web-control-canary-green")
     assert slug_utils.dev_slugify("---all separators---") == "all-separators"
     assert slug_utils.dev_slugify("") == ""                             # 空串稳
 

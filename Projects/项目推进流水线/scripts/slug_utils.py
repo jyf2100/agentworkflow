@@ -8,7 +8,11 @@ dev_slugify 被 dev-agent.py（分支命名）与 run_daily.py（幂等前置闸
 而 run_cron.sh 用裸 /usr/bin/python3（无 sdk）跑 run_daily.py 顶层 → 每晚 cron 直接崩。
 本模块只依赖 re，run_daily.py 顶部 import 它零副作用。单一源头在此，禁止复刻。
 
-算法（与历史 dev-agent.{py,mjs} 等价）：lowercase → [^a-z0-9]+ 替 "-" → 去首尾 "-" → 截断 24。
+算法（与历史 dev-agent.{py,mjs} 等价）：lowercase → [^a-z0-9]+ 替 "-" → 去首尾 "-" → 截断 48。
+
+截断长度 48（非历史 24）：slug = date(8)+project+desc，24 会吞掉描述（cc-web-control 占 15 + date 8 = 23，
+描述全截）→ 同日同 project PRD devslug 退化成相同串 → 幂等前置闸子串匹配误判「已投递」→ 静默跳过
+（canary 判据 c 暴露，2026-07-30）。48 保留描述区分性，分支总长 auto/<stamp>-<stamp>-<48> 仍 < 255（git ref 安全）。
 """
 from __future__ import annotations
 
@@ -21,4 +25,4 @@ def dev_slugify(stem: str) -> str:
     被 dev-agent.py 的分支命名与 run_daily.py 的幂等前置闸（按 slug 匹配 auto/* 分支）
     共用——两者必须产同一 slug，否则已投递检查静默失效。本函数是唯一源头，禁止复刻。
     """
-    return re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")[:24]
+    return re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")[:48]
