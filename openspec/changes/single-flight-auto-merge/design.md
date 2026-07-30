@@ -46,8 +46,8 @@ merge / revert / post-merge test **经 dev-agent 在目标仓 worktree 内执行
 
 > **实现细化（apply 2026-07-30，task 3.2 + 4.1-4.3）**：原措辞「SDK loop」落地时收敛为 **dev-agent 机械 `--phase` 子命令**（`merge` / `post-merge-test` / `revert`）——纯 subprocess + git，**不经 claude-agent-sdk dev loop**（与已上线 task 3.2 一致；SDK loop 仅供语义 dev/verify）。ADR-0001 不变：控制面只发 `--phase` cmd，机械层在目标仓 worktree（`REPO_ROOT=Path.cwd()`）内跑，不持写句柄。三态判定由控制面 `merge_phase.classify_*` 对 dev-agent JSON **双重重判**（parse 后再 classify），fail-safe。post-merge test_cmd 源同 verify（Node→`scripts.test` / Python→`dev_test_cmd`），基线=集成后 main（D8）；环境注入靠 dev-agent `sys.executable`（dispatch 经 `_env_python` 用 conda env python 启动 dev-agent）→ 裸 `python` 命中 conda env。「独立 env / 更严覆盖」（D8 open question）留 task 4.6。
 
-### D7. 合并策略（--no-ff + ff-only push）
-merge 用 `--no-ff` 产生**单一 merge commit**（revert 目标明确）；push **fast-forward only，严禁 `--force*`**（防覆盖人工/并发提交）。revert 目标 = 本次自动合入产生的唯一 commit（journal 记其 sha）。
+### D7. 合并策略（PR auto-merge `--merge`，双 parent）
+merge 经 `gh pr create` + `gh pr merge --merge` 产生**单一双 parent merge commit**（revert 目标明确；`--merge` 非 squash/rebase，守粒度）。**直接 push main 已弃用**——PR-review 分支保护（`required_pull_request_reviews` + `enforce_admins=true`）下 owner/admin 直推也被 GH006 拒（2026-07-30 canary 实证，详见 Risk [main 分支保护]）。rebased feature branch 是 pa 临时分支，可 `--force-with-lease` 推送；**`main` 严禁 `--force*`**（防覆盖人工/并发提交）。merge_commit/revert_commit 记 **PR merge 后 main tip**（`fetch+rev-parse origin/main`），非 feature/revert branch tip（守 D12 ancestry——误记会致 `merge-base --is-ancestor` False→误判未 apply→盲目重 merge）。revert 目标 = 本次自动合入产生的唯一 commit（journal 记其 sha）。marker = PR title 含 `Pipeline-Merge: <prd_id>`（`gh pr merge --merge` commit message = PR title）。
 
 ### D8. post-merge 测试须与 verify 有差异 + 三态
 post-merge 跑的是**集成后的 main 全量 suite**（基线 = main，含本次合入），与 verify（candidate branch、可能是 dev 子集）**覆盖面与基线都不同**——这是 R4 存在的理由，须显式注释，否则 implementer 当冗余偷工。更关键：若 post-merge 与 verify **同源同套**，verify 假绿→post-merge 假绿→auto-revert 永不触发（安全网失效）；post-merge 须更严或独立 env。结果三态（PASS/FAIL/UNKNOWN），UNKNOWN 不自动 revert（D3）。
@@ -93,7 +93,7 @@ merge/revert 是新破坏性副作用，须纳入 exactly-once：新增幂等 ki
 
 - **[吞吐塌方]** 同项目串行 → 多 PRD 日 wall-clock 变长 → 缓解：跨项目并行 + D10 上限 + 异常出队。
 - **[verify 漏判 → 烂代码进 main]** → 缓解：D3 auto-revert 三态 + D8 post-merge 与 verify 差异 + D7 单 commit revert 粒度。
-- **[main 分支保护 / CD 耦合]**（审核架构 F2）目标仓 main 可能受分支保护 / 是 CD 触发器 → auto-merge 直接放大成未审代码上线 → 缓解：canary 只在安全仓白名单；spec 加不变式「main 有 CD 绑定/无保护分支策略 → 禁 auto-merge，退 triage」；显式 push 凭据来源。
+- **[main 分支保护 / CD 耦合]**（审核架构 F2）目标仓 main 可能受分支保护 / 是 CD 触发器 → auto-merge 直接放大成未审代码上线。**v2 修正（2026-07-30 canary 实证）**：原 D7「direct push main」在有 PR-review 保护（`required_pull_request_reviews` + `enforce_admins=true`）的仓被 **GH006 拒**（owner/admin 直推也不行）→ 致命前提缺陷，§8.1 判据 (a) 从未真验证（#50 是 baseline PR 合并非 pa 直推）。**缓解（PR path）**：merge/revert 改走 `gh pr merge --merge`（0 review 已满足 + `enforce_admins` 只拦直推不拦 PR 合并，cc-web-control 可过）；有必过 CI（`required_status_checks`）→ PR merge 被 check 阻塞 → 禁 auto-merge 退 triage；CD 触发器同理退 triage。canary 只在安全仓白名单；显式 gh 凭据来源。
 - **[main 瞬态红新契约]**（审核安全 F8）先 push 再测 → main 在 [push, 验证完成] 窗口必然可能红 → 须对外暴露「main may be transiently red」契约 + 最大红窗上界（联 D10）+ 可查询的「main 是否已过 post-merge 验证」状态。
   > **实现细化（apply 2026-07-30，task 4.6）**：落地为 `main_status.py`——`MAX_MAIN_RED_WINDOW_SECONDS=1800`（红窗上界 = dev-agent `POST_MERGE_TEST_TIMEOUT`，D10；契约：main 在 [push, post-merge verdict] 窗口可能红，窗口后必为已判决态）+ `record_main_verified`/`main_post_merge_status`（per-owner_repo journal，**不受 flag gating**，状态查询须总可用）。dispatch 在 post-merge 三态判决后 record，下游/CD 据 `main_post_merge_status` 判 main 验证态（PASS=已验证 / FAIL=曾红已 revert / UNKNOWN=halt）而非盲猜 raw push。
 - **[dispatch god-stage]**（审核架构 F4）闭环含 8 子阶段 → 须画子阶段 state machine，每个子阶段独立 journal checkpoint（不只「闭环」整体），否则 crash 恢复只能整段重跑/放弃。

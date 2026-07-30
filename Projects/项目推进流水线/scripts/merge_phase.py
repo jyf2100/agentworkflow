@@ -423,8 +423,9 @@ def build_revert_cmd(*, python: str, dev_agent_py, merge_commit: str, main_ref: 
     """构造 ``dev-agent --phase revert`` 命令（控制面发，dev-agent 在目标仓 revert 单一 merge commit + push）。
 
     守 D6/ADR-0001：控制面只发 cmd，dev-agent 在目标仓 worktree 经机械层（``git()``）执行
-    ``git revert -m 1 --no-edit <merge_commit>`` + ff-only push + 记 revert_commit。``merge_commit`` = 本次
-    自动合入产出的单一 commit（D7 粒度；journal 须另记 revert_commit sha，task 6.1b）。
+    ``git revert -m 1 --no-edit <merge_commit>`` + 建 revert branch + gh pr merge --merge + 记 revert_commit
+    （ADR-0008 §PR-path）。``merge_commit`` = 本次自动合入产出的单一 commit（D7 粒度；journal 须另记
+    revert_commit sha，task 6.1b）。
     """
     cmd = [python, str(dev_agent_py), "--phase", "revert",
            "--merge-commit", merge_commit, "--main", main_ref, "--prd-id", prd_id]

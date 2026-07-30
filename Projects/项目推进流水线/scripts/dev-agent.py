@@ -163,6 +163,29 @@ def gh(args: list[str]) -> str:
         raise RuntimeError("gh 不在 PATH")
 
 
+def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> str:
+    """PR auto-merge（ADR-0008 §PR-path）：幂等 gh pr create → gh pr merge --merge → 返回 PR merge 后 main tip。
+
+    复用 _lookup_pr 幂等模板（``gh pr list --head --state open --json number``；cwd=REPO_ROOT 推断 owner/repo，
+    无 -R）：已有 open PR → merge 已有；无 → create 后 merge。``gh pr merge --merge`` 造单一双 parent merge
+    commit（非 squash/rebase，守 D7 回滚粒度），其 message = PR title（含 marker，可 git log --grep，守护栏#5）。
+
+    **sha 陷阱（D12 ancestry）**：返回 ``fetch + rev-parse origin/<main>``（= PR merge 后 main tip），**非** head
+    tip——``LocalGitResolver.merge-base --is-ancestor <target> origin/main`` 须 True；误记 head tip 或用 squash
+    → is-ancestor False → 误判未 apply → 盲目重 merge。caller 须先 push rebased head branch（--force-with-lease）。
+    """
+    existing = gh(["pr", "list", "--head", head, "--state", "open", "--json", "number"])
+    prs = json.loads(existing) if existing.strip() else []
+    if prs:
+        pr_num = str(prs[0]["number"])
+    else:
+        url = gh(["pr", "create", "--base", main_ref, "--head", head, "--title", title, "--body", body])
+        pr_num = url.rstrip("/").split("/")[-1]
+    gh(["pr", "merge", pr_num, "--merge"])
+    git(["fetch", "origin", main_ref])
+    return git(["rev-parse", f"origin/{main_ref}"])
+
+
 def stamp() -> str:
     d = datetime.now()
     return f"{d.year}{d.month:02d}{d.day:02d}-{d.hour:02d}{d.minute:02d}"
@@ -493,11 +516,12 @@ def _emit_merge(rebase_outcome, merge_commit=None, push_failed=False,
 
 
 def run_merge_phase(args: dict) -> int:
-    """merge phase 主编排：fetch→checkout branch→rebase→收证→classify→（CLEAN）merge+push。
+    """merge phase 主编排：fetch→checkout branch→rebase→收证→classify→（CLEAN）PR auto-merge。
 
-    非 CLEAN 不碰 main（rebase 残留 abort 清干净）；CLEAN 则 ``--no-ff`` merge 进 main + ff-only push +
-    记 merge_commit（带 ``Pipeline-Merge: <prd_id>`` marker footer，task 3.4）；push reject 回退本地 main
-    （spec「main unchanged」）。任一未预期异常 → UNKNOWN（fail-safe，不当 merged）。
+    非 CLEAN 不碰 main（rebase 残留 abort 清干净）；CLEAN 则 push rebased feature branch（--force-with-lease）
+    + gh pr create（幂等）+ gh pr merge --merge（双 parent；commit message = PR title，含 ``Pipeline-Merge:
+    <prd_id>`` marker）+ 记 PR merge 后 main tip 为 merge_commit（守 D12 ancestry）。push/PR 任一失败 →
+    push_failed/UNKNOWN（main 零副作用；spec「main unchanged」）。任一未预期异常 → UNKNOWN（fail-safe）。
     """
     branch, main_ref, prd_id = args["branch"], args["main_ref"], args["prd_id"]
     try:
@@ -532,32 +556,25 @@ def run_merge_phase(args: dict) -> int:
             _safe_git(["rebase", "--abort"])
             return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, evidence=evidence,
                                error="shadow classify-only：CLEAN 但不 merge（serial_shadow 模式，main 未碰）")
-        # 5. CLEAN：ref 级 --no-ff merge into main（**永不 checkout main**——canary bug：main 可能已在目标仓
-        #    主工作目录检出，git 拒绝同分支双 worktree 检出 → auto-merge 永不成功）。rebase CLEAN 后 feature 已
-        #    是 origin/main 线性后代，其树 == 集成后 main 树；故用 commit-tree 直接造 --no-ff merge commit（双
-        #    parent：origin/main + feature）+ push <merge_sha>:refs/heads/main（ff-only，禁 --force*；spec「Push
-        #    fails→UNKNOWN」）。本地 main ref / wt 检出均不动（远端是真理源），merge_commit 失败→UNKNOWN。
+        # 5. CLEAN：PR auto-merge（替代 direct push main；ADR-0008 §PR-path + canary GH006 修复）。rebase CLEAN
+        #    后 feature 已是 origin/main 线性后代（其树 == 集成后 main 树）。先 push rebased feature branch
+        #    （--force-with-lease：rebase 改写 branch 历史、远端落后；feature 是 pa 临时分支，D7「禁 --force*」
+        #    针对 main，feature 分支是例外）→ gh pr create（幂等）→ gh pr merge --merge（双 parent）→ fetch+
+        #    rev-parse origin/main 取 merge_commit。永不 checkout main（dual-checkout bug）；PR title 含
+        #    ``Pipeline-Merge: <prd_id>``（gh pr merge --merge commit message = PR title → marker 可 git log
+        #    --grep，守护栏#5）。push/PR 任一失败 → push_failed/UNKNOWN（main 零副作用）。
         try:
-            main_sha = git(["rev-parse", f"origin/{main_ref}"])
-            feat_sha = git(["rev-parse", branch])
-            feat_tree = git(["rev-parse", f"{branch}^{{tree}}"])
-            merge_commit = git(["commit-tree", feat_tree, "-p", main_sha, "-p", feat_sha,
-                                "-m", f"pa-merge: {prd_id}",
-                                "-m", f"项目推进流水线自动合入（Pipeline-Merge: {prd_id}）。"])   # task 3.4 marker footer
+            git(["push", "--force-with-lease", "origin", f"{branch}:{branch}"])
         except Exception as e:
-            return _emit_merge(RebaseOutcome.UNKNOWN, evidence=evidence, error=f"merge commit 构造失败: {e}")
-        try:
-            git(["push", "origin", f"{merge_commit}:refs/heads/{main_ref}"])
-        except Exception:
             return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, push_failed=True,
-                               evidence=evidence, error="push rejected（非 ff/auth/network）")
-        # 远端是真理源（已更新）；best-effort 把本地 <main_ref> ff 到 merge_commit，让下游 revert / 复跑
-        #   ``checkout main`` 取到「已合态」。常态会失败（main 可能已在目标仓主工作目录检出 → ``branch -f`` 被
-        #   拒），吞掉即可——远端已合，本地 main 落后只是 stale（不影响 green 闭环；revert 走 red path 另修）。
+                               evidence=evidence, error=f"push rebased branch {branch} 失败: {e}")
         try:
-            git(["branch", "-f", main_ref, merge_commit])
-        except Exception:
-            pass
+            merge_commit = _pr_automerge(branch, main_ref,
+                                         title=f"pa-merge: {prd_id} (Pipeline-Merge: {prd_id})",
+                                         body=f"项目推进流水线自动合入（Pipeline-Merge: {prd_id}）。")
+        except Exception as e:
+            return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, push_failed=True,
+                               evidence=evidence, error=f"PR auto-merge 失败: {e}")
         return _emit_merge(RebaseOutcome.CLEAN, merge_commit=merge_commit, evidence=evidence)
     except Exception as e:
         return _emit_merge(RebaseOutcome.UNKNOWN, error=f"merge phase 未预期异常: {e}")
@@ -659,11 +676,13 @@ def run_revert(args: dict) -> int:
     守 dual-checkout（canary bug 同因，与 merge phase 一致）：**不 checkout <main> 分支**——main 可能已在目标仓
     主工作目录检出 → git 拒绝同分支双 worktree 检出 → red path 走不到回滚。改为 detached at origin/<main>（= 当前
     main tip），在其上跑 ``git revert -m 1``：3-way vs origin/main 正确（CONFLICT 语义不变），detached 不锁 main
-    分支、不撞别处检出。revert 成功后 ref-level push <revert_sha>:refs/heads/main（ff-only，禁 --force*；spec
-    「push fails→UNKNOWN，远端 main 未回滚」）。结束 finally 恢复原检出（detached HEAD 不留）。非 REVERTED 不留
-    半完成态（冲突/异常均 revert --abort 回到 detached origin/main）。revert_commit 仅在 push 成功后记（D12 锚点）。
+    分支、不撞别处检出。revert 成功后建 revert branch + PR auto-merge（替代 direct push main；ADR-0008 §PR-path
+    + canary GH006 修复）：detached HEAD 上建/移 revert_branch ref → push --force-with-lease（feature 临时分支，
+    D7 force 例外）→ gh pr create + --merge → fetch+rev-parse origin/main 取 revert_commit（= PR merge 后 main tip；
+    spec「push/PR fails→UNKNOWN，远端 main 未回滚」）。结束 finally 恢复原检出（detached HEAD 不留）。非 REVERTED
+    不留半完成态（冲突/异常均 revert --abort 回到 detached origin/main）。revert_commit 仅在 PR merge 成功后记（D12 锚点）。
     """
-    merge_commit, main_ref = args["merge_commit"], args["main_ref"]
+    merge_commit, main_ref, prd_id = args["merge_commit"], args["main_ref"], args["prd_id"]
     prev_branch = ""
     try:
         prev_branch = git(["branch", "--show-current"])   # 记原检出，finally 恢复（detached 不留）
@@ -683,13 +702,22 @@ def run_revert(args: dict) -> int:
             _safe_git(["revert", "--abort"])
             return _emit_revert(RevertOutcome.UNKNOWN, revert_rc=revert_rc,
                                 error=f"revert rc={revert_rc} 无冲突标记，状态不明")
-        # rc==0：revert 成功（detached HEAD at revert_commit）→ ref-level ff-only push（禁 --force*）
-        revert_commit = _safe_revparse("HEAD")
+        # rc==0：revert 成功（detached HEAD at revert_commit）→ 建 revert branch + PR auto-merge（替代 direct
+        #    push main；ADR-0008 §PR-path + canary GH006 修复）。detached HEAD 上建/移 revert_branch ref（不
+        #    checkout main，守 dual-checkout）→ push --force-with-lease（feature 临时分支，D7 force 例外）→ gh pr
+        #    create + --merge → fetch+rev-parse origin/main 取 revert_commit（= PR merge 后 main tip，守 D12
+        #    ancestry）。revert_commit 仅在 PR merge 成功后记（D12 锚点）。
+        revert_sha = _safe_revparse("HEAD")
+        revert_branch = f"pa-revert/{prd_id}"
         try:
-            git(["push", "origin", f"{revert_commit}:refs/heads/{main_ref}"])
+            git(["branch", "-f", revert_branch, revert_sha])   # detached HEAD 上建/移 revert_branch ref（不锁 main）
+            git(["push", "--force-with-lease", "origin", f"{revert_branch}:{revert_branch}"])
+            revert_commit = _pr_automerge(revert_branch, main_ref,
+                                          title=f"pa-revert: {prd_id} (Pipeline-Revert: {prd_id})",
+                                          body=f"项目推进流水线自动回滚 {prd_id}（revert merge commit {merge_commit}）。")
         except Exception:
             return _emit_revert(RevertOutcome.UNKNOWN, revert_commit=None, revert_rc=revert_rc,
-                                push_failed=True, error="revert push reject（远端 main 未回滚）")
+                                push_failed=True, error="revert PR auto-merge 失败（远端 main 未回滚）")
         return _emit_revert(RevertOutcome.REVERTED, revert_commit=revert_commit, revert_rc=revert_rc)
     except Exception as e:
         return _emit_revert(RevertOutcome.UNKNOWN, error=f"revert phase 未预期异常: {e}")

@@ -91,19 +91,26 @@ prep() {
   log "▸ gh 认证（push 凭证）…"
   gh auth status 2>&1 | grep -q "Logged in" && log "  ✅ gh 已认证（$(gh auth status 2>&1 | grep -o 'as [^ ]*' | head -1)）" || { log "  ⚠️ gh 未认证（push 会失败）"; rc=1; }
 
-  # 分支保护 + direct push 实测（判据 a 前置——以 origin/main 真实 marker 为权威，非理论推断）
-  log "▸ cc-web-control main direct push 可行性（判据 a 前置）…"
-  local bp marker
+  # 分支保护 + PR auto-merge 可行性（判据 a 前置；task §9 PR path：direct push 已弃用，走 gh pr merge）
+  log "▸ cc-web-control main PR auto-merge 可行性（判据 a 前置，task §9 PR path）…"
+  local bp checks
   bp=$(gh api "repos/$OWNER_REPO/branches/main/protection" 2>&1) || true
-  marker=$(git -C "$CC_WEB" log origin/main --grep='Pipeline-Merge:' --oneline 2>/dev/null | head -1)
-  if [ -n "$marker" ]; then
-    log "  ✅ origin/main 已有自动合入 marker（${marker%% *}）→ direct push 实测可过，auto-merge 不被分支保护拦"
-    log "     （main 有 PR-review 保护但 owner direct push 不被拒；branch-protect 子命令留作可选保险，非必需）"
-  elif echo "$bp" | grep -q "required_pull_request_reviews"; then
-    log "  ⚠️ main 有 required_pull_request_reviews 且 origin/main 暂无自动合入 marker"
-    log "     → 若 direct push 被拒（push_failed→UNKNOWN→halt），用 \`branch-protect save/restore --go\` 临时移除"
+  checks=$(echo "$bp" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin); r=d.get("required_pull_request_reviews") or {}; c=d.get("required_status_checks")
+  rev=r.get("required_approving_review_count",0); chk="yes" if c and c.get("contexts") else "none"
+  print("reviews=%s checks=%s" % (rev,chk))
+except Exception: print("no-protection")' 2>/dev/null || echo "parse-fail")
+  if echo "$checks" | grep -q "^reviews=0"; then
+    if echo "$checks" | grep -q "checks=none"; then
+      log "  ✅ PR auto-merge 可过：0 review 已满足 + 无 required_status_checks（enforce_admins 只拦 direct push 不拦 PR 合并）"
+    else
+      log "  ⚠️ main 有 required_status_checks（$checks）→ PR merge 会被 check 阻塞 → auto-merge 退 triage"; rc=1
+    fi
+  elif echo "$checks" | grep -q "no-protection"; then
+    log "  ✅ main 无分支保护，PR auto-merge 可过（PR path 统一，无 direct push 需求）"
   else
-    log "  ✅ main 无 PR-review 保护，direct push 可过"
+    log "  ⚠️ main PR-review 要求 approving reviews（$checks）→ auto-merge 被 review 阻塞 → 退 triage"; rc=1
   fi
 
   # 工作区说明（主工作区的 effort 重构是并行工作，canary 用 dispatch 独立 worktree 不受影响）
@@ -122,7 +129,9 @@ prep() {
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 # branch-protect：备份/恢复 cc-web-control main 分支保护（outward，--go）
-# 直接 push main 会被 required_pull_request_reviews 拒；canary 前临时移除、后恢复。
+# ⚠️ PR path（task §9）后**非必需**——gh pr merge 可过 PR-review 保护（0 review + enforce_admins 只拦直推）。
+# 仅当 required_status_checks 阻塞 PR merge 且需临时移除时才用。restore 的 PUT body schema ≠ GET 返回 schema，
+# 直接回灌 GET JSON 会 422（已知限制）——真要恢复须按 PUT 文档精简 schema，故此子命令保留作历史/极端保险。
 # ══════════════════════════════════════════════════════════════════════════════════════
 branch-protect() {
   local op="${1:-}"
@@ -132,7 +141,7 @@ branch-protect() {
       if [ "$GO" = "1" ]; then
         gh api "repos/$OWNER_REPO/branches/main/protection" > "$BRANCH_PROTECT_BACKUP" 2>/dev/null && \
           log "  ✅ 已备份（$(wc -c < "$BRANCH_PROTECT_BACKUP") bytes）" || die "备份失败（main 可能本就无保护）"
-        echo "▸ 临时移除 main 保护（让 auto-merge direct push 可过）"
+        echo "▸ 临时移除 main 保护（极端保险：PR path 通常无需，仅 required_status_checks 阻塞 PR merge 时）"
         gh api -X DELETE "repos/$OWNER_REPO/branches/main/protection" 2>/dev/null && \
           log "  ✅ main 保护已移除（canary 后务必 restore）" || die "移除保护失败"
         log "  ⚠️ 恢复命令：$0 branch-protect restore --go"
@@ -173,7 +182,7 @@ run-a() {
 # ══════════════════════════════════════════════════════════════════════════════════════
 # inject-red：判据 b 故意红 auto-revert（outward，--go）
 # 双绿约束下 PRD 经 dev loop 无法自然 post-merge 红（verify 先拦），故绕 dev loop：
-# 独立 worktree 建红 merge commit（--no-ff + Pipeline-Merge marker，复刻 dispatch 形态）push 到 main
+# 独立 worktree 建红 feature → gh pr create + gh pr merge --merge（双 parent + Pipeline-Merge marker，复刻 dispatch PR path）
 # → 触发 dev-agent --phase post-merge-test（FAIL）→ --phase revert（REVERTED）→ main 回绿。
 # 对齐离线 drill test_post_merge_fail_then_revert_restores_green 的 fixture 模式。
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -202,19 +211,24 @@ REDTEST
   git -C "$WT" add test/canary-red.test.cjs
   git -C "$WT" commit -q -m "canary red: 故意红测试（判据 b）"
 
-  # detached at main + --no-ff merge（双 parent merge commit，可被 revert -m 1；带 Pipeline-Merge marker）
-  git -C "$WT" checkout -q --detach origin/main
-  git -C "$WT" merge --no-ff "redfeat-$RED_SLUG" -m "canary red merge（判据 b）" -m "Pipeline-Merge: $RED_SLUG"
-  local MC; MC="$(git -C "$WT" rev-parse HEAD)"
-  log "  红 merge commit: $MC（双 parent + marker，复刻 dispatch 形态）"
-  git -C "$WT" push origin "HEAD:main"   # main 现在红
+  # 经 PR 注入红 merge（PR path：direct push main 被 GH006 拒，复刻 dispatch gh pr merge --merge 形态）
+  git -C "$WT" checkout -q "redfeat-$RED_SLUG"
+  git -C "$WT" push -u origin "redfeat-$RED_SLUG"
+  local pr_url pr_num; pr_url="$(gh pr create --repo "$OWNER_REPO" --base main --head "redfeat-$RED_SLUG" \
+    --title "canary red merge（判据 b） (Pipeline-Merge: $RED_SLUG)" \
+    --body "canary 故意红 merge，验证 post-merge auto-revert 闭环（判据 b）。勿 review/合并此 PR 外的改动。")"
+  pr_num="$(echo "$pr_url" | grep -oE '[0-9]+$')"
+  gh pr merge --repo "$OWNER_REPO" --merge "$pr_num"   # --merge 双 parent，复刻 dispatch；merge msg=PR title（含 marker）
+  git -C "$CC_WEB" fetch origin main
+  local MC; MC="$(git -C "$CC_WEB" rev-parse origin/main)"   # PR merge 后 main tip = 红 merge commit
+  log "  红 merge commit: $MC（PR merge 双 parent + marker，复刻 dispatch 形态）"
 
   # post-merge-test（dev-agent 在 worktree cwd 跑 npm test → 红 → FAIL）
   log "  ▸ 触发 post-merge-test（预期 FAIL）…"
   ( cd "$WT" && python3 "$DEV_AGENT_PY" --phase post-merge-test \
       --test-cmd "npm test" --main main --prd-id "$RED_SLUG" --state-dir "$CANARY_STATE" ) | tee -a "$CANARY_LOG"
 
-  # revert（merge_commit=MC → git revert -m 1 → push → main 回绿）
+  # revert（dev-agent 建 pa-revert branch + gh pr merge --merge → main 回绿；MC 作 revert -m 1 锚）
   log "  ▸ 触发 revert（预期 REVERTED，main 回绿）…"
   ( cd "$WT" && python3 "$DEV_AGENT_PY" --phase revert \
       --merge-commit "$MC" --main main --prd-id "$RED_SLUG" --state-dir "$CANARY_STATE" ) | tee -a "$CANARY_LOG"
@@ -234,9 +248,9 @@ check-c() {
   require_go
   log "  ▸ 手动注入 cooldown 记录（record_revert）…"
   python3 - <<PY 2>&1 | tee -a "$CANARY_LOG"
-import sys; sys.path.insert(0, "$PA/scripts")
+import sys, datetime; sys.path.insert(0, "$PA/scripts")
 import circuit_breaker as CB
-CB.record_revert("$CANARY_STATE", "$OWNER_REPO", "$RED_SLUG")
+CB.record_revert("$CANARY_STATE", "$OWNER_REPO", "$RED_SLUG", stamp_fn=lambda: datetime.datetime.now().isoformat())
 print("  ✅ cooldown 记录已注入（slug=$RED_SLUG）")
 PY
   log "  ▸ 再投同 slug PRD（merge 前 is_in_cooldown 应命中 → triage）…"
@@ -257,7 +271,7 @@ verify() {
   [ -f "$CANARY_LOG" ] || { log "⚠️ 无 canary log（先跑 run-a/inject-red/check-c --go）"; return 0; }
   local a=0 b=0 c=0 d=0
   grep -qE '🎉.*已合 main|✅.*post-merge main 全量测试绿.*merged' "$CANARY_LOG" && a=1
-  grep -qE '🔴.*post-merge main 红.*auto-revert|↩️.*revert 成功' "$CANARY_LOG" && b=1
+  grep -qE '🔴.*post-merge main 红.*auto-revert|↩️.*revert 成功|"phase": "revert".*"outcome": "reverted"|"revert_commit": "[0-9a-f]' "$CANARY_LOG" && b=1
   grep -qE '🧊.*熔断命中.*cooldown_revert_loop' "$CANARY_LOG" && c=1
   grep -qE '🛑.*(halt|CRITICAL)' "$CANARY_LOG" && d=1
   log "判据 (a) 正常闭环 merge+PASS  : $([ $a = 1 ] && echo '✅ 出现' || echo '⬜ 未出现')"

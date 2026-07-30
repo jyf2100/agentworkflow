@@ -15,19 +15,19 @@ The dispatch stage SHALL consume admitted PRDs for a single target repository st
 - **THEN** the single-flight slot for the affected owner_repo resolves to a known state (free, or in-flight-with-lease under a timeout) before any new PRD for that repo is admitted — it MUST NOT default to free
 
 ### Requirement: Automated merge on verified green
-When development and verification both pass (green) for a PRD, the dispatch stage SHALL rebase the branch onto the current main and, when the rebase is clean, merge it into main with `--no-ff` (producing a single merge commit) and push fast-forward only — in place of opening a pending-review pull request. The merge, push, revert, and post-merge test operations SHALL be performed via the dev-agent SDK loop inside the target worktree, not by the control plane holding a direct git write handle. The pending-review PR path is removed by this change; every PRD that is not auto-merged is routed to the triage pool.
+When development and verification both pass (green) for a PRD, the dispatch stage SHALL rebase the branch onto the current main and, when the rebase is clean, merge it into main by opening a pull request and auto-merging it with `--merge` (producing a single dual-parent merge commit) — never by pushing directly to `main`. Direct pushes to `main` are rejected by repositories whose `main` branch is under pull-request review protection (even with zero required reviews and `enforce_admins=true`), so the auto-merge path MUST go through `gh pr create` + `gh pr merge --merge`. The merge commit message (which equals the PR title) SHALL carry a `Pipeline-Merge: <prd_id>` marker so the merge is locatable by `git log --grep` for revert anchoring. The rebased feature branch is a transient pa branch and MAY be force-pushed with `--force-with-lease`; `main` MUST NEVER be force-pushed. The merge, PR, revert, and post-merge test operations SHALL be performed via the dev-agent inside the target worktree, not by the control plane holding a direct git write handle. Every PRD that is not auto-merged is routed to the triage pool.
 
 #### Scenario: Verified green and clean rebase
 - **WHEN** dev and verify pass and rebasing the branch onto main produces no conflict
-- **THEN** dispatch merges the branch into main with `--no-ff`, pushes fast-forward only, and records the single merge commit sha; no pending-review PR is opened
+- **THEN** dispatch force-pushes (with lease) the rebased branch, opens a pull request against `main`, auto-merges it with `--merge`, and records the resulting `main` tip sha (after the PR merge) as the merge commit; the PR title carries the `Pipeline-Merge` marker
 
 #### Scenario: Verification not green
 - **WHEN** verify is red or has not reached a pass verdict
 - **THEN** dispatch performs no merge and ejects the PRD to the triage pool
 
-#### Scenario: Push of the merge commit fails
-- **WHEN** pushing the merge commit is rejected (non-fast-forward, missing authentication, or network failure)
-- **THEN** the outcome is treated as `UNKNOWN`, the PRD is ejected to triage, main is left unchanged, and the slot is released; dispatch MUST NOT force-push
+#### Scenario: PR create or merge fails
+- **WHEN** the pull request cannot be created or merged (missing authentication, required-status-checks blocking under branch protection, or network failure)
+- **THEN** the outcome is treated as `UNKNOWN`, the PRD is ejected to triage, main is left unchanged, and the slot is released; dispatch MUST NOT force-push `main`
 
 ### Requirement: Three-state rebase safety before merge
 The pre-merge rebase MUST resolve to an explicit `CLEAN`, `CONFLICT`, or `UNKNOWN` outcome. Only `CLEAN` triggers automatic merge; `CONFLICT` and `UNKNOWN` MUST route the PRD to the triage pool and MUST NOT force-merge. `CLEAN` MUST be asserted only on positive evidence — a successful fetch of main's HEAD, rebase exit code zero, a clean working tree, and no conflict markers; absence of positive evidence MUST yield `UNKNOWN`, never `CLEAN`.

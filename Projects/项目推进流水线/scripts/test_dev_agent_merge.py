@@ -22,11 +22,105 @@ post-merge 验证 + auto-revert（task 4.x）：post-merge-test phase 三态（P
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 DEV_AGENT_PY = Path(__file__).parent / "dev-agent.py"
+
+
+# ─── PR 路径离线 drill：fake gh（模拟 GitHub pr list/create/merge，transparent 经 PATH 注入）──────────
+# dev-agent gh() 经 PATH 解析 gh → 命中 fake gh（dev-agent 代码不变）。fake gh 用真实 git 在 cwd(worktree)
+# 上模拟 GitHub --no-ff PR merge（commit-tree 双 parent + push main），使 PR 路径全链路离线可测（无真实 GitHub）。
+FAKE_GH_SCRIPT = r'''#!/usr/bin/env python3
+"""fake gh CLI（测试用）：模拟 gh pr list/create/merge。匹配 dev-agent gh() 调用（无 -R，cwd=worktree）。
+
+pr merge 模拟 GitHub --no-ff 合并：fetch head + commit-tree 双 parent（origin/main + origin/<head>）
++ push origin <merge>:refs/heads/main → dev-agent fetch+rev-parse origin/main 取得 merge_commit
+（= 真实 GitHub PR merge 后 main tip；merge commit message = PR title，含 Pipeline-Merge marker）。
+状态存 PA_GH_FAKE_STATE（测试 fixture 设 tmp_path 隔离，跨 PRD/phase 不串）。
+"""
+import json, os, subprocess, sys
+
+
+def _load():
+    p = os.environ.get("PA_GH_FAKE_STATE")
+    if p and os.path.exists(p):
+        return json.load(open(p))
+    return {"prs": [], "next": 1}
+
+
+def _save(s):
+    p = os.environ.get("PA_GH_FAKE_STATE")
+    if p:
+        json.dump(s, open(p, "w"))
+
+
+def _git(*a):
+    r = subprocess.run(["git", *a], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) < 2 or args[0] != "pr":
+        sys.stderr.write("fake-gh: 只支持 pr 子命令\n"); sys.exit(1)
+    sub, rest = args[1], args[2:]
+    s = _load()
+    if sub == "list":
+        head = rest[rest.index("--head") + 1] if "--head" in rest else None
+        st = rest[rest.index("--state") + 1] if "--state" in rest else "open"
+        out = [{"number": p["number"], "url": p["url"], "state": p["state"]}
+               for p in s["prs"]
+               if p.get("state") == st and (head is None or p["head"] == head)]
+        print(json.dumps(out))
+    elif sub == "create":
+        head = rest[rest.index("--head") + 1]
+        title = rest[rest.index("--title") + 1]
+        num = s["next"]; s["next"] += 1
+        url = "https://fake-gh.test/pr/%d" % num
+        s["prs"].append({"number": num, "head": head, "state": "open", "url": url, "title": title})
+        _save(s); print(url)
+    elif sub == "merge":
+        token = rest[0]   # number 或 url
+        num = int(token.rstrip("/").split("/")[-1])
+        pr = next((p for p in s["prs"] if p["number"] == num), None)
+        if pr is None:
+            sys.stderr.write("fake-gh: PR %d 不存在\n" % num); sys.exit(1)
+        head, title = pr["head"], pr["title"]
+        _git("fetch", "origin", head)                         # 确保 head 最新（rebase 后 force-push 的 rebased 分支）
+        _, main_sha, _ = _git("rev-parse", "origin/main")
+        _, head_sha, _ = _git("rev-parse", "origin/" + head)
+        _, tree, _ = _git("rev-parse", head_sha + "^{tree}")
+        # --no-ff 双 parent merge commit（main + head），message = PR title（含 marker）
+        _, merge_sha, _ = _git("commit-tree", tree, "-p", main_sha, "-p", head_sha, "-m", title)
+        _git("push", "origin", merge_sha + ":refs/heads/main")
+        pr["state"] = "merged"; _save(s)
+    else:
+        sys.stderr.write("fake-gh: 不支持 pr %s\n" % sub); sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+@pytest.fixture(autouse=True)
+def _fake_gh(tmp_path, monkeypatch):
+    """部署 fake gh 到 tmp_path/bin + 注入 PATH/PA_GH_FAKE_STATE（subprocess 经继承当前进程 env 命中 fake gh）。
+
+    dev-agent gh() 经 PATH 解析 gh → 命中 fake gh（transparent，dev-agent 代码零改动）。每个测试独立 tmp_path
+    → 独立 gh-state.json（PR 状态隔离，不跨测试串）。merge/revert 走 PR 路径时 fake gh 模拟 GitHub PR merge。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "gh").write_text(FAKE_GH_SCRIPT, encoding="utf-8")
+    (bin_dir / "gh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("PA_GH_FAKE_STATE", str(tmp_path / "gh-state.json"))
 
 
 def _git(cwd: Path, *args: str) -> str:
