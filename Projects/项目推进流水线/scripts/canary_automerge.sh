@@ -186,7 +186,7 @@ run-a() {
 # ══════════════════════════════════════════════════════════════════════════════════════
 # inject-red：判据 b 故意红 auto-revert（outward，--go）
 # 双绿约束下 PRD 经 dev loop 无法自然 post-merge 红（verify 先拦），故绕 dev loop：
-# 独立 worktree 建红 feature → gh pr create + gh pr merge --merge（双 parent + Pipeline-Merge marker，复刻 dispatch PR path）
+# 独立 worktree 建红 feature → gh pr create + gh pr merge --merge --subject（双 parent + Pipeline-Merge marker，复刻 dispatch PR path）
 # → 触发 dev-agent --phase post-merge-test（FAIL）→ --phase revert（REVERTED）→ main 回绿。
 # 对齐离线 drill test_post_merge_fail_then_revert_restores_green 的 fixture 模式。
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -200,7 +200,7 @@ inject-red() {
   # 独立 worktree（detached at origin/main）——不碰主工作区的 effort 重构（memory pa-concurrent-claude-session-git）
   git -C "$CC_WEB" fetch origin main
   git -C "$CC_WEB" worktree add --detach "$WT" origin/main
-  trap 'git -C "$CC_WEB" worktree remove --force "$WT" 2>/dev/null || true' EXIT
+  trap "git -C \"$CC_WEB\" worktree remove --force \"$WT\" 2>/dev/null || true" EXIT   # 双引号：定义时展开 $WT 实际路径（local WT 函数返回后销毁，单引号在 EXIT 触发时 $WT 未绑定 → set -u crash，exit 1）
 
   # feature 分支 + 红测试 + commit
   git -C "$WT" checkout -q -b "redfeat-$RED_SLUG"
@@ -222,7 +222,9 @@ REDTEST
     --title "canary red merge（判据 b） (Pipeline-Merge: $RED_SLUG)" \
     --body "canary 故意红 merge，验证 post-merge auto-revert 闭环（判据 b）。勿 review/合并此 PR 外的改动。")"
   pr_num="$(echo "$pr_url" | grep -oE '[0-9]+$')"
-  gh pr merge --repo "$OWNER_REPO" --merge "$pr_num"   # --merge 双 parent，复刻 dispatch；merge msg=PR title（含 marker）
+  gh pr merge --repo "$OWNER_REPO" --merge "$pr_num" \
+    --subject "canary red merge（判据 b） (Pipeline-Merge: $RED_SLUG)" \
+    --body "canary 故意红 merge，验证 post-merge auto-revert 闭环（判据 b）。"   # --subject 使 merge commit msg=PR title（含 marker，对齐 dev-agent _pr_automerge --subject）
   git -C "$CC_WEB" fetch origin main
   local MC; MC="$(git -C "$CC_WEB" rev-parse origin/main)"   # PR merge 后 main tip = 红 merge commit
   log "  红 merge commit: $MC（PR merge 双 parent + marker，复刻 dispatch 形态）"
