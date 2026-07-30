@@ -164,11 +164,13 @@ def gh(args: list[str]) -> str:
 
 
 def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> str:
-    """PR auto-merge（ADR-0008 §PR-path）：幂等 gh pr create → gh pr merge --merge → 返回 PR merge 后 main tip。
+    """PR auto-merge（ADR-0008 §PR-path）：幂等 gh pr create → gh pr merge --merge --subject --body → 返回 PR merge 后 main tip。
 
     复用 _lookup_pr 幂等模板（``gh pr list --head --state open --json number``；cwd=REPO_ROOT 推断 owner/repo，
     无 -R）：已有 open PR → merge 已有；无 → create 后 merge。``gh pr merge --merge`` 造单一双 parent merge
-    commit（非 squash/rebase，守 D7 回滚粒度），其 message = PR title（含 marker，可 git log --grep，守护栏#5）。
+    commit（非 squash/rebase，守 D7 回滚粒度）。``gh pr merge --merge`` 默认 message = "Merge pull request #N"（**不含**
+    marker），故**必须显式传 ``--subject <title>``** 使 merge commit message = title（含 marker，可 git log
+    --grep，守护栏#5）；``--body <body>`` 成 message 第二段。
 
     **sha 陷阱（D12 ancestry）**：返回 ``fetch + rev-parse origin/<main>``（= PR merge 后 main tip），**非** head
     tip——``LocalGitResolver.merge-base --is-ancestor <target> origin/main`` 须 True；误记 head tip 或用 squash
@@ -181,7 +183,7 @@ def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> str:
     else:
         url = gh(["pr", "create", "--base", main_ref, "--head", head, "--title", title, "--body", body])
         pr_num = url.rstrip("/").split("/")[-1]
-    gh(["pr", "merge", pr_num, "--merge"])
+    gh(["pr", "merge", pr_num, "--merge", "--subject", title, "--body", body])
     git(["fetch", "origin", main_ref])
     return git(["rev-parse", f"origin/{main_ref}"])
 
@@ -519,8 +521,8 @@ def run_merge_phase(args: dict) -> int:
     """merge phase 主编排：fetch→checkout branch→rebase→收证→classify→（CLEAN）PR auto-merge。
 
     非 CLEAN 不碰 main（rebase 残留 abort 清干净）；CLEAN 则 push rebased feature branch（--force-with-lease）
-    + gh pr create（幂等）+ gh pr merge --merge（双 parent；commit message = PR title，含 ``Pipeline-Merge:
-    <prd_id>`` marker）+ 记 PR merge 后 main tip 为 merge_commit（守 D12 ancestry）。push/PR 任一失败 →
+    + gh pr create（幂等）+ gh pr merge --merge --subject <title> --body <body>（双 parent；merge commit message =
+    --subject 值 = PR title，含 ``Pipeline-Merge: <prd_id>`` marker）+ 记 PR merge 后 main tip 为 merge_commit（守 D12 ancestry）。push/PR 任一失败 →
     push_failed/UNKNOWN（main 零副作用；spec「main unchanged」）。任一未预期异常 → UNKNOWN（fail-safe）。
     """
     branch, main_ref, prd_id = args["branch"], args["main_ref"], args["prd_id"]
@@ -560,8 +562,8 @@ def run_merge_phase(args: dict) -> int:
         #    后 feature 已是 origin/main 线性后代（其树 == 集成后 main 树）。先 push rebased feature branch
         #    （--force-with-lease：rebase 改写 branch 历史、远端落后；feature 是 pa 临时分支，D7「禁 --force*」
         #    针对 main，feature 分支是例外）→ gh pr create（幂等）→ gh pr merge --merge（双 parent）→ fetch+
-        #    rev-parse origin/main 取 merge_commit。永不 checkout main（dual-checkout bug）；PR title 含
-        #    ``Pipeline-Merge: <prd_id>``（gh pr merge --merge commit message = PR title → marker 可 git log
+        #    rev-parse origin/main 取 merge_commit。永不 checkout main（dual-checkout bug）；``gh pr merge --merge
+        #    --subject <title>`` 使 merge commit message = title（含 ``Pipeline-Merge: <prd_id>`` → marker 可 git log
         #    --grep，守护栏#5）。push/PR 任一失败 → push_failed/UNKNOWN（main 零副作用）。
         try:
             git(["push", "--force-with-lease", "origin", f"{branch}:{branch}"])

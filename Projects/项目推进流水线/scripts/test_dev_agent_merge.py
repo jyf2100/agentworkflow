@@ -40,7 +40,7 @@ FAKE_GH_SCRIPT = r'''#!/usr/bin/env python3
 
 pr merge 模拟 GitHub --no-ff 合并：fetch head + commit-tree 双 parent（origin/main + origin/<head>）
 + push origin <merge>:refs/heads/main → dev-agent fetch+rev-parse origin/main 取得 merge_commit
-（= 真实 GitHub PR merge 后 main tip；merge commit message = PR title，含 Pipeline-Merge marker）。
+（= 真实 GitHub PR merge 后 main tip；merge commit message = --subject 值 = PR title，含 Pipeline-Merge marker）。
 状态存 PA_GH_FAKE_STATE（测试 fixture 设 tmp_path 隔离，跨 PRD/phase 不串）。
 """
 import json, os, subprocess, sys
@@ -90,13 +90,21 @@ def main():
         pr = next((p for p in s["prs"] if p["number"] == num), None)
         if pr is None:
             sys.stderr.write("fake-gh: PR %d 不存在\n" % num); sys.exit(1)
-        head, title = pr["head"], pr["title"]
+        head = pr["head"]
         _git("fetch", "origin", head)                         # 确保 head 最新（rebase 后 force-push 的 rebased 分支）
         _, main_sha, _ = _git("rev-parse", "origin/main")
         _, head_sha, _ = _git("rev-parse", "origin/" + head)
         _, tree, _ = _git("rev-parse", head_sha + "^{tree}")
-        # --no-ff 双 parent merge commit（main + head），message = PR title（含 marker）
-        _, merge_sha, _ = _git("commit-tree", tree, "-p", main_sha, "-p", head_sha, "-m", title)
+        # 模拟真实 gh pr merge --merge：--subject 决定 merge commit title（含 marker），--body 成第二段；
+        # 无 --subject → 默认 "Merge pull request #N"（无 marker，对齐真实 gh → 可捕获「dev-agent 漏传 --subject」回归）。
+        ct = ["commit-tree", tree, "-p", main_sha, "-p", head_sha]
+        if "--subject" in rest:
+            ct += ["-m", rest[rest.index("--subject") + 1]]
+            if "--body" in rest:
+                ct += ["-m", rest[rest.index("--body") + 1]]
+        else:
+            ct += ["-m", "Merge pull request #%d" % num]
+        _, merge_sha, _ = _git(*ct)
         _git("push", "origin", merge_sha + ":refs/heads/main")
         pr["state"] = "merged"; _save(s)
     else:
