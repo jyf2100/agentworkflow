@@ -346,3 +346,30 @@ def test_revert_conflict_aborts_and_keeps_main(tmp_path):
     # main 未碰（revert --abort 清冲突残留）；origin/main 仍是 revert 前
     _git(wt, "fetch", "-q", "origin", "main")
     assert _git(wt, "rev-parse", "origin/main") == pre_revert
+
+
+# ─── canary bug 修复（revert phase 同因）：main 已在主工作目录检出时 revert 仍须 REVERTED ──
+def test_revert_clean_when_main_checked_out_elsewhere(tmp_path):
+    """canary bug（revert phase，与 merge phase 同因）：main 已在 primary 主工作目录检出，revert phase 在
+    linked worktree 里 ``git checkout main`` 会被 git 拒绝（同分支双 worktree 检出）→ UNKNOWN → halt（red
+    path 走不到回滚）。修后：``checkout --detach origin/main``（不锁 main 分支）+ ``git revert -m 1`` +
+    ref-level push → REVERTED → main 回绿，且 wt 检出恢复（不留 detached HEAD）。
+    """
+    primary, wt = _make_linked_worktree_repo(tmp_path)
+    # 前置：先 merge auto/feat 到 main（修复后能在 linked wt 合）→ 拿 merge_commit
+    _, mp = _run_merge(wt, "auto/feat")
+    merge_commit = mp["merge_commit"]
+    assert merge_commit, "前置：merge 须成功（linked worktree 场景）"
+    _git(wt, "fetch", "-q", "origin", "main")
+    assert _git(wt, "rev-parse", "origin/main") == merge_commit
+    # revert merge_commit（main 在 primary 主工作目录检出 = dual-checkout 现场）
+    r, rv = _run_phase(wt, "revert", merge_commit=merge_commit, main="main", prd_id="prd-test")
+    assert rv["outcome"] == "reverted", f"REVERTED {rv}（stderr={r.stderr[:300]!r}）"
+    assert rv["revert_commit"], "REVERTED 须记 revert_commit（D12 reconcile 锚点）"
+    # origin/main 前进到 revert commit（真回滚 main）
+    _git(wt, "fetch", "-q", "origin", "main")
+    assert _git(wt, "rev-parse", "origin/main") == rv["revert_commit"]
+    # revert commit 的 parent 含 merge_commit（revert 的是它，历史可追溯）
+    assert merge_commit in _git(wt, "log", "-1", "--format=%P", "origin/main").split()
+    # wt 检出恢复（detached 不留）—— canary bug 核心：不 checkout main 分支，且结束回原分支
+    assert _git(wt, "branch", "--show-current") == "auto/feat", "revert 须恢复原检出（不留 detached HEAD）"

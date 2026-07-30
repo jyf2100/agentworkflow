@@ -654,37 +654,48 @@ def _emit_revert(outcome, revert_commit: str | None = None, revert_rc: int | Non
 
 
 def run_revert(args: dict) -> int:
-    """revert phase 主编排：checkout main → revert merge_commit → push → 记 revert_commit。
+    """revert phase 主编排：checkout --detach origin/main → revert merge_commit → ref-level push → 记 revert_commit。
 
-    非 REVERTED 不留半完成态（冲突/push-reject 均清理本地 main 对齐远端）。revert_commit 仅在 push 成功后记
-    （未 push 的本地 revert 不是远端 main 祖先，非 reconcile 锚点）。
+    守 dual-checkout（canary bug 同因，与 merge phase 一致）：**不 checkout <main> 分支**——main 可能已在目标仓
+    主工作目录检出 → git 拒绝同分支双 worktree 检出 → red path 走不到回滚。改为 detached at origin/<main>（= 当前
+    main tip），在其上跑 ``git revert -m 1``：3-way vs origin/main 正确（CONFLICT 语义不变），detached 不锁 main
+    分支、不撞别处检出。revert 成功后 ref-level push <revert_sha>:refs/heads/main（ff-only，禁 --force*；spec
+    「push fails→UNKNOWN，远端 main 未回滚」）。结束 finally 恢复原检出（detached HEAD 不留）。非 REVERTED 不留
+    半完成态（冲突/异常均 revert --abort 回到 detached origin/main）。revert_commit 仅在 push 成功后记（D12 锚点）。
     """
     merge_commit, main_ref = args["merge_commit"], args["main_ref"]
+    prev_branch = ""
     try:
-        git(["checkout", main_ref])
+        prev_branch = git(["branch", "--show-current"])   # 记原检出，finally 恢复（detached 不留）
+        try:
+            git(["checkout", "--detach", f"origin/{main_ref}"])   # detached at 当前 main tip（不锁 main 分支）
+        except Exception as e:
+            return _emit_revert(RevertOutcome.UNKNOWN, error=f"checkout --detach origin/{main_ref} 失败: {e}")
         revert_rc, timed_out = _run_git_rc(["revert", "-m", "1", "--no-edit", merge_commit], REVERT_TIMEOUT)
         if timed_out:
             _safe_git(["revert", "--abort"])
             return _emit_revert(RevertOutcome.UNKNOWN, timed_out=True, error="revert 超时")
         conflict_files = _count_conflict_files()
         if revert_rc != 0 and conflict_files > 0:
-            _safe_git(["revert", "--abort"])   # 清冲突残留（main 未碰）
+            _safe_git(["revert", "--abort"])   # 清冲突残留（origin/main 未碰）
             return _emit_revert(RevertOutcome.CONFLICT, revert_rc=revert_rc, conflict_files=conflict_files)
         if revert_rc != 0:   # 非0但无冲突标记 = 异常态 → UNKNOWN
             _safe_git(["revert", "--abort"])
             return _emit_revert(RevertOutcome.UNKNOWN, revert_rc=revert_rc,
                                 error=f"revert rc={revert_rc} 无冲突标记，状态不明")
-        # rc==0：revert 本地成功 → ff-only push（禁 --force*）
+        # rc==0：revert 成功（detached HEAD at revert_commit）→ ref-level ff-only push（禁 --force*）
         revert_commit = _safe_revparse("HEAD")
         try:
-            git(["push", "origin", main_ref])
+            git(["push", "origin", f"{revert_commit}:refs/heads/{main_ref}"])
         except Exception:
-            _safe_git(["reset", "--hard", f"origin/{main_ref}"])   # 回退本地 main 到远端（仍含坏 merge）
             return _emit_revert(RevertOutcome.UNKNOWN, revert_commit=None, revert_rc=revert_rc,
                                 push_failed=True, error="revert push reject（远端 main 未回滚）")
         return _emit_revert(RevertOutcome.REVERTED, revert_commit=revert_commit, revert_rc=revert_rc)
     except Exception as e:
         return _emit_revert(RevertOutcome.UNKNOWN, error=f"revert phase 未预期异常: {e}")
+    finally:
+        if prev_branch:
+            _safe_git(["checkout", prev_branch])   # 恢复原检出（detached HEAD 不留，免混淆后续 baseline）
 
 
 async def main() -> int:
