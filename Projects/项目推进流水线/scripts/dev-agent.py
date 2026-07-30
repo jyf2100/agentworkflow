@@ -532,21 +532,32 @@ def run_merge_phase(args: dict) -> int:
             _safe_git(["rebase", "--abort"])
             return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, evidence=evidence,
                                error="shadow classify-only：CLEAN 但不 merge（serial_shadow 模式，main 未碰）")
-        # 5. CLEAN：--no-ff merge <branch> into main + ff-only push + 记 merge_commit
+        # 5. CLEAN：ref 级 --no-ff merge into main（**永不 checkout main**——canary bug：main 可能已在目标仓
+        #    主工作目录检出，git 拒绝同分支双 worktree 检出 → auto-merge 永不成功）。rebase CLEAN 后 feature 已
+        #    是 origin/main 线性后代，其树 == 集成后 main 树；故用 commit-tree 直接造 --no-ff merge commit（双
+        #    parent：origin/main + feature）+ push <merge_sha>:refs/heads/main（ff-only，禁 --force*；spec「Push
+        #    fails→UNKNOWN」）。本地 main ref / wt 检出均不动（远端是真理源），merge_commit 失败→UNKNOWN。
         try:
-            git(["checkout", main_ref])
-            git(["merge", "--no-ff", branch, "-m", f"pa-merge: {prd_id}",
-                 "-m", f"项目推进流水线自动合入（Pipeline-Merge: {prd_id}）。"])   # task 3.4：稳定 marker footer
+            main_sha = git(["rev-parse", f"origin/{main_ref}"])
+            feat_sha = git(["rev-parse", branch])
+            feat_tree = git(["rev-parse", f"{branch}^{{tree}}"])
+            merge_commit = git(["commit-tree", feat_tree, "-p", main_sha, "-p", feat_sha,
+                                "-m", f"pa-merge: {prd_id}",
+                                "-m", f"项目推进流水线自动合入（Pipeline-Merge: {prd_id}）。"])   # task 3.4 marker footer
         except Exception as e:
-            _safe_git(["merge", "--abort"]); _safe_git(["checkout", branch])
-            return _emit_merge(RebaseOutcome.UNKNOWN, evidence=evidence, error=f"merge 失败: {e}")
-        merge_commit = _safe_revparse("HEAD")
+            return _emit_merge(RebaseOutcome.UNKNOWN, evidence=evidence, error=f"merge commit 构造失败: {e}")
         try:
-            git(["push", "origin", main_ref])   # 非 ff 自动 reject（禁 --force*）；spec「Push fails→UNKNOWN」
+            git(["push", "origin", f"{merge_commit}:refs/heads/{main_ref}"])
         except Exception:
-            _safe_git(["reset", "--hard", f"origin/{main_ref}"])   # 回退本地 main（main unchanged）
             return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, push_failed=True,
                                evidence=evidence, error="push rejected（非 ff/auth/network）")
+        # 远端是真理源（已更新）；best-effort 把本地 <main_ref> ff 到 merge_commit，让下游 revert / 复跑
+        #   ``checkout main`` 取到「已合态」。常态会失败（main 可能已在目标仓主工作目录检出 → ``branch -f`` 被
+        #   拒），吞掉即可——远端已合，本地 main 落后只是 stale（不影响 green 闭环；revert 走 red path 另修）。
+        try:
+            git(["branch", "-f", main_ref, merge_commit])
+        except Exception:
+            pass
         return _emit_merge(RebaseOutcome.CLEAN, merge_commit=merge_commit, evidence=evidence)
     except Exception as e:
         return _emit_merge(RebaseOutcome.UNKNOWN, error=f"merge phase 未预期异常: {e}")
@@ -592,19 +603,23 @@ def _emit_post_merge(verdict, ran: bool, test_rc: int | None, timed_out: bool,
 
 
 def run_post_merge_test(args: dict) -> int:
-    """post-merge-test phase 主编排：checkout main → 跑 --test-cmd → 收证判三态。
+    """post-merge-test phase 主编排：校验 main 可达 → 在当前 worktree 跑 --test-cmd → 收证判三态。
 
-    main 已由 merge phase 合入 + push；本 phase checkout main 后就地跑测试 = 测**集成后 main**。
-    fail-safe：checkout 失败 → UNKNOWN；测试未跑/超时 → UNKNOWN（控制面 halt，不 auto-revert）。
+    main 已由 merge phase（ref 级合并）push 到远端；本 phase **不 checkout main**（canary bug：main 可能已在
+    目标仓主工作目录检出 → git 拒绝同分支双 worktree 检出），而是 fetch+rev-parse 校验 main_ref 可达后，就地
+    跑测试 = 测**集成后 main**（merge phase 后 worktree 仍在 feature 分支，其树 == 集成后 main 树：rebase CLEAN
+    后 feature = main + feature 改动）。fail-safe：main_ref 不可达 → UNKNOWN；测试未跑/超时 → UNKNOWN（控制面
+    halt，不 auto-revert）。
     """
     main_ref = args["main_ref"]
     test_cmd = args.get("test_cmd") or ""
     timeout = int(args["timeout"]) if args.get("timeout") else POST_MERGE_TEST_TIMEOUT
     try:
-        git(["checkout", main_ref])   # 确保 worktree 在 main（merge phase 后应已在；no-op 兜底）
+        git(["fetch", "origin", main_ref])
+        git(["rev-parse", f"origin/{main_ref}"])   # base 过时/打错 → 无法确认集成基线 → UNKNOWN（不当代绿）
     except Exception as e:
         return _emit_post_merge(PostMergeVerdict.UNKNOWN, False, None, False,
-                                error=f"checkout {main_ref} 失败: {e}")
+                                error=f"main_ref {main_ref} 不可达: {e}")
     ran, test_rc, timed_out = _run_test_cmd(test_cmd, timeout)
     verdict = classify_post_merge(PostMergeEvidence(ran, test_rc, timed_out))
     return _emit_post_merge(verdict, ran, test_rc, timed_out)

@@ -74,6 +74,57 @@ def _run_merge(wt: Path, branch: str, main_ref: str = "main", prd_id: str = "prd
     return r, payload
 
 
+def _make_linked_worktree_repo(tmp_path: Path):
+    """复刻 canary 布局：主仓 primary（main 已检出）+ 链接 worktree wt（feature 分支）。
+
+    canary 实测 bug：merge phase 想在 wt 里 ``git checkout main`` 做 --no-ff merge，但 main 已在
+    primary 主工作目录检出 → git 拒绝同分支双 worktree 检出 → auto-merge 永不成功（常规仓布局：main 总
+    在主工作目录）。返回 (primary, wt)。
+    """
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], capture_output=True, check=True)
+    primary = tmp_path / "primary"
+    subprocess.run(["git", "clone", "-q", str(origin), str(primary)], capture_output=True, check=True)
+    _git(primary, "config", "user.email", "t@t.t"); _git(primary, "config", "user.name", "test")
+    (primary / "f.txt").write_text("init\n", encoding="utf-8")
+    _git(primary, "add", "."); _git(primary, "commit", "-q", "-m", "init"); _git(primary, "push", "-q", "origin", "main")
+    # 链接 worktree：-b auto/feat 从 main 建分支并在 wt 检出它（main 仍绑在 primary → wt 里 checkout main 会撞）
+    wt = tmp_path / "wt"
+    _git(primary, "worktree", "add", "-b", "auto/feat", str(wt), "main")
+    _git(wt, "config", "user.email", "t@t.t"); _git(wt, "config", "user.name", "test")
+    (wt / "feat.txt").write_text("feat\n", encoding="utf-8")
+    _git(wt, "add", "."); _git(wt, "commit", "-q", "-m", "auto/feat"); _git(wt, "push", "-q", "origin", "auto/feat")
+    return primary, wt
+
+
+# ─── canary bug 修复：main 已在主工作目录检出时 merge phase 仍须 CLEAN（ref 级合并，永不 checkout main）──
+def test_merge_clean_when_main_checked_out_elsewhere(tmp_path):
+    """canary 实测 bug（task 7.2，cc-web-control）：main 已在 primary 主工作目录检出，merge phase 在
+    linked worktree 里 ``git checkout main`` 会被 git 拒绝（同分支双 worktree 检出）→ auto-merge 永不成功。
+
+    修后：ref 级合并（``commit-tree`` 双 parent = --no-ff 语义 + ``push <sha>:refs/heads/main``），永不
+    checkout main → CLEAN 合并成功，origin/main 前进到双 parent merge commit，且 main 仍绑在 primary
+    （wt 检出未动，仍在 auto/feat）。
+    """
+    primary, wt = _make_linked_worktree_repo(tmp_path)
+    pre_main = _git(wt, "rev-parse", "origin/main")
+    r, payload = _run_merge(wt, "auto/feat")
+    assert payload is not None, f"无末行 JSON（stdout={r.stdout!r} stderr={r.stderr[:400]!r})"
+    assert payload["rebase_outcome"] == "clean", payload
+    assert payload["merge_commit"], "CLEAN 须落地 merge_commit（ref 级合并，不 checkout main）"
+    assert payload["push_failed"] is False
+    # origin/main 前进到 merge commit（真合 main，非双检出 bail）
+    _git(wt, "fetch", "-q", "origin", "main")
+    assert _git(wt, "rev-parse", "origin/main") == payload["merge_commit"]
+    # --no-ff：merge commit 双 parent + feature commit 保留
+    assert _git(wt, "rev-list", "--count", f"{pre_main}..origin/main") == "2"
+    # marker footer
+    msg = _git(wt, "log", "-1", "--format=%B", "origin/main")
+    assert "Pipeline-Merge: prd-test" in msg
+    # main 仍未在 wt 检出（ref 级合并不动 wt 检出；wt 仍在 auto/feat）—— canary bug 核心：不 checkout main
+    assert _git(wt, "branch", "--show-current") == "auto/feat"
+
+
 # ─── CLEAN：rebase 干净 → --no-ff merge + ff-only push + marker footer ──────────────
 def test_merge_clean_no_ff_push_and_marker(tmp_path):
     wt = _make_repo(tmp_path)
