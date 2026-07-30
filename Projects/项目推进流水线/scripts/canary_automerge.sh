@@ -36,7 +36,7 @@ OWNER_REPO="jyf2100/cc-web-control"
 CC_WEB="${PA_CC_WEB:-/mnt/disk01/workspaces/worksummary/cc-web-control}"
 GREEN_PRD="$PA/scripts/canary-green.prd.md"   # 判据 a 载体（trivial 绿 smoke）
 RED_PRD="$PA/scripts/canary-red.prd.md"        # 判据 b 载体（故意红，双绿约束说明见文件内）
-RED_SLUG="cc-web-control-canary-red"           # 判据 b/c 幂等键（circuit_breaker 的 _prd）
+RED_SLUG="cc-web-control-canary-red"           # 判据 b 幂等键（circuit_breaker 记录用；c 改用 GREEN_PRD 的 circuit_key）
 
 # ── PATH 补齐（同 run_cron.sh：dev-agent.py import claude_agent_sdk 在 miniconda）─────────
 export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
@@ -244,28 +244,51 @@ REDTEST
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 # check-c：判据 c 熔断（outward，--go）
-# 双绿约束下"经 dispatch 的 post-merge FAIL→record_revert"难自然触发（同判据 b 根因）。故这里验证
-# 熔断门本身：手动经 circuit_breaker.record_revert 注入 cooldown 记录 → 再投同 slug PRD →
-# dispatch merge 前 is_in_cooldown 命中 → triage(cooldown_revert_loop)。完整 record→cooldown 闭环
-# 由 test_circuit_breaker.py 11 测覆盖；此处验 is_in_cooldown 门在 dispatch 真实路径生效。
+# 修双重缺陷（2026-07-30 canary 暴露）：① 旧版注入裸 RED_SLUG，但 dispatch 查 _coord.circuit_key =
+#   prd_id(stable_slug, prd_digest)（coordinator.py:283），裸 slug 永不命中；② 旧版投 RED_PRD，但
+#   is_in_cooldown（run_daily:2217）在 vinfo.verdict=="pass"（2180）之后，RED_PRD 故意红到不了熔断门。
+# 修法三步：(1) inject GREEN_PRD（双绿才到熔断门）+ critic-skip 产 gate；(2) 读 inject 后 PRD 复刻
+#   circuit_key（同公式），record_revert 注入 cooldown；(3) dispatch GREEN_PRD → dev+verify 双绿 →
+#   熔断门命中 → triage（不 merge main）。副作用仅 auto/* 分支推送，main 不动。
 # ══════════════════════════════════════════════════════════════════════════════════════
 check-c() {
-  echo "═══ 判据 c：circuit breaker 熔断门 ═══  slug=$RED_SLUG"
+  echo "═══ 判据 c：circuit breaker 熔断门 ═══  PRD=$GREEN_PRD"
   require_go
-  log "  ▸ 手动注入 cooldown 记录（record_revert）…"
-  python3 - <<PY 2>&1 | tee -a "$CANARY_LOG"
-import sys, datetime; sys.path.insert(0, "$PA/scripts")
-import circuit_breaker as CB
-CB.record_revert("$CANARY_STATE", "$OWNER_REPO", "$RED_SLUG", stamp_fn=lambda: datetime.datetime.now().isoformat())
-print("  ✅ cooldown 记录已注入（slug=$RED_SLUG）")
-PY
-  log "  ▸ 再投同 slug PRD（merge 前 is_in_cooldown 应命中 → triage）…"
+  [ -f "$GREEN_PRD" ] || die "绿 smoke PRD 缺：$GREEN_PRD"
   export PA_SINGLE_FLIGHT_SERIAL_SHADOW=1 PA_SINGLE_FLIGHT_AUTO_MERGE=1
   unset PA_HEARTBEAT || true
   cd "$VAULT"
-  python3 "$RUN_DAILY" --from-stage inject --to-stage dispatch \
-    --inject-prd "$RED_PRD" --project cc-web-control --state-dir "$CANARY_STATE" --no-notify --skip-critic \
+
+  # step 1：inject + critic-skip → 产 inject 后 PRD（dispatch 算 circuit_key 所依）+ prd_gate_{today}
+  log "  ▸ step 1：inject GREEN_PRD + critic-skip（产 inject 后 PRD + gate）…"
+  python3 "$RUN_DAILY" --from-stage inject --to-stage critic \
+    --inject-prd "$GREEN_PRD" --project cc-web-control --state-dir "$CANARY_STATE" --no-notify --skip-critic \
     2>&1 | tee -a "$CANARY_LOG"
+
+  # step 2：读 inject 后 PRD，复刻 circuit_key（coordinator.py:283 同源），record_revert 注入
+  log "  ▸ step 2：注入 cooldown（circuit_key 复刻 coordinator.py:283，非裸 slug）…"
+  python3 - <<PY 2>&1 | tee -a "$CANARY_LOG"
+import sys, glob, re, datetime; sys.path.insert(0, "$PA/scripts")
+import ids, circuit_breaker as CB
+from artifact_store import compute_digest
+import yaml
+prds = sorted(glob.glob("$CANARY_STATE/prd/cc-web-control/*.md"))
+assert prds, "step 1 inject 未产 PRD（检查 CANARY_STATE）"
+prd_content = open(prds[-1], encoding="utf-8").read()
+m = re.match(r"^---\n(.*?)\n---\n", prd_content, re.S)
+fm = yaml.safe_load(m.group(1)) if m else {}
+stable_slug = fm.get("slug") or "cc-web-control-canary-green"   # 同 dispatch_one:1941-1944
+circuit_key = ids.prd_id(stable_slug, compute_digest(prd_content.encode("utf-8")))  # 同 coordinator:283
+CB.record_revert("$CANARY_STATE", "$OWNER_REPO", circuit_key, stamp_fn=lambda: datetime.datetime.now().isoformat())
+print("  ✅ cooldown 已注入（stable_slug=%s circuit_key=%s）" % (stable_slug, circuit_key))
+PY
+
+  # step 3：dispatch 读 gate（GREEN_PRD dev loop → verify 绿 → 熔断门 is_in_cooldown 命中 → triage）
+  log "  ▸ step 3：dispatch GREEN_PRD（dev loop → verify 绿 → 熔断门应命中 → triage）…"
+  python3 "$RUN_DAILY" --from-stage dispatch --to-stage dispatch \
+    --project cc-web-control --state-dir "$CANARY_STATE" --no-notify \
+    2>&1 | tee -a "$CANARY_LOG"
+
   log "  判据 c 完成——跑 \`$0 verify\` 检查 (c) 熔断命中 cooldown_revert_loop"
 }
 
