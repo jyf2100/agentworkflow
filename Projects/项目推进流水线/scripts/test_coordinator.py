@@ -194,6 +194,29 @@ def test_preflight_rejects_flag_without_journal_dependency(bad_flags, violated_s
     assert any(violated_substring in v for v in r.blocked.violations)
 
 
+# ═══ single-flight-auto-merge task 7.1a：auto_merge⇒serial_shadow preflight 安全门（ADR-0008 护栏#7）═══
+def test_preflight_rejects_auto_merge_without_serial_shadow():
+    """task 7.1a：auto_merge=on, serial_shadow=off = 禁用组合 → blocked（ADR-0008 护栏#7 shadow→drill→canary→全量）。
+
+    auto_merge 真合 main 必须先串行单飞准入——无 serial_shadow slot = 并发同仓 merge = chaos（跨分支 rebase
+    冲突压垮 + 重复合 main）。preflight 硬依赖链拦截，防误配「auto_merge on 但 serial_shadow off」直跳到破坏性
+    合 main 而无串行保护（docstring「auto_merge gated on serial_shadow」的运行时强制）。"""
+    flags = LoopFlags(single_flight_auto_merge=True, single_flight_serial_shadow=False)
+    r = CO.preflight(flags)
+    assert not r.is_ok
+    assert r.blocked is not None
+    assert any("single_flight_auto_merge requires single_flight_serial_shadow" in v
+               for v in r.blocked.violations)
+
+
+def test_preflight_accepts_auto_merge_with_serial_shadow():
+    """task 7.1a：合法组合 auto_merge=on + serial_shadow=on → preflight 放行（依赖满足）。"""
+    flags = LoopFlags(single_flight_auto_merge=True, single_flight_serial_shadow=True)
+    r = CO.preflight(flags)
+    assert r.is_ok
+    assert r.blocked is None
+
+
 def test_preflight_records_all_violations_structured():
     """task 2.5「record a structured blocked reason」：多条依赖同时违 → violations 全列出（不漏报）。"""
     # Arrange — driven + retry + hooks 全开但 shadow 关（3 条依赖链全违）
@@ -201,10 +224,10 @@ def test_preflight_records_all_violations_structured():
                       lifecycle_hooks=True, journal_shadow=False)
     # Act
     r = CO.preflight(flags)
-    # Assert — 3 条违规全记录，reason 含 journal_shadow
+    # Assert — 3 条违规全记录；journal_shadow 出现在具体违规描述里（reason 已泛化为「N dependency violation(s)」）
     assert not r.is_ok
     assert len(r.blocked.violations) == 3
-    assert "journal_shadow" in r.blocked.reason
+    assert any("journal_shadow" in v for v in r.blocked.violations)
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -53,14 +53,21 @@ from loop_state import JOURNAL_SCHEMA_VERSION, JournalEvent
 DEFAULT_SLOT_LEASE_TTL: int = 7200
 
 _SLOT_DIR = "slots"
-_SLOT_EVENTS: frozenset[str] = frozenset({"slot_acquired", "slot_released"})
+_SLOT_EVENTS: frozenset[str] = frozenset({"slot_acquired", "slot_released",
+                                           "slot_halted", "slot_resumed"})
 
 
 class SlotState(str, Enum):
-    """slot 三态（str 子类化便于 JSON 序列化进 state 记录，同 ``ExtState``）。"""
+    """slot 四态（str 子类化便于 JSON 序列化进 state 记录，同 ``ExtState``）。
 
-    FREE = "free"             # 无在途（无记录 / released / lease 过期 stale）
+    ``HALTED``（task 4.2/4.3）：post-merge UNKNOWN / revert 非 REVERTED → 整仓 halt 到人工。HALTED 是**终态**
+    （覆盖 lease：lease 过期也不自动 free），直到 ``resume_slot`` 人工 unblock（spec「no further PRD admitted
+    until manual resolution」）。lease 撑不住「halt 到人工」（2h 过期自动 free），故独立 HALTED 态。
+    """
+
+    FREE = "free"             # 无在途（无记录 / released / resumed / lease 过期 stale）
     IN_FLIGHT = "in_flight"   # acquired 且 lease 未过期——另一闭环在途
+    HALTED = "halted"         # slot_halted 终态——整仓 halt 到人工（覆盖 lease，不自动 free）
     UNKNOWN = "unknown"       # journal 损坏/读失败 → fail-safe 阻断（不当代空闲）
 
 
@@ -93,6 +100,7 @@ class SlotHandle:
     lock_path: Path
     journal_path: Path
     _released: bool = False
+    _halted: bool = False      # task 4.x：halt_slot 标记——release_slot 见之跳过 slot_released（保 HALTED 终态）
 
 
 def _safe_name(owner_repo: str) -> str:
@@ -147,6 +155,11 @@ def query_slot(state_dir, owner_repo: str, *, now_fn) -> SlotQuery:
             last = e
     if last is None:
         return SlotQuery(SlotState.FREE, None, "no_record: journal 无 slot 事件")
+    if last.event_type == "slot_halted":
+        return SlotQuery(SlotState.HALTED, None,
+                         f"halted: {last.payload.get('reason', 'post_merge_safety')}（整仓 halt 到人工，覆盖 lease）")
+    if last.event_type == "slot_resumed":
+        return SlotQuery(SlotState.FREE, None, "resumed: 人工 unblock halt，slot 恢复空闲")
     if last.event_type == "slot_released":
         return SlotQuery(SlotState.FREE, None, "released: 上次闭环已释放 slot")
     # slot_acquired：判 lease（task 2.3 crash 恢复核心）
@@ -164,13 +177,16 @@ def query_slot(state_dir, owner_repo: str, *, now_fn) -> SlotQuery:
 def _append_slot_event(journal_path, *, event_type: str, run_id: str, prd_id: str,
                        iteration_id: str, owner_repo: str, stamp_fn,
                        lease_expires_at: str | None = None,
-                       outcome: str | None = None) -> None:
+                       outcome: str | None = None,
+                       reason: str | None = None) -> None:
     """原子追加一条 slot 事件（复用 ``journal.append_event`` 的 O_APPEND+fsync）。"""
     payload: dict = {"owner_repo": owner_repo}
     if lease_expires_at is not None:
         payload["lease_expires_at"] = lease_expires_at
     if outcome is not None:
         payload["outcome"] = outcome
+    if reason is not None:
+        payload["reason"] = reason
     ev = JournalEvent(
         schema_version=JOURNAL_SCHEMA_VERSION,
         event_id=f"slot-{run_id}-{prd_id}-{event_type}",   # 单次投递 acquire/release 各一，event_type 区分唯一
@@ -198,6 +214,9 @@ def acquire_slot(state_dir, owner_repo: str, *, run_id: str, prd_id: str, iterat
         return AcquireResult(False, "inflight", q), None
     if q.state is SlotState.UNKNOWN:
         return AcquireResult(False, "unknown", q), None
+    if q.state is SlotState.HALTED:
+        # task 4.2/4.3：halt 整仓到人工——新 PRD 不投递（spec「no further PRD admitted until manual resolution」）
+        return AcquireResult(False, "halted", q), None
     # FREE：跨进程 flock（O_CREAT 兜底建 lock 文件）
     lk = slot_lock_path(state_dir, owner_repo)
     lk.parent.mkdir(parents=True, exist_ok=True)
@@ -222,11 +241,16 @@ def acquire_slot(state_dir, owner_repo: str, *, run_id: str, prd_id: str, iterat
 
 def release_slot(handle: SlotHandle, *, stamp_fn, run_id: str, prd_id: str,
                  iteration_id: str, owner_repo: str, outcome: str = "done") -> None:
-    """释放 slot：写 ``slot_released`` + 释放 flock（close fd → unlock）。幂等（重复 release no-op）。"""
+    """释放 slot：写 ``slot_released`` + 释放 flock（close fd → unlock）。幂等（重复 release no-op）。
+
+    task 4.x halt 路径：若 ``handle._halted``（``halt_slot`` 已写 ``slot_halted`` 终态），**跳过** ``slot_released``
+    追加——保末事件 = ``slot_halted`` → 下轮 ``query_slot`` 判 HALTED（不自动 free）。flock 仍释放（进程退出语义）。
+    """
     if handle._released:
         return
-    _append_slot_event(handle.journal_path, event_type="slot_released", run_id=run_id, prd_id=prd_id,
-                       iteration_id=iteration_id, owner_repo=owner_repo, stamp_fn=stamp_fn, outcome=outcome)
+    if not handle._halted:   # halt 是终态：不写 slot_released 覆盖（保 HALTED）
+        _append_slot_event(handle.journal_path, event_type="slot_released", run_id=run_id, prd_id=prd_id,
+                           iteration_id=iteration_id, owner_repo=owner_repo, stamp_fn=stamp_fn, outcome=outcome)
     try:
         fcntl.flock(handle.fd, fcntl.LOCK_UN)
     except OSError:
@@ -236,6 +260,37 @@ def release_slot(handle: SlotHandle, *, stamp_fn, run_id: str, prd_id: str,
     except OSError:
         pass
     handle._released = True
+
+
+def halt_slot(handle: SlotHandle, *, reason: str, run_id: str, prd_id: str,
+              iteration_id: str, owner_repo: str, stamp_fn) -> None:
+    """把已获取的 slot 标 HALTED（写 ``slot_halted`` 终态事件）——task 4.2/4.3 整仓 halt。
+
+    spec「Revert itself fails halts the queue ... no further PRD admitted until manual resolution」+「UNKNOWN test
+    result SHALL halt」。触发场景：post-merge UNKNOWN（不 auto-revert，keep+halt）/ revert 非 REVERTED（CONFLICT/
+    UNKNOWN）。HALTED 覆盖 lease（lease 过期也不自动 free），直到 ``resume_slot`` 人工 unblock。
+
+    标 ``handle._halted``：后续 ``release_slot``（slot_scope ``__exit__``）见之跳过 ``slot_released``，保末事件 =
+    ``slot_halted``。幂等（重复 halt no-op）。须在持 slot（acquired）时调；调用方 ``_run_one`` 经 ``scope.handle`` 取句柄。
+    """
+    if handle._halted:
+        return
+    _append_slot_event(handle.journal_path, event_type="slot_halted", run_id=run_id, prd_id=prd_id,
+                       iteration_id=iteration_id, owner_repo=owner_repo, stamp_fn=stamp_fn, reason=reason)
+    handle._halted = True
+
+
+def resume_slot(state_dir, owner_repo: str, *, run_id: str, prd_id: str,
+                iteration_id: str, stamp_fn) -> None:
+    """人工 unblock halt（写 ``slot_resumed`` → FREE，恢复投递）——运维 triage 解决 halt 原因后手动调。
+
+    幂等 append（末事件 ``slot_resumed`` → ``query_slot`` 判 FREE → 可重新 acquire）。recovery_cli / 运维工具接线点
+    （task 4.6「可查询的 halt 状态」+ 人工 unblock 闭环）。
+    """
+    jp = slot_journal_path(state_dir, owner_repo)
+    jp.parent.mkdir(parents=True, exist_ok=True)
+    _append_slot_event(jp, event_type="slot_resumed", run_id=run_id, prd_id=prd_id,
+                       iteration_id=iteration_id, owner_repo=owner_repo, stamp_fn=stamp_fn)
 
 
 class slot_scope:
@@ -257,6 +312,7 @@ class slot_scope:
     def __enter__(self) -> AcquireResult:
         res, handle = acquire_slot(**self._acquire_kwargs)
         self._handle = handle
+        self.handle = handle    # task 4.x：公开句柄供 _run_one 在 halt 路径调 halt_slot（acquired 时非 None）
         self._acquired = res.acquired
         return res
 

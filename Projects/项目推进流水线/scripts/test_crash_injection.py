@@ -118,10 +118,10 @@ def test_idempotency_key_stable_across_replay():
 
 
 def test_idempotency_rejects_illegal_kind():
-    """idempotency kind 必须在 commit/push/pr 允许列表（防构造非法幂等键混入 reconcile 逻辑）。"""
+    """idempotency kind 必须在 commit/push/pr/test/merge/revert 允许列表（防构造非法幂等键混入 reconcile 逻辑）。"""
     iter_id = ids.iteration_id("run_1", "prd_1", 0)
     with pytest.raises(ValueError):
-        ids.idempotency_id("merge", iter_id, "owner/repo:auto/b")   # merge 不在允许列表（永不 auto-merge 契约）
+        ids.idempotency_id("bogus_kind", iter_id, "owner/repo:auto/b")   # 不在允许列表（merge/revert 已由 6.1b 合法化）
 
 
 # ─── recovery 据归约态（非内存）决定 reconcile 路径 ──────────────────────────

@@ -14,7 +14,9 @@
 守 D6/ADR-0001：控制面只发 ``--phase merge`` cmd，dev-agent 在目标仓 worktree 内执行（控制面不持 git 写句柄）。
 三态判定对齐 ``merge_phase.classify_rebase``（CLEAN 须正向证据；CONFLICT 须 fetched main 明确报告；UNKNOWN 兜底）。
 
-post-merge 验证 + auto-revert（task 4.x）尚未实现，故本测只覆盖 **merge 阶段全链路**（rebase→merge→push 三态）。
+post-merge 验证 + auto-revert（task 4.x）：post-merge-test phase 三态（PASS/FAIL/UNKNOWN）+ revert phase 三态
+（REVERTED/CONFLICT/UNKNOWN）的**真实 git 全链路**离线 drill。核心安全网证据链：merge 合入红代码（机械层不跑
+测试，照合）→ post-merge-test FAIL → revert REVERTED → main 回绿（D3/D8，spec「Post-merge ... revert」）。
 跑：python -m pytest scripts/test_dev_agent_merge.py -q
 """
 from __future__ import annotations
@@ -96,6 +98,33 @@ def test_merge_clean_no_ff_push_and_marker(tmp_path):
     assert _git(wt, "log", "origin/main", "--grep=Pipeline-Merge: prd-test", "--oneline")
 
 
+# ─── task 7.1a shadow（--classify-only）：CLEAN 也只判 rebase 三态，**不 merge/push**，main 未碰 ──
+def test_classify_only_clean_does_not_touch_main(tmp_path):
+    wt = _make_repo(tmp_path)
+    _add_branch_commit(wt, "auto/feat", "feat.txt", "feat\n")
+    pre_main = _git(wt, "rev-parse", "origin/main")
+    # --classify-only：shadow 模式只判 rebase 三态作 parity 证据，CLEAN 也不 merge/push（main 零副作用）
+    cmd = [sys.executable, str(DEV_AGENT_PY), "--phase", "merge", "--classify-only",
+           "--branch", "auto/feat", "--main", "main", "--prd-id", "prd-shadow"]
+    r = subprocess.run(cmd, cwd=str(wt), capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, timeout=90)
+    lines = (r.stdout or "").strip().splitlines()
+    payload = json.loads(lines[-1]) if lines else None
+    assert payload is not None, f"无末行 JSON（stdout={r.stdout!r} stderr={r.stderr[:300]!r})"
+    # shadow 决策=clean（rebase 干净判定），但**绝不**合（merge_commit 必 None）
+    assert payload["rebase_outcome"] == "clean", payload
+    assert payload["merge_commit"] is None, "classify-only 绝不合（merge_commit 必 None，main 不碰）"
+    assert payload["push_failed"] is False
+    assert payload["rebase"]["fetch_ok"] is True
+    # fail-safe：main 完全未碰（origin/main 仍是 classify 前 HEAD；未 checkout main/未 merge/未 push）
+    _git(wt, "fetch", "-q", "origin", "main")
+    assert _git(wt, "rev-parse", "origin/main") == pre_main, "classify-only 不应碰 main"
+    # 无 Pipeline-Merge marker（未产生 merge commit——shadow 不合）
+    assert not _git(wt, "log", "origin/main", "--grep=Pipeline-Merge: prd-shadow", "--oneline")
+    # worktree 干净（rebase --abort 还原 feature 分支到 ORIG_HEAD，不留半完成 rebased 态）
+    assert _git(wt, "status", "--porcelain") == ""
+
+
 # ─── CONFLICT：rebase 冲突 → triage rebase_conflict，main 未碰 ──────────────────────
 def test_merge_conflict_does_not_touch_main(tmp_path):
     wt = _make_repo(tmp_path)
@@ -132,3 +161,137 @@ def test_merge_unknown_when_main_ref_missing(tmp_path):
     # fail-safe：main 未碰
     _git(wt, "fetch", "-q", "origin", "main")
     assert _git(wt, "rev-parse", "origin/main") == pre_main
+
+
+# ═══ task 4.1-4.3：post-merge-test + revert phase 离线 drill（真实 git 全链路）═══════
+# 守 D6/ADR-0001：控制面只发 --phase post-merge-test|revert cmd + 参数；dev-agent 在 worktree 内机械执行。
+# post-merge-test 测**集成后 main**（D8：基线=main，≠ verify 的 candidate branch）；revert 撤销单一 merge commit
+# （D7：git revert -m 1 + ff-only push）。三态 fail-safe：UNKNOWN/CONFLICT 不留半完成态、不误判 REVERTED。
+TEST_CMD = "bash test.sh"   # worktree 内的「测试脚本」（post-merge-test --test-cmd）
+
+
+def _write_test_script(wt: Path, exit_code: int = 0) -> None:
+    """写 test.sh（exit <exit_code>）——模拟「测试套件」：0=绿，非0=红。"""
+    (wt / "test.sh").write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
+
+
+def _run_phase(wt: Path, phase: str, **flags) -> tuple:
+    """subprocess 跑 dev-agent --phase <phase>（cwd=worktree），解析末行 stdout JSON。返回 (proc, payload|None)。"""
+    cmd = [sys.executable, str(DEV_AGENT_PY), "--phase", phase]
+    for k, v in flags.items():
+        cmd += ["--" + k.replace("_", "-"), str(v)]
+    r = subprocess.run(cmd, cwd=str(wt), capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, timeout=90)
+    lines = (r.stdout or "").strip().splitlines()
+    payload = json.loads(lines[-1]) if lines else None
+    return r, payload
+
+
+def _green_baseline(wt: Path) -> None:
+    """在 main 上加一个绿的 test.sh baseline（exit0），让 feature 可在其上改红。"""
+    _write_test_script(wt, exit_code=0)
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-q", "-m", "green baseline")
+    _git(wt, "push", "-q", "origin", "main")
+
+
+# ─── post-merge-test：PASS（main 合入后仍绿）─────────────────────────────────
+def test_post_merge_pass_when_main_stays_green(tmp_path):
+    wt = _make_repo(tmp_path)
+    _green_baseline(wt)                                   # main: test.sh=exit0
+    _add_branch_commit(wt, "auto/feat", "feat.txt", "feat\n")   # 无关文件，test.sh 不动 → 合后仍绿
+    _, mp = _run_merge(wt, "auto/feat")
+    assert mp["merge_commit"]
+    r, pm = _run_phase(wt, "post-merge-test", test_cmd=TEST_CMD, main="main", prd_id="prd-test")
+    assert pm is not None, f"无末行 JSON（stderr={r.stderr[:300]!r})"
+    assert pm["verdict"] == "pass", pm
+    assert pm["ran"] is True and pm["test_rc"] == 0
+
+
+# ─── 核心安全网证据链：merge 合红 → post-merge FAIL → revert REVERTED → main 回绿 ──
+def test_post_merge_fail_then_revert_restores_green(tmp_path):
+    wt = _make_repo(tmp_path)
+    _green_baseline(wt)                                   # main: test.sh=exit0
+    # feature：在分支上把 test.sh 改红（exit1）——模拟 dev 提交了 bug / 集成后才暴露的回归
+    _git(wt, "checkout", "-q", "-b", "auto/red", "main")
+    _write_test_script(wt, exit_code=1)
+    _git(wt, "add", "."); _git(wt, "commit", "-q", "-m", "red code")
+    _git(wt, "push", "-q", "origin", "auto/red")
+    _git(wt, "checkout", "-q", "main")
+    # merge：机械层不跑测试，照合（merge_commit 落地，main 此刻是红的）
+    _, mp = _run_merge(wt, "auto/red")
+    merge_commit = mp["merge_commit"]
+    assert merge_commit, "须先 merge 成功（机械层不拦红代码）"
+    _git(wt, "fetch", "-q", "origin", "main")
+    assert _git(wt, "rev-parse", "origin/main") == merge_commit
+    # post-merge-test：checkout main → bash test.sh → exit1 → FAIL（触发 revert）
+    _, pm = _run_phase(wt, "post-merge-test", test_cmd=TEST_CMD, main="main", prd_id="prd-test")
+    assert pm["verdict"] == "fail", pm
+    assert pm["test_rc"] == 1
+    # revert：revert merge_commit → REVERTED → main 回绿
+    r, rv = _run_phase(wt, "revert", merge_commit=merge_commit, main="main", prd_id="prd-test")
+    assert rv["outcome"] == "reverted", f"REVERTED {rv}（stderr={r.stderr[:300]!r}）"
+    assert rv["revert_commit"], "REVERTED 须记 revert_commit（D12 reconcile 锚点）"
+    # origin/main 前进到 revert commit
+    _git(wt, "fetch", "-q", "origin", "main")
+    assert _git(wt, "rev-parse", "origin/main") == rv["revert_commit"]
+    # main 回绿：revert 撤销红代码，test.sh 回 exit0
+    _git(wt, "checkout", "-q", "origin/main")
+    rc = subprocess.run(["bash", "test.sh"], cwd=str(wt), capture_output=True).returncode
+    assert rc == 0, "revert 后 main 须回绿（test.sh exit0）"
+    # revert commit 的 parent 含 merge_commit（revert 的是它，历史可追溯）
+    assert merge_commit in _git(wt, "log", "-1", "--format=%P", "origin/main").split()
+
+
+# ─── post-merge-test：UNKNOWN（无 --test-cmd → ran=False，不当代绿）────────────
+def test_post_merge_unknown_when_no_test_cmd(tmp_path):
+    wt = _make_repo(tmp_path)
+    _add_branch_commit(wt, "auto/feat", "feat.txt", "feat\n")
+    _, mp = _run_merge(wt, "auto/feat")
+    assert mp["merge_commit"]
+    # 不传 --test-cmd → ran=False → UNKNOWN（fail-safe：无测试证据不当代 PASS）
+    r, pm = _run_phase(wt, "post-merge-test", main="main", prd_id="prd-test")
+    assert pm["verdict"] == "unknown", pm
+    assert pm["ran"] is False
+
+
+# ─── post-merge-test：UNKNOWN（main_ref 不存在 → checkout 失败）────────────────
+def test_post_merge_unknown_when_main_ref_missing(tmp_path):
+    wt = _make_repo(tmp_path)
+    _add_branch_commit(wt, "auto/feat", "feat.txt", "feat\n")
+    _, _ = _run_merge(wt, "auto/feat")
+    r, pm = _run_phase(wt, "post-merge-test", test_cmd=TEST_CMD, main="nonexistent", prd_id="prd-test")
+    assert pm["verdict"] == "unknown", pm   # checkout 失败 → UNKNOWN
+
+
+# ─── revert：UNKNOWN（merge_commit 不存在 → rc≠0 无冲突标记 → UNKNOWN，main 未碰）──
+def test_revert_unknown_when_merge_commit_missing(tmp_path):
+    wt = _make_repo(tmp_path)
+    pre_main = _git(wt, "rev-parse", "origin/main")
+    r, rv = _run_phase(wt, "revert", merge_commit="deadbeef", main="main", prd_id="prd-test")
+    assert rv["outcome"] == "unknown", rv
+    # main 未碰
+    _git(wt, "fetch", "-q", "origin", "main")
+    assert _git(wt, "rev-parse", "origin/main") == pre_main
+
+
+# ─── revert：CONFLICT（merge 后 main 改了同一行 → revert 三方冲突 → abort，main 未碰）──
+def test_revert_conflict_aborts_and_keeps_main(tmp_path):
+    wt = _make_repo(tmp_path)                            # init: f.txt="init\n"
+    _add_branch_commit(wt, "auto/feat", "f.txt", "feat-line\n")   # feature: f.txt="feat-line"
+    _, mp = _run_merge(wt, "auto/feat")                  # merge → main f.txt="feat-line"
+    merge_commit = mp["merge_commit"]
+    # main 前进：改 f.txt 同行（revert merge 会与此三方冲突）
+    _git(wt, "fetch", "-q", "origin", "main")
+    _git(wt, "checkout", "-q", "main")
+    _git(wt, "reset", "--hard", "origin/main")
+    (wt / "f.txt").write_text("post-merge-edit\n", encoding="utf-8")
+    _git(wt, "add", "."); _git(wt, "commit", "-q", "-m", "post merge edit")
+    _git(wt, "push", "-q", "origin", "main")
+    pre_revert = _git(wt, "rev-parse", "origin/main")
+    r, rv = _run_phase(wt, "revert", merge_commit=merge_commit, main="main", prd_id="prd-test")
+    assert rv["outcome"] == "conflict", f"CONFLICT {rv}（stderr={r.stderr[:300]!r}）"
+    assert rv["conflict_files"] > 0
+    # main 未碰（revert --abort 清冲突残留）；origin/main 仍是 revert 前
+    _git(wt, "fetch", "-q", "origin", "main")
+    assert _git(wt, "rev-parse", "origin/main") == pre_revert

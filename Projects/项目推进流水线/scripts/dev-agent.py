@@ -62,7 +62,9 @@ from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # O
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
 import sdk_compat_patch                   # ADR-0006 #7（migrate-dev-agent-streaming-with-1106-patch）：#1106 keep-alive 定向 patch，根治 #1105（零依赖模块，apply 内延迟 import SDK）
 from external_state import sanitize   # C2 脱敏：git()/gh() stderr 进 JSON error 前抹 token（无依赖模块，同上）
-from merge_phase import classify_rebase, RebaseEvidence, RebaseOutcome   # task 3.2：merge phase 三态判定（纯 stdlib 无依赖模块，同上避免顶部 SDK 连带加载拖垮 cron）
+from merge_phase import (classify_rebase, RebaseEvidence, RebaseOutcome,   # task 3.2：merge phase 三态判定（纯 stdlib 无依赖模块，同上避免顶部 SDK 连带加载拖垮 cron）
+                         classify_post_merge, PostMergeEvidence, PostMergeVerdict,   # task 4.1/4.2：post-merge 三态
+                         RevertOutcome)   # task 4.3：revert 三态
 from coordinator import build_coordinator   # task 2.3b：coordinator 边界（design 决策#1：一次解析 loop flag + own journal/artifacts/IDs）
 from hook_bridge import build_dev_hooks      # task 2.3b：lifecycle_hooks 开 → 注册真实 SDK lifecycle hooks（ClaudeAgentOptions.hooks）
 
@@ -92,7 +94,11 @@ def parse_args(argv: list[str]) -> dict:
            #   baseline / injection=off → None（build_prompt 跳过注入，prompt byte-identical baseline）。
            "lessons_artifact": None,
            # task 3.2：merge phase 参数（--phase merge 时用；默认 phase=dev = 原 dev loop 路径零变化，design 决策#8）
-           "phase": "dev", "branch": None, "main_ref": "main", "prd_id": ""}
+           "phase": "dev", "branch": None, "main_ref": "main", "prd_id": "",
+           # task 7.1a：shadow classify-only（--phase merge --classify-only 时用；CLEAN 也只判不 merge/push）
+           "classify_only": False,
+           # task 4.x：post-merge-test / revert phase 参数（--phase post-merge-test|revert 时用）
+           "test_cmd": None, "merge_commit": None, "timeout": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -108,9 +114,13 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--state-dir": out["state_dir"] = argv[i + 1]; i += 1                  # task 3.3 P0-3：控制面注入 state_dir（SessionStore 统一）
         elif a == "--dry-run": out["dry_run"] = True
         elif a == "--phase": out["phase"] = argv[i + 1]; i += 1                       # task 3.2：merge phase 模式（dev|merge）
+        elif a == "--classify-only": out["classify_only"] = True                       # task 7.1a：shadow 只判 rebase 不 merge/push
         elif a == "--branch": out["branch"] = argv[i + 1]; i += 1                    # task 3.2：merge 目标 feature 分支
         elif a == "--main": out["main_ref"] = argv[i + 1]; i += 1                    # task 3.2：目标仓主干（默认 main）
         elif a == "--prd-id": out["prd_id"] = argv[i + 1]; i += 1                    # task 3.2：merge commit marker 幂等键
+        elif a == "--test-cmd": out["test_cmd"] = argv[i + 1]; i += 1               # task 4.1：post-merge 全量测试命令（控制面传 verify 用过的）
+        elif a == "--merge-commit": out["merge_commit"] = argv[i + 1]; i += 1       # task 4.3：待 revert 的单一 merge commit sha
+        elif a == "--timeout": out["timeout"] = argv[i + 1]; i += 1                 # task 4.1：post-merge test wall-clock 上界（D10）
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
     return out
@@ -415,6 +425,8 @@ async def _can_use_tool(
 #   CLEAN→--no-ff merge + ff-only push + 记 merge_commit；CONFLICT/UNKNOWN→不碰 main；
 #   push reject→reset 本地 main + UNKNOWN（spec「Push fails → main unchanged」）。
 REBASE_TIMEOUT = 120   # D10：rebase wall-clock 上界（秒）
+POST_MERGE_TEST_TIMEOUT = 1800   # D10：post-merge main 全量测试 wall-clock 上界（秒；profile 化，如 ~1800s）
+REVERT_TIMEOUT = 60               # D10：revert+push wall-clock 上界（秒；~60s）
 
 
 def _run_rebase(main_ref: str) -> tuple[int | None, bool]:
@@ -511,6 +523,15 @@ def run_merge_phase(args: dict) -> int:
         if outcome is not RebaseOutcome.CLEAN:
             _safe_git(["rebase", "--abort"])   # CONFLICT/UNKNOWN：清 rebase 残留，main 未碰
             return _emit_merge(outcome, evidence=evidence)
+        # task 7.1a shadow（--classify-only）：CLEAN 也**不 merge/push**——abort rebase 还原 feature 分支
+        #   （rebase 成功后已动 branch 指针，须 --abort 复位到 ORIG_HEAD，免留 rebased 态干扰后续 baseline
+        #   开 PR/reconcile），emit CLEAN 决策（merge_commit=None，main 零副作用）。只算 rebase 三态作 shadow
+        #   parity 证据（守 docstring「merge/revert 只 log 不改 main」+ ADR-0008 护栏#7）。CONFLICT/UNKNOWN 已
+        #   上面 abort+emit（classify-only 不改其行为——它们本就不 merge）。
+        if args.get("classify_only"):
+            _safe_git(["rebase", "--abort"])
+            return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, evidence=evidence,
+                               error="shadow classify-only：CLEAN 但不 merge（serial_shadow 模式，main 未碰）")
         # 5. CLEAN：--no-ff merge <branch> into main + ff-only push + 记 merge_commit
         try:
             git(["checkout", main_ref])
@@ -531,6 +552,126 @@ def run_merge_phase(args: dict) -> int:
         return _emit_merge(RebaseOutcome.UNKNOWN, error=f"merge phase 未预期异常: {e}")
 
 
+# ─── task 4.1/4.2：post-merge-test phase（机械执行：对集成后 main 跑全量测试）──────────
+# 守 D6/ADR-0001（同 merge phase）：在目标仓 worktree（REPO_ROOT）经机械层（subprocess）跑测试套件；控制面
+#   只发 --phase post-merge-test cmd + --test-cmd。D8：基线 = 集成后 main（≠ verify 的 candidate branch）——
+#   覆盖面/基线均不同，故非 verify 重复。三态经 classify_post_merge（控制面 parse 重判，双重保险）。
+def _run_test_cmd(test_cmd: str, timeout: int) -> tuple[bool, int | None, bool]:
+    """跑 test 命令（shell=True，兼容 ``npm test`` / ``pytest`` / ``bash -c '...'``），收 ``(ran, rc, timed_out)``。
+
+    ``ran=False`` 仅当 test_cmd 空/None（无测试可跑 → UNKNOWN）；其余 ``ran=True``（命令执行过，含非0退出）。
+    ``timed_out=True`` 时 ``rc=None``（被杀未取到）。启动异常 → ``ran=False``。
+    """
+    if not test_cmd:
+        return False, None, False
+    try:
+        # 让 test_cmd 里的裸 python 命中启动 dev-agent 的解释器 bin——dispatch 经 _env_python 用 conda env
+        # python 启动 dev-agent（sys.executable 即 conda env python）；prepend 其 dirname 使子进程 python 落
+        # conda env（Python 仓 post-merge 测试须 conda deps）。Node 仓 npm 在系统 PATH，不受影响。
+        env = dict(os.environ)
+        env["PATH"] = os.path.dirname(os.path.abspath(sys.executable)) + os.pathsep + env.get("PATH", "")
+        r = subprocess.run(test_cmd, shell=True, cwd=REPO_ROOT, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=timeout, env=env)
+        return True, r.returncode, False
+    except subprocess.TimeoutExpired:
+        return True, None, True
+    except Exception:
+        return False, None, False   # 启动失败（shell 缺失等）→ ran=False → UNKNOWN
+
+
+def _emit_post_merge(verdict, ran: bool, test_rc: int | None, timed_out: bool,
+                     error: str | None = None) -> int:
+    """post-merge-test phase 末行 JSON（控制面 ``parse_post_merge_result`` 消费）。
+
+    三态均为合法判决（PASS/FAIL/UNKNOWN 非错误），故恒 exit0——控制面读 JSON 路由。
+    """
+    print(json.dumps({"phase": "post-merge-test", "verdict": verdict.value,
+                      "ran": ran, "test_rc": test_rc, "timed_out": timed_out,
+                      "error": error}, ensure_ascii=False))
+    return 0
+
+
+def run_post_merge_test(args: dict) -> int:
+    """post-merge-test phase 主编排：checkout main → 跑 --test-cmd → 收证判三态。
+
+    main 已由 merge phase 合入 + push；本 phase checkout main 后就地跑测试 = 测**集成后 main**。
+    fail-safe：checkout 失败 → UNKNOWN；测试未跑/超时 → UNKNOWN（控制面 halt，不 auto-revert）。
+    """
+    main_ref = args["main_ref"]
+    test_cmd = args.get("test_cmd") or ""
+    timeout = int(args["timeout"]) if args.get("timeout") else POST_MERGE_TEST_TIMEOUT
+    try:
+        git(["checkout", main_ref])   # 确保 worktree 在 main（merge phase 后应已在；no-op 兜底）
+    except Exception as e:
+        return _emit_post_merge(PostMergeVerdict.UNKNOWN, False, None, False,
+                                error=f"checkout {main_ref} 失败: {e}")
+    ran, test_rc, timed_out = _run_test_cmd(test_cmd, timeout)
+    verdict = classify_post_merge(PostMergeEvidence(ran, test_rc, timed_out))
+    return _emit_post_merge(verdict, ran, test_rc, timed_out)
+
+
+# ─── task 4.3：revert phase（机械执行：revert 单一 merge commit + ff-only push）────────
+# 守 D6/ADR-0001（同 merge phase）：在目标仓 worktree（REPO_ROOT）经机械层（git()）执行。D7 单 commit 粒度：
+#   ``git revert -m 1 --no-edit <merge_commit>``（revert merge 到第一父=main）+ ff-only push（禁 --force*）+
+#   记 revert_commit（D12 exactly-once reconcile 锚点）。三态：CONFLICT→abort；push reject→reset 本地 main
+#   到 origin + UNKNOWN（远端 main 仍红，halt）；任一未预期→UNKNOWN（fail-safe，不当 REVERTED）。
+def _run_git_rc(git_args: list[str], timeout: int) -> tuple[int | None, bool]:
+    """跑 git 收 ``(rc, timed_out)``（非 raise；revert 收证用——冲突=非0不抛，配合冲突标记判定）。"""
+    try:
+        r = subprocess.run(["git", *git_args], cwd=REPO_ROOT, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=timeout)
+        return r.returncode, False
+    except subprocess.TimeoutExpired:
+        return None, True
+    except Exception:
+        return None, False
+
+
+def _emit_revert(outcome, revert_commit: str | None = None, revert_rc: int | None = None,
+                 conflict_files: int = 0, push_failed: bool = False, timed_out: bool = False,
+                 error: str | None = None) -> int:
+    """revert phase 末行 JSON（控制面 ``parse_revert_result`` 消费）。REVERTED=exit0；其余 13。"""
+    print(json.dumps({"phase": "revert", "outcome": outcome.value, "revert_commit": revert_commit,
+                      "revert_rc": revert_rc, "conflict_files": conflict_files,
+                      "push_failed": push_failed, "timed_out": timed_out,
+                      "error": error}, ensure_ascii=False))
+    return 0 if outcome is RevertOutcome.REVERTED else 13
+
+
+def run_revert(args: dict) -> int:
+    """revert phase 主编排：checkout main → revert merge_commit → push → 记 revert_commit。
+
+    非 REVERTED 不留半完成态（冲突/push-reject 均清理本地 main 对齐远端）。revert_commit 仅在 push 成功后记
+    （未 push 的本地 revert 不是远端 main 祖先，非 reconcile 锚点）。
+    """
+    merge_commit, main_ref = args["merge_commit"], args["main_ref"]
+    try:
+        git(["checkout", main_ref])
+        revert_rc, timed_out = _run_git_rc(["revert", "-m", "1", "--no-edit", merge_commit], REVERT_TIMEOUT)
+        if timed_out:
+            _safe_git(["revert", "--abort"])
+            return _emit_revert(RevertOutcome.UNKNOWN, timed_out=True, error="revert 超时")
+        conflict_files = _count_conflict_files()
+        if revert_rc != 0 and conflict_files > 0:
+            _safe_git(["revert", "--abort"])   # 清冲突残留（main 未碰）
+            return _emit_revert(RevertOutcome.CONFLICT, revert_rc=revert_rc, conflict_files=conflict_files)
+        if revert_rc != 0:   # 非0但无冲突标记 = 异常态 → UNKNOWN
+            _safe_git(["revert", "--abort"])
+            return _emit_revert(RevertOutcome.UNKNOWN, revert_rc=revert_rc,
+                                error=f"revert rc={revert_rc} 无冲突标记，状态不明")
+        # rc==0：revert 本地成功 → ff-only push（禁 --force*）
+        revert_commit = _safe_revparse("HEAD")
+        try:
+            git(["push", "origin", main_ref])
+        except Exception:
+            _safe_git(["reset", "--hard", f"origin/{main_ref}"])   # 回退本地 main 到远端（仍含坏 merge）
+            return _emit_revert(RevertOutcome.UNKNOWN, revert_commit=None, revert_rc=revert_rc,
+                                push_failed=True, error="revert push reject（远端 main 未回滚）")
+        return _emit_revert(RevertOutcome.REVERTED, revert_commit=revert_commit, revert_rc=revert_rc)
+    except Exception as e:
+        return _emit_revert(RevertOutcome.UNKNOWN, error=f"revert phase 未预期异常: {e}")
+
+
 async def main() -> int:
     args = parse_args(sys.argv[1:])
     if args["help"]:
@@ -539,6 +680,11 @@ async def main() -> int:
     #   dev loop 路径零回归（phase 默认 dev = 原 main 逻辑）。守 D6：控制面只发 --phase merge cmd。
     if args.get("phase") == "merge":
         return run_merge_phase(args)
+    # task 4.x：post-merge-test / revert phase 早期分叉（机械执行，不经 SDK loop；守 D6）
+    if args.get("phase") == "post-merge-test":
+        return run_post_merge_test(args)
+    if args.get("phase") == "revert":
+        return run_revert(args)
     if not args["prd"]:
         sys.stderr.write("✗ 缺 --prd（控制面投递的 PRD）\n" + HELP + "\n"); return 10
 

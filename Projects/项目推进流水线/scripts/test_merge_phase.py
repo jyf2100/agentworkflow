@@ -177,3 +177,177 @@ def test_build_merge_cmd_state_dir_optional(tmp_path):
     cmd = MP.build_merge_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
                              branch="auto/x", main_ref="main", prd_id="p", state_dir=None)
     assert "--state-dir" not in cmd
+
+
+# ─── build_classify_cmd（task 7.1a shadow：控制面构造 dev-agent --phase merge --classify-only）─────
+def test_build_classify_cmd_carries_classify_only_flag(tmp_path):
+    cmd = MP.build_classify_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
+                                branch="auto/x", main_ref="main", prd_id="prd-1",
+                                state_dir=str(tmp_path))
+    assert cmd[0] == "python3"
+    assert "--phase" in cmd and cmd[cmd.index("--phase") + 1] == "merge"
+    assert "--classify-only" in cmd, "shadow classify-only 须透传 --classify-only（dev-agent CLEAN 短路开关）"
+    assert "--branch" in cmd and "auto/x" in cmd
+    assert "--prd-id" in cmd and "prd-1" in cmd
+    assert "--main" in cmd
+    assert "--state-dir" in cmd
+
+
+def test_build_classify_cmd_state_dir_optional(tmp_path):
+    cmd = MP.build_classify_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
+                                branch="auto/x", main_ref="main", prd_id="p", state_dir=None)
+    assert "--state-dir" not in cmd
+
+
+# ═══ task 4.1 / 4.2：post-merge main 全量测试三态判定（spec「Post-merge main verification」）═══
+# D8：post-merge 跑的是**集成后 main 全量 suite**（基线=main，≠ verify 的 candidate branch）——覆盖面与基线都
+# 不同，故非 verify 的重复。结果三态：PASS 保留+放行；FAIL→revert(4.3)；UNKNOWN→keep+halt+CRITICAL（不 auto-revert）。
+# fail-safe 判定（同 classify_rebase 结构）：PASS 须**全正向证据**（确实跑过 + exit0 + 未超时）；缺证=UNKNOWN。
+def _pm(**kw) -> MP.PostMergeEvidence:
+    """构造 PostMergeEvidence，默认全正向（PASS 候选），测试只覆写被测字段。"""
+    base = dict(ran=True, test_rc=0, timed_out=False)
+    base.update(kw)
+    return MP.PostMergeEvidence(**base)
+
+
+def test_post_merge_pass_when_all_positive_evidence():
+    # 确实跑过 + exit0 + 未超时 → PASS（spec scenario「Main stays green after merge」）
+    assert MP.classify_post_merge(_pm()) is MP.PostMergeVerdict.PASS
+
+
+@pytest.mark.parametrize("field,value,why", [
+    ("ran", False, "测试未跑/环境失败（无 exit code 可信）→ UNKNOWN（非 PASS）"),
+    ("test_rc", None, "未取到 exit code（超时被杀/异常）→ UNKNOWN"),
+    ("timed_out", True, "超时 → 无法判定（半跑完）→ UNKNOWN（spec scenario「Post-merge test result unknown」）"),
+])
+def test_post_merge_unknown_when_any_positive_evidence_missing(field, value, why):
+    # 缺任一正向证据 → UNKNOWN（绝不误判 PASS——否则烂代码留 main 不触发 revert，安全网失效）
+    assert MP.classify_post_merge(_pm(**{field: value})) is MP.PostMergeVerdict.UNKNOWN, why
+
+
+def test_post_merge_fail_when_ran_and_nonzero_exit():
+    # 确实跑过 + 非0退出（非超时）= 明确测试失败 → FAIL（spec scenario「Main goes red」触发 revert）
+    assert MP.classify_post_merge(_pm(test_rc=1)) is MP.PostMergeVerdict.FAIL
+    assert MP.classify_post_merge(_pm(test_rc=130)) is MP.PostMergeVerdict.FAIL   # SIGTERM-like
+
+
+def test_post_merge_timeout_overrides_exit_zero():
+    # 即使 test_rc 巧合为 0，超时已破坏正向证据 → UNKNOWN（timeout 优先于 rc；非 PASS）
+    assert MP.classify_post_merge(_pm(test_rc=0, timed_out=True)) is MP.PostMergeVerdict.UNKNOWN
+
+
+def test_post_merge_not_run_is_unknown_even_if_rc_zero():
+    # ran=False + rc=0（命令根本没执行，rc 无意义）→ UNKNOWN（fail-safe：不当代绿）
+    assert MP.classify_post_merge(_pm(ran=False, test_rc=0)) is MP.PostMergeVerdict.UNKNOWN
+
+
+# ─── parse_post_merge_result（dev-agent JSON → PostMergeResult，fail-safe 坏→UNKNOWN）─────
+def _pm_payload(**kw) -> dict:
+    base = {"phase": "post-merge-test", "verdict": "pass",
+            "ran": True, "test_rc": 0, "timed_out": False}
+    base.update(kw)
+    return base
+
+
+def test_parse_post_merge_pass():
+    r = MP.parse_post_merge_result(_pm_payload())
+    assert r.verdict is MP.PostMergeVerdict.PASS
+
+
+def test_parse_post_merge_fail():
+    r = MP.parse_post_merge_result(_pm_payload(verdict="fail", test_rc=1))
+    assert r.verdict is MP.PostMergeVerdict.FAIL
+
+
+def test_parse_post_merge_malformed_is_unknown():
+    # 坏/缺字段 payload → fail-safe UNKNOWN（绝不误判 PASS——否则不 revert）
+    assert MP.parse_post_merge_result({"bad": "payload"}).verdict is MP.PostMergeVerdict.UNKNOWN
+    assert MP.parse_post_merge_result(None).verdict is MP.PostMergeVerdict.UNKNOWN   # 非 dict
+
+
+# ═══ task 4.3：auto-revert 三态判定（spec「Post-merge ... revert itself SHALL be three-state」）═══
+# D3 / D7：post-merge FAIL → revert 本次自动合入产出的单一 merge commit（``git revert -m 1``，journal 记其 sha）。
+# revert 本身三态：REVERTED→triage(post_merge_red_reverted)+放行；CONFLICT/UNKNOWN→halt 整仓+CRITICAL
+# （**不 continue，不强改 main**——spec scenario「Revert itself fails halts the queue」）。
+# fail-safe（同 classify_rebase/post_merge）：REVERTED 须**全正向证据**；push reject=UNKNOWN（远端 main 仍红）。
+def _rv(**kw) -> MP.RevertEvidence:
+    """构造 RevertEvidence，默认全正向（REVERTED 候选），测试只覆写被测字段。"""
+    base = dict(revert_rc=0, conflict_files=0, push_failed=False, timed_out=False)
+    base.update(kw)
+    return MP.RevertEvidence(**base)
+
+
+def test_revert_reverted_when_all_positive_evidence():
+    # rc0 + 无冲突 + push 成功 + 未超时 → REVERTED（spec scenario「revert succeeds」）
+    assert MP.classify_revert(_rv()) is MP.RevertOutcome.REVERTED
+
+
+@pytest.mark.parametrize("field,value,why", [
+    ("timed_out", True, "revert 超时 → 无法判定 → UNKNOWN（halt，不 continue）"),
+    ("revert_rc", None, "未取到 revert exit code → UNKNOWN"),
+    ("push_failed", True, "revert 本地成功但 push reject → 远端 main 仍红 → UNKNOWN（halt）"),
+])
+def test_revert_unknown_when_any_positive_evidence_missing(field, value, why):
+    # push reject / 超时 / 无 rc → UNKNOWN（绝不误判 REVERTED 放行——否则烂代码留 main + 队列续跑叠加）
+    assert MP.classify_revert(_rv(**{field: value})) is MP.RevertOutcome.UNKNOWN, why
+
+
+def test_revert_conflict_when_markers_present():
+    # revert 产生冲突标记（非超时）→ CONFLICT（revert --abort；spec「revert fails halts」）
+    assert MP.classify_revert(_rv(conflict_files=2, revert_rc=1)) is MP.RevertOutcome.CONFLICT
+
+
+def test_revert_push_failed_overrides_clean_local():
+    # 本地 revert 干净（rc0+无冲突）但 push reject → 远端未 revert → UNKNOWN（halt，非 REVERTED）
+    assert MP.classify_revert(_rv(push_failed=True)) is MP.RevertOutcome.UNKNOWN
+
+
+def test_revert_timeout_overrides_exit_zero():
+    # 即使 revert_rc 巧合 0，超时已破坏正向证据 → UNKNOWN（非 REVERTED）
+    assert MP.classify_revert(_rv(revert_rc=0, timed_out=True)) is MP.RevertOutcome.UNKNOWN
+
+
+# ─── parse_revert_result（dev-agent JSON → RevertResult，fail-safe 坏→UNKNOWN；记 revert_commit）──
+def _rv_payload(**kw) -> dict:
+    base = {"phase": "revert", "outcome": "reverted", "revert_commit": "face0ff",
+            "revert_rc": 0, "conflict_files": 0, "push_failed": False, "timed_out": False}
+    base.update(kw)
+    return base
+
+
+def test_parse_revert_reverted_records_commit():
+    r = MP.parse_revert_result(_rv_payload())
+    assert r.outcome is MP.RevertOutcome.REVERTED
+    assert r.revert_commit == "face0ff"   # 记 revert_commit sha 供 exactly-once reconcile（D12 / task 6.1b）
+
+
+def test_parse_revert_conflict():
+    r = MP.parse_revert_result(_rv_payload(outcome="conflict", revert_commit=None,
+                                           conflict_files=1, revert_rc=1))
+    assert r.outcome is MP.RevertOutcome.CONFLICT
+
+
+def test_parse_revert_malformed_is_unknown():
+    # 坏 payload → fail-safe UNKNOWN（绝不误判 REVERTED——否则不 halt）
+    assert MP.parse_revert_result({"bad": "payload"}).outcome is MP.RevertOutcome.UNKNOWN
+    assert MP.parse_revert_result(None).outcome is MP.RevertOutcome.UNKNOWN
+
+
+# ─── build_revert_cmd / build_post_merge_cmd（控制面构造 dev-agent --phase 命令）─────────
+def test_build_revert_cmd_shape(tmp_path):
+    cmd = MP.build_revert_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
+                              merge_commit="abc123", main_ref="main", prd_id="prd-1",
+                              state_dir=str(tmp_path))
+    assert cmd[0] == "python3"
+    assert "--phase" in cmd and cmd[cmd.index("--phase") + 1] == "revert"
+    assert "--merge-commit" in cmd and "abc123" in cmd
+    assert "--main" in cmd and "--prd-id" in cmd and "--state-dir" in cmd
+
+
+def test_build_post_merge_cmd_shape(tmp_path):
+    cmd = MP.build_post_merge_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
+                                  test_cmd="npm test", main_ref="main", prd_id="prd-1",
+                                  state_dir=str(tmp_path), timeout=1800)
+    assert "--phase" in cmd and cmd[cmd.index("--phase") + 1] == "post-merge-test"
+    assert "--test-cmd" in cmd and "npm test" in cmd
+    assert "--timeout" in cmd   # D10 post-merge test wall-clock 上界透传

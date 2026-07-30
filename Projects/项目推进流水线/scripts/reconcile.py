@@ -39,7 +39,7 @@ from session_meta import ExceptionClass, SessionStore
 
 # ids.idempotency_id 允许的 kind（commit/push/pr/test），覆盖 task 5.5 的 branch/commit/PR/publication
 # + task 4.4 的 test evidence（target=evidence digest，publication/retry 前 reconcile green evidence）
-ALLOWED_KINDS: frozenset[str] = frozenset({"commit", "push", "pr", "test"})
+ALLOWED_KINDS: frozenset[str] = frozenset({"commit", "push", "pr", "test", "merge", "revert"})
 
 
 @dataclass(frozen=True)
@@ -134,9 +134,13 @@ class LocalGitResolver:
     crash drill 据此可能盲目重放 push）。``pr`` kind 返回 None（需 ``GhPrResolver``）。
     git 命令失败/无 remote → None（fail-safe unknown，绝不把"查不到远端"当"未 push"而盲目重放）。"""
 
-    def __init__(self, repo_dir: str | Path = ".", remote: str = "origin"):
+    def __init__(self, repo_dir: str | Path = ".", remote: str = "origin",
+                 main_ref: str = "refs/remotes/origin/main"):
         self.repo_dir = str(repo_dir)
         self.remote = remote
+        # task 6.1b：merge/revert ancestry check 的 main 参照（默认远端 main 真源——dispatch 在 merge_phase
+        #   前 fetch 过 main，故 origin/main 新鲜；merge-base --is-ancestor 据此判 merge/revert commit 是否已进 main）。
+        self.main_ref = main_ref
 
     def check(self, kind: str, target: str) -> bool | None:
         try:
@@ -155,6 +159,23 @@ class LocalGitResolver:
                 if r.returncode != 0:
                     return None
                 return bool(r.stdout.strip())
+            if kind in ("merge", "revert"):
+                # task 6.1b：ancestry check——target（merge_commit / revert_commit sha）是否 main 祖先。
+                #   git merge-base --is-ancestor <target> <main_ref>：
+                #     exit 0 → True（是祖先 = 副作用已发生，skip 重 merge/revert）
+                #     exit 1 → False（不是祖先 = 未发生，可安全重 apply）
+                #     其他（main_ref 不存在 / 对象缺失 / 超时）→ None（fail-safe unknown，BLOCK）
+                #   ⚠️ revert 查 revert_commit（git revert 产的新 commit），非 merge_commit——git revert 不删
+                #   原 merge commit，revert 后原 merge commit 仍是 main 祖先（spec v2.1）；故 revert 状态
+                #   不可由 merge_commit presence 推断，必须查 revert_commit ancestry。
+                r = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", target, self.main_ref],
+                    cwd=self.repo_dir, capture_output=True, timeout=15)
+                if r.returncode == 0:
+                    return True
+                if r.returncode == 1:
+                    return False
+                return None
             # pr 本地查不到 → None（交 GhPrResolver）
             return None
         except Exception:

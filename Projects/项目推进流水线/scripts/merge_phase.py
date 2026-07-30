@@ -182,3 +182,252 @@ def build_merge_cmd(*, python: str, dev_agent_py, branch: str, main_ref: str,
     if state_dir:
         cmd += ["--state-dir", state_dir]
     return cmd
+
+
+def build_classify_cmd(*, python: str, dev_agent_py, branch: str, main_ref: str,
+                       prd_id: str, state_dir: str | None = None) -> list[str]:
+    """构造 ``dev-agent --phase merge --classify-only`` 命令（shadow 模式：只判 rebase 三态，**不 merge/push**）。
+
+    task 7.1a shadow parity：``single_flight_serial_shadow=on``（``auto_merge=off``）时，控制面发此 cmd 让
+    dev-agent 跑 fetch→rebase→收证→classify 三态，但 CLEAN 也**短路**（``--classify-only``）——不 ``--no-ff``
+    merge、不 push（main 零副作用，守 docstring「merge/revert 只 log 不改 main」+ ADR-0008 护栏#7 shadow gate）。
+    返回 JSON 经 ``parse_merge_result`` 消费 ``rebase_outcome``（= shadow 决策：clean/conflict/unknown）；
+    ``merge_commit`` 恒 None（shadow 不合）。守 D6/ADR-0001（同 ``build_merge_cmd``：控制面只发 cmd）。
+    """
+    cmd = [python, str(dev_agent_py), "--phase", "merge", "--classify-only",
+           "--branch", branch, "--main", main_ref, "--prd-id", prd_id]
+    if state_dir:
+        cmd += ["--state-dir", state_dir]
+    return cmd
+
+
+# ─── task 4.1 / 4.2：post-merge main 全量测试三态判定（D3 / D8，纯机械判定层）──────────
+# spec「Post-merge main verification and auto-revert」：merge+push main 后对**集成后 main** 跑全量测试套件
+# （基线=main，含本次合入；覆盖面/基线均 ≠ verify 的 candidate branch —— D8：这是该阶段存在的理由，须显式
+# 注释防被 implementer 当 verify 重复偷工）。结果三态驱动 dispatch 路由：
+#   PASS   main 绿 → 保留 + 放行（slot 释放，队列续跑）
+#   FAIL   main 红 → 触发 revert（task 4.3）
+#   UNKNOWN 跑不完/环境失败/超时 → **不 auto-revert 也 keep**，halt 整仓 + CRITICAL（spec scenario
+#          「Post-merge test result unknown halts the queue」——不 auto-revert：不确定是否本次合入所致）
+#
+# fail-safe 判定（同 ``classify_rebase`` 结构——最危险的「误判 PASS 留烂代码」须最难达成）：
+# PASS 仅在**全正向证据**齐时断言——确实跑过(ran) + exit0(test_rc==0) + 未超时；缺任一 → UNKNOWN（非 PASS）。
+# FAIL 须**确实跑过**且非0退出（非超时）；超时/未跑/无 rc 一律 UNKNOWN（fail-safe：宁可 halt 不误 revert）。
+class PostMergeVerdict(str, Enum):
+    """post-merge main 全量测试三态（str 子类化便于 JSON 序列化进 state 记录，同 ``RebaseOutcome``）。
+
+    ``UNKNOWN`` 是 fail-safe 信号：dispatch 见之 → keep + halt 整仓 + CRITICAL，**不 auto-revert**
+    （spec「any UNKNOWN test result SHALL halt the queue ... MUST NOT continue」）。
+    """
+
+    PASS = "pass"      # main 全量测试绿 → 保留 merge + 放行
+    FAIL = "fail"      # main 全量测试红（确实跑过 + 非0退出）→ 触发 revert（task 4.3）
+    UNKNOWN = "unknown"   # 跑不完/超时/环境失败/无 rc → keep + halt + CRITICAL（不 auto-revert）
+
+
+@dataclass(frozen=True)
+class PostMergeEvidence:
+    """post-merge 测试执行证据（dev-agent ``--phase post-merge-test`` 收集后交 ``classify_post_merge``）。
+
+    各字段为**正向证据**语义：``ran=True``/``test_rc=0`` 表示该证据存在且良好。``classify_post_merge`` 据
+    正向证据聚合判三态（PASS 须全齐；缺/坏 → UNKNOWN）。``raw`` 留原始诊断（stderr 尾部等）供审计，不参与判定。
+    """
+
+    __test__: ClassVar[bool] = False
+    ran: bool                  # 测试命令是否确实执行（False=环境失败/命令缺失/未启动 → 无可信 exit code）
+    test_rc: int | None        # 测试命令 exit code（None=未取到：超时被杀/异常）；0=绿，非0=红
+    timed_out: bool            # 被 wall-clock timeout 杀？（D10：post-merge test profile 化上界）
+    raw: dict | None = None    # 原始证据快照（诊断/审计，不参与判定逻辑）
+
+
+def classify_post_merge(ev: PostMergeEvidence) -> PostMergeVerdict:
+    """据 post-merge 测试证据判三态（**纯机械判定**，spec「Post-merge main verification」）。
+
+    判定顺序（fail-safe：「误判 PASS 留烂代码」须最难达成——安全网失效 = 最危险）：
+      1. ``timed_out`` → ``UNKNOWN``（半跑完，无法判定；spec scenario「timeout/crash/env failure」）。
+      2. 未 ``ran`` → ``UNKNOWN``（命令未执行，exit code 无意义）。
+      3. ``test_rc is None`` → ``UNKNOWN``（未取到 exit code）。
+      4. ``test_rc == 0`` → ``PASS``（全正向证据齐）。
+      5. 其余（``test_rc != 0``）→ ``FAIL``（确实跑过且明确红）。
+    """
+    if ev.timed_out:
+        return PostMergeVerdict.UNKNOWN
+    if not ev.ran:
+        return PostMergeVerdict.UNKNOWN
+    if ev.test_rc is None:
+        return PostMergeVerdict.UNKNOWN
+    if ev.test_rc == 0:
+        return PostMergeVerdict.PASS
+    return PostMergeVerdict.FAIL
+
+
+@dataclass(frozen=True)
+class PostMergeResult:
+    """post-merge phase 整体结果（控制面 parse dev-agent 返回所得；驱动 dispatch 路由）。
+
+    ``verdict`` = 三态；``evidence`` 留诊断；``error`` 留非预期原因。dispatch 据 ``verdict`` 决 keep/revert/halt。
+    """
+
+    __test__: ClassVar[bool] = False
+    verdict: PostMergeVerdict
+    evidence: PostMergeEvidence
+    error: str | None = None
+
+
+def parse_post_merge_result(payload) -> PostMergeResult:
+    """解析 dev-agent post-merge-test phase 末行 JSON 为 ``PostMergeResult``（**fail-safe**：坏/缺 → UNKNOWN）。
+
+    非 dict / 缺证据 / 坏 verdict 值 → 一律降级 UNKNOWN（绝不误判 PASS——否则烂代码留 main 不 revert，安全网
+    失效；同 fail-safe-dispatch 不变式：状态不明即阻断）。允许 dev-agent 已判 verdict 直传，亦允许只传原始
+    证据由本函数重判（双重保险：dev-agent 判错时控制面据证据纠正）。
+    """
+    if not isinstance(payload, dict):
+        return PostMergeResult(PostMergeVerdict.UNKNOWN,
+                               PostMergeEvidence(False, None, False), error="非 dict payload")
+    try:
+        evidence = PostMergeEvidence(
+            ran=bool(payload.get("ran", False)),
+            test_rc=payload.get("test_rc"),
+            timed_out=bool(payload.get("timed_out", False)),
+        )
+    except (TypeError, ValueError) as ex:
+        return PostMergeResult(PostMergeVerdict.UNKNOWN, PostMergeEvidence(False, None, False),
+                               error=f"post-merge 证据解析失败: {ex}")
+    # 双重保险：以控制面据证据重判的 verdict 为准（dev-agent 传的 verdict 仅诊断参考）
+    return PostMergeResult(classify_post_merge(evidence), evidence, error=payload.get("error"))
+
+
+# ─── task 4.3：auto-revert 三态判定（D3 / D7，纯机械判定层）──────────────────────────
+# spec「Post-merge ... revert itself SHALL be three-state REVERTED/CONFLICT/UNKNOWN」：post-merge FAIL →
+# revert 本次自动合入产出的单一 merge commit（``git revert -m 1 --no-edit``，D7 单 commit 粒度；journal 记
+# revert_commit sha 供 exactly-once reconcile，D12 / task 6.1b）。三态驱动 dispatch：
+#   REVERTED  远端 main 已回滚干净 → triage(post_merge_red_reverted) + 放行（slot 释放，队列续跑）
+#   CONFLICT  revert 产生冲突 → halt 整仓 + CRITICAL（revert --abort，不强改 main）
+#   UNKNOWN   push reject / 超时 / 无 rc → halt 整仓 + CRITICAL（**不 continue**——远端 main 仍红，
+#             spec scenario「Revert itself fails halts the queue ... no further PRD admitted」）
+#
+# fail-safe（同 classify_rebase/post_merge——「误判 REVERTED 当成功放行」最危险：烂代码留 main + 队列续跑叠加）：
+# REVERTED 须**全正向证据**：rc0 + 无冲突 + push 成功 + 未超时；push reject = UNKNOWN（本地 revert 了但远端
+# main 仍红——非 REVERTED，halt）。
+class RevertOutcome(str, Enum):
+    """auto-revert 三态（str 子类化便于 JSON 序列化进 state 记录，同 ``RebaseOutcome``）。
+
+    非 ``REVERTED``（``CONFLICT``/``UNKNOWN``）= halt 整仓 + CRITICAL——dispatch **不 continue** 到下一 PRD
+    （spec「Any non-REVERTED revert outcome ... SHALL halt the queue ... MUST NOT continue」）。
+    """
+
+    REVERTED = "reverted"   # 远端 main 已回滚干净 → triage + 放行
+    CONFLICT = "conflict"   # revert 产生冲突标记 → halt + CRITICAL（revert --abort，不强改 main）
+    UNKNOWN = "unknown"     # push reject / 超时 / 无 rc → halt + CRITICAL（不 continue）
+
+
+@dataclass(frozen=True)
+class RevertEvidence:
+    """revert 执行证据（dev-agent ``--phase revert`` 收集后交 ``classify_revert``）。
+
+    各字段为**正向证据**语义。``classify_revert`` 据正向证据聚合判三态（REVERTED 须全齐；缺/坏 → UNKNOWN）。
+    """
+
+    __test__: ClassVar[bool] = False
+    revert_rc: int | None      # ``git revert`` exit code（None=未取到：超时/异常）；0=干净 revert
+    conflict_files: int        # unmerged 文件数（>0 = revert 产生冲突）
+    push_failed: bool          # revert 后 ``git push`` 被 reject？（True=远端 main 未回滚 → UNKNOWN）
+    timed_out: bool            # revert 被 wall-clock timeout 杀？（D10：revert ~60s 上界）
+    raw: dict | None = None    # 原始证据快照（诊断/审计，不参与判定逻辑）
+
+
+def classify_revert(ev: RevertEvidence) -> RevertOutcome:
+    """据 revert 执行证据判三态（**纯机械判定**，spec「revert itself SHALL be three-state」）。
+
+    判定顺序（fail-safe：「误判 REVERTED 放行」最危险——烂代码留 main + 队列续跑叠加）：
+      1. ``timed_out`` → ``UNKNOWN``（半完成，无法判定）。
+      2. ``revert_rc is None`` → ``UNKNOWN``（未取到 exit code）。
+      3. ``conflict_files > 0`` → ``CONFLICT``（revert 产生冲突标记；revert --abort）。
+      4. ``push_failed`` → ``UNKNOWN``（本地 revert 了但 push reject → 远端 main 仍红，非 REVERTED）。
+      5. ``revert_rc == 0`` → ``REVERTED``（rc0 + 无冲突 + push 成功）。
+      6. 其余 → ``UNKNOWN``（rc 非0 但无冲突标记等异常态，无法确立）。
+    """
+    if ev.timed_out:
+        return RevertOutcome.UNKNOWN
+    if ev.revert_rc is None:
+        return RevertOutcome.UNKNOWN
+    if ev.conflict_files > 0:
+        return RevertOutcome.CONFLICT
+    if ev.push_failed:
+        return RevertOutcome.UNKNOWN
+    if ev.revert_rc == 0:
+        return RevertOutcome.REVERTED
+    return RevertOutcome.UNKNOWN
+
+
+@dataclass(frozen=True)
+class RevertResult:
+    """revert phase 整体结果（控制面 parse dev-agent 返回所得；驱动 dispatch 路由）。
+
+    ``revert_commit`` = revert 产出的新 commit sha（``git revert`` 新建，非删原 merge commit；记录供
+    exactly-once reconcile 查 ancestry，D12 / task 6.1b）。``outcome`` 驱动 keep/halt。
+    """
+
+    __test__: ClassVar[bool] = False
+    outcome: RevertOutcome
+    revert_commit: str | None
+    evidence: RevertEvidence
+    error: str | None = None
+
+
+def parse_revert_result(payload) -> RevertResult:
+    """解析 dev-agent revert phase 末行 JSON 为 ``RevertResult``（**fail-safe**：坏/缺 → UNKNOWN）。
+
+    非 dict / 缺证据 → 一律降级 UNKNOWN（绝不误判 REVERTED——否则不 halt，烂代码留 main + 队列续跑）。
+    以控制面据证据重判的 outcome 为准（dev-agent 传值仅诊断参考，双重保险）。
+    """
+    if not isinstance(payload, dict):
+        return RevertResult(RevertOutcome.UNKNOWN, None,
+                            RevertEvidence(None, 0, False, False), error="非 dict payload")
+    try:
+        evidence = RevertEvidence(
+            revert_rc=payload.get("revert_rc"),
+            conflict_files=int(payload.get("conflict_files", 0) or 0),
+            push_failed=bool(payload.get("push_failed", False)),
+            timed_out=bool(payload.get("timed_out", False)),
+        )
+    except (TypeError, ValueError) as ex:
+        return RevertResult(RevertOutcome.UNKNOWN, None, RevertEvidence(None, 0, False, False),
+                            error=f"revert 证据解析失败: {ex}")
+    revert_commit = payload.get("revert_commit")
+    if not isinstance(revert_commit, str):
+        revert_commit = None
+    return RevertResult(classify_revert(evidence), revert_commit, evidence, error=payload.get("error"))
+
+
+def build_post_merge_cmd(*, python: str, dev_agent_py, test_cmd: str, main_ref: str,
+                         prd_id: str, state_dir: str | None = None,
+                         timeout: int | None = None) -> list[str]:
+    """构造 ``dev-agent --phase post-merge-test`` 命令（控制面发，dev-agent 在目标仓对集成后 main 跑测试）。
+
+    守 D6/ADR-0001（同 ``build_merge_cmd``）：控制面只发 cmd，dev-agent 在目标仓 worktree 经机械层
+    （subprocess）跑测试套件。``test_cmd`` = verify 用过的同一条命令（决策 E：profile/上报单一真理源），
+    基线换成集成后 main（D8：≠ verify 的 candidate branch）。``timeout`` = D10 post-merge test 上界。
+    """
+    cmd = [python, str(dev_agent_py), "--phase", "post-merge-test",
+           "--test-cmd", test_cmd, "--main", main_ref, "--prd-id", prd_id]
+    if state_dir:
+        cmd += ["--state-dir", state_dir]
+    if timeout is not None:
+        cmd += ["--timeout", str(timeout)]
+    return cmd
+
+
+def build_revert_cmd(*, python: str, dev_agent_py, merge_commit: str, main_ref: str,
+                     prd_id: str, state_dir: str | None = None) -> list[str]:
+    """构造 ``dev-agent --phase revert`` 命令（控制面发，dev-agent 在目标仓 revert 单一 merge commit + push）。
+
+    守 D6/ADR-0001：控制面只发 cmd，dev-agent 在目标仓 worktree 经机械层（``git()``）执行
+    ``git revert -m 1 --no-edit <merge_commit>`` + ff-only push + 记 revert_commit。``merge_commit`` = 本次
+    自动合入产出的单一 commit（D7 粒度；journal 须另记 revert_commit sha，task 6.1b）。
+    """
+    cmd = [python, str(dev_agent_py), "--phase", "revert",
+           "--merge-commit", merge_commit, "--main", main_ref, "--prd-id", prd_id]
+    if state_dir:
+        cmd += ["--state-dir", state_dir]
+    return cmd

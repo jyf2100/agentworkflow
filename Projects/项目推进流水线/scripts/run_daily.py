@@ -58,6 +58,10 @@ import cutover                             # add-cross-prd-learning-memory 批�
 import ids as loop_ids                     # single-flight-auto-merge task 2.2：slot 事件审计归属 IDs（run_id/prd_id/iteration_id，纯 stdlib）
 import merge_phase as MP                   # single-flight-auto-merge task 3.2：merge phase 机械判定（classify_rebase/MergeResult/parse_merge_result/build_merge_cmd；纯 stdlib 零 git/SDK，cron 安全）
 import single_flight as SF                 # single-flight-auto-merge task 2.2/2.3：per-owner_repo 跨进程 slot（flock + journal；Linux fcntl，cron 安全）
+import circuit_breaker as CB               # single-flight-auto-merge task 4.4：revert 循环熔断（同幂等键 PRD cooldown 窗口内禁再 auto-merge→triage；纯 stdlib journal，cron 安全）
+import critical_alert as CA                # single-flight-auto-merge task 4.5：CRITICAL 告警 durable 化（halt→独立 alerts journal，不受 flag gating，crash 不丢；纯 stdlib，cron 安全）
+import main_status as MS                   # single-flight-auto-merge task 4.6：main 瞬态红契约 + 可查询 post-merge 验证状态（per-owner_repo journal，不受 flag gating；纯 stdlib，cron 安全）
+import merge_loop as ML                    # single-flight-auto-merge task 6.x 方案 C：merge/revert 闭环 crash 安全门（intent→push→confirm 写顺序；has_open_intent 阻盲目重 merge；纯 stdlib journal，cron 安全）
 # add-cross-prd-learning-memory Section 7 接线（控制面纯 stdlib 模块，cron 隔离不变）：
 #   envelope 构造（journal events → sanitized TerminalEnvelope）+ reflection（read-only SDK，mock-SDK 可注入）+
 #   retrieval（dispatch-entry catalog 检索 + lesson block 渲染）+ effectiveness（memory_mode record）。
@@ -186,6 +190,39 @@ def load_profiles() -> dict:
         if prof.get("admission"):
             profiles[prof["name"]] = prof
     return profiles
+
+
+def _normalize_projects(raw: list[str] | None) -> list[str] | None:
+    """``--project`` 归一：append（可重复）+ 逗号分隔混用 → 去空白 list；None/空 → None（baseline 不过滤）。
+    canary 隔离用：``--project cc-web-control`` 只跑该仓。"""
+    if not raw:
+        return None
+    out: list[str] = []
+    for part in raw:
+        out.extend(p.strip() for p in part.split(",") if p.strip())
+    return out or None
+
+
+def _filter_profiles(profiles: dict, project: list[str] | None) -> dict:
+    """``--project`` 单/多仓限制：只保留命中的已准入 profile（canary 隔离核心）。
+    None/空 → 全量透传（baseline）。命中不存在的项目 → 硬错（绝不静默跑空，免 canary 误判「无产出=绿」）。"""
+    if not project:
+        return profiles
+    missing = [p for p in project if p not in profiles]
+    if missing:
+        sys.exit(f"✗ --project 指定项目不在已准入 profiles 中：{missing}（可用：{list(profiles)}）")
+    keep = set(project)
+    return {k: v for k, v in profiles.items() if k in keep}
+
+
+def _apply_state_dir(override: str | None) -> None:
+    """``--state-dir`` 覆盖：重绑模块级 STATE_DIR + RUN_LOCK。RUN_LOCK 在 import 时从 STATE_DIR 派生
+    （L121），若不一并重算，隔离金丝雀的 run 锁仍落真实 ``state/.run.lock`` → 与真实 cron 互斥、且污染真 state。
+    须在 ``acquire_run_lock`` / ``STATE_DIR.mkdir`` 之前调。"""
+    global STATE_DIR, RUN_LOCK
+    if override:
+        STATE_DIR = Path(override).resolve()
+        RUN_LOCK = STATE_DIR / ".run.lock"
 
 
 def read_marker(source: dict) -> str:
@@ -1859,7 +1896,7 @@ def _sj_terminal(sj: ShadowJournal, rec: dict, iteration_id: str, prd_id: str,
                 payload={"status": status, "skip_reason": rec.get("skip_reason")})
 
 
-def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
+def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None) -> dict:
     """单 PRD 全流程：准入→建 worktree→触发 dev-agent→对账→独立验证。返回记录 dict。
 
     task 3.2：全程用 ``ShadowJournal`` 旁路写 journal 事件（``journal_shadow`` flag 关→全 no-op，dispatch
@@ -2162,9 +2199,31 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
             #   守 D6：控制面只发 cmd，在目标仓 worktree 内经 git() 机械层跑，不直接持 git 写句柄）。flag 关 → baseline
             #   兜底开 PR 待 review（dispatch 决策零变化，design 决策#8）。merged→记 merge_commit + status=merged；
             #   CONFLICT/UNKNOWN/push_failed→不强合（main 未碰），triage_reason 进 triage 池（task 5.1）。
-            #   ⚠️ post-merge 验证 + auto-revert 兜底在 task 4.x（此阶段 merged 路径已通但缺 post-merge 闸；
-            #   flag 默认关→baseline 不真合，待 task 4.x 补齐 + canary 后再开）。
+            #   post-merge 闸 + auto-revert 兜底已接（task 4.x：PASS→merged / FAIL→revert，REVERTED=triage /
+            #   revert CONFLICT·UNKNOWN 或 post-merge UNKNOWN→halt 整仓+CRITICAL；flag 默认关→baseline 不真合，待 canary 后再开）。
             if _coord.flags.single_flight_auto_merge:
+                # task 4.4 revert 循环熔断（D11）：同幂等键（_prd）PRD 在 cooldown 窗口内曾被 post_merge_red_reverted
+                #   → 禁再 auto-merge，直接进 triage——防「branch 绿但 main 红」的 PRD 夜夜复发无限循环（spec
+                #   「Reverted PRD re-admitted inside cooldown」）。fail-open：冷却 journal 读不到/损坏 → 不 block。
+                if CB.is_in_cooldown(STATE_DIR, owner_repo, _prd, now_fn=_slot_now):
+                    rec["status"] = "triaged"
+                    rec["triage_reason"] = "cooldown_revert_loop"
+                    log(f"  🧊 {slug}: 熔断命中（PRD {_prd[:12]} 在 {owner_repo} cooldown 窗口内）→ 不 merge，进 triage(cooldown_revert_loop)")
+                    break   # → round 循环外 2272 统一 _sj_terminal 收尾
+                # task 6.x 方案 C（D12）：merge 闭环 crash 安全门——上次 merge/revert started 无闭合（crash 在
+                #   phase 中，push 可能已发生）→ halt 整仓 + CRITICAL（绝不盲目重 merge，防「merge push 后 crash
+                #   → cron 重分发 → rebase CLEAN → 重复合 main」致命场景，Agent 实证 D12 三缺）。fail-safe：journal
+                #   损坏→True halt（破坏性副作用门不可放行，区别于 circuit_breaker fail-open）。6.1b reconcile 种 /
+                #   6.1c crash boundary 为 follow-up，本门是主防线，先落地。
+                if ML.has_open_intent(STATE_DIR, owner_repo, _prd):
+                    rec["status"] = "halted"
+                    rec["triage_reason"] = "merge_loop_open_intent"
+                    _halt_slot_safe(slot_handle, reason="merge_loop_open_intent", run_id=_run, prd_id=_prd,
+                                    iteration_id=_iter, owner_repo=owner_repo)
+                    _raise_critical_alert_safe(STATE_DIR, owner_repo, _prd, reason="merge_loop_open_intent", stamp_fn=_now_iso)
+                    log(f"  🛑 {slug}: merge_loop 检出未闭合 intent（PRD {_prd[:12]} 上次 merge/revert crash 在 phase 中）→ halt 整仓 + CRITICAL（不重 merge，须人工查 main_status）")
+                    break   # → round 循环外统一 _sj_terminal 收尾
+                ML.record_event(STATE_DIR, owner_repo, _prd, "merge_started", stamp_fn=_now_iso, branch=branch, main_ref=base)
                 _merge_cmd = MP.build_merge_cmd(
                     python=_env_python(prof.get("conda_env", "")), dev_agent_py=DEV_AGENT_PY,
                     branch=branch, main_ref=base, prd_id=_prd, state_dir=str(STATE_DIR))
@@ -2172,13 +2231,79 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args) -> dict:
                 _mr = MP.parse_merge_result(_merge_json)
                 if _mr.merged:
                     rec["merge_commit"] = _mr.merge_commit
-                    rec["status"] = "merged"            # task 5.3 report 桶；post-merge 闸 task 4.x 升级
                     log(f"  🎉 {slug}: verify 绿 + rebase CLEAN → 已合 main（merge {_mr.merge_commit[:8]}）")
+                    # task 4.x post-merge 闸（D8：基线=集成后 main 全量 suite，≠ verify candidate branch；三态经
+                    #   classify_post_merge）。PASS→放行 merged；FAIL→revert(4.3)；UNKNOWN→keep+halt+CRITICAL（不 auto-revert）。
+                    _pm_cmd = MP.build_post_merge_cmd(
+                        python=_env_python(prof.get("conda_env", "")), dev_agent_py=DEV_AGENT_PY,
+                        test_cmd=_post_merge_test_cmd(repo, rec, prof) or "", main_ref=base, prd_id=_prd,
+                        state_dir=str(STATE_DIR))
+                    _pmr = MP.parse_post_merge_result(_run_dev_agent(_pm_cmd, wt, slug, log_file))
+                    rec["post_merge_verdict"] = _pmr.verdict.value
+                    # task 4.6：可查询「main 是否已过 post-merge 验证」状态（design F8）——下游/CD 据 main_post_merge_status
+                    #   判 main 验证态，而非盲猜（main 在 [push, verdict] 窗口可能红，MAX_MAIN_RED_WINDOW_SECONDS 上界）。
+                    MS.record_main_verified(STATE_DIR, owner_repo, main_ref=base, merge_commit=_mr.merge_commit,
+                                            verdict=_pmr.verdict.value, prd_id=_prd, stamp_fn=_now_iso)
+                    if _pmr.verdict is MP.PostMergeVerdict.PASS:
+                        rec["status"] = "merged"
+                        ML.record_event(STATE_DIR, owner_repo, _prd, "merge_completed", stamp_fn=_now_iso, merge_commit=_mr.merge_commit)   # task 6.x：闭合 merge intent（闭环成功=merged，crash 后据闭合事件知 main 已验证）
+                        log(f"  ✅ {slug}: post-merge main 全量测试绿 → 保留（merged）")
+                    elif _pmr.verdict is MP.PostMergeVerdict.FAIL:
+                        # task 4.3：post-merge FAIL → revert 单一 merge commit（D7：git revert -m 1 + ff-only push）
+                        log(f"  🔴 {slug}: post-merge main 红 → auto-revert merge {_mr.merge_commit[:8]}")
+                        ML.record_event(STATE_DIR, owner_repo, _prd, "revert_started", stamp_fn=_now_iso, merge_commit=_mr.merge_commit)   # task 6.x：revert intent（revert 是独立破坏性 push；crash 在 revert push 中→下轮 has_open_intent True→halt 防重复 revert）
+                        _rv_cmd = MP.build_revert_cmd(
+                            python=_env_python(prof.get("conda_env", "")), dev_agent_py=DEV_AGENT_PY,
+                            merge_commit=_mr.merge_commit, main_ref=base, prd_id=_prd, state_dir=str(STATE_DIR))
+                        _rvr = MP.parse_revert_result(_run_dev_agent(_rv_cmd, wt, slug, log_file))
+                        if _rvr.outcome is MP.RevertOutcome.REVERTED:
+                            rec["reverted"] = True
+                            rec["revert_commit"] = _rvr.revert_commit
+                            rec["status"] = "triaged"
+                            rec["triage_reason"] = "post_merge_red_reverted"
+                            CB.record_revert(STATE_DIR, owner_repo, _prd, stamp_fn=_now_iso)   # task 4.4：记 cooldown（下轮 re-admission 熔断查此）
+                            ML.record_event(STATE_DIR, owner_repo, _prd, "revert_completed", stamp_fn=_now_iso, merge_commit=_mr.merge_commit, revert_commit=_rvr.revert_commit)   # task 6.x：闭合 revert intent（main 回绿，闭环以 triage 收尾，可重试）
+                            log(f"  ↩️ {slug}: revert 成功（{_rvr.revert_commit[:8]}）→ main 回绿，进 triage(post_merge_red_reverted)")
+                        else:   # CONFLICT/UNKNOWN：revert 本身失败 → halt 整仓 + CRITICAL（main 仍红，绝不 continue）
+                            rec["status"] = "halted"
+                            rec["triage_reason"] = f"post_merge_revert_{_rvr.outcome.value}"
+                            _halt_slot_safe(slot_handle, reason=rec["triage_reason"], run_id=_run, prd_id=_prd,
+                                            iteration_id=_iter, owner_repo=owner_repo)
+                            _raise_critical_alert_safe(STATE_DIR, owner_repo, _prd, reason=rec["triage_reason"], stamp_fn=_now_iso)
+                            log(f"  🛑 {slug}: revert {_rvr.outcome.value} → halt 整仓 + CRITICAL（main 仍红，须人工）")
+                    else:   # UNKNOWN：不确定真红 → 保留 main（不 auto-revert）+ halt 整仓 + CRITICAL
+                        rec["status"] = "halted"
+                        rec["triage_reason"] = "post_merge_unknown"
+                        _halt_slot_safe(slot_handle, reason="post_merge_unknown", run_id=_run, prd_id=_prd,
+                                        iteration_id=_iter, owner_repo=owner_repo)
+                        _raise_critical_alert_safe(STATE_DIR, owner_repo, _prd, reason="post_merge_unknown", stamp_fn=_now_iso)
+                        log(f"  🛑 {slug}: post-merge UNKNOWN（ran={_pmr.evidence.ran}）→ halt 整仓 + CRITICAL（不 auto-revert，须人工）")
                 else:
                     rec["triage_reason"] = _mr.triage_reason    # 固定枚举：rebase_conflict/rebase_unknown/push_failed
                     rec["status"] = "triaged"            # task 5.1 triage 池（不阻塞，不强合，main 未碰）
+                    ML.record_event(STATE_DIR, owner_repo, _prd, "merge_abandoned", stamp_fn=_now_iso, reason=_mr.triage_reason)   # task 6.x：闭合 merge intent（main 未碰，安全结束→允许重试，非 halt）
                     log(f"  🧪 {slug}: merge 进 triage（{_mr.triage_reason}，rebase={_mr.rebase_outcome.value}）→ 不强合")
             else:
+                # single-flight-auto-merge task 7.1a shadow 模式（serial_shadow on, auto_merge off）：verify 绿后
+                #   跑 classify-only rebase，记 shadow merge 决策（CLEAN/CONFLICT/UNKNOWN）作 parity 证据，但**不
+                #   merge/push**（main 不碰，守 docstring「merge/revert 只 log」+ ADR-0008 护栏#7 shadow gate）。
+                #   fail-open：classify 调用异常/超时/无输出 → 记 unknown 但**不阻断** baseline 开 PR（shadow 是
+                #   可观测层非安全层；「main 不碰」由 dev-agent classify-only 契约 + 离线 drill 7.1b 保证）。
+                if _coord.flags.single_flight_serial_shadow:
+                    _decision = None
+                    try:
+                        _cls_cmd = MP.build_classify_cmd(
+                            python=_env_python(prof.get("conda_env", "")), dev_agent_py=DEV_AGENT_PY,
+                            branch=branch, main_ref=base, prd_id=_prd, state_dir=str(STATE_DIR))
+                        _decision = _shadow_merge_decision(True, _run_dev_agent(_cls_cmd, wt, slug, log_file))
+                    except Exception as _e:
+                        _decision = "unknown"
+                        log(f"  ⚠️ {slug}: shadow classify 异常→记 unknown，不阻断 baseline 开 PR（{_e}）")
+                    if _decision is not None:
+                        rec["shadow_merge_decision"] = _decision
+                        _sj.emit("shadow_merge_decision", _iter, _prd,
+                                 payload={"owner_repo": owner_repo, "decision": _decision})
+                        log(f"  👻 {slug}: shadow merge 决策={_decision}（serial_shadow：只 log 不改 main）")
                 # baseline：兜底开正常 PR 收尾（治 baostock 式 interrupted_pr；reconcile 查到 dev 自开 PR 则保持 pr_open）
                 log(f"  ✅ {slug}: verify 绿（r{round_n}）→ 兜底开 PR 收尾")
                 reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=False)
@@ -2394,6 +2519,58 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
                        capture_output=True, text=True, timeout=60)
 
 
+def _post_merge_test_cmd(repo: str, rec: dict, prof: dict | None) -> str | None:
+    """single-flight-auto-merge task 4.x：构造 post-merge main 全量测试命令（D8：基线=集成后 main，≠ verify 的
+    candidate branch）。命令源同 verify（决策 E）：Node 仓 → package.json scripts.test；Python 仓 → dev-agent
+    上报的 ``dev_test_cmd``（dev-agent 经 sys.executable 注入 conda env PATH，裸 python 命中 env）。未上报 →
+    None（dev-agent ran=False → UNKNOWN → halt，不当代绿）。"""
+    if (Path(repo) / "package.json").exists():
+        try:
+            scripts = json.loads((Path(repo) / "package.json").read_text(encoding="utf-8")).get("scripts", {})
+            return scripts.get("test")
+        except Exception:
+            return None
+    return rec.get("dev_test_cmd")
+
+
+def _halt_slot_safe(slot_handle, *, reason: str, run_id: str, prd_id: str,
+                    iteration_id: str, owner_repo: str) -> None:
+    """single-flight-auto-merge task 4.x：post-merge UNKNOWN / revert 非 REVERTED → halt 整仓到人工（spec
+    「halts the queue ... no further PRD admitted until manual resolution」）。serial_shadow on（有 handle）
+    → ``halt_slot`` 写 slot_halted 终态（下轮 acquire blocked(halted)，本 run 后续同仓 PRD 亦 blocked）；
+    off（baseline 无 slot）→ no-op（halt 仅记 rec/log）。幂等 + fail-open（halt_slot 异常不掩盖 rec 已标 halted）。"""
+    if slot_handle is None:
+        return
+    try:
+        SF.halt_slot(slot_handle, reason=reason, run_id=run_id, prd_id=prd_id,
+                     iteration_id=iteration_id, owner_repo=owner_repo, stamp_fn=_now_iso)
+    except Exception as e:
+        log(f"  ⚠️ halt_slot 失败（{reason}）: {e}（rec 已标 halted，须人工查 slot）")
+
+
+def _raise_critical_alert_safe(state_dir, owner_repo: str, prd_id: str, *, reason: str, stamp_fn) -> None:
+    """single-flight-auto-merge task 4.5：halt 时落 durable CRITICAL 告警到 alerts journal（design F5）。
+    CRITICAL 安全事件须总 durable（**不受 ``journal_shadow`` flag gating**，crash 不丢），区别于 ShadowJournal。
+    fail-open：写失败不 raise（halt 安全已由 ``_halt_slot_safe`` 的 slot_halted 保证；告警丢失须人工查）。"""
+    try:
+        CA.raise_alert(state_dir, owner_repo, prd_id, reason=reason, stamp_fn=stamp_fn)
+    except Exception as e:
+        log(f"  ⚠️ raise_alert 失败（{reason}）: {e}（rec 已标 halted + slot 已 halt，须人工查 alerts）")
+
+
+def _shadow_merge_decision(serial_shadow: bool, classify_payload: dict | None) -> str | None:
+    """single-flight-auto-merge task 7.1a：serial_shadow on → 据 classify-only dev-agent 结果返 shadow merge 决策。
+
+    纯决策缝合点（接 ``dispatch_one`` verify-绿 else 分支）：``single_flight_serial_shadow=on`` 且 ``auto_merge=off``
+    时，控制面已发 ``--classify-only`` cmd 跑 fetch→rebase→classify（main 不碰），本函数把 dev-agent 末行 JSON
+    经 ``parse_merge_result`` 降级解析为 rebase 三态（clean/conflict/unknown）作 shadow parity 证据（canary gate
+    的对照基线——shadow 须产出可观测决策信号，否则 canary=开盲盒）。serial_shadow off → None（baseline 无 shadow
+    决策，不记不 emit）。fail-safe：坏/缺 payload → ``parse_merge_result`` 降级 unknown（绝不当代 clean）。"""
+    if not serial_shadow:
+        return None
+    return MP.parse_merge_result(classify_payload).rebase_outcome.value
+
+
 def _slot_now() -> datetime:
     """slot lease 算术用的「当前时间」（datetime）。独立成函数便于测试 monkeypatch（同 ``_now_iso``）。"""
     return datetime.now(timezone.utc)
@@ -2446,12 +2623,14 @@ def _run_one(entry: dict, prof: dict | None, stamp: str, args) -> dict:
         _run = loop_ids.run_id(stamp)
         _prd = loop_ids.prd_id(entry.get("prd_path", ""), None)
         _iter = loop_ids.iteration_id(_run, _prd, 0)
-        with SF.slot_scope(STATE_DIR, owner_repo, run_id=_run, prd_id=_prd, iteration_id=_iter,
-                           now_fn=_slot_now, stamp_fn=_now_iso) as _slot:
+        _scope = SF.slot_scope(STATE_DIR, owner_repo, run_id=_run, prd_id=_prd, iteration_id=_iter,
+                               now_fn=_slot_now, stamp_fn=_now_iso)
+        with _scope as _slot:
             if not _slot.acquired:                 # inflight/unknown/flock_busy → 不投递（让位/fail-safe）
                 rec = _slot_blocked_record(entry, owner_repo, _slot)
                 _learn(rec); return rec
-            rec = dispatch_one(entry, prof, stamp, args)
+            # task 4.x：传 slot_handle 进 dispatch_one——post-merge UNKNOWN / revert 非 REVERTED 时 halt 整仓
+            rec = dispatch_one(entry, prof, stamp, args, slot_handle=_scope.handle)
             _learn(rec); return rec
     # off → baseline：进程内 threading.Lock（同仓串行、跨仓并行；design 决策#8 不变）
     lock = DISPATCH_LOCKS.get(owner_repo) if owner_repo else None
@@ -2626,6 +2805,24 @@ def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str) -> list[d
     return records
 
 
+# task 5.1：triage/halt 出口 triage_reason 固定枚举（防漂移）。report 段聚合校验：triaged/halted rec 的
+# triage_reason 非枚举值→log warning（fail-open 不阻断报告）。含 spec D4 七值 + 实现新增（4.3 revert 非
+# REVERTED halt / 4.4 cooldown 熔断；D3 halt 强于 D4，故 post_merge_unknown 走 halted 而非 triage）。
+TRIAGE_REASONS: frozenset[str] = frozenset({
+    "timeout",                       # dev wall-clock 超时（D10；pre-merge 出口，预留）
+    "verify_exhausted",              # verify 2 轮仍红（D4；pre-merge 出口，预留）
+    "rebase_conflict",               # rebase CONFLICT→不强合（D2）
+    "rebase_unknown",                # rebase UNKNOWN→不强合（fail-safe）
+    "push_failed",                   # ff-only push reject→不强合（D7）
+    "post_merge_red_reverted",       # post-merge FAIL→revert REVERTED→放行进 triage（D3）
+    "post_merge_unknown",            # post-merge UNKNOWN→halt 整仓（D3 强于 D4）
+    "cooldown_revert_loop",          # 4.4 熔断：同 PRD 冷却窗口内禁再 auto-merge（D11）
+    "post_merge_revert_conflict",    # 4.3 revert CONFLICT→halt 整仓（D3）
+    "post_merge_revert_unknown",     # 4.3 revert UNKNOWN→halt 整仓（D3）
+    "merge_loop_open_intent",        # 6.x 方案 C：merge_loop 检出未闭合 intent→halt 整仓（D12，防 merge push 后 crash 重复合 main）
+})
+
+
 # ─── report 段（§8：纯机械聚合 state JSON → 报告 + 日报指针 + SMTP 直发）──
 def _read_json(path: Path, default):
     """读 state JSON；缺失/损坏返回 default（纯函数语义，不改入参）。"""
@@ -2668,6 +2865,17 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
     # 损坏 fail-closed（state_corrupt）。独立桶：既非测试红（不进 failing）、也非未投递（不在
     # blocked_external/gate）——运维须 triage artifact 存储 / journal 恢复，不能混进 verify 绿红。
     integrity_blocked = [d for d in disp if d.get("status") in ("blocked_evidence", "state_corrupt")]
+    # task 5.3：single-flight-auto-merge 闭环三态——merged（已合 main）/ triaged（出队进池不阻塞）/ halted
+    # （整仓暂停须人工）。新闭环语义，不进 baseline 的 review/failing/abnormal/blocked/integrity 桶（防混计）。
+    merged = [d for d in disp if d.get("status") == "merged"]
+    triaged = [d for d in disp if d.get("status") == "triaged"]
+    halted = [d for d in disp if d.get("status") == "halted"]
+    # task 5.1：triaged/halted 的 triage_reason 须取自 TRIAGE_REASONS 固定枚举；漂移→log warning（fail-open，
+    # 不阻断报告；reason 原样渲染 + 计数仍计）。单点聚合校验，不改各 dispatch 出口。
+    for _d in (*triaged, *halted):
+        _reason = _d.get("triage_reason")
+        if _reason and _reason not in TRIAGE_REASONS:
+            log(f"[report] ⚠️ triage_reason 漂移：{_reason} 不在固定枚举（slug={_d.get('slug')}）")
     target_repos = sorted({d.get("project", "?") for d in disp})
 
     def repo_of(d: dict) -> str:
@@ -2690,8 +2898,11 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
                     f"候选：{len(cand.get('candidates', []))}｜"
                     f"过闸 PRD：{len(passed)}（drop {len(dropped)}）｜"
                     f"投递目标仓：{len(target_repos)}｜"
+                    f"已合 main：{len(merged)}｜"
                     f"产出 PR：{len([d for d in disp if d.get('status') in ('pr_open', 'interrupted_pr')])}｜"
                     f"验证 failing：{len(failing)}｜"
+                    f"triage：{len(triaged)}｜"
+                    f"halt：{len(halted)}｜"
                     f"完整性阻断：{len(integrity_blocked)}｜"
                     f"失败/超时/跳过：{len([d for d in disp if d.get('status') in ('skip', 'planned', 'fail')])}｜"
                     f"阻断（未投递）：{len(blocked_external) + len(blocked_gate)}"
@@ -2709,6 +2920,39 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
         L.append("（无）")
     L += ["", "> 📝 若某 PR 触碰了既有 `test/*` 文件，review 请重点看测试 diff——"
           "独立验证抓不到测试篡改（§7 盲区）。", ""]
+
+    # ✅ 已自动合入 main（single-flight-auto-merge task 5.2/5.3）——dev+verify 双绿 + rebase CLEAN → 自动
+    # --no-ff merge + ff-only push main（替换兜底开 PR）。merge_commit 是本次合入产出的单一 merge commit sha。
+    L += ["## ✅ 已自动合入 main（auto-merge）"]
+    if merged:
+        L += ["| 目标仓 | commit | PRD |", "|---|---|---|"]
+        for d in merged:
+            L.append(f"| {repo_of(d)} | `{d.get('merge_commit') or '—'}` | {d.get('slug', '')} |")
+    else:
+        L.append("（无）")
+    L.append("")
+
+    # 🔧 需 triage（task 5.2/5.3 / design D4）——出队进池，**不阻塞队列**：dev 超时 / verify 耗尽 / rebase
+    # 冲突或不明 / push 失败 / post-merge 红已 revert / 冷却熔断。ejection reason 取自固定枚举（task 5.1）。
+    L += ["## 🔧 需 triage（出队进池，不阻塞队列）"]
+    if triaged:
+        L += ["| 目标仓 | PRD | 原因 |", "|---|---|---|"]
+        for d in triaged:
+            L.append(f"| {repo_of(d)} | {d.get('slug', '')} | {d.get('triage_reason') or '—'} |")
+    else:
+        L.append("（无）")
+    L.append("")
+
+    # 🛑 halted（task 5.2/5.3 / design D3）——整仓队列暂停，**须人工介入**：post-merge UNKNOWN 或 revert 非
+    # REVERTED（CONFLICT/UNKNOWN）。CRITICAL 告警已 durable 落盘（task 4.5），ack 后方可 resume。
+    L += ["## 🛑 halted（整仓队列暂停，须人工介入）"]
+    if halted:
+        L += ["| 目标仓 | PRD | 原因 |", "|---|---|---|"]
+        for d in halted:
+            L.append(f"| {repo_of(d)} | {d.get('slug', '')} | {d.get('triage_reason') or '—'} |")
+    else:
+        L.append("（无）")
+    L.append("")
 
     # 🔴 failing
     L += ["## 🔴 验证 failing（项目自报绿但独立测试红，慎合）"]
@@ -2807,12 +3051,13 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
     log(f"[report] 已生成 {report_path}（review {len(review)} / failing {len(failing)} / "
         f"drop {len(dropped)} / 阻断 {n_blocked}）")
 
-    _append_daily_pointer(date_disp, stamp, len(review), len(failing), n_blocked)
+    _append_daily_pointer(date_disp, stamp, len(review), len(failing), n_blocked,
+                          n_merged=len(merged), n_triaged=len(triaged), n_halted=len(halted))
 
     # SMTP 直发（§8：有活才发，全绿不发；--dry-run/--no-notify 只落盘）
     # 心跳模式（PA_HEARTBEAT=1，cron 触发）：全绿也发一封状态邮件——无头服务器上邮件断了即流水线挂了。
     # 阻断（远程态不明 / 测试门未过）计入 active：须运维 triage（auth / 远程服务 / flaky test），不能静默。
-    active = bool(review or failing or n_blocked or integrity_blocked)   # task 4.3：完整性阻断也计入 active（须 triage）
+    active = bool(review or failing or n_blocked or integrity_blocked or triaged or halted)   # task 4.3 完整性阻断 + task 5.3 triaged/halted 均计入 active（运维须 triage：halted=CRITICAL / triaged=可人工 review 重试）
     heartbeat = os.environ.get("PA_HEARTBEAT", "").lower() in ("1", "true", "yes")
     if not active and not heartbeat:
         log("[report] 全绿（无待 review 绿 PR / 无 failing / 无阻断）——不发邮件（SPEC §8 全绿不投递）")
@@ -2822,17 +3067,23 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
         state = "有活但 " + tag if active else "全绿（心跳模式）但 " + tag
         log(f"[report] {state}——不发邮件，报告已落盘")
         return report_path
-    _smtp_notify(stamp, report_path, len(review), len(failing), n_blocked, active=active)
+    _smtp_notify(stamp, report_path, len(review), len(failing), n_blocked, active=active,
+                 n_merged=len(merged), n_triaged=len(triaged), n_halted=len(halted))
     return report_path
 
 
 def _append_daily_pointer(date_disp: str, stamp: str, n_review: int, n_failing: int,
-                          n_blocked: int = 0) -> None:
-    """日报加一行指针指向本报告（§8）；日报不存在则极简创建（仅指针，不侵入既有日报）。"""
+                          n_blocked: int = 0, *, n_merged: int = 0, n_triaged: int = 0,
+                          n_halted: int = 0) -> None:
+    """日报加一行指针指向本报告（§8）；日报不存在则极简创建（仅指针，不侵入既有日报）。
+
+    single-flight-auto-merge task 5.2：指针含 auto-merge 闭环三态计数（已合 main / triage / halt）。
+    """
     DAILY_DIR.mkdir(parents=True, exist_ok=True)
     daily = DAILY_DIR / f"work-daily-{date_disp}.md"
-    pointer = (f"- 项目推进报告 → [[项目推进报告_{stamp}]]（{n_review} 待 review / "
-               f"{n_failing} failing / {n_blocked} 阻断）")
+    pointer = (f"- 项目推进报告 → [[项目推进报告_{stamp}]]（{n_merged} 已合main / "
+               f"{n_review} 待 review / {n_failing} failing / {n_triaged} triage / "
+               f"{n_halted} halt / {n_blocked} 阻断）")
     if daily.is_file():
         txt = daily.read_text(encoding="utf-8")
         if f"项目推进报告_{stamp}" not in txt:        # 幂等：同日重出报告不重复加指针
@@ -2842,14 +3093,19 @@ def _append_daily_pointer(date_disp: str, stamp: str, n_review: int, n_failing: 
 
 
 def _smtp_notify(stamp: str, report_path: Path, n_review: int, n_failing: int,
-                 n_blocked: int = 0, *, active: bool = True) -> None:
+                 n_blocked: int = 0, *, active: bool = True, n_merged: int = 0,
+                 n_triaged: int = 0, n_halted: int = 0) -> None:
     """发简讯（§8/§10）：标题=N 待 review / M failing / K 阻断；报告为正文+附件。失败退化为告警，不阻塞流水线。
 
     active=False 时为「全绿心跳」（PA_HEARTBEAT 触发的 cron 模式）——无头服务器上
     邮件断了即流水线挂了，故全绿也发一封状态邮件做心跳。
+
+    single-flight-auto-merge task 5.2：subject 含 auto-merge 闭环三态（已合 main / 需 triage / halted）——
+    已合是完成态（信息性），triage/halted 是行动项（运维须 triage/halt 介入）。
     """
     suffix = "" if active else "（全绿心跳）"
-    subject = f"项目推进 {stamp}｜{n_review} 待 review / {n_failing} failing / {n_blocked} 阻断{suffix}"
+    subject = (f"项目推进 {stamp}｜已合{n_merged} 待review{n_review} failing{n_failing} "
+               f"需triage{n_triaged} halted{n_halted} 阻断{n_blocked}{suffix}")
     # 收件人：观察期发自己（dvs），稳定后改回 juyf@newland.com.cn（居燕峰）——2026-07-17 上线初用户决策。
     # 如需更灵活可挪到 profile/env（PA_REPORT_TO），当前按用户选择保持简单硬编码 + 醒目注释。
     report_to = "dvs@vip.sina.com"   # 观察期；稳定后改 "juyf@newland.com.cn"
@@ -2927,7 +3183,13 @@ def main():
                     help="报告段不 SMTP 直发（仍落盘报告+日报指针；cron/wka 默认发）")
     ap.add_argument("--inject-prd", default=None, metavar="PATH",
                     help="inject 段：手写 PRD md 路径（--from-stage inject 时必填）。替 radar→prd，直接产出 manifest")
+    ap.add_argument("--project", action="append", default=None, metavar="NAME",
+                    help="只跑指定项目（可重复 / 逗号分隔多仓）；canary 隔离用，如 --project cc-web-control")
+    ap.add_argument("--state-dir", default=None, metavar="PATH",
+                    help="覆盖 state 落盘根（默认 .project-auto/state）；canary/演练用，与真实 cron state 物理隔离")
     args = ap.parse_args()
+    args.project = _normalize_projects(args.project)          # append+逗号 归一为 list（None=不过滤）
+    _apply_state_dir(args.state_dir)                          # 须在 STATE_DIR.mkdir / acquire_run_lock 之前：重绑 STATE_DIR+RUN_LOCK
     if args.from_stage == "inject" and not args.inject_prd:
         ap.error("--from-stage inject 需要 --inject-prd <path>")
     _load_claude_settings_env()   # 供 node dev-agent 的 SDK 子进程拿到 ANTHROPIC_* 认证（cron/SSH 启动兜底）
@@ -2951,6 +3213,9 @@ def _run_pipeline(args) -> None:
 
     sources = load_sources()
     profiles = load_profiles()
+    if args.project:                                           # canary 单仓隔离：只留命中的 profile（其余 stage 自动收窄）
+        profiles = _filter_profiles(profiles, args.project)
+        log(f"  [PROJECT] 仅跑：{args.project}")
     log(f"sources={[s['name'] for s in sources]}  profiles={list(profiles)}")
 
     run = {s: i for i, s in enumerate(STAGES)}

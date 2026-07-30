@@ -51,13 +51,16 @@ def _git(args, cwd):
 # unknown fail-safe），push 用远端真源（ls-remote，非本地 show-ref）。exactly-once ⇔ 无 unknown。
 # ════════════════════════════════════════════════════════════════════════════
 def real_crash_restart_drill(workdir: Path, gh_repo: str = "jyf2100/agentworkflow") -> dict:
-    """7.3 真实子进程 crash/restart drill（r2 P1-2：5 边界逐项 SIGKILL/restart）。
+    """7.3 真实子进程 crash/restart drill（r2 P1-2：5 边界逐项 SIGKILL/restart + 6.1c merge_push/revert_push）。
 
     每边界起**真实子进程**（``_crash_child`` 经 ``python -c``）：先持久化 session state（``SessionStore.save``）
     再 emit boundary event 到 journal（emit ⇔ state 已落盘 = durable boundary 达成）→ 阻塞 → 父进程
     ``SIGKILL`` 模拟进程崩溃 → **restart entrypoint** 重新载入落盘 journal + ``SessionStore.load`` →
-    ``recover_iteration`` 对账（commit cat-file / push ls-remote 远端真源 / pr gh CLI）。
-    5 边界（agent_done/test_done/commit/push/pr_create）逐项验证 exactly-once + safe_to_retry + 真实子进程被 kill。
+    ``recover_iteration`` 对账（commit cat-file / push ls-remote 远端真源 / pr gh CLI / merge·revert ancestry）。
+    7 边界（agent_done/test_done/commit/push/pr_create/merge_push/revert_push）逐项验证 exactly-once +
+    safe_to_retry + 真实子进程被 kill。merge_push/revert_push（task 6.1c）：真实 merge/revert commit 经
+    ``git merge-base --is-ancestor <sha> origin/main`` 对账（6.1b ancestry resolver），覆盖 auto-merge/revert
+    push 独立 checkpoint 的 crash 恢复（不只把闭环当整体）。
 
     评审 P1-2：旧版同进程写 journal 后直接调 recover_iteration（无真实 crash/restart，未验证 restart
     entrypoint 真实载入落盘 state）。现版真实 subprocess kill/restart。
@@ -82,6 +85,19 @@ def real_crash_restart_drill(workdir: Path, gh_repo: str = "jyf2100/agentworkflo
     sha = _git(["rev-parse", "HEAD"], repo).strip()
     _git(["branch", "feat-branch"], repo)
     _git(["push", "-q", "origin", "feat-branch"], repo)            # 真实 push：远端 origin 有 feat-branch
+    # task 6.1c：真实 merge/revert 副作用——main merge feat-branch（no-ff）→ merge_commit，revert → revert_commit。
+    # LocalGitResolver.check('merge'/'revert', sha) 用 git merge-base --is-ancestor <sha> origin/main（ancestry 真源）。
+    _git(["branch", "-M", "main"], repo)                           # 默认分支（HEAD）→ main（merge 目标 + ancestry 参照）
+    _git(["checkout", "-q", "feat-branch"], repo)
+    (repo / "feat.txt").write_text("feat", encoding="utf-8")       # feat-branch 推进一 commit（non-ff merge 才产 merge_commit）
+    _git(["add", "."], repo)
+    _git(["commit", "-q", "-m", "feat work"], repo)
+    _git(["checkout", "-q", "main"], repo)
+    _git(["merge", "--no-ff", "-q", "-m", "merge feat-branch", "feat-branch"], repo)   # merge_commit（双父）
+    merge_sha = _git(["rev-parse", "HEAD"], repo).strip()
+    _git(["revert", "--no-edit", "-m", "1", "HEAD"], repo)         # revert merge → revert_commit（-m 1：merge 双父须指定 mainline；不用 -q，git 2.34 revert -q exit 129）
+    rev_sha = _git(["rev-parse", "HEAD"], repo).strip()
+    _git(["push", "-q", "origin", "main"], repo)                   # origin/main 真源 → merge/revert ancestry check 可用
 
     scripts_dir = str(Path(__file__).resolve().parent)
     py = sys.executable
@@ -90,8 +106,11 @@ def real_crash_restart_drill(workdir: Path, gh_repo: str = "jyf2100/agentworkflo
         RE.SideEffectTarget("commit", sha),                              # 真实 commit sha（cat-file 真源）
         RE.SideEffectTarget("push", "feat-branch"),                      # 真实 push（ls-remote 远端真源）
         RE.SideEffectTarget("pr", f"{gh_repo}:feat-branch-absent-canary"),  # 真实 gh（absent：canary 分支无 PR）
+        RE.SideEffectTarget("merge", merge_sha),                         # 6.1c：真实 merge ancestry（merge_commit 是 main 祖先→confirmed）
+        RE.SideEffectTarget("revert", rev_sha),                          # 6.1c：真实 revert ancestry（revert_commit 是 main 祖先→confirmed）
     ]
-    boundaries = ["agent_done", "test_done", "commit", "push", "pr_create"]
+    boundaries = ["agent_done", "test_done", "commit", "push", "pr_create",
+                  "merge_push", "revert_push"]
     per_boundary = []
     for b in boundaries:
         jf = workdir / f"crash_{b}.journal.jsonl"
@@ -148,6 +167,8 @@ def real_crash_restart_drill(workdir: Path, gh_repo: str = "jyf2100/agentworkflo
             "commit_state": by_kind.get("commit"),
             "push_state": by_kind.get("push"),
             "pr_state": by_kind.get("pr"),
+            "merge_state": by_kind.get("merge"),                       # 6.1c：merge ancestry 状态（merge-base origin/main）
+            "revert_state": by_kind.get("revert"),                     # 6.1c：revert ancestry 状态
             "external_known": plan.reconciliation.external_known,
             "safe_to_retry": plan.reconciliation.safe_to_retry,
             "decision_mode": plan.decision.mode.value,
@@ -169,7 +190,7 @@ def real_crash_restart_drill(workdir: Path, gh_repo: str = "jyf2100/agentworkflo
     all_safe = all(pb["safe_to_retry"] for pb in per_boundary)
     bm = {pb["boundary"]: pb for pb in per_boundary}
     return {
-        "drill": "7.3 real subprocess crash/restart (5 boundaries) + remote ls-remote reconciliation",
+        "drill": "7.3 real subprocess crash/restart (7 boundaries: +merge_push/revert_push) + remote ls-remote + merge/revert ancestry reconciliation",
         "crash_boundaries": boundaries,
         "crash_method": "subprocess SIGKILL after boundary event emit (durable boundary: state persisted → process killed → restart reloads)",
         "per_boundary": per_boundary,
@@ -177,9 +198,11 @@ def real_crash_restart_drill(workdir: Path, gh_repo: str = "jyf2100/agentworkflo
             "commit": {"state": bm["commit"]["commit_state"], "source": "git cat-file (local object store)"},
             "push": {"state": bm["push"]["push_state"], "source": "git ls-remote origin (REMOTE truth, not show-ref)"},
             "pr": {"state": bm["pr_create"]["pr_state"], "source": f"gh pr list --head (real gh CLI on {gh_repo})"},
+            "merge": {"state": bm["merge_push"]["merge_state"], "source": "git merge-base --is-ancestor merge_commit origin/main"},
+            "revert": {"state": bm["revert_push"]["revert_state"], "source": "git merge-base --is-ancestor revert_commit origin/main"},
         },
         "all_subprocesses_killed": all_killed,
-        "exactly_once": all_external_known,     # 5 边界全无 unknown ⇔ 每副作用状态明确
+        "exactly_once": all_external_known,     # 7 边界全无 unknown ⇔ 每副作用状态明确
         "safe_to_retry": all_safe,
         "push_after_remote_ref_deleted": plan_after_drop.pending[0].state if plan_after_drop.pending else "confirmed",
         "push_resolver_is_remote_truth": plan_after_drop.pending[0].state == "absent",  # 删远端 ref→absent 证查远端

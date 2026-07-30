@@ -23,6 +23,7 @@ import artifact_store  # noqa: E402
 import journal as J  # noqa: E402
 import loop_runtime as RT  # noqa: E402
 import reconcile as RE  # noqa: E402
+import ids as loop_ids  # noqa: E402
 import retry_policy as RP  # noqa: E402
 from session_meta import ResultSubtype, SessionMeta, SessionStore  # noqa: E402
 
@@ -92,8 +93,8 @@ def test_reconcile_all_known_is_safe_to_retry():
 
 
 def test_reconcile_illegal_kind_is_unknown_fail_safe():
-    """非法 kind（非 commit/push/pr）→ unknown（绝不构造非法幂等键，绝不盲目跳过/执行）。"""
-    targets = [RE.SideEffectTarget("merge", "x")]
+    """非法 kind（非 commit/push/pr/merge/revert）→ unknown（绝不构造非法幂等键，绝不盲目跳过/执行）。"""
+    targets = [RE.SideEffectTarget("bogus_kind", "x")]
     report = RE.reconcile_side_effects(iteration_id="i", targets=targets,
                                        resolver=FakeResolver({}))
     assert report.unknown[0].state == "unknown" and report.unknown[0].key == ""
@@ -197,6 +198,90 @@ def test_artifact_evidence_resolver_three_states(tmp_path):
     (root / artifact_store._bucketed_path(ref.digest)).write_text("TAMPERED", encoding="utf-8")
     assert res.check("test", ref.digest) is None
     assert res.check("commit", "x") is None                 # 非 test kind → None（不归本 resolver）
+
+
+# ─── 6.1b：merge/revert 种 + ancestry resolver（D12 exactly-once reconcile）─────────
+def test_merge_revert_kinds_in_allowed_lists():
+    """6.1b：merge/revert 纳入幂等种白名单（ids + reconcile.ALLOWED_KINDS），不再是 illegal kind。"""
+    assert "merge" in RE.ALLOWED_KINDS and "revert" in RE.ALLOWED_KINDS
+    assert "merge" in loop_ids._IDEMPOTENCY_KINDS and "revert" in loop_ids._IDEMPOTENCY_KINDS
+
+
+def test_idempotency_id_accepts_merge_revert():
+    """merge/revert kind 可构造幂等键（不再 raise ValueError）。"""
+    assert loop_ids.idempotency_id("merge", "iter_1", "abc1234").startswith("idem_")
+    assert loop_ids.idempotency_id("revert", "iter_1", "def5678").startswith("idem_")
+
+
+def test_local_git_resolver_merge_ancestry(tmp_path):
+    """6.1b：merge 种 ancestry check——merge_commit 是否 main 祖先（git merge-base --is-ancestor）。
+    是祖先→True（已合，skip）；非祖先→False（未合，可重 apply）。spec「Merge already applied is not repeated」。"""
+    repo = tmp_path / "repo"; repo.mkdir(); _git_init(repo)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=repo, check=True)   # 默认 branch=main
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "A"], cwd=repo, check=True)           # A
+    a_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    (repo / "b.txt").write_text("b", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "B"], cwd=repo, check=True)           # B = main HEAD
+    r = RE.LocalGitResolver(repo, main_ref="refs/heads/main")
+    assert r.check("merge", a_sha) is True              # A 是 main 祖先 → 已合 → confirmed（skip）
+    # 非祖先：side 分支上的 C（父=B；main 只到 B，C 不是 main 祖先；C 在 repo 对象库内可被 merge-base 判定）
+    subprocess.run(["git", "checkout", "-q", "-b", "side"], cwd=repo, check=True)
+    (repo / "c.txt").write_text("c", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "C"], cwd=repo, check=True)
+    c_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    assert r.check("merge", c_sha) is False             # C 不是 main 祖先 → 未合 → absent（可重 apply）
+
+
+def test_local_git_resolver_revert_ancestry(tmp_path):
+    """6.1b：revert 种 ancestry check——revert_commit（git revert 产的新 commit）是否 main 祖先。
+    ⚠️ 不查 merge_commit：git revert 不删原 merge commit，revert 后原 merge commit 仍是 main 祖先
+    （spec v2.1）。查 revert_commit ancestry 才正确反映 revert 是否已发生。"""
+    repo = tmp_path / "repo"; repo.mkdir(); _git_init(repo)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=repo, check=True)   # 默认 branch=main
+    (repo / "a.txt").write_text("1", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "A"], cwd=repo, check=True)
+    # 非空 M：让 a.txt 从 "1" 变 "2" 再提交（git revert 拒绝还原空 commit，故 M 必须带 diff）
+    (repo / "a.txt").write_text("2", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "M"], cwd=repo, check=True)                     # M 模拟 merge commit（非空）
+    subprocess.run(["git", "revert", "--no-edit", "HEAD"], cwd=repo, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)                          # revert M → revert_commit（-q 在 git 2.34 不支持→exit129）
+    rev_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    r = RE.LocalGitResolver(repo, main_ref="refs/heads/main")
+    assert r.check("revert", rev_sha) is True           # revert_commit 是 main 祖先 → 已 revert → confirmed（skip）
+
+
+def test_local_git_resolver_merge_unknown_when_main_ref_missing(tmp_path):
+    """main_ref 不存在（未 fetch / ref 缺失）→ merge-base 失败 → None（fail-safe unknown，block，不重 apply）。
+    spec「Merge state unknown blocks retry」。"""
+    repo = tmp_path / "repo"; repo.mkdir(); _git_init(repo)
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "A"], cwd=repo, check=True)
+    a_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    r = RE.LocalGitResolver(repo, main_ref="refs/remotes/origin/nope")   # 不存在的 ref
+    assert r.check("merge", a_sha) is None              # ref 缺失 → merge-base 失败 → unknown → block
+
+
+def test_reconcile_merge_found_is_confirmed_skip():
+    """spec fail-safe-dispatch「Merge already applied is not repeated」：merge ancestry FOUND→confirmed（skip re-merge）。"""
+    targets = [RE.SideEffectTarget("merge", "abc1234")]
+    report = RE.reconcile_side_effects(iteration_id="iter_1", targets=targets,
+                                       resolver=FakeResolver({("merge", "abc1234"): True}))
+    assert len(report.confirmed) == 1 and report.confirmed[0].kind == "merge"
+    assert report.external_known is True and report.safe_to_retry is True
+
+
+def test_reconcile_merge_unknown_blocks():
+    """spec fail-safe-dispatch「Merge state unknown blocks retry」：merge ancestry UNKNOWN→unknown（block，不重 apply）。"""
+    targets = [RE.SideEffectTarget("merge", "abc1234")]
+    report = RE.reconcile_side_effects(iteration_id="iter_1", targets=targets,
+                                       resolver=FakeResolver({("merge", "abc1234"): None}))
+    assert len(report.unknown) == 1 and not report.safe_to_retry
 
 
 def test_composite_resolver_first_non_none_wins():

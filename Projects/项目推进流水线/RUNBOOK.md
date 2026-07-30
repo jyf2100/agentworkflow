@@ -182,3 +182,91 @@ grep -E '语义契约违反|契约 warning|fail-open 降级' <cron/run log>
 2. 收紧对应 persona 定义的输出 schema（列 MUST 字段 + 受控值）。
 3. **Non-goal**：stage_contracts 不自动改 persona 定义——谁改 `.claude/agents/pa-*.md` 是独立治理问题。
 4. 无需人工干预 cron：dispatch 段不会因 critic 违反崩（Phase 0 止血已防）。
+
+## 8. single-flight-auto-merge（控制面自动合 main + 回滚）
+
+`single-flight-auto-merge` change（ADR-0008）：dispatch 段经 dev-agent 把 verify 双绿分支自动 `--no-ff` merge
+进目标仓 main + ff-only push（取代兜底开 PR），merge 后 main 全量测试红则 auto-revert 单 commit。这是 ADR-0001
+「不污染目标仓」的受控扩展——**自动 push 到 main**，故叠 8 护栏（执行位置/--no-ff+ff-only/三态 rebase/三态
+post-merge+auto-revert/merge commit marker/exactly-once reconcile/flag gated/分支保护准入）。
+
+### 8.1 渐进启用门（ADR-0008 护栏#7：shadow → drill → canary → 全量）
+
+flag 默认关。渐进启用顺序，**逐级**（跳级=危险）：
+
+1. **serial_shadow on**（`PA_SINGLE_FLIGHT_SERIAL_SHADOW=1`）：串行单飞消费（per-repo slot 准入）+ classify-only
+   rebase 记 shadow 决策（`shadow_merge_decision` journal 事件），**不 merge/push**（main 不碰）。观察串行不崩 +
+   shadow 决策 CLEAN 占比（canary 对照基线）。
+2. **离线 drill**（task 7.1b，必做）：`python -m pytest scripts/test_dev_agent_merge.py -q`——真实 git tmp repo
+   跑 merge→push→post-merge-test→revert 全链路（含故意红 auto-revert + CONFLICT/UNKNOWN）。补 shadow 测不到的核心链。
+3. **canary**（task 7.2）：单项目（cc-web-control）开 `PA_SINGLE_FLIGHT_AUTO_MERGE=1`（须同时 serial_shadow=on，
+   preflight 硬拦禁用组合），观察 N 次闭环（含一次故意红 auto-revert + 一次熔断触发）。
+4. **全量**：canary 稳定后扩到所有项目。
+
+**preflight 安全门**：`auto_merge=on, serial_shadow=off` → preflight blocked（`coordinator._FLAG_DEPENDENCIES`），
+防并发同仓 merge chaos。`auto_merge` docstring 的「gated on serial_shadow+parity+canary」由此硬强制 serial_shadow 依赖。
+
+### 8.2 Rollback（关 flag 回 baseline + 已合 commit 不自动撤回）
+
+关 `single_flight_auto_merge`（及 `single_flight_serial_shadow`）→ dispatch 立即回 baseline：并发投递 + 兜底开
+PR 待 review（旧行为，design 决策#8「flag off → baseline 不变」）。**已合进 main 的 commit 不自动撤回**（flag off
+不触发 revert——ADR-0008 护栏#5：回滚后可 `git log --grep` 机械找出已合 commit，人工 revert）。
+
+```bash
+# 1. 关 flag（profile/env/cron 任一处；两级 rollback：关 auto_merge 回开 PR，再关 serial_shadow 回并发投递）
+unset PA_SINGLE_FLIGHT_AUTO_MERGE PA_SINGLE_FLIGHT_SERIAL_SHADOW
+# 或 profile: loop: { single_flight_auto_merge: false, single_flight_serial_shadow: false }
+
+# 2. 找出本流水线自动合进 main 的 commit（稳定 marker footer，task 3.4）
+git -C <目标仓> log origin/main --grep='Pipeline-Merge: ' --oneline          # 全部自动合入
+git -C <目标仓> log origin/main --grep='Pipeline-Merge: <prd_id>' --oneline   # 某 PRD 的合入
+
+# 3. 人工 revert 需回滚的合入（单 merge commit 粒度，-m 1 主线父级；禁 --force*）
+git -C <目标仓> revert -m 1 --no-edit <merge_commit_sha>
+git -C <目标仓> push origin main
+
+# 4. 查「main 是否已过 post-merge 验证」+ merge/revert 闭环历史（定位坏合入的判决态）
+#    main_status journal: state_dir/main_status/<owner_repo>.journal.jsonl（post-merge verdict + merge_commit）
+#    merge_loop journal : state_dir/merge_loop/<owner_repo>.journal.jsonl  （merge_started/completed/revert 事件）
+```
+
+**halt/quarantine 态**：若回滚前有仓处于 `halted`（post-merge UNKNOWN / revert 非 REVERTED），其 slot 已是 `slot_halted`
+终态，下轮 cron 自动 blocked（不再 admit 新 PRD）。回滚后该仓仍 blocked——须人工 triage 后清 slot（参考 §1 journal
+恢复 + `recovery_cli.py`），确认 main 干净再恢复。CRITICAL 告警见 `state_dir/alerts/<owner_repo>.journal.jsonl`
+（durable，不受 flag gating；ack 后才视为处理）。
+
+### 8.3 Canary 执行（task 7.2：cc-web-control 单项目真实自动 merge）
+
+⚠️ **破坏性、outward**：canary 会把真实 commit 合进 **cc-web-control `main`**（非 throwaway tmp repo；merge/revert
+commit 留真实历史）。§8.1 step 1-2（shadow + 离线 drill）全过 + 运维显式 go 才执行。守 `pa-test-no-dirty-data`：手动跑
+用**隔离 state + 临时 log + unset PA_HEARTBEAT**，不碰真实 cron.log/SMTP/日报。
+
+**前置**：① cc-web-control profile 就绪 + 今日有针对它的 PRD（`run_daily.py --limit 1 --project cc-web-control` dry-run
+   有候选）；② 目标仓 main 有分支保护但允许 ff-only push（ADR-0008 护栏#8：绑 CD/无分支保护 → 禁 auto-merge 退 triage）；
+  ③ `PA_GITHUB_TOKEN` 有 cc-web-control 写权限。
+
+**执行**（隔离 state，临时 log）：
+
+```bash
+export PA_SINGLE_FLIGHT_SERIAL_SHADOW=1 PA_SINGLE_FLIGHT_AUTO_MERGE=1   # 双 flag on（preflight 要求 serial_shadow on）
+unset PA_HEARTBEAT                                                       # 手动跑防误触 heartbeat 告警
+CANARY_STATE=$(mktemp -d)                                                # 隔离 state（不碰真实 .project-auto/state）
+python3 Projects/项目推进流水线/scripts/run_daily.py \
+    --project cc-web-control --state-dir "$CANARY_STATE" --no-notify \
+    2>&1 | tee /tmp/canary-automerge-$(date +%s).log
+# 确定性投递（不依赖今日 radar 命中）：用 --from-stage inject --inject-prd <手写PRD.md> 替上面，直达 dispatch
+```
+
+**观察 N 次闭环**（跨多 cron 周期；含一次故意红 auto-revert + 一次熔断触发）：
+
+```bash
+LOG=/tmp/canary-automerge-*.log
+grep -E '🎉.*已合 main|✅.*post-merge main 全量测试绿.*merged' $LOG    # (a) 正常闭环：merge + post-merge PASS
+grep -E '🔴.*post-merge main 红.*auto-revert|↩️.*revert 成功' $LOG     # (b) 故意红 → auto-revert REVERTED → main 回绿
+grep -E '🧊.*熔断命中.*cooldown_revert_loop' $LOG                      # (c) 同 PRD 再投 → circuit breaker 触发 → triage
+grep -E '🛑.*(halt|CRITICAL)' $LOG                                      # halt/quarantine（UNKNOWN/revert 失败）→ 须人工
+git -C <cc-web-control> log origin/main --grep='Pipeline-Merge: '      # 确认 marker 落地（§8.2 回滚锚点）
+```
+
+**通过判据**（全过才扩全量）：(a)(b)(c) 各至少出现一次且无 (d)；merge_loop/main_status/alerts journal 事件自洽
+（merge_started→completed / revert_started→completed 闭合无 open intent）；目标仓 main 最终绿（无残留红 commit）。

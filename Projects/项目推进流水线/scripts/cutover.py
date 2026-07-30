@@ -362,11 +362,14 @@ def run_sdk_hook_canary(*, stamp_fn=None) -> SdkHookCanaryEvidence:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 7.3 / 8.3 controlled crash drill（agent/test/commit/push/PR 后）确认 exactly-once
+# 7.3 / 8.3 controlled crash drill（agent/test/commit/push/PR/merge_push/revert_push 后）确认 exactly-once
 # ════════════════════════════════════════════════════════════════════════════
-# spec task 7.3 的 5 边界（side-effect 发生点），崩溃后 reconcile 判定每个副作用是否已发生。
+# spec task 7.3 的 5 边界（agent/test/commit/push/PR，side-effect 发生点）+ task 6.1c 追加 merge_push/
+# revert_push（auto-merge/revert push 是独立 checkpoint，崩溃后 reconcile merge/revert commit ancestry，
+# 不只把「闭环」当整体——防 god-stage 整段重跑/放弃）。崩溃后 reconcile 判定每个副作用是否已发生。
 CRASH_BOUNDARIES: frozenset[str] = frozenset(
-    {"agent_done", "test_done", "commit", "push", "pr_create"})
+    {"agent_done", "test_done", "commit", "push", "pr_create",
+     "merge_push", "revert_push"})
 
 
 @dataclass(frozen=True)
@@ -379,14 +382,18 @@ class CrashDrillResult:
     external_known: bool
 
 
-# 各边界注入崩溃后待 reconcile 的副作用目标（agent_done/test_done 无外部副作用；commit/push/pr 有）。
-# SideEffectTarget.kind 对齐 ids.idempotency_id 允许列表（commit/push/pr）；target 语义随 kind。
+# 各边界注入崩溃后待 reconcile 的副作用目标（agent_done/test_done 无外部副作用；commit/push/pr/merge_push/
+# revert_push 有）。SideEffectTarget.kind 对齐 ids.idempotency_id 允许列表（commit/push/pr/merge/revert）；
+# target 语义随 kind。merge_push/revert_push（task 6.1c）：target = merge_commit/revert_commit sha，
+# resolver 查其是否 main 祖先（spec v2.1：revert 查 revert_commit 非 merge_commit）。
 _BOUNDARY_TARGETS = {
     "agent_done": (),
     "test_done": (),
     "commit": (RC.SideEffectTarget("commit", "feat-branch"),),
     "push": (RC.SideEffectTarget("push", "feat-branch"),),
     "pr_create": (RC.SideEffectTarget("pr", "owner/repo:feat-branch"),),
+    "merge_push": (RC.SideEffectTarget("merge", "merge_commit_sha"),),
+    "revert_push": (RC.SideEffectTarget("revert", "revert_commit_sha"),),
 }
 
 
@@ -415,7 +422,7 @@ def run_crash_drill(boundary: str, *, resolver: RC.KeyResolver,
 class CrashReconciliationEvidence:
     """task 7.3：crash reconciliation 的可归档证据。
 
-    跑 spec 全 5 边界（agent/test/commit/push/PR），聚合每边界 ``CrashDrillResult``。
+    跑 spec 全 7 边界（agent/test/commit/push/PR/merge_push/revert_push），聚合每边界 ``CrashDrillResult``。
     ``all_exactly_once`` ⇔ 每边界 reconcile 无 unknown（崩溃后副作用状态全明确，retry 安全决策）。
     design 决策#6（archive immutable passing evidence）：frozen dataclass + tuple results。
     """
@@ -425,19 +432,21 @@ class CrashReconciliationEvidence:
     summary: str
 
 
-# 跑序（spec 7.3 边界顺序：side-effect 发生时点）
+# 跑序（spec 7.3 边界顺序：side-effect 发生时点；merge_push/revert_push 是 auto-merge 闭环内的子 checkpoint，
+# 接在 pr_create 之后——merge push → post-merge verify → (fail) revert push 的时序）
 _CRASH_BOUNDARY_ORDER: tuple[str, ...] = (
     "agent_done", "test_done", "commit", "push", "pr_create",
+    "merge_push", "revert_push",
 )
 
 
 def run_crash_reconciliation_evidence(*, resolver: RC.KeyResolver,
                                       iteration_id: str = "iter_crash") -> CrashReconciliationEvidence:
-    """task 7.3：crash reconciliation evidence——跑 spec 全 5 边界（agent/test/commit/push/PR），
+    """task 7.3：crash reconciliation evidence——跑 spec 全 7 边界（agent/test/commit/push/PR/merge_push/revert_push），
     聚合每边界 reconcile 结果为可归档证据。
 
     production wiring（design 决策#1）：把 ``run_crash_drill`` 从 disconnected 单点 helper 连成覆盖
-    spec 全 5 边界的可重复 reconciliation 证据命令。``all_exactly_once`` 汇总每边界 exactly_once——
+    spec 全 7 边界的可重复 reconciliation 证据命令。``all_exactly_once`` 汇总每边界 exactly_once——
     任一边界 unknown（reconcile 查不到）→ False（fail-safe，design risk#90 不盲目重放）。返回
     ``CrashReconciliationEvidence`` 供 quality gate / 运维归档（design 决策#6 archive）。
 

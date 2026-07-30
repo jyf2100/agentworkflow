@@ -81,7 +81,7 @@ def test_report_renders_blocked_and_keeps_counts_orthogonal(tmp_path, monkeypatc
     assert smtp_cmds, "阻断项应触发邮件（active）"
     cmd = smtp_cmds[0]
     subject = cmd[cmd.index("--subject") + 1]
-    assert "2 阻断" in subject
+    assert "阻断2" in subject        # task 5.2：subject 格式「词+数字」（阻断2 / 已合N / 需triageN / haltedN）
 
 
 def test_report_no_blocked_shows_none(tmp_path, monkeypatch):
@@ -198,3 +198,83 @@ def test_report_renders_integrity_blocked_separately_from_failing(tmp_path, monk
     assert "验证 failing：1" in txt
     # 概览显式列完整性阻断计数
     assert "完整性阻断：2" in txt
+
+
+def test_triage_reasons_enum_is_complete_and_covers_dispatch_exits():
+    """task 5.1：TRIAGE_REASONS 固定枚举须覆盖所有 dispatch 出口实际设的 triage_reason 值（防漂移）。"""
+    # triaged 出口（进池不阻塞）
+    assert "cooldown_revert_loop" in run_daily.TRIAGE_REASONS          # 4.4 熔断
+    assert "post_merge_red_reverted" in run_daily.TRIAGE_REASONS       # 4.3 revert REVERTED
+    assert "rebase_conflict" in run_daily.TRIAGE_REASONS               # 3.x rebase CONFLICT
+    assert "rebase_unknown" in run_daily.TRIAGE_REASONS                # 3.x rebase UNKNOWN
+    assert "push_failed" in run_daily.TRIAGE_REASONS                   # 3.x push reject
+    # halted 出口（整仓暂停；D3 halt 强于 D4 triage）
+    assert "post_merge_unknown" in run_daily.TRIAGE_REASONS            # 4.2 post-merge UNKNOWN→halt
+    assert "post_merge_revert_conflict" in run_daily.TRIAGE_REASONS    # 4.3 revert CONFLICT→halt
+    assert "post_merge_revert_unknown" in run_daily.TRIAGE_REASONS     # 4.3 revert UNKNOWN→halt
+    assert "merge_loop_open_intent" in run_daily.TRIAGE_REASONS        # 6.x 方案 C：merge_loop 未闭合 intent→halt（防 merge push 后 crash 重复合）
+    # spec D4 七值预留（dev/verify 阶段转 triage 接入后用）
+    assert "timeout" in run_daily.TRIAGE_REASONS
+    assert "verify_exhausted" in run_daily.TRIAGE_REASONS
+
+
+def test_report_renders_merged_triaged_halted_buckets(tmp_path, monkeypatch):
+    """task 5.3：single-flight-auto-merge 闭环三态（merged/triaged/halted）渲染进独立桶，不混进 baseline 的
+    review/failing/abnormal/blocked——它们是新闭环语义。task 5.2：subject + 概览 + 日报指针含三态计数。"""
+    disp = [
+        {"project": "o/r1", "status": "merged", "merge_commit": "abc1234", "slug": "m-slug",
+         "branch": "auto/m", "pr_url": None},
+        {"project": "o/r2", "status": "triaged", "triage_reason": "rebase_conflict",
+         "slug": "t-slug", "branch": "auto/t", "pr_url": None},
+        {"project": "o/r3", "status": "halted", "triage_reason": "post_merge_unknown",
+         "slug": "h-slug", "branch": "auto/h", "pr_url": None},
+    ]
+    smtp_cmds = _setup_report(tmp_path, monkeypatch, disp)
+    rp = run_daily.stage_report(SimpleNamespace(dry_run=False, no_notify=False), {}, STAMP)
+    txt = rp.read_text(encoding="utf-8")
+
+    # merged 桶（含 merge commit sha）
+    assert "## ✅ 已自动合入 main" in txt
+    merged_section = txt.split("## ✅ 已自动合入 main", 1)[1]
+    assert "m-slug" in merged_section and "abc1234" in merged_section
+
+    # triaged 桶（含 ejection reason）
+    assert "## 🔧 需 triage" in txt
+    triage_section = txt.split("## 🔧 需 triage", 1)[1]
+    assert "t-slug" in triage_section and "rebase_conflict" in triage_section
+
+    # halted 桶（含 reason）
+    assert "## 🛑 halted" in txt
+    halted_section = txt.split("## 🛑 halted", 1)[1]
+    assert "h-slug" in halted_section and "post_merge_unknown" in halted_section
+
+    # 概览含三态计数
+    assert "已合 main：1" in txt
+    assert "triage：1" in txt
+    assert "halt：1" in txt
+
+    # 三态不混进 baseline 桶（merged/triaged/halted 非 pr_open/skip/fail）
+    assert "产出 PR：0" in txt
+    assert "验证 failing：0" in txt
+    assert "失败/超时/跳过：0" in txt
+
+    # 5.2：subject 含三态；triaged/halted 算 active 触发邮件（运维须 triage）
+    assert smtp_cmds, "triaged/halted 应触发邮件（active）"
+    subject = smtp_cmds[0][smtp_cmds[0].index("--subject") + 1]
+    assert "已合1" in subject
+    assert "需triage1" in subject
+    assert "halted1" in subject
+
+
+def test_triage_reason_drift_logs_warning_not_crash(tmp_path, monkeypatch):
+    """task 5.1：triaged/halted 的 triage_reason 非 TRIAGE_REASONS 枚举值→report log warning（防漂移），
+    fail-open 不阻断报告（报告仍落盘，reason 原样渲染，计数仍计）。"""
+    disp = [{"project": "o/r1", "status": "triaged", "triage_reason": "totally_new_reason_not_in_enum",
+             "slug": "x-slug", "branch": "auto/x", "pr_url": None}]
+    _setup_report(tmp_path, monkeypatch, disp)
+    # 不崩 + reason 原样渲染（fail-open）+ 计数仍计
+    rp = run_daily.stage_report(SimpleNamespace(dry_run=True, no_notify=False), {}, STAMP)
+    txt = rp.read_text(encoding="utf-8")
+    assert "x-slug" in txt
+    assert "totally_new_reason_not_in_enum" in txt
+    assert "triage：1" in txt

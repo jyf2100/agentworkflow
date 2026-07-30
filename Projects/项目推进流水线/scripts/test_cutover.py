@@ -272,10 +272,53 @@ def test_crash_commit_absent_reapplies_once():
     assert r.exactly_once is True
 
 
+# ─── 6.1c：merge_push/revert_push 边界（auto-merge/revert push 独立 checkpoint）─────────
+def test_crash_merge_push_confirmed_skips_on_retry():
+    """6.1c merge_push 边界：merge_commit 已是 main 祖先(FOUND)→ confirmed 跳过重 merge（exactly-once）。
+    spec fail-safe-dispatch「Merge already applied is not repeated」的 crash drill 覆盖。"""
+    r = CT.run_crash_drill("merge_push", resolver=FakeResolver(True))
+    assert r.boundary == "merge_push"
+    assert r.confirmed == 1 and r.exactly_once is True
+
+
+def test_crash_merge_push_absent_reapplies_once():
+    """6.1c merge_push 边界：merge_commit 非 main 祖先(NOT_FOUND)→ pending 可安全重 apply。"""
+    r = CT.run_crash_drill("merge_push", resolver=FakeResolver(False))
+    assert r.pending == 1 and r.exactly_once is True
+
+
+def test_crash_merge_push_unknown_blocks():
+    """6.1c merge_push 边界：ancestry UNKNOWN（main_ref 缺失/remote 不可达）→ block，不盲目重 merge。
+    spec fail-safe-dispatch「Merge state unknown blocks retry」的 crash drill 覆盖。"""
+    r = CT.run_crash_drill("merge_push", resolver=FakeResolver(None))
+    assert r.unknown == 1 and r.exactly_once is False and r.external_known is False
+
+
+def test_crash_revert_push_confirmed_skips_on_retry():
+    """6.1c revert_push 边界：revert_commit 已是 main 祖先(FOUND)→ confirmed 跳过重 revert（exactly-once）。
+    spec fail-safe-dispatch「Revert already applied is detected via the revert commit」的 crash drill 覆盖。"""
+    r = CT.run_crash_drill("revert_push", resolver=FakeResolver(True))
+    assert r.boundary == "revert_push"
+    assert r.confirmed == 1 and r.exactly_once is True
+
+
+def test_crash_revert_push_absent_reapplies_once():
+    """6.1c revert_push 边界：revert_commit 非 main 祖先(NOT_FOUND)→ pending 可安全重 apply revert。"""
+    r = CT.run_crash_drill("revert_push", resolver=FakeResolver(False))
+    assert r.pending == 1 and r.exactly_once is True
+
+
+def test_crash_revert_push_unknown_blocks():
+    """6.1c revert_push 边界：ancestry UNKNOWN → block，不盲目重 revert（fail-safe）。"""
+    r = CT.run_crash_drill("revert_push", resolver=FakeResolver(None))
+    assert r.unknown == 1 and r.exactly_once is False and r.external_known is False
+
+
 def test_run_crash_reconciliation_evidence_all_boundaries():
-    """归档命令覆盖 spec 全 5 边界（agent/test/commit/push/PR），全 confirmed → all exactly-once。"""
+    """归档命令覆盖 spec 全 7 边界（agent/test/commit/push/PR/merge_push/revert_push），全 confirmed → all exactly-once。"""
     ev = CT.run_crash_reconciliation_evidence(resolver=FakeResolver(True))
-    assert set(ev.boundaries_run) == {"agent_done", "test_done", "commit", "push", "pr_create"}
+    assert set(ev.boundaries_run) == {"agent_done", "test_done", "commit", "push", "pr_create",
+                                      "merge_push", "revert_push"}
     assert ev.all_exactly_once is True
 
 

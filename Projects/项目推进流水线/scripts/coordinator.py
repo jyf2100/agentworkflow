@@ -321,6 +321,8 @@ class PreflightResult:
 #   journal_driven_dispatch ⇒ journal_shadow   driven 必须先 shadow（cutover 前置 shadow parity）
 #   session_aware_retry     ⇒ journal_shadow   retry 需 journal 持久化 session（无 journal = 无 session 可 resume）
 #   lifecycle_hooks         ⇒ journal_shadow   hooks 需 journal 落盘事件（无 journal = hook 事件丢失）
+#   single_flight_auto_merge⇒ single_flight_serial_shadow  真合 main 必须先串行单飞准入（ADR-0008 护栏#7：
+#                                shadow→drill→canary→全量；无串行 slot = 并发同仓 merge = chaos；7.1a shadow gate）
 # 注：cross_prd_learning_injection **不进**此硬依赖链——injection 对 shadow 的依赖是 advisory（provenance
 # 安全策略），不是功能硬依赖（shadow off 时 injection 仍可基于历史 catalog 工作）。invalid 组合
 # injection=on, shadow=off 走**运行时降级**：resolve_learning_injections_source 返 fallback
@@ -334,6 +336,8 @@ _FLAG_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
      "session_aware_retry requires journal_shadow (retry needs journal-persisted session)"),
     ("lifecycle_hooks", "journal_shadow",
      "lifecycle_hooks requires journal_shadow (hooks must persist events to journal)"),
+    ("single_flight_auto_merge", "single_flight_serial_shadow",
+     "single_flight_auto_merge requires single_flight_serial_shadow (auto-merge needs serial single-flight admission first)"),
 )
 
 
@@ -358,7 +362,7 @@ def preflight(flags: LoopFlags) -> PreflightResult:
     return PreflightResult(
         ok=False,
         blocked=PreflightBlocked(
-            reason=f"invalid loop flag combination: {len(violations)} violation(s) of journal_shadow dependency",
+            reason=f"invalid loop flag combination: {len(violations)} dependency violation(s)",
             violations=tuple(violations),
         ),
     )

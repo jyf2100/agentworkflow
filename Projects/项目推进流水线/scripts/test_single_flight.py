@@ -214,3 +214,85 @@ def test_slot_scope_blocked_returns_non_acquired(tmp_path):
                        now_fn=lambda: _now(1), stamp_fn=_stamp, lease_ttl=3600) as res:
         assert not res.acquired
         assert res.blocked_reason == "inflight"
+
+
+# ═══ task 4.2 / 4.3：HALTED 态（post-merge UNKNOWN / revert 非 REVERTED → halt 整仓到人工）═══════
+# spec「Revert itself fails halts the queue ... no further PRD admitted until manual resolution」+「UNKNOWN test
+# result SHALL halt the queue」。slot 须能表达「halt 到人工」——lease(2h) 过期会自动 free，撑不住；故新 HALTED
+# 态：末事件 slot_halted → HALTED（覆盖 lease，lease 过期也不自动 free），直到 slot_resumed（人工 unblock）。
+def _halted_event(jpath, *, owner_repo=OWNER, reason="post_merge_safety", event_id="e3",
+                  run_id="run-1", prd_id="prd-1", iteration_id="iter-1"):
+    """直接写一条 slot_halted 事件（测 query 独立于 halt_slot 实现）。"""
+    ev = JournalEvent(schema_version=JOURNAL_SCHEMA_VERSION, event_id=event_id,
+                      timestamp=_stamp(), iteration_id=iteration_id, run_id=run_id,
+                      prd_id=prd_id, event_type="slot_halted",
+                      payload={"owner_repo": owner_repo, "reason": reason})
+    J.append_event(jpath, ev)
+
+
+def _resumed_event(jpath, *, owner_repo=OWNER, event_id="e4",
+                   run_id="run-1", prd_id="prd-1", iteration_id="iter-1"):
+    ev = JournalEvent(schema_version=JOURNAL_SCHEMA_VERSION, event_id=event_id,
+                      timestamp=_stamp(), iteration_id=iteration_id, run_id=run_id,
+                      prd_id=prd_id, event_type="slot_resumed",
+                      payload={"owner_repo": owner_repo})
+    J.append_event(jpath, ev)
+
+
+def test_query_halted_when_last_event_halted(tmp_path):
+    # acquired→halted：末事件 slot_halted → HALTED（4.2/4.3 halt 整仓）
+    jp = SF.slot_journal_path(tmp_path, OWNER)
+    _acquired_event(jp, lease_expires_at=_now(2).isoformat())
+    _halted_event(jp)
+    assert SF.query_slot(tmp_path, OWNER, now_fn=lambda: _now(1)).state is SlotState.HALTED
+
+
+def test_query_halted_persists_past_lease_expiry(tmp_path):
+    # halted + lease 早过期 → 仍 HALTED（不自动 free——halt 须到人工 resume，lease 不能偷放）
+    jp = SF.slot_journal_path(tmp_path, OWNER)
+    _acquired_event(jp, lease_expires_at=_now(1).isoformat())
+    _halted_event(jp)
+    q = SF.query_slot(tmp_path, OWNER, now_fn=lambda: _now(48))   # now 48h ≫ lease
+    assert q.state is SlotState.HALTED
+
+
+def test_query_free_after_resume(tmp_path):
+    # halted→resumed：末事件 slot_resumed → FREE（人工 unblock 后可重新投递）
+    jp = SF.slot_journal_path(tmp_path, OWNER)
+    _acquired_event(jp, lease_expires_at=_now(2).isoformat())
+    _halted_event(jp)
+    _resumed_event(jp)
+    assert SF.query_slot(tmp_path, OWNER, now_fn=lambda: _now(1)).state is SlotState.FREE
+
+
+def test_acquire_halted_blocked(tmp_path):
+    # halt 状态下新 PRD 准入 → blocked(halted)（不投递，spec「no further PRD admitted」）
+    jp = SF.slot_journal_path(tmp_path, OWNER)
+    _halted_event(jp)
+    res, handle = SF.acquire_slot(tmp_path, OWNER, run_id="r2", prd_id="p2", iteration_id="i2",
+                                  now_fn=lambda: _now(0), stamp_fn=_stamp, lease_ttl=3600)
+    assert not res.acquired and res.blocked_reason == "halted"
+
+
+def test_halt_slot_then_release_keeps_halted(tmp_path):
+    # acquire → halt_slot(handle) → release（slot_scope __exit__ 语义）→ 末事件仍 slot_halted（非 released）
+    res, handle = SF.acquire_slot(tmp_path, OWNER, run_id="r", prd_id="p", iteration_id="i",
+                                  now_fn=lambda: _now(0), stamp_fn=_stamp, lease_ttl=3600)
+    assert res.acquired
+    SF.halt_slot(handle, reason="post_merge_revert_unknown", run_id="r", prd_id="p",
+                 iteration_id="i", owner_repo=OWNER, stamp_fn=_stamp)
+    SF.release_slot(handle, stamp_fn=_stamp, run_id="r", prd_id="p",
+                    iteration_id="i", owner_repo=OWNER)   # 模拟 slot_scope __exit__
+    q = SF.query_slot(tmp_path, OWNER, now_fn=lambda: _now(0))
+    assert q.state is SlotState.HALTED   # release 未写 slot_released 覆盖 halt
+
+
+def test_resume_slot_clears_halt_then_acquire_ok(tmp_path):
+    # halt 后人工 resume_slot → FREE → 可重新 acquire（恢复投递）
+    jp = SF.slot_journal_path(tmp_path, OWNER)
+    _halted_event(jp)
+    SF.resume_slot(tmp_path, OWNER, run_id="r", prd_id="p", iteration_id="i", stamp_fn=_stamp)
+    assert SF.query_slot(tmp_path, OWNER, now_fn=lambda: _now(0)).state is SlotState.FREE
+    res, _ = SF.acquire_slot(tmp_path, OWNER, run_id="r2", prd_id="p2", iteration_id="i2",
+                             now_fn=lambda: _now(0), stamp_fn=_stamp, lease_ttl=3600)
+    assert res.acquired
