@@ -44,7 +44,11 @@ export PATH="$HOME/.local/bin:$HOME/miniconda3/bin:$PATH"
 PYTHON="$(command -v python3 || true)"
 
 # ── canary 隔离 state + 临时 log（守 pa-test-no-dirty-data：不碰真实 .project-auto/state）──
-CANARY_STATE="${PA_CANARY_STATE:-$(mktemp -d -t canary-automerge-state-XXXXXX)}"
+# state 落 .project-auto/ 下独立子目录（.project-auto 已 gitignore，CLAUDE.md）：既在 VAULT_ROOT 内
+# （run_daily.stage_inject 的 prd_path.relative_to(VAULT_ROOT) + 下游 VAULT_ROOT/prd_path 可过），又隔离
+# 真实 .project-auto/state + 不入仓。/tmp 会破坏 relative_to（/tmp 不在 vault 子路径）。
+mkdir -p "$VAULT/.project-auto"
+CANARY_STATE="${PA_CANARY_STATE:-$(mktemp -d -p "$VAULT/.project-auto" -t canary-state-XXXXXX)}"
 CANARY_LOG="${PA_CANARY_LOG:-/tmp/canary-automerge-$$.log}"
 BRANCH_PROTECT_BACKUP="${PA_BP_BACKUP:-/tmp/canary-automerge-bp-$$.json}"
 
