@@ -7,9 +7,15 @@ single-flight-auto-merge task 4.4。
 →rebase CLEAN→**又合 main 又红又 revert**——「branch 绿但 main 红」的 PRD 夜夜复发，无限循环。熔断在
 re-admission 时查 cooldown 窗口：同幂等键（prd_id）刚被 revert 过 → 禁 auto-merge → 强制 triage 等人工。
 
-**幂等键**：``prd_id``（``ids.prd_id(prd_path, content_hash)``，content-addressed）。PRD 内容不变 → 键不变 →
-跨 cron 稳定（spec「across cron rounds」）；PRD 改了（验收标准/信号变）→ 新键 → 视作新 PRD 放行重试（合理：
-内容变了可能已修）。record/check 同用 dispatch_one 内的 ``_prd``（``_coord.prd_id``），自洽。
+**幂等键**：``circuit_key``（``ids.prd_id(stable_slug, content_hash)``，slug-based content-addressed）。
+跨 cron 稳定——``stable_slug``（frontmatter 语义 slug）+ 内容 digest 都不含 cron stamp，同 PRD 跨 cron 同键
+（spec「across cron rounds」）；PRD 改了（验收标准/信号变）→ 新 digest → 新键 → 视作新 PRD 放行重试（合理：
+内容变了可能已修）。record/check 同用 ``Coordinator.circuit_key``，自洽。
+
+**task 4.4 fix（canary 判据 c 2026-07-30 暴露）**：旧键用 path-based ``prd_id``（``ids.prd_id(prd_path,
+content_hash)``），但 ``prd_path`` = ``{stamp}_{slug}.md`` 含 cron stamp → 跨 cron stamp 变 → 键变 →
+``is_in_cooldown`` 跨 cron 不命中 → 本模块要防的「branch 绿 main 红 PRD 夜夜复发」恰好防不住。改 slug-based
+``circuit_key``（``prd_id(stable_slug, digest)``，两因子都不含 stamp）根治。
 
 **fail-open（额外保护层，非 fail-safe 核心）**：熔断是「额外阻止」型护栏，不是「破坏性副作用准入门」。
 rebase/merge/revert 那种破坏性操作无正向证据 → UNKNOWN → block（fail-safe，绝不动 main）；熔断无正向匹配
@@ -55,15 +61,16 @@ def _parse_iso(s: str) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def record_revert(state_dir, owner_repo: str, prd_id: str, *, stamp_fn) -> None:
+def record_revert(state_dir, owner_repo: str, circuit_key: str, *, stamp_fn) -> None:
     """记一条 revert 事件到 cooldown journal（post-merge red → auto-revert REVERTED 后调用）。
 
-    fail-open：写失败不 raise（熔断是额外护栏，不应阻断已成功的 revert + triage 流程；调用方 ``run_daily``
-    负责 log；durable 告警化留 task 4.5）。复用 ``append_event`` 原子追加（``O_APPEND``+``fsync``，crash 安全）。
+    ``circuit_key``：跨 cron 稳定的熔断键（``ids.prd_id(stable_slug, content_hash)``，slug-based）——由调用方
+    （``run_daily`` 经 ``Coordinator.circuit_key``）传入。fail-open：写失败不 raise（熔断是额外护栏，不应阻断
+    已成功的 revert + triage 流程；durable 告警化留 task 4.5）。复用 ``append_event`` 原子追加（crash 安全）。
     """
     ts = stamp_fn()
-    ev = JournalEvent(schema_version=JOURNAL_SCHEMA_VERSION, event_id=f"cb-{prd_id}-{ts}",
-                      timestamp=ts, iteration_id="", run_id="", prd_id=prd_id,
+    ev = JournalEvent(schema_version=JOURNAL_SCHEMA_VERSION, event_id=f"cb-{circuit_key}-{ts}",
+                      timestamp=ts, iteration_id="", run_id="", prd_id=circuit_key,
                       event_type=_COOLDOWN_EVENT, payload={"owner_repo": owner_repo})
     try:
         append_event(cooldown_journal_path(state_dir, owner_repo), ev)
@@ -71,10 +78,12 @@ def record_revert(state_dir, owner_repo: str, prd_id: str, *, stamp_fn) -> None:
         pass
 
 
-def is_in_cooldown(state_dir, owner_repo: str, prd_id: str, *, now_fn,
+def is_in_cooldown(state_dir, owner_repo: str, circuit_key: str, *, now_fn,
                    window_seconds: int = DEFAULT_COOLDOWN_WINDOW) -> bool:
-    """该 PRD 是否在 cooldown 窗口内（窗口内有匹配 prd_id 的 revert 记录 → True，禁 auto-merge）。
+    """该 PRD 是否在 cooldown 窗口内（窗口内有匹配 ``circuit_key`` 的 revert 记录 → True，禁 auto-merge）。
 
+    ``circuit_key``：跨 cron 稳定熔断键（slug-based，``ids.prd_id(stable_slug, content_hash)``）——与
+    ``record_revert`` 写入同键，跨 cron re-admission 命中（防 "branch 绿 main 红 PRD 夜夜复发"）。
     fail-open：journal 损坏/读失败/缺文件 → ``False``（额外保护层无正向证据则放行，不 block）。
     spec「Reverted PRD re-admitted inside cooldown」→ True；「after cooldown」→ False。
     """
@@ -85,7 +94,7 @@ def is_in_cooldown(state_dir, owner_repo: str, prd_id: str, *, now_fn,
         return False                      # fail-open：读不到 → 不 block（让正常流程走）
     now = now_fn()
     for ev in events:
-        if ev.event_type != _COOLDOWN_EVENT or ev.prd_id != prd_id:
+        if ev.event_type != _COOLDOWN_EVENT or ev.prd_id != circuit_key:
             continue
         try:
             reverted_at = _parse_iso(ev.timestamp)

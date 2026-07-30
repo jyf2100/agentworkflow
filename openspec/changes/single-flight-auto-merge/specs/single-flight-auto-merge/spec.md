@@ -77,6 +77,8 @@ PRDs that time out, fail verification after the configured retries, hit a rebase
 ### Requirement: Revert loop circuit breaker
 A PRD whose idempotency key matches a `post_merge_red_reverted` ejection within the configured cooldown window SHALL be blocked from auto-merge on re-admission across cron rounds, and routed to the triage pool — to prevent a PRD that is green on its branch but red on integrated main from being re-merged nightly in an infinite loop.
 
+> **Implementation note (apply 2026-07-30, task 4.4 fix)**: The idempotency key is `circuit_key` = `prd_id(stable_slug, content_hash)` (slug-based) — both factors are stamp-free, so the key is stable across cron rounds as this requirement demands. The earlier path-based `prd_id(prd_path, ...)` violated "across cron rounds": `prd_path` embeds the cron stamp (`{stamp}_{slug}.md`), so the key drifted across cron and `is_in_cooldown` missed re-admission — the breaker could not prevent the nightly loop it exists for. Canary criterion (c) surfaced this; the fix is the slug-based `circuit_key`.
+
 #### Scenario: Reverted PRD re-admitted inside cooldown
 - **WHEN** a PRD whose idempotency key was `post_merge_red_reverted` within the cooldown window is re-admitted
 - **THEN** dispatch blocks auto-merge for that PRD and routes it to the triage pool

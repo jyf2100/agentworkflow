@@ -1934,10 +1934,19 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         prd_content = Path(prd_abs).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         prd_content = None
+    # task 4.4 fix：stable_slug = frontmatter 语义 slug（跨 cron 稳定），喂 circuit_key（熔断跨 cron 键）。
+    #   slug（本函数 1907）= Path(prd_path).stem = {stamp}_{slug}（含 cron stamp，跨 cron 变），不可直接做熔断键——
+    #   旧 path-based prd_id 跨 cron 变致 is_in_cooldown 跨 cron 不命中（"branch 绿 main 红 PRD 夜夜复发"防不住）。
+    #   frontmatter.slug（pa-prd/inject 都写）是语义 slug；缺则 fallback slug（仅异常 PRD 兜底）。
+    stable_slug = slug
+    if prd_content:
+        _fm, _ = _split_frontmatter(prd_content)
+        stable_slug = _fm.get("slug") or slug
     _coord = build_coordinator(stamp=stamp, prd_path=entry.get("prd_path") or "",
                                proj=proj, slug=slug, state_dir=STATE_DIR, profile=prof,
                                stamp_fn=_now_iso, prd_content=prd_content,
-                               resolver=reconcile.default_resolver(repo, owner_repo))   # task 2.1：coord own reconcile resolver（4.4 publication 前对账消费）
+                               resolver=reconcile.default_resolver(repo, owner_repo),
+                               stable_slug=stable_slug)   # task 2.1：coord own reconcile resolver（4.4 publication 前对账消费）
     _run, _prd, _iter, _sj = (_coord.run_id, _coord.prd_id, _coord.iteration_id, _coord.journal)
     # task 2.5：preflight 校验 loop flag 组合一致性（design 决策#1 防 impossible partial 组合）。
     #   违规→阻断不投递（status=skip + 结构化 reason），在 admission profile 门**之前**拦截，不起 dev loop。
@@ -2205,7 +2214,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
                 # task 4.4 revert 循环熔断（D11）：同幂等键（_prd）PRD 在 cooldown 窗口内曾被 post_merge_red_reverted
                 #   → 禁再 auto-merge，直接进 triage——防「branch 绿但 main 红」的 PRD 夜夜复发无限循环（spec
                 #   「Reverted PRD re-admitted inside cooldown」）。fail-open：冷却 journal 读不到/损坏 → 不 block。
-                if CB.is_in_cooldown(STATE_DIR, owner_repo, _prd, now_fn=_slot_now):
+                if CB.is_in_cooldown(STATE_DIR, owner_repo, _coord.circuit_key, now_fn=_slot_now):
                     rec["status"] = "triaged"
                     rec["triage_reason"] = "cooldown_revert_loop"
                     log(f"  🧊 {slug}: 熔断命中（PRD {_prd[:12]} 在 {owner_repo} cooldown 窗口内）→ 不 merge，进 triage(cooldown_revert_loop)")
@@ -2261,7 +2270,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
                             rec["revert_commit"] = _rvr.revert_commit
                             rec["status"] = "triaged"
                             rec["triage_reason"] = "post_merge_red_reverted"
-                            CB.record_revert(STATE_DIR, owner_repo, _prd, stamp_fn=_now_iso)   # task 4.4：记 cooldown（下轮 re-admission 熔断查此）
+                            CB.record_revert(STATE_DIR, owner_repo, _coord.circuit_key, stamp_fn=_now_iso)   # task 4.4 fix：记 cooldown（circuit_key 跨 cron 稳定，下轮 cron re-admission 熔断查此）
                             ML.record_event(STATE_DIR, owner_repo, _prd, "revert_completed", stamp_fn=_now_iso, merge_commit=_mr.merge_commit, revert_commit=_rvr.revert_commit)   # task 6.x：闭合 revert intent（main 回绿，闭环以 triage 收尾，可重试）
                             log(f"  ↩️ {slug}: revert 成功（{_rvr.revert_commit[:8]}）→ main 回绿，进 triage(post_merge_red_reverted)")
                         else:   # CONFLICT/UNKNOWN：revert 本身失败 → halt 整仓 + CRITICAL（main 仍红，绝不 continue）

@@ -326,6 +326,44 @@ def test_prd_digest_differs_when_prd_content_changes(tmp_path):
     assert c1.prd_id != c2.prd_id
 
 
+# ─── task 4.4 fix：circuit_key 跨 cron 稳定（slug-based，防熔断夜夜复发）──────────────
+def test_circuit_key_stable_across_cron_stamps(tmp_path):
+    """canary 判据 c（2026-07-30）回归：同 PRD（同 stable_slug + 同内容）跨 cron stamp → 同 circuit_key。
+
+    旧 path-based prd_id 含 stamp（``{stamp}_{slug}.md``）跨 cron 变 → 熔断跨 cron 失效。circuit_key =
+    prd_id(stable_slug, digest) 两因子不含 stamp → 跨 cron 稳定。验 Coordinator 层。
+    """
+    import artifact_store
+    content = "# PRD\n实现 X"
+    digest = artifact_store.compute_digest(content.encode("utf-8"))
+    # 跨两天 cron stamp：prd_path 不同，stable_slug + content 同
+    c1 = CO.build_coordinator(stamp=_STAMP, prd_path="prd/cc/20260730-0317_feat.md", proj="cc",
+                              slug="20260730-0317_feat", state_dir=tmp_path, env={}, stamp_fn=lambda: "T",
+                              prd_content=content, stable_slug="feat")
+    c2 = CO.build_coordinator(stamp=_STAMP, prd_path="prd/cc/20260731-0317_feat.md", proj="cc",
+                              slug="20260731-0317_feat", state_dir=tmp_path, env={}, stamp_fn=lambda: "T",
+                              prd_content=content, stable_slug="feat")
+    assert c1.circuit_key == c2.circuit_key            # 跨 stamp 稳定（熔断跨 cron 生效前提）
+    assert c1.prd_id != c2.prd_id                       # 对照：path-based prd_id 跨 stamp 变（旧 bug）
+    assert c1.circuit_key == loop_ids.prd_id("feat", digest)   # slug-based，非 path-based
+
+
+def test_circuit_key_falls_back_to_path_based_when_no_stable_slug(tmp_path):
+    """baseline 向后兼容：stable_slug 不传（默认 ""）→ circuit_key = path-based prd_id（旧行为，不破旧调用方）。"""
+    coord = CO.build_coordinator(stamp=_STAMP, prd_path="prd/proj/x.md", proj="proj", slug="x",
+                                 state_dir=tmp_path, env={}, stamp_fn=lambda: "T")
+    assert coord.circuit_key == coord.prd_id            # fallback path-based
+
+
+def test_circuit_key_differs_when_prd_content_changes(tmp_path):
+    """同 stable_slug，PRD 内容改 → digest 变 → circuit_key 变（视作新 PRD 放行重试，合理：内容变可能已修）。"""
+    c1 = CO.build_coordinator(stamp=_STAMP, prd_path="p.md", proj="p", slug="s", state_dir=tmp_path,
+                              env={}, stamp_fn=lambda: "T", prd_content="v1", stable_slug="s")
+    c2 = CO.build_coordinator(stamp=_STAMP, prd_path="p.md", proj="p", slug="s", state_dir=tmp_path,
+                              env={}, stamp_fn=lambda: "T", prd_content="v2", stable_slug="s")
+    assert c1.circuit_key != c2.circuit_key
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Section 6 task 6.1：coordinator own root trace + propagation through operations
 # design 决策#1：telemetry 从 coord 派生，非 disconnected helper。trace_context 已实现 generic

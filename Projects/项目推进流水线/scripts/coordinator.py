@@ -67,6 +67,8 @@ class Coordinator:
     trace: TC.TraceContext               # task 6.1：root trace（per PRD run，trace_id 由 run_id 派生，metadata-only）
     telemetry_sink: OTLP.TelemetrySink   # task 6.2：OTLP export + degradation journaling（enabled 从 telemetry_export flag）
     prd_digest: str | None = None        # task 3.1：dispatch entry PRD 内容 digest（``sha256:<hex>``；None=未捕获）
+    circuit_key: str = ""                # task 4.4 fix：跨 cron 稳定熔断键 = prd_id(stable_slug, prd_digest)（slug-based，
+                                         #   非 path-based prd_id——prd_path 含 stamp 跨 cron 变，旧键致熔断跨 cron 失效）
     # task 2.1：own retry·session·reconciliation（design 决策#1：coordinator 集中 own 所有运行时关注点，
     #   production code 不再 disconnected helper 式各自 resolve）。评审 P0-1：曾散建、coordinator 未持有
     #   retry/session/reconcile，导致 recover_iteration / publication 前对账无法从 coordinator 单点派生。
@@ -250,7 +252,8 @@ def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
                       prd_content: str | None = None,
                       telemetry_exporter=None,
                       otlp_timeout: float = 5.0,
-                      resolver: object | None = None) -> Coordinator:
+                      resolver: object | None = None,
+                      stable_slug: str = "") -> Coordinator:
     """dispatch/dev-agent 入口：一次解析 flag + 建 IDs/journal/artifact_root，返回 ``Coordinator``。
 
     替代 ``dispatch_one`` 散建的 ``_run``/``_prd``/``_iter``/``_sj``。所有 adapter 从返回的
@@ -273,6 +276,11 @@ def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
     run = loop_ids.run_id(stamp)
     prd_digest = compute_digest(prd_content.encode("utf-8")) if prd_content is not None else None
     prd = loop_ids.prd_id(prd_path, prd_digest)        # task 3.1：content-addressed（PRD 改→新 prd_id）
+    # task 4.4 fix：circuit_key 跨 cron 稳定——prd_path 含 stamp（{stamp}_{slug}.md）跨 cron 变，致 path-based
+    #   prd_id 跨 cron 变 → is_in_cooldown 跨 cron 不命中 → "branch 绿 main 红 PRD 夜夜复发"防不住。改用
+    #   prd_id(stable_slug, prd_digest)：stable_slug（frontmatter 语义 slug，跨 cron 稳定）+ 内容 digest。
+    #   stable_slug 空（无 frontmatter / baseline）→ fallback path-based prd（向后兼容）。
+    circuit_key = loop_ids.prd_id(stable_slug or prd_path, prd_digest)
     iteration = loop_ids.iteration_id(run, prd, 0)
     journal_path = Path(state_dir) / "runs" / proj / f"{stamp}_{slug}.journal.jsonl"
     journal = ShadowJournal(journal_path, run, stamp_fn or _real_stamp,
@@ -294,7 +302,7 @@ def build_coordinator(*, stamp: str, prd_path: str, proj: str, slug: str,
         retry_budget = None
     return Coordinator(flags=flags, run_id=run, prd_id=prd, iteration_id=iteration,
                        journal=journal, artifact_root=artifact_root, trace=trace,
-                       telemetry_sink=telemetry_sink, prd_digest=prd_digest,
+                       telemetry_sink=telemetry_sink, prd_digest=prd_digest, circuit_key=circuit_key,
                        retry_budget=retry_budget, session_store=session_store, resolver=resolver)
 
 
