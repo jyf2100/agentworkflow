@@ -96,3 +96,10 @@ persona 调用**省略 model 参数** → 走 roc LiteLLM 代理默认（`glm-5.
 - **路径同目录 import**：`scripts/` 下扁平模块互相 `sys.path.insert` 引用（pytest 的 `pythonpath=["scripts"]` 支持），**不是**可安装包（`pyproject.toml` 显式 `py-modules = []`）。不要改成包结构。
 - **`cron` 非 login shell**：`run_cron.sh` 已处理 nvm/PATH；改 cron 链路时记住 PATH 极简，找不到 node/claude 之外的依赖会静默失败。
 - **并发写风险**：常有长驻 `claude` web 会话在编辑 pa 脚本。对 pa 做 rebase / push / commit 前先 `git status -sb` 确认工作区稳定；若反复变脏且自己没改，多半是并发会话在写（见 `ps -eo pid,etime,cmd | grep claude`）。
+
+### 错误处理与调试
+
+-  **诊断，不要猜测：** 当遇到错误或测试失败时，首先**逐步解释**可能的原因。检查假设、输入和相关的代码路径。
+-  **优雅处理：** 代码应**优雅地处理错误**。例如，对异步调用使用 `try/catch`，并在适当时返回用户友好的错误消息或回退值。
+-  **日志记录：** 为关键故障包含**有帮助**的控制台日志或错误日志（但避免在生产代码中记录过多日志）。
+-  **无静默失败：** **不要默默地吞噬异常。** 始终通过抛出或记录它们来暴露错误。
