@@ -51,6 +51,8 @@ from feature_flags import resolve_flags  # add-cross-prd-learning-memory Section
 from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写入器（类型注解用；纯 stdlib，cron 安全）
 import journal as J                        # task 3.4：driven retry 读 journal events → recovery context（纯 stdlib）
 import recovery_context as RC              # task 3.4：driven retry prompt 从 immutable PRD + journal artifacts（纯函数）
+from verify_anchors import derive_anchors  # harden-pa-verify-determinism task 1.1/4.0：机械锚点推导（纯 stdlib：re + dataclass，cron 安全）
+from verify_bundles import split_bundles    # harden-pa-verify-determinism task 3.1：大 diff 文件打包（纯 stdlib，cron 安全）
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
 import reconcile                           # task 4.4：ArtifactEvidenceResolver（publication 前 reconcile test evidence）
 import retry_policy as RP                  # task 3.3 P0-3：run_daily 驱动 retry（decide/recover_iteration/budget/session 参数生成）
@@ -534,12 +536,95 @@ def critic_prompt(prd_path: str, source_path: str, prof: dict) -> str:
 按你的 persona 输出契约：Read PRD + 信息源 + profile，逐条验（有据/可执行/贴合/scope），只吐一行 gate JSON（verdict=pass|drop|revise）。"""
 
 
+def _render_anchor_block(anchors: list) -> str:
+    """把 derive_anchors 的结果渲染成 prompt 里的机械锚点块（design D1 确定性半边）。
+
+    persona 的 feedback ①定位应引这些锚点而非自己 recall；persona prose 合规是 design guidance，
+    这里的结构化锚点本身由编排器机械算出、可复核。"""
+    if not anchors:
+        return ""
+    lines = ["机械锚点（编排器算，你 feedback ①定位只引这些、不自己 recall——design D1 确定性半边）："]
+    for a in anchors:
+        if a.status == "ok":
+            hunk = f"（hunk: {a.hunk}）" if a.hunk else ""
+            lines.append(f"- [ok] {a.test_name} @ {a.file}:{a.line}{hunk}")
+        elif a.status == "base-side":
+            lines.append(f"- [base-side 回归] {a.test_name} @ {a.file}:{a.line}（{a.reason}）")
+        else:
+            lines.append(f"- [unresolved] {a.test_name}（{a.reason}）")
+    return "\n".join(lines)
+
+
+def _derive_verify_anchors(rec: dict, diff_path: Path, prof: dict) -> list:
+    """flag-gated 锚点推导（task 1.1 wire / 4.0 / 4.1）。
+
+    ``verify_anchor_evidence`` 开 + 测试红（test_rc≠0）→ derive anchors（testout→anchor→diff hunk）。
+    flag 关 / 测试绿 → ``[]``（baseline 行为不变，向后兼容）。fail-open：推导自身故障 → ``[]``，
+    不拖垮 verify 闭环（同 loop_runtime 契约——观测/确定性层故障不得改 dispatch 决策）。
+    """
+    try:
+        if not resolve_flags(profile=prof).verify_anchor_evidence:
+            return []
+        vj = rec.get("verify") or {}
+        if vj.get("test_rc") == 0:          # 绿不需要 anchor（green-path 不变）
+            return []
+        testout = ""
+        if vj.get("test_log"):
+            try:
+                testout = Path(vj["test_log"]).read_text(encoding="utf-8")
+            except Exception:
+                testout = ""
+        diff_text = ""
+        try:
+            if diff_path and diff_path.exists():
+                diff_text = diff_path.read_text(encoding="utf-8")
+        except Exception:
+            diff_text = ""
+        return derive_anchors(testout, vj.get("test_cmd"), diff_text)
+    except Exception:
+        return []   # fail-open：anchor 推导自身故障不得拖垮 verify 闭环
+
+
+def _render_bundle_block(bundles: list) -> str:
+    """大 diff 文件打包块（design D3，Requirement B）：仅多 bundle（已 split）时显示；
+    单 bundle（小 diff）→ 空（baseline prompt 不变）。逐 bundle 边界 = spec「isolated per-bundle context」
+    的 prompt 内实现（真物理 multi-call 是 follow-up：pa-verify 测试输出本就全局读，multi-call N 倍成本
+    + verdict 合并不划算）。"""
+    if not bundles:
+        return ""
+    if len(bundles) == 1 and "single-bundle" in (bundles[0].reason or ""):
+        return ""
+    lines = ["文件打包（大 diff 按相关文件分组，**逐 bundle 审**——design D3 divide-and-conquer）："]
+    for i, b in enumerate(bundles, 1):
+        lines.append(f"[bundle {i}] {', '.join(b.files)}（{b.reason}）")
+    return "\n".join(lines)
+
+
+def _derive_verify_bundles(diff_path: Path, prof: dict) -> list:
+    """flag-gated bundle 推导（task 3.3，复用 verify_anchor_evidence flag——bundle 是 anchor 的组织延伸，
+    同一 flag 控制整个 harden rollout）：flag 开 → split_bundles；flag 关 / 空 diff → []。fail-open。"""
+    try:
+        if not resolve_flags(profile=prof).verify_anchor_evidence:
+            return []
+        diff_text = ""
+        try:
+            if diff_path and diff_path.exists():
+                diff_text = diff_path.read_text(encoding="utf-8")
+        except Exception:
+            diff_text = ""
+        return split_bundles(diff_text) if diff_text else []
+    except Exception:
+        return []   # fail-open
+
+
 def verify_prompt(prd_path: str, branch: str | None, base: str, diff_path: Path,
-                  verify: dict | None, round_n: int, prof: dict) -> str:
-    """pa-verify prompt（docs/verify-commit-loop-design.md §5-② 契约）：喂 PRD+分支+base+diff+测试输出+round。
+                  verify: dict | None, round_n: int, prof: dict,
+                  anchors: list | None = None, bundles: list | None = None) -> str:
+    """pa-verify prompt（docs/verify-commit-loop-design.md §5-② 契约）：喂 PRD+分支+base+diff+测试输出+round+锚点+bundle。
 
     base 在 round≥2 是「上次 dev 分支」（增量重投）；verify 是 independent_verify 的产物（含 test_rc/test_log），
-    None 表示测试未跑（dev 未报 test_cmd / 仓无 scripts.test）。"""
+    None 表示测试未跑（dev 未报 test_cmd / 仓无 scripts.test）。anchors = 机械行级锚点；bundles = 大 diff 文件打包。
+    两者 None/空/单 bundle = baseline（flag 关或小 diff），prompt 行为不变。"""
     test_rc = (verify or {}).get("test_rc")
     if test_rc == 0:
         test_state = "绿（test_rc=0，全量测试过）"
@@ -548,6 +633,18 @@ def verify_prompt(prd_path: str, branch: str | None, base: str, diff_path: Path,
     else:
         test_state = "未跑（dev 未报 test_cmd 或仓无 scripts.test → independent_verify 跳过）"
     test_log = (verify or {}).get("test_log")
+    anchor_block = _render_anchor_block(anchors or [])
+    bundle_block = _render_bundle_block(bundles or [])
+    anchor_section = (anchor_block + "\n\n") if anchor_block else ""
+    bundle_section = (bundle_block + "\n\n") if bundle_block else ""
+    locate_hint = ("①定位（**引上方机械锚点的文件/测试/行，不自己 recall**）"
+                   if anchor_block else "①定位（文件/测试/断言行）")
+    # bundle 时补 coverage 指引（revise 产 criteria_coverage / green quick-sany，design 方向 A）
+    bundle_guidance = ""
+    if bundle_block:
+        bundle_guidance = ("- 大 diff 已按 bundle 打包：revise 时逐 bundle 核对 PRD 验收标准，并在 feedback "
+                           "产 criteria_coverage（每条 criterion: covered/not-covered-in-bundle）；"
+                           "green 时逐 bundle quick sanity 即可（不穷尽 accounting）。\n")
     return f"""[verify 第{round_n}轮] 项目={prof.get('name')} 分支={branch} base={base}（round≥2 为增量：上次 dev 分支）
 
 PRD（验收标准在此）：{prd_path}
@@ -555,9 +652,9 @@ git diff（{base}..{branch}）：{diff_path}
 测试输出（independent_verify 全量重跑的 stdout）：{test_log or '（无；测试未跑）'}
 测试结论：{test_state}
 
-按你的 persona 输出契约：Read PRD 验收标准 + diff + 测试输出，判「验证绿且无回归」。
-- 测试绿 → verdict=pass（快速确认 diff 与验收标准大致对应、无重大跑题即可）。
-- 测试红 → verdict=revise，写 feedback_section 四要素：①定位（文件/测试/断言行）②原因 ③怎么改（可执行）④收尾门（全量测试绿才算过）。
+{anchor_section}{bundle_section}按你的 persona 输出契约：Read PRD 验收标准 + diff + 测试输出，判「验证绿且无回归」。
+{bundle_guidance}- 测试绿 → verdict=pass（快速确认 diff 与验收标准大致对应、无重大跑题即可）。
+- 测试红 → verdict=revise，写 feedback_section 四要素：{locate_hint} ②原因 ③怎么改（可执行）④收尾门（全量测试绿才算过）。
 - round=2 表示 dev 已按上轮反馈增量重做过一次，重点看反馈是否被落实。
 只吐那一行 JSON，多一个字都算失败。"""
 
@@ -1285,8 +1382,17 @@ def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int, *
 
 def _pa_verify_round(rec: dict, prof: dict, prd_abs: str, cur_base: str,
                      diff_path: Path, round_n: int, slug: str) -> dict:
-    """单轮 pa-verify 裁判：喂 PRD+diff+测试输出+round，吐一行 JSON payload（verdict=pass|revise）。"""
-    prompt = verify_prompt(prd_abs, rec.get("branch"), cur_base, diff_path, rec.get("verify"), round_n, prof)
+    """单轮 pa-verify 裁判：喂 PRD+diff+测试输出+round+机械锚点，吐一行 JSON payload（verdict=pass|revise）。
+
+    锚点（harden-pa-verify-determinism task 1.1/1.4/4.0）：``verify_anchor_evidence`` flag 开 + 测试红时，
+    derive anchors（testout→anchor→diff hunk，round≥2 对新 base 重算）注入 prompt；flag 关/绿 → anchors=[]
+    （baseline 不变，flag-gated rollout）。"""
+    anchors = _derive_verify_anchors(rec, diff_path, prof)
+    bundles = _derive_verify_bundles(diff_path, prof)
+    rec["verify_anchors"] = anchors   # task 1.3：anchors 入 dispatch record（unresolved/base-side gap 可追溯）
+    rec["verify_bundles"] = [list(b.files) for b in bundles]   # task 3.3：bundles 入 record（可序列化）
+    prompt = verify_prompt(prd_abs, rec.get("branch"), cur_base, diff_path, rec.get("verify"),
+                           round_n, prof, anchors=anchors, bundles=bundles)
     payload, meta = run_persona("pa-verify", prompt, "verify", f"verify:{slug}:r{round_n}")
     log(f"[verify] r{round_n} {str(payload.get('verdict', '?')).upper():6} {slug}｜"
         f"cost=${meta['cost']:.4f} turns={meta['turns']}")

@@ -65,7 +65,8 @@ def test_all_env_names_mapped():
     """FLAGS_ENV_MAP 覆盖所有 flag，且 env 名稳定（运维/CI 文档化的开关名）。
 
     add-cross-prd-learning-memory task 1.3a/1.3b 追加 cross_prd_learning_shadow / cross_prd_learning_injection，
-    **不带 PA_LOOP_ prefix，有意域切割**（learning memory 是独立能力域）。"""
+    **不带 PA_LOOP_ prefix，有意域切割**（learning memory 是独立能力域）。harden-pa-verify-determinism
+    task 4.0 追加 verify_anchor_evidence（pa-verify 质量闸域，同样不带 PA_LOOP_ prefix）。"""
     assert FLAGS_ENV_MAP == {
         "journal_shadow": "PA_LOOP_JOURNAL_SHADOW",
         "journal_driven_dispatch": "PA_LOOP_JOURNAL_DRIVEN_DISPATCH",
@@ -79,6 +80,8 @@ def test_all_env_names_mapped():
         # single-flight-auto-merge task 1.1：dispatch 串行单飞 + auto-merge 双 flag（域切割，PA_SINGLE_FLIGHT_ 前缀）
         "single_flight_serial_shadow": "PA_SINGLE_FLIGHT_SERIAL_SHADOW",
         "single_flight_auto_merge": "PA_SINGLE_FLIGHT_AUTO_MERGE",
+        # harden-pa-verify-determinism task 4.0：verify 锚点域切割（不带 PA_LOOP_ prefix）
+        "verify_anchor_evidence": "PA_VERIFY_ANCHOR_EVIDENCE",
     }
 
 

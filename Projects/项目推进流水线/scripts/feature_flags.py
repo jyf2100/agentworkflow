@@ -42,6 +42,11 @@ class LoopFlags:
         ``single_flight_serial_shadow`` — 同目标仓 dispatch 串行单飞消费，但 merge/revert 只 log 不改 main（shadow）。
         ``single_flight_auto_merge``    — 真实 merge/revert 闭环（改目标仓 main，破坏性）。gated on serial_shadow +
                                           parity + canary。off → 仍并发投递 + 兜底开 PR 待 review（baseline 不变）。
+
+    harden-pa-verify-determinism task 4.0：
+        ``verify_anchor_evidence`` — pa-verify revise 反馈注入机械行级锚点（testout→anchor→diff hunk）。
+                                     off → anchor 推导零执行、prompt 零变化（baseline 行为不变，design 迁移
+                                     flag-gated rollout）。独立能力域（pa-verify 质量闸），非 loop runtime 6 面。
     """
     __test__ = False   # 显式声明非测试类，免 pytest 收集告警（与 evidence.TestEvidence 一致；名 Loop* 不命中但保持一致）
 
@@ -55,6 +60,7 @@ class LoopFlags:
     cross_prd_learning_injection: bool = False    # task 1.3b（gated on shadow；preflight 静态阻断 invalid 组合）
     single_flight_serial_shadow: bool = False     # single-flight-auto-merge task 1.1：串行单飞消费（shadow：merge/revert 只 log 不改 main）
     single_flight_auto_merge: bool = False        # single-flight-auto-merge task 1.1：真实 merge/revert 闭环（gated on shadow+parity+canary；破坏性，改目标仓 main）
+    verify_anchor_evidence: bool = False          # harden-pa-verify-determinism task 4.0（flag-gated rollout）
 
 
 # flag 名 → 环境变量名（运维/CI 文档化的稳定开关名）。改这些 = 改对外契约。
@@ -74,6 +80,9 @@ FLAGS_ENV_MAP: dict[str, str] = {
     # 非 PA_LOOP_——dispatch 串行+auto-merge 是独立能力域，不属于 loop runtime 6 大渐进启用面）。
     "single_flight_serial_shadow": "PA_SINGLE_FLIGHT_SERIAL_SHADOW",
     "single_flight_auto_merge": "PA_SINGLE_FLIGHT_AUTO_MERGE",
+    # harden-pa-verify-determinism task 4.0：**不带 PA_LOOP_ prefix，域切割**——pa-verify 质量闸是独立
+    # 能力域（机械锚点 + bundle 覆盖），不属于 loop runtime 6 大渐进启用面。env 名稳定，改 = 改对外契约。
+    "verify_anchor_evidence": "PA_VERIFY_ANCHOR_EVIDENCE",
 }
 
 # 真值集合（strip + lower 后判定）。其余一律 False（保守：未知字符串不开）。

@@ -222,10 +222,11 @@ status: spec-draft
 - **输出**：`state/dispatch_YYYYMMDD.json`（投递 + 验证记录）+ 脚本 JSON 入 `state/runs/`。
 - **工具**：Bash（git worktree + 触发脚本 + `npm test` + 只读查 GitHub PR 计数）, Read, Write（限 `.project-auto/`）。
 - **硬约束**：超 `max_prs_in_flight` 不投递（登记"跳过-超额"）；在途 PR 查询失败则 **fail closed**（登记"跳过-在途 PR 数未知"，不得当作 0）；**投递前 `gh api repos/<owner>/<repo>/branches/main/protection` 实时校验，404 即拒投并记"跳过-未保护"**（protection 是平台态、可被外部改动，故运行时实查、**不引入静态 profile 字段**，与 `dev_agent_ready` 解耦）；**绝不把控制面产物写进目标仓**；failing PR 留作 GitHub PR、报告标红（不自动关）；**never-merge / never-touch-main 由 GitHub branch protection 平台兜底**，不依赖脚本。
+- **verify 闘认机械锚点 + 文件打包**（`harden-pa-verify-determinism`，flag `verify_anchor_evidence` gated）：revise 反馈消费编排器机械算的行级锚点（`.testout`→anchor→diff hunk，含 `base-side` 回归标记）+ 大 diff 按相关文件打包（逐 bundle 审、revise 产 `criteria_coverage`、green 仅 quick sanity）；flag 关 = baseline 自由文本反馈（逐字不变）。详见 `docs/verify-commit-loop-design.md` + `.claude/agents/pa-verify.md`。
 
 ### 4.5 开发 agent（归属目标面，每仓一个 SDK 脚本，自治完整 dev loop）
 
-> 落点：「项目仓走 Agent SDK 流程」。dev agent **不再是 markdown persona，而是仓自带的 SDK 脚本**（ADR-0003）。控制面的 3 个语义 persona 仍是 CLI markdown，dispatch/report 为机械 stage。
+> 落点：「项目仓走 Agent SDK 流程」。dev agent **不再是 markdown persona，而是仓自带的 SDK 脚本**（ADR-0003）。控制面的 4 个语义 persona（radar / prd / prd-critic / verify）仍是 CLI markdown，dispatch/report 为机械 stage。`pa-verify` 是第 4 个语义 persona，其 ADR 锚是**机械-语义切分原则**（语义活才立 persona，全流水线通用），非 ADR-0005 的 report 段文本——见 `harden-pa-verify-determinism` design D6。
 
 - **角色**：接收 PRD + 信息源，用 `claude-agent-sdk` 的 `query()` 在目标仓 worktree 内**自治跑完整 dev loop**：需求分析 → 设计 → 开发 → review → 回归 → **自己 push + 开 PR**。
 - **定义位置**：`<仓>/scripts/dev-agent.*`（语言跟仓栈；cc-web-control = `dev-agent.mjs`）+ 该仓 CLAUDE.md（dev persona + 自治 scope/质量/review）。**仓自己 owning，随仓走**（ADR-0001 原则不变，产物从 dev.md 换成脚本，不算污染）。

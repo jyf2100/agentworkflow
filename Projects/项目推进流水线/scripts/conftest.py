@@ -75,6 +75,25 @@ def python_target_repo(tmp_path) -> Path:
 
 
 @pytest.fixture
+def node_target_repo_red(node_target_repo) -> Path:
+    """Node 目标仓骨架（红测试版，harden-pa-verify-determinism task 5.1a）：smoke.test.js 改成 ``assert.ok(false)``。
+
+    供 anchor 映射的端到端 integration（npm test 真→红→.testout→parser）；与恒绿的 ``node_target_repo``
+    并存，互不影响——现有 dispatch 单测沿用 green fixture，anchor integration 用 red。"""
+    (node_target_repo / "tests" / "smoke.test.js").write_text(
+        "const assert = require('assert');\nassert.ok(false);\n", encoding="utf-8")
+    return node_target_repo
+
+
+@pytest.fixture
+def python_target_repo_red(python_target_repo) -> Path:
+    """Python 目标仓骨架（红测试版，task 5.1a）：test_smoke.py 改成 ``assert False``。"""
+    (python_target_repo / "tests" / "test_smoke.py").write_text(
+        "def test_ok():\n    assert False\n", encoding="utf-8")
+    return python_target_repo
+
+
+@pytest.fixture
 def stub_externals(monkeypatch):
     """桩掉 dispatch 全部外部依赖（SDK / GitHub / SMTP / 凭证 / 模型）——单测零 IO。
 
