@@ -76,7 +76,7 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 | pa-verify | dev 产出验证闸（审 diff + 全量测试，判绿/红，2 次重做机会） |
 
 ### 控制面标准执行器（ADR-0006）
-`dev-agent.py` 是驱动**所有**目标仓的唯一执行器，在目标仓 worktree 内经 `claude-agent-sdk` 的 `query()`（string-prompt）跑 dev loop。**SDK 版本钉死 `>=0.2.121,<0.2.123`**：0.2.123 起 `can_use_tool` 回调要求 streaming 模式，与本执行器的 string-prompt `query()` 冲突。迁移到 streaming 是已知 follow-up。
+`dev-agent.py` 是驱动**所有**目标仓的唯一执行器，在目标仓 worktree 内经 `claude-agent-sdk` 的 `query()` 跑 dev loop。**SDK 版本钉 `>=0.2.128,<0.2.130`**（对齐 `pyproject.toml`，实装 0.2.128）：streaming 模式要求已由 `prompt_stream.py` 满足（prompt 包成 AsyncIterable，非 string-prompt，解决 0.2.123+ 的 `can_use_tool` streaming 冲突）；0.2.128 配本地 `sdk_compat_patch.py`（#1106 keep-alive 定向 ast patch，上游 PR OPEN 未合，合并后移除并放宽上界，独立 follow-up）。
 
 ### Fail-safe 分发 + 验证开发执行
 两条贯穿性不变式（见 `openspec/specs/fail-safe-dispatch` / `verified-dev-execution`）：

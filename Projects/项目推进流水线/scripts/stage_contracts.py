@@ -132,6 +132,28 @@ class PrdContract:
         return issues
 
 
-# 注册第一版契约
+_PROGRESS_VERDICT_VALUES = ("on_track", "off_track")
+
+
+class ProgressContract:
+    """progress（pa-progress 内循环方向评判）输出契约（in-loop-semantic-checkpoint）。
+    error: verdict（必填 + ∈{on_track,off_track}）。
+    其余字段（covered/off_topic/redirect_hint/summary）= warning（保持现状宽容语义）。"""
+
+    def validate(self, payload: object) -> list[Issue]:
+        if not isinstance(payload, dict):
+            return [Issue("payload", "error", "progress 输出必须是 JSON 对象")]
+        issues: list[Issue] = []
+        verdict = payload.get("verdict")
+        if verdict is None:
+            issues.append(Issue("verdict", "error", "缺 verdict 字段（必须 ∈{on_track,off_track}）"))
+        elif verdict not in _PROGRESS_VERDICT_VALUES:
+            issues.append(Issue("verdict", "error",
+                                f"verdict 必须 ∈{{on_track,off_track}}，实际 {verdict!r}"))
+        return issues
+
+
+# 注册契约
 register("critic", CriticContract())
 register("prd", PrdContract())
+register("progress", ProgressContract())

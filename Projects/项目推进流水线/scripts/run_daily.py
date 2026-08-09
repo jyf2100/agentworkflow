@@ -2209,6 +2209,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
             rec["dev_cost"] = script_json.get("cost"); rec["dev_turns"] = script_json.get("turns")
             rec["branch"] = script_json.get("branch")
             rec["stalled"] = bool(script_json.get("stalled"))   # SPEC #27：dev-agent 主动刹车（exit 12，非超时）
+            rec["off_track"] = bool(script_json.get("off_track"))   # in-loop-semantic-checkpoint：语义跑偏止损（exit 15）
             rec["run_log"] = script_json.get("run_log")          # 监控 jsonl 路径（state/runs/...）
             rec["dev_test_cmd"] = script_json.get("test_cmd")
             _af_payload = {   # task 3.2：dev-agent 阶段结束（RUNNING→AGENT_FINISHED）
@@ -2220,6 +2221,18 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
                 _af_payload["parent_feedback_digest"] = _parent_fb_digest
             _sj.emit("agent_finished", _iter, _prd, payload=_af_payload)
         rec["dev_killed"] = script_json is None   # 无 stdout JSON → 大概率 kill/崩（与 stalled 互补：超时 vs 主动刹车）
+
+        # in-loop-semantic-checkpoint：off_track（exit 15）→ dev 语义跑偏止损，无 commit 不进 verify/merge
+        # → reconcile 删分支 + triage 池（pre-merge 出口，类比 timeout/verify_exhausted，不阻塞队列）。
+        if rec.get("off_track"):
+            log(f"  🧭 {slug}: semantic off_track（judge_rounds={script_json.get('judge_rounds')}, "
+                f"last_verdict={script_json.get('last_verdict')}）→ triage")
+            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True)
+            _sj.emit("agent_finished", _iter, _prd, payload={
+                "round": round_n, "branch": rec.get("branch"), "off_track": True,
+                "judge_rounds": script_json.get("judge_rounds"), "last_verdict": script_json.get("last_verdict")})
+            _sj_terminal(_sj, rec, _iter, _prd)
+            return rec
 
         branch = rec.get("branch")
         if not branch:                        # dev 建分支前就崩/超时 → 无可验证、无分支做下次 base，对账收尾（stall 救不了，§2 实证）
@@ -2561,7 +2574,12 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
                    capture_output=True, text=True, timeout=20)
     subprocess.run(["git", "-C", repo, "push", "origin", "--delete", branch],
                    capture_output=True, text=True, timeout=30)
-    if rec.get("stalled"):
+    if rec.get("off_track"):
+        rec["status"] = "triaged"
+        rec["triage_reason"] = "semantic_off_track"
+        rec["skip_reason"] = "dev 内循环方向抽查两阶段耗尽（exit 15，语义跑偏止损）"
+        log(f"  🧭 {slug}: semantic off_track，无 commit 分支 {branch} 已删→triage（run_log: {rec.get('run_log')})")
+    elif rec.get("stalled"):
         rec["status"] = "stalled"
         rec["skip_reason"] = "dev loop 主动刹车（验证红后连续 N 轮无写类进展，exit 12）"
         log(f"  🧯 {slug}: stalled，无 commit 分支 {branch} 已删（run_log: {rec.get('run_log')})")
@@ -2935,6 +2953,7 @@ TRIAGE_REASONS: frozenset[str] = frozenset({
     "post_merge_revert_conflict",    # 4.3 revert CONFLICT→halt 整仓（D3）
     "post_merge_revert_unknown",     # 4.3 revert UNKNOWN→halt 整仓（D3）
     "merge_loop_open_intent",        # 6.x 方案 C：merge_loop 检出未闭合 intent→halt 整仓（D12，防 merge push 后 crash 重复合 main）
+    "semantic_off_track",            # in-loop-semantic-checkpoint：dev 内循环方向抽查两阶段耗尽（exit 15，pre-merge 出口）
 })
 
 

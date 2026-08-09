@@ -21,7 +21,8 @@ vault，但执行贴被控仓。被控仓零脚本。
   CLI: --prd/--source/--base/--branch-prefix/--dry-run
   退出码: 0=成功（开 PR 或 dry-run 完成）| 10=PRD 缺失/读不到 | 11=SDK dev loop 失败 |
           12=stalled（SPEC #27 主动刹车）| 13=git/push/PR 失败 |
-          14=发布门拦截（测试未跑/失败/过期，OpenSpec verified-dev-execution）| 99=未捕获
+          14=发布门拦截（测试未跑/失败/过期，OpenSpec verified-dev-execution）|
+          15=semantic off_track（内循环方向抽查两阶段耗尽，OpenSpec in-loop-semantic-checkpoint）| 99=未捕获
   stdout: 仅最终一行 JSON（字段名与历史完全一致）
 
 用法（pa-dispatch 自动调，或人手动）：
@@ -67,6 +68,7 @@ from merge_phase import (classify_rebase, RebaseEvidence, RebaseOutcome,   # tas
                          RevertOutcome)   # task 4.3：revert 三态
 from coordinator import build_coordinator   # task 2.3b：coordinator 边界（design 决策#1：一次解析 loop flag + own journal/artifacts/IDs）
 from hook_bridge import build_dev_hooks      # task 2.3b：lifecycle_hooks 开 → 注册真实 SDK lifecycle hooks（ClaudeAgentOptions.hooks）
+import semantic_gate                   # in-loop-semantic-checkpoint：内循环方向抽查（零依赖模块，stalled 之外的第二干预源）
 
 REPO_ROOT = Path.cwd()
 
@@ -135,7 +137,7 @@ HELP = """dev-agent.py — 项目推进流水线·控制面标准执行器（ADR
   --feedback-artifact  上轮 verify 反馈 artifact path（driven 模式 retry 用；baseline 不传）
   --lessons-artifact   prior-PRD 经验 lesson block path（learning memory injection；baseline 不传）
   --dry-run        只跑到"改完代码 + 本地 test"，不 commit/push/开 PR
-退出码: 0 OK | 10 无/读不到 PRD | 11 SDK 失败 | 12 stalled | 13 git/PR 失败 | 99 未捕获"""
+退出码: 0 OK | 10 无/读不到 PRD | 11 SDK 失败 | 12 stalled | 13 git/PR 失败 | 15 off_track | 99 未捕获"""
 
 
 def git(args: list[str]) -> str:
@@ -258,12 +260,36 @@ def append_run_line(run_log: Path, obj: dict) -> None:
 def create_loop_state(run_log: Path) -> dict:
     return {"run_log": run_log, "turn": 0, "last_test": None, "last_test_cmd": None,
             "no_write_streak": 0, "stalled": False, "pending_test_ids": set(),
-            "test_evidence": None}   # OpenSpec verified-dev-execution：结构化测试证据（None=未采集）
+            "test_evidence": None,   # OpenSpec verified-dev-execution：结构化测试证据（None=未采集）
+            # in-loop-semantic-checkpoint：方向抽查状态（stalled 之外的第二干预源）
+            "judge_k": semantic_gate.JUDGE_K, "judge_rounds": 0, "off_track_count": 0,
+            "last_verdict": None, "last_covered": [], "redirect_pending": None,
+            "off_track_exhausted": False, "judge_cost_acc": 0.0}
+# 注：无 last_session_id——H1 review 后接受新 session 现实（break 拿不到流末 session_id），
+# redirect leg 开新 query 不 resume。未来若做 Path A（ClaudeSDKClient+interrupt 真·注入）再加锚点。
 
 
-async def process_dev_loop(messages, state: dict) -> ResultMessage | None:
-    """dev loop 循环体（SPEC #27：监控落盘 + 无进展刹车 + 配对 tool_result 拿红/绿）。"""
+async def process_dev_loop(messages, state: dict, prd_text: str = "") -> ResultMessage | None:
+    """dev loop 循环体（SPEC #27：监控落盘 + 无进展刹车 + 配对 tool_result 拿红/绿）。
+
+    in-loop-semantic-checkpoint：prd_text 非空时每 K turn 方向抽查（stalled 之外的第二干预源，
+    补三道机械机制对"方向"瞎眼的盲区）。off_track 两阶段纠偏：首 off_track（hint 合法）→
+    redirect_pending+break（main 开新 session 续做——H1 review 三方确认 break 在 AssistantMessage
+    拿不到流末 session_id，resume 不可行）；次→off_track_exhausted+break（main exit 15）。
+    fail-open（评判失败/熔断/H2 空 hint/H3 非法 hint）不干预、不污染 off_track_count。"""
     result_msg: ResultMessage | None = None
+    _judge_bin: str | None = None   # None=未解析；""=已解析且 claude 缺失（缓存负结果，python-reviewer L1）
+
+    def _judge_fn(pt: str, db: str):
+        nonlocal _judge_bin
+        if _judge_bin is None:
+            _judge_bin = semantic_gate.resolve_claude_bin_safe()   # "" 也缓存：claude 缺失不重复 resolve
+        if not _judge_bin:
+            return None   # claude 缺失 → fail-open（已缓存，不调 judge_direction 免双重 resolve）
+        return semantic_gate.judge_direction(
+            pt, db, claude_bin=_judge_bin,
+            log_fn=lambda m: append_run_line(state["run_log"], {"event": "judge_log", "msg": m}))
+
     async for msg in messages:
         if isinstance(msg, AssistantMessage):
             state["turn"] += 1
@@ -297,6 +323,19 @@ async def process_dev_loop(messages, state: dict) -> ResultMessage | None:
                 "test": state["last_test"], "verified_red": state["last_test"] == "red",
                 "no_write_streak": state["no_write_streak"],
             })
+            # in-loop-semantic-checkpoint：每 K turn 方向抽查（append_run_line 后 / stall 刹车前）。
+            # turn 计数此处可靠（每个 AssistantMessage +1）。prd_text 空（如 merge phase）→ 不启用。
+            if prd_text:
+                action, record = semantic_gate.run_checkpoint(
+                    state, state["turn"], prd_text,
+                    semantic_gate.collect_diff(git, log_fn=lambda m: append_run_line(state["run_log"], m)),
+                    judge_fn=_judge_fn)
+                if record:
+                    append_run_line(state["run_log"], record)
+                if action in ("redirect", "exhausted"):
+                    break
+            # 不变式（architect Q2）：N_STALL 必须 ≫ JUDGE_K × (允许 redirect 次数 + 1)，否则 stall
+            # 抢先进刹车、浪费纠偏机会。当前 N_STALL=100 ≫ JUDGE_K=10 × 2，gap 90 turn 安全。
             if state["last_test"] == "red" and state["no_write_streak"] >= N_STALL:
                 state["stalled"] = True
                 sys.stderr.write(f"🧯 stalled：验证红后连续 {state['no_write_streak']} 轮无写类进展，主动刹车\n")
@@ -784,33 +823,66 @@ async def main() -> int:
         # except 捕获 → exit 11（fail-loud：dispatch 标红→人介入），严禁单独 try/except 吞掉。
         # apply 幂等 + conftest session fixture 已在测试 session 打过，此处生产路径再打是 no-op。
         sdk_compat_patch.apply()
-        options = ClaudeAgentOptions(
-            cwd=str(REPO_ROOT),
-            # model 刻意省略 → 走 roc 代理默认（glm-5.2）；勿传裸 Anthropic model id
-            permission_mode="acceptEdits",          # 编辑类自动过；Bash 不自动批 → 走 can_use_tool 闸（下）
-            can_use_tool=_can_use_tool,             # ADR-0006 #7：Bash 放行长效修法，摆脱机器本地 settings 依赖
-            setting_sources=["project"],            # 加载仓 CLAUDE.md(仓特定守则) + .claude/hooks
-            tools=["Read", "Grep", "Glob", "Edit", "Write", "MultiEdit",
-                   "TodoWrite", "Bash", "Agent"],   # 硬白名单（Python SDK：tools=可用性限制；allowed_tools 仅批准列表，非白名单）
-            # ⚠ follow-up（canary 2026-07-20 实证）：max_turns/max_budget_usd 在 SDK 0.2.121 似被绕过
-            #   （canary 实跑 325 turn 远超 150、total_cost_usd=None 未报成本）——实际仅 SPEC #27 stall
-            #   刹车兜住失控。budget/turn 硬执行 + SDK cost 上报机制排查列为 follow-up（ADR-0006 #6）。
-            max_turns=150,
-            max_budget_usd=MAX_BUDGET,               # 预算刹车（降级兜底，非硬保证——见上 follow-up）
-            env=build_env_for_sdk(),                 # PATH 前置 runtime python + claude CLI
-            hooks=sdk_hooks,                          # task 2.3b：lifecycle_hooks 开→真实 SDK lifecycle hooks（None=baseline，design 决策#8）
-            # task 3.3：session-aware retry 接入生产执行路径
-            #   retry 同 session → resume=<session_id>（SDK ResultMessage.session_id，transient/agent 中断续传）；
-            #   context 污染/compaction → fork_session=True（new_session 从 parent session 派生）；
-            #   均无 → 新 session（seq=0 baseline）。design 决策#3：transient+session 可用→resume；context 污染→new_session。
-            resume=args["resume_session"],
-            fork_session=args["fork_session"] or None,
-        )
+        # M1（architect Q4）：抽 _build_options 工厂，每段 new 一个 ClaudeAgentOptions。
+        # 原因：(1) 不依赖 options 可变性——SDK 升级若把 ClaudeAgentOptions 改 frozen/property，
+        # `options.resume = ...` 赋值会抛 FrozenInstanceError → 被 main 的 except 兜成 exit 11 杀进程，
+        # 违背 D5 fail-open（本机制从护栏变杀进程单点）；(2) 消除跨 leg 对象复用的隐性状态泄漏。
+        # 纯重构、零行为变更（options 构造本就不在单测覆盖）。
+        def _build_options(*, resume, fork_session):
+            return ClaudeAgentOptions(
+                cwd=str(REPO_ROOT),
+                # model 刻意省略 → 走 roc 代理默认（glm-5.2）；勿传裸 Anthropic model id
+                permission_mode="acceptEdits",          # 编辑类自动过；Bash 不自动批 → 走 can_use_tool 闸（下）
+                can_use_tool=_can_use_tool,             # ADR-0006 #7：Bash 放行长效修法，摆脱机器本地 settings 依赖
+                setting_sources=["project"],            # 加载仓 CLAUDE.md(仓特定守则) + .claude/hooks
+                tools=["Read", "Grep", "Glob", "Edit", "Write", "MultiEdit",
+                       "TodoWrite", "Bash", "Agent"],   # 硬白名单（Python SDK：tools=可用性限制；allowed_tools 仅批准列表，非白名单）
+                # ⚠ follow-up（canary 2026-07-20 实证）：max_turns/max_budget_usd 在 SDK 0.2.121 似被绕过
+                #   （canary 实跑 325 turn 远超 150、total_cost_usd=None 未报成本）——实际仅 SPEC #27 stall
+                #   刹车兜住失控。budget/turn 硬执行 + SDK cost 上报机制排查列为 follow-up（ADR-0006 #6）。
+                max_turns=150,
+                max_budget_usd=MAX_BUDGET,               # 预算刹车（降级兜底，非硬保证——见上 follow-up）
+                env=build_env_for_sdk(),                 # PATH 前置 runtime python + claude CLI
+                hooks=sdk_hooks,                          # task 2.3b：lifecycle_hooks 开→真实 SDK lifecycle hooks（None=baseline，design 决策#8）
+                # task 3.3：session-aware retry 接入生产执行路径
+                #   retry 同 session → resume=<session_id>（SDK ResultMessage.session_id，transient/agent 中断续传）；
+                #   context 污染/compaction → fork_session=True（new_session 从 parent session 派生）；
+                #   均无 → 新 session（seq=0 baseline）。design 决策#3：transient+session 可用→resume；context 污染→new_session。
+                resume=resume,
+                fork_session=fork_session or None,
+            )
+
         # can_use_tool 回调要求 streaming 模式（SDK 0.2.x：_internal/client.py:103 见 prompt 为
         # str 即 raise「can_use_tool callback requires streaming mode」）。string prompt 经
         # prompt_stream() 包成单条 user 消息异步流（dict 对齐 _internal/client.py:214-219）。
         # 实现抽到零依赖模块 prompt_stream.py 以便单测锁定 dict 结构（ADR-0006 #7）。
-        result_msg = await process_dev_loop(query(prompt=prompt_stream(prompt), options=options), state)
+        #
+        # in-loop-semantic-checkpoint：两阶段纠偏 while 循环（H1 review 后接受新 session 现实）。
+        # 首次 off_track（hint 合法）→ build_redirect_prompt + 开新 session 续做（给且仅给 1 次机会）；
+        # ⚠ 非 resume 续做——break 在 AssistantMessage 拿不到流末 session_id（H1 三方确认），redirect leg
+        # 是全新 query（PRD+hint+worktree 自恢复），options.resume=None；二次 off_track → decide_after_leg
+        # terminal=exhausted → 下方 exit 15。on_track/正常完成 → resume_redirect=False，break 进既有
+        # stalled(12)/发布门(14)/commit。prd_text 传 process_dev_loop 启用方向抽查。
+        redirects_done = 0
+        while True:
+            if redirects_done > 0 and state["redirect_pending"]:
+                # H1：接受新 session 现实。redirect hint 注入新 query（非 resume 续做）。
+                # 用完即清 redirect_pending（已注入本段 prompt），防下轮 checkpoint 误读残留。
+                leg_prompt = semantic_gate.build_redirect_prompt(prompt, state["redirect_pending"])
+                state["redirect_pending"] = None
+                append_run_line(state["run_log"], {"event": "redirect_new_session",
+                                                   "redirects_done": redirects_done})
+                options = _build_options(resume=None, fork_session=args["fork_session"])
+            else:
+                leg_prompt = prompt
+                options = _build_options(resume=args["resume_session"], fork_session=args["fork_session"])
+            result_msg = await process_dev_loop(
+                query(prompt=prompt_stream(leg_prompt), options=options), state, prd_text)
+            decision = semantic_gate.decide_after_leg(state, redirects_done)
+            if decision.resume_redirect:
+                redirects_done = decision.next_redirects_done
+                continue
+            break
     except Exception as e:
         sys.stderr.write(f"✗ SDK dev loop 异常: {e}\n"); return 11
 
@@ -834,6 +906,17 @@ async def main() -> int:
         sys.stderr.write(f"⚠ 预算刹车未生效（total_cost_usd={cost}），仅 maxTurns 兜底\n")
     else:
         sys.stderr.write(f"💰 本次 cost=${cost}（maxBudgetUsd={MAX_BUDGET}）\n")
+
+    # in-loop-semantic-checkpoint：off_track 两阶段耗尽 → 不 commit/不开 PR，吐 JSON + exit 15。
+    # 语义跑偏止损（pre-merge triage 出口，区别于 stalled(12)/发布门(14)）。优先于 stalled/gate/commit。
+    # M4：控制流用 state[]（loud KeyError on typo）非 state.get（silent None→exit15 永不触发）。
+    if state["off_track_exhausted"]:
+        print(json.dumps({"ok": False, "off_track": True, "exit_code": 15, "branch": branch, "base": base,
+                          "run_log": str(run_log), "cost": cost, "turns": turns,
+                          "judge_rounds": state.get("judge_rounds"), "last_verdict": state.get("last_verdict"),
+                          "test_cmd": state.get("last_test_cmd"),
+                          "test_passed": state.get("last_test") == "green"}, ensure_ascii=False))
+        return 15
 
     # stalled：不 commit/不开 PR，吐 JSON + exit 12（SPEC #27；半成品靠 run_log 留痕）
     if state["stalled"]:
