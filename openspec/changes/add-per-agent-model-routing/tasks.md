@@ -44,6 +44,7 @@ TDD 顺序：先写测试（RED）→ 最小实现（GREEN）→ ruff 干净（�
 - [x] R4 equals 形式（silent-failure LOW + security）：`--model=X` 单 token（跟随 SDK subprocess_cli.py 惯例）
 - [x] R5 审计 log（architect LOW + security LOW）：env 命中 log route 行
 - [x] R6 文档更正：design D4/D6/D7 + Non-Goals reflection 论据修正 + spec scenario + tasks
+- [x] R7 配置入口（用户问「env 表在哪」暴露的缺口）：`_load_claude_settings_env` 扩注入条件含 `PA_*_MODEL*` → settings.json env block 成统一配置入口；+ `test_load_claude_settings_env.py` 3 测试（注入/非路由项跳过/setdefault）
 
 ### 列 follow-up（不本 change 做）
 

@@ -112,3 +112,19 @@ AND persona_call `meta["model"]`（= outer `modelUsage`）反映 glm-5.1。
 WHEN `PA_DEV_MODEL=claude-sonnet-5`（裸 Anthropic id）
 THEN roc 代理拒绝该请求
 AND dev-agent 经现有非零退出 / is_error 路径 raise（不静默吞），错误可见。
+
+### Requirement: Config entry via settings.json env block
+
+per-agent 模型路由的配置入口 SHALL 是 `~/.claude/settings.json` 的 `env` block：`_load_claude_settings_env`（`run_daily.py:3277`）启动时 SHALL 把 env block 里的 `ANTHROPIC_*` 与 `PA_*_MODEL*`（`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL` / 未来 `PA_REFLECTION_MODEL`）注入 `os.environ`（setdefault 语义）。注入条件 MUST 限定 `ANTHROPIC_` 前缀、或 `PA_` 前缀且含 `_MODEL`——避开 `PA_HEARTBEAT` / `PA_CLAUDE_BIN` / `OBSIDIAN_VAULT_PATH` 等非路由项。这让 settings.json env block 成为认证 + 路由的统一配置入口；cron 经 run_cron.sh → run_daily → dev-agent subprocess（`dict(os.environ)`）天然继承。
+
+#### Scenario: settings.json 配 PA_*_MODEL → 注入 os.environ 生效
+
+WHEN `~/.claude/settings.json` env block 含 `"PA_PERSONA_MODEL_PA_PROGRESS": "haiku"` 且 run_daily 启动
+THEN `_load_claude_settings_env` 把它注入 `os.environ`
+AND pa-progress 的 base_cmd 含 `--model=haiku`，路由到 glm-5.1。
+
+#### Scenario: 非 model 的 PA_* 不被注入
+
+WHEN settings.json env block 含 `PA_HEARTBEAT` / `PA_CLAUDE_BIN`（PA_* 但无 `_MODEL`）
+THEN `_load_claude_settings_env` 不注入它们（避开运行时 env 污染）
+AND 仅 `ANTHROPIC_*` + `PA_*_MODEL*` 被注入。

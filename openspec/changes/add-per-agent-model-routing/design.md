@@ -87,6 +87,16 @@ pa 两类 LLM 调用路径均刻意省略 model，走 roc 默认：
 - **空串 env 显式 warn**（review follow-up，3 人共识）：`PA_PERSONA_MODEL_X=""` 被 `if _model:` 跳过 = 配错无反馈。现 `_model == ""` 时经 log 回调（persona_call）/ 全局 log（run_daily）warn「设为空串→走 roc 默认」。
 - **审计 log**（review follow-up，architect LOW + security LOW）：env 命中时 log「model route → X（per-agent env）」—— cron 调试可观测性（配了什么模型 / 走没走路由）。
 
+### D8：配置入口 = settings.json env block（_load_claude_settings_env 注入 PA_*_MODEL）
+
+review 后续发现（用户问「env 表配置在哪」暴露）：机制读 `os.environ`，但 `_load_claude_settings_env`（`run_daily.py:3277`）原本只注入 `ANTHROPIC_` 前缀 → settings.json 里写 `PA_PERSONA_MODEL_*` 读不到。**扩注入条件**为 `(k.startswith("ANTHROPIC_") or (k.startswith("PA_") and "_MODEL" in k))`，让 settings.json env block 成为 per-agent 路由的**统一配置入口**（与 `ANTHROPIC_*` 认证同处一处）。仅 `PA_*_MODEL*` 模式（避开 `PA_HEARTBEAT` / `PA_CLAUDE_BIN` / `OBSIDIAN_VAULT_PATH` 等非路由项）。setdefault 语义不变。
+
+**配置样例**（`~/.claude/settings.json` 的 `env` block，纯 JSON 无注释——`json.loads` 遇注释会失败跳过注入）：
+```json
+{ "env": { "PA_PERSONA_MODEL_PA_PROGRESS": "haiku", "PA_DEV_MODEL": "sonnet" } }
+```
+不设任何 `PA_*_MODEL` = 默认全走 glm-5.2（零变更 baseline）。值须 roc 别名（haiku=glm-5.1 / sonnet|opus|fable=glm-5.2[1M]）；裸 Anthropic id 被 roc 拒。cron 经 run_cron.sh → run_daily（注入）→ dev-agent subprocess（`dict(os.environ)` 继承）天然生效，无需 run_daily 显式透传。
+
 ## Open Questions
 
 1. **哪些 persona 实际该配什么模型** —— 本期只建机制（值留空），上线后按任务类型 + 成本观察再定。候选直觉：pa-progress / pa-radar（轻量结构化）试 `haiku`=glm-5.1；pa-prd-critic / pa-verify（对抗）试 `sonnet`=glm-5.2（同档，可能无差异）。

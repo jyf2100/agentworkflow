@@ -3275,7 +3275,7 @@ def _smtp_notify(stamp: str, report_path: Path, n_review: int, n_failing: int,
 
 # ─── main ───────────────────────────────────────────────────────────
 def _load_claude_settings_env() -> None:
-    """启动时把 ~/.claude/settings.json 的 env block 里的 ANTHROPIC_* 注入 os.environ（setdefault 语义）。
+    """启动时把 ~/.claude/settings.json 的 env block 里的 ANTHROPIC_* + PA_*_MODEL* 注入 os.environ（setdefault 语义）。
 
     背景：settings.json 的 env block 默认只被 claude CLI 自身读取并注入到 CLI 进程；非 CLI 子进程拿不到。
     典型坑——dispatch 段触发 node dev-agent.mjs，其 claude-agent-sdk query() 以 settingSources:["project"]
@@ -3284,8 +3284,10 @@ def _load_claude_settings_env() -> None:
     "Not logged in · Please run /login"。Mac 上手工能跑是因 Claude Code 会话已把 env block 注入自身进程；
     cron 下 Mac 同样会崩（潜伏 bug，迁移 smoke 才暴露）。
 
-    本函数在编排器启动时统一注入 ANTHROPIC_*（只此前缀——避开 OBSIDIAN_VAULT_PATH 等 Mac 专属路径），
-    使 CLI persona + node dev-agent 都继承到认证，与启动方式（交互/cron/SSH）无关。setdefault：已在环境中
+    本函数在编排器启动时统一注入：(1) ANTHROPIC_* 认证；(2) add-per-agent-model-routing 的 PA_*_MODEL*
+    per-agent 路由（PA_PERSONA_MODEL_<AGENT> / PA_DEV_MODEL / 未来 PA_REFLECTION_MODEL）——让 settings.json
+    env block 成为 per-agent 路由的统一配置入口（与 ANTHROPIC_* 同处）。避开 OBSIDIAN_VAULT_PATH 等 Mac 专属
+    路径、及 PA_HEARTBEAT / PA_CLAUDE_BIN 等非路由 PA_* 项（仅 PA_*_MODEL* 模式）。setdefault：已在环境中
     显式 export 的不覆盖（与 claude CLI 自身行为一致）。
     """
     sf = Path.home() / ".claude" / "settings.json"
@@ -3294,15 +3296,15 @@ def _load_claude_settings_env() -> None:
     try:
         env = json.loads(sf.read_text(encoding="utf-8")).get("env", {}) or {}
     except (OSError, ValueError) as e:
-        log(f"⚠ 读取 {sf} env block 失败（{e}），跳过 ANTHROPIC_* 注入")
+        log(f"⚠ 读取 {sf} env block 失败（{e}），跳过 ANTHROPIC_*/PA_*_MODEL 注入")
         return
     n = 0
     for k, v in env.items():
-        if k.startswith("ANTHROPIC_") and k not in os.environ:
+        if (k.startswith("ANTHROPIC_") or (k.startswith("PA_") and "_MODEL" in k)) and k not in os.environ:
             os.environ[k] = str(v)
             n += 1
     if n:
-        log(f"[env] 注入 {n} 个 ANTHROPIC_* 自 ~/.claude/settings.json（供 node dev-agent 的 SDK 子进程认证）")
+        log(f"[env] 注入 {n} 个 ANTHROPIC_*/PA_*_MODEL 自 ~/.claude/settings.json（认证 + per-agent 模型路由）")
 
 
 def main():
