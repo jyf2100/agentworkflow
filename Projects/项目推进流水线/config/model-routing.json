@@ -1,11 +1,11 @@
 {
   "pa-fetch-deepresearch": "sonnet",
-  "pa-fetch-wechat-url": "haiku",
-  "pa-fetch-github-repo": "haiku",
+  "pa-fetch-wechat-url": "qwen3.6-35b",
+  "pa-fetch-github-repo": "qwen3.6-35b",
   "pa-radar": "haiku",
   "pa-prd": "sonnet",
   "pa-prd-critic": "sonnet",
   "pa-verify": "sonnet",
   "pa-progress": "haiku",
-  "dev": "sonnet"
+  "dev": "qwen3.6-35b"
 }
