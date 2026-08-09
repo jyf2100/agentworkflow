@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 import run_daily  # noqa: E402
 
@@ -57,6 +59,13 @@ def test_run_persona_contract_violation_budget_exhausted_failopen(monkeypatch):
 # ─── per-agent model routing：twin 镜像守（add-per-agent-model-routing）─────────
 # review HIGH（3 人共识）：persona_call 端有 env 注入测试，run_daily 端（7 persona）零守护。
 # 此处补 twin 守护——捕获 run_persona 拼的 cmd，断言 equals 形式注入 / 不设则无。
+# 优先级：env（canary）> config/model-routing.json（主配置）> roc 默认。
+@pytest.fixture(autouse=True)
+def _isolate_model_routing_file(tmp_path, monkeypatch):
+    """隔离文件层：默认指向不存在的临时文件 → resolve 返回 None（env 测试不受真实 config 干扰）。"""
+    monkeypatch.setattr(run_daily.model_routing, "_DEFAULT_PATH", tmp_path / "isolated-empty.json")
+
+
 def _cmd_capturing_run(captured: dict):
     """记下每次 subprocess.run 收到的 cmd（位置参 args[0]），再返空信封。"""
     def _fake(*a, **k):
@@ -82,3 +91,29 @@ def test_run_persona_no_model_env_omits_flag(monkeypatch):
     monkeypatch.setattr(run_daily.subprocess, "run", _cmd_capturing_run(captured))
     run_daily.run_persona("pa-radar", "P", "radar", "t-radar2")
     assert not any(x.startswith("--model") for x in captured["cmds"][0])
+
+
+def test_run_persona_model_file_fallback_twin(monkeypatch, tmp_path):
+    """env 未设 + config 配 pa-radar=haiku → cmd 含 '--model=haiku'（文件兜底，twin 镜像 persona_call）。"""
+    for k in [k for k in os.environ if k.startswith("PA_PERSONA_MODEL_")]:
+        monkeypatch.delenv(k, raising=False)
+    cfg = tmp_path / "model-routing.json"
+    cfg.write_text(json.dumps({"pa-radar": "haiku"}), encoding="utf-8")
+    monkeypatch.setattr(run_daily.model_routing, "_DEFAULT_PATH", cfg)
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(run_daily.subprocess, "run", _cmd_capturing_run(captured))
+    run_daily.run_persona("pa-radar", "P", "radar", "t-radar3")
+    assert any(x == "--model=haiku" for x in captured["cmds"][0])
+
+
+def test_run_persona_model_env_overrides_file_twin(monkeypatch, tmp_path):
+    """env + 文件都配 → env 胜（canary 覆盖主配置，twin 镜像）。"""
+    monkeypatch.setenv("PA_PERSONA_MODEL_PA_RADAR", "opus")
+    cfg = tmp_path / "model-routing.json"
+    cfg.write_text(json.dumps({"pa-radar": "haiku"}), encoding="utf-8")
+    monkeypatch.setattr(run_daily.model_routing, "_DEFAULT_PATH", cfg)
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(run_daily.subprocess, "run", _cmd_capturing_run(captured))
+    run_daily.run_persona("pa-radar", "P", "radar", "t-radar4")
+    assert any(x == "--model=opus" for x in captured["cmds"][0])
+    assert not any(x == "--model=haiku" for x in captured["cmds"][0])

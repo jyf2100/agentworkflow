@@ -57,7 +57,7 @@ AND cmd 不含任何 `--model*`（走 roc 默认 glm-5.2）。
 #### Scenario: env 命中经 log 记审计行（review follow-up）
 
 WHEN `PA_PERSONA_MODEL_PA_PROGRESS=haiku` 且调 run_persona_subproc（传 log 回调）
-THEN log 含「model route → haiku（per-agent env）」审计行。
+THEN log 含「model route → haiku（env）」审计行。
 
 ### Requirement: Twin-mirror base_cmd alignment
 
@@ -113,18 +113,58 @@ WHEN `PA_DEV_MODEL=claude-sonnet-5`（裸 Anthropic id）
 THEN roc 代理拒绝该请求
 AND dev-agent 经现有非零退出 / is_error 路径 raise（不静默吞），错误可见。
 
-### Requirement: Config entry via settings.json env block
+### Requirement: Config via independent file (primary) + env override (canary)
 
-per-agent 模型路由的配置入口 SHALL 是 `~/.claude/settings.json` 的 `env` block：`_load_claude_settings_env`（`run_daily.py:3277`）启动时 SHALL 把 env block 里的 `ANTHROPIC_*` 与 `PA_*_MODEL*`（`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL` / 未来 `PA_REFLECTION_MODEL`）注入 `os.environ`（setdefault 语义）。注入条件 MUST 限定 `ANTHROPIC_` 前缀、或 `PA_` 前缀且含 `_MODEL`——避开 `PA_HEARTBEAT` / `PA_CLAUDE_BIN` / `OBSIDIAN_VAULT_PATH` 等非路由项。这让 settings.json env block 成为认证 + 路由的统一配置入口；cron 经 run_cron.sh → run_daily → dev-agent subprocess（`dict(os.environ)`）天然继承。
+per-agent 模型路由的**主配置源** SHALL 是独立文件 `Projects/项目推进流水线/config/model-routing.json`（独立于 `~/.claude/settings.json` 与认证 env，解耦——日常配置不经认证注入函数 `_load_claude_settings_env`）。零依赖模块 `scripts/model_routing.py` SHALL 解析之：`resolve_persona_model(agent_name)` / `resolve_dev_model()`；文件不存在 / 空 / key 缺 / null / 空串 → None（roc 默认，零变更 baseline）。
 
-#### Scenario: settings.json 配 PA_*_MODEL → 注入 os.environ 生效
+env `PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL` SHALL 保留作 canary 覆盖（临时覆盖主配置）。persona 优先级 SHALL 为 **env > 文件 > roc**；dev 经 `run_daily._dev_cmd` 解析 `env or resolve_dev_model()` 透传 `--model` flag（dev-agent 是 ADR-0006 纯调度器，不读控制面文件）。`_load_claude_settings_env` 的 `PA_*_MODEL` 注入保留作可选 canary 通道（env 配在 settings.json 时生效），日常用文件则不触发。
 
-WHEN `~/.claude/settings.json` env block 含 `"PA_PERSONA_MODEL_PA_PROGRESS": "haiku"` 且 run_daily 启动
-THEN `_load_claude_settings_env` 把它注入 `os.environ`
-AND pa-progress 的 base_cmd 含 `--model=haiku`，路由到 glm-5.1。
+#### Scenario: config 文件配 pa-progress → persona cmd 含 --model
 
-#### Scenario: 非 model 的 PA_* 不被注入
+WHEN `config/model-routing.json` 含 `{"pa-progress": "haiku"}` 且 env 未设
+THEN persona_call / run_persona 读文件 → cmd 含 `--model=haiku`（路由 glm-5.1）。
 
-WHEN settings.json env block 含 `PA_HEARTBEAT` / `PA_CLAUDE_BIN`（PA_* 但无 `_MODEL`）
-THEN `_load_claude_settings_env` 不注入它们（避开运行时 env 污染）
-AND 仅 `ANTHROPIC_*` + `PA_*_MODEL*` 被注入。
+#### Scenario: env 覆盖 config 文件（canary）
+
+WHEN env `PA_PERSONA_MODEL_PA_PROGRESS=opus` 且 config 配 `pa-progress=haiku`
+THEN cmd 含 `--model=opus`（env 胜，canary 覆盖主配置）。
+
+#### Scenario: dev model 经 _dev_cmd 文件透传
+
+WHEN config 配 `{"dev": "sonnet"}` 且 env `PA_DEV_MODEL` 未设
+THEN run_daily._dev_cmd 读文件 → cmd 含 `--model=sonnet`（dev-agent flag，路由 glm-5.2[1M]）。
+
+#### Scenario: 文件缺/空 → 走 roc 默认（零变更 baseline）
+
+WHEN `config/model-routing.json` 不存在 / `{}` / key 缺 / value null 或空串
+THEN resolve_* 返回 None → cmd 无 `--model` → 走 roc 默认 glm-5.2。
+
+#### Scenario: dev model 命中 → _dev_cmd 记 route 审计 log（对称 persona；review ⑤）
+
+WHEN `_dev_cmd` 解析到 dev model（env 或 config 文件）
+THEN run_daily log 含 `[dev] model route → <model>（env|config）` 审计行
+AND dev 是最昂贵的调用（完整 dev loop），route 行供 cron 后重建所用模型。
+
+#### Scenario: PA_DEV_MODEL 空串 → _dev_cmd 记 warn（对称 persona；review ⑥）
+
+WHEN env `PA_DEV_MODEL=""`（空串）
+THEN run_daily log 含 `⚠ PA_DEV_MODEL 设为空串` warn（配错反馈，对称 persona 空串 warn）
+AND cmd 不含 `--model*`（空串经 `or` 降级文件/roc 默认）。
+
+### Requirement: Degrade-without-raise contract + misconfig feedback (review 2026-08-09)
+
+`model_routing._load` SHALL 对**任意**损坏输入降级到 roc 默认且**不 raise**：缺文件 / IO 错（`OSError`）/ JSON 语法错（`ValueError`）/ 深嵌套（`RecursionError`，实测 `[`×10000 触发，须显式捕——不被 `ValueError` 覆盖）/ 超大文件（> `_MAX_BYTES` 64KB cap，防 `MemoryError`）/ 顶层非 object / value 非字符串。消费点（`run_persona` / `_dev_cmd` / `persona_call`）裸调用无 try/except 兜底，`_load` raise 会穿透致整晚 pipeline abort。
+
+配错 SHALL 经 `_log.warning` 反馈（无静默失败）：顶层非 object（对称语法错 warn）/ 未知 key（typo/大小写，如 `pa-progres` / `DEV`，比对 `_KNOWN_KEYS` 9 个已知 key）/ 超大文件。value 非字符串（int/bool/object 真值）SHALL 经 `_coerce`（`isinstance(v, str) and v`）归一为 None——不穿透成 `--model=123`，守 `str | None` 返回契约。
+
+#### Scenario: 深嵌套 JSON 触发 RecursionError → 降级不 raise
+
+WHEN `config/model-routing.json` 含 `[`×10000 + `]`×10000（深嵌套，触发 `RecursionError`）
+THEN `_load` 的 `except (OSError, ValueError, RecursionError)` 捕获 → warn + 返 `{}`
+AND resolve_* 返回 None → 走 roc 默认，**不穿透 raise 致 pipeline abort**。
+
+#### Scenario: value 非字符串 → None（守 str|None 契约）
+
+WHEN config 含 `{"dev": 123}` / `{"dev": true}` / `{"dev": {"x": 1}}`（非字符串真值）
+THEN `_coerce` 归一为 None（不穿透成 `--model=123` / `--model=True`）
+AND resolve_* 返回 None → 走 roc 默认。

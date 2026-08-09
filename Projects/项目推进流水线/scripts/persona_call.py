@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable
 
 from stage_contracts import validate_stage, render_repair_hint   # 纯 stdlib 模块
+import model_routing   # per-agent 模型路由配置解析（config/model-routing.json，零依赖）
 
 
 # ─── claude CLI 解析（复制自 run_daily.resolve_claude_bin，自包含）──────
@@ -111,17 +112,19 @@ def run_persona_subproc(
     """
     base_cmd = [claude_bin, "--agent", agent_name, "--output-format", "json",
                 "--max-turns", str(max_turns)]
-    # add-per-agent-model-routing：per-persona env 查表 → --model（不设=零变更 baseline）
-    # equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 对 dash-leading
-    #   value flag 的安全惯例，单 token 绑定消 parser 灰色地带）；空串 env 显式 warn（配错反馈）。
+    # add-per-agent-model-routing：per-persona 模型路由 → --model（不设=零变更 baseline）
+    # 优先级：env PA_PERSONA_MODEL_<AGENT>（canary 覆盖）> config/model-routing.json（主配置）> roc 默认。
+    # equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 对 dash-leading value flag
+    #   的安全惯例，单 token 绑定消 parser 灰色地带）；空串 env 显式 warn（配错反馈）；命中经 log 记 route 行。
     _env_key = f"PA_PERSONA_MODEL_{agent_name.upper().replace('-', '_')}"
-    _model = os.environ.get(_env_key)
-    if _model == "" and log:
-        log(f"[{agent_name}] ⚠ {_env_key} 设为空串（忽略→走 roc 默认 glm-5.2）")
+    _env_model = os.environ.get(_env_key)
+    if _env_model == "" and log:
+        log(f"[{agent_name}] ⚠ {_env_key} 设为空串（忽略→走文件/roc 默认）")
+    _model = _env_model or model_routing.resolve_persona_model(agent_name)
     if _model:
         base_cmd += [f"--model={_model}"]
         if log:
-            log(f"[{agent_name}] model route → {_model}（per-agent env）")
+            log(f"[{agent_name}] model route → {_model}（{'env' if _env_model else 'config'}）")
     if allowed_tools:
         base_cmd += ["--allowedTools", ",".join(allowed_tools)]
     cur_prompt = prompt

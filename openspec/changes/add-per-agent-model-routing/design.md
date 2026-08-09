@@ -87,15 +87,21 @@ pa 两类 LLM 调用路径均刻意省略 model，走 roc 默认：
 - **空串 env 显式 warn**（review follow-up，3 人共识）：`PA_PERSONA_MODEL_X=""` 被 `if _model:` 跳过 = 配错无反馈。现 `_model == ""` 时经 log 回调（persona_call）/ 全局 log（run_daily）warn「设为空串→走 roc 默认」。
 - **审计 log**（review follow-up，architect LOW + security LOW）：env 命中时 log「model route → X（per-agent env）」—— cron 调试可观测性（配了什么模型 / 走没走路由）。
 
-### D8：配置入口 = settings.json env block（_load_claude_settings_env 注入 PA_*_MODEL）
+### D8：配置入口 = 独立文件（主）+ env PA_*_MODEL（canary 覆盖）
 
-review 后续发现（用户问「env 表配置在哪」暴露）：机制读 `os.environ`，但 `_load_claude_settings_env`（`run_daily.py:3277`）原本只注入 `ANTHROPIC_` 前缀 → settings.json 里写 `PA_PERSONA_MODEL_*` 读不到。**扩注入条件**为 `(k.startswith("ANTHROPIC_") or (k.startswith("PA_") and "_MODEL" in k))`，让 settings.json env block 成为 per-agent 路由的**统一配置入口**（与 `ANTHROPIC_*` 认证同处一处）。仅 `PA_*_MODEL*` 模式（避开 `PA_HEARTBEAT` / `PA_CLAUDE_BIN` / `OBSIDIAN_VAULT_PATH` 等非路由项）。setdefault 语义不变。
+**解耦动机**（用户「不做强耦合」）：阶段 C/D 初版把 per-agent 路由配置塞进 `~/.claude/settings.json` env block，经 `_load_claude_settings_env` 注入 os.environ。但这让**认证注入函数"知道"了路由的 `_MODEL` 命名约定**——职责混合 + 知识泄漏（新增 `PA_REFLECTION_MODEL` 要回来改注入条件）。用户要求解耦。
 
-**配置样例**（`~/.claude/settings.json` 的 `env` block，纯 JSON 无注释——`json.loads` 遇注释会失败跳过注入）：
+**修订（独立文件为主）**：主配置源 = `Projects/项目推进流水线/config/model-routing.json`（独立于 settings.json / 认证），由零依赖模块 `scripts/model_routing.py` 解析（`resolve_persona_model` / `resolve_dev_model`，路径经 `parents[1]/config/...` 自定位，不依赖 cwd）。3 个消费点各自读文件：`persona_call.run_persona_subproc` / `run_daily.run_persona`（双胞胎镜像，`env or resolve_persona_model(name)`）/ `run_daily._dev_cmd`（dev：`env or resolve_dev_model()` 透传 `--model` flag）。
+
+**env 保留作 canary 覆盖**（用户选「env 保留作覆盖」）：`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL` 保留，优先级 **env > 文件 > roc**（canary 临时覆盖主配置）。`_load_claude_settings_env` 的 `PA_*_MODEL` 注入**保留**（env canary 配在 settings.json 时仍生效），但降级为**可选 canary 通道**——日常用文件则不触发，不强耦合认证。
+
+**dev 优先级细节**：dev-agent 是 ADR-0006 纯调度器（cwd-相对，不读控制面文件），故文件经 `run_daily._dev_cmd` 解析（`env or 文件`）转成 `--model` flag 送达；dev-agent 内 `flag > env > roc`（flag 由 run_daily 透传或手动 `--model`，env 自查在 cron 下被 flag 短路）。**dev 路由知识属编排器职责**（review architect #4）：dev 经 `_dev_cmd` 代读文件转 flag，与 persona「消费点自解析文件」不对称，但 ADR-0006（dev-agent 不读控制面文件）正当化此间接层——耦合点从认证函数迁移到编排器（auth → orchestrator），而非 persona 的消费点自治；这是有意取舍，非缺陷。
+
+**配置样例**（`config/model-routing.json`，纯 JSON 无注释）：
 ```json
-{ "env": { "PA_PERSONA_MODEL_PA_PROGRESS": "haiku", "PA_DEV_MODEL": "sonnet" } }
+{ "pa-progress": "haiku", "dev": "sonnet" }
 ```
-不设任何 `PA_*_MODEL` = 默认全走 glm-5.2（零变更 baseline）。值须 roc 别名（haiku=glm-5.1 / sonnet|opus|fable=glm-5.2[1M]）；裸 Anthropic id 被 roc 拒。cron 经 run_cron.sh → run_daily（注入）→ dev-agent subprocess（`dict(os.environ)` 继承）天然生效，无需 run_daily 显式透传。
+key = agent_name（如 pa-progress）或 `"dev"`；value = roc 别名（haiku=glm-5.1 / sonnet|opus|fable=glm-5.2[1M]）；裸 Anthropic id 被 roc 拒。文件不存在 / 空 / key 缺 / null / 空串 → None（走 roc 默认 glm-5.2，零变更 baseline）。
 
 ## Open Questions
 

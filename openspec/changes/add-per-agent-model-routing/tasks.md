@@ -45,6 +45,16 @@ TDD 顺序：先写测试（RED）→ 最小实现（GREEN）→ ruff 干净（�
 - [x] R5 审计 log（architect LOW + security LOW）：env 命中 log route 行
 - [x] R6 文档更正：design D4/D6/D7 + Non-Goals reflection 论据修正 + spec scenario + tasks
 - [x] R7 配置入口（用户问「env 表在哪」暴露的缺口）：`_load_claude_settings_env` 扩注入条件含 `PA_*_MODEL*` → settings.json env block 成统一配置入口；+ `test_load_claude_settings_env.py` 3 测试（注入/非路由项跳过/setdefault）
+- [x] R8 独立文件解耦（用户「不做强耦合」：主配置塞 settings.json → 认证注入函数知道路由 `_MODEL` 命名 = 职责混合/知识泄漏）：主配置改 `config/model-routing.json` + 零依赖 `model_routing.py`（`resolve_persona_model`/`resolve_dev_model`，路径 `parents[1]/config/...` 自定位）；3 消费点 env 查表 → `env or 文件`（env 降级 canary 覆盖，文件为主）；dev 经 `_dev_cmd` 解析 `env or resolve_dev_model()` 透传 `--model`（dev-agent 纯调度器不读文件）；env 注入保留作 canary 通道；+ `test_model_routing.py` 6 测试 + persona/twin/dev_cmd 文件兜底测试
+- [x] R9 review 修复（5 专家团队 review 阶段 E，用户选「核心 7 项全修」；architect 维度输出被 harness 安全 hook 中和——settings-json pattern——无有效结论）：
+  - ① RecursionError 契约（security MED）：`_load` 扩 except `RecursionError` + read_text 64KB cap（`_MAX_BYTES`）→ 深/超大 JSON 降级不 raise（守「不 raise」契约，防 pipeline abort；实测 `[`×10000 触发）
+  - ② value 类型校验（python MED + security LOW-2 共识）：`_coerce`（`isinstance str`）守 `str|None` 契约，非字符串真值（int/bool/object）不穿透成 `--model=123`
+  - ③ 非 dict JSON warn（silent-failure HIGH）：顶层非 object → warn（symmetry 语法错 warn）
+  - ④ 未知 key warn（silent-failure HIGH）：`_KNOWN_KEYS`（9 key 闭集），typo/大小写 → warn（主配置通道配错反馈）
+  - ⑤ dev route log（silent-failure MED）：`_dev_cmd` 加 `[dev] model route` 审计 log（对称 persona run_persona route log，dev 最贵调用零审计补齐）
+  - ⑥ dev 空串 warn（python MED + silent-failure HIGH 共识）：`PA_DEV_MODEL=""` → log warn（对称 persona 空串 warn）
+  - ⑦ spec 文档（code-reviewer LOW）：route log 文本「(per-agent env)」→「(env)」对齐代码
+  - +7 测试（5 `test_model_routing` + 2 `test_dev_cmd_retry`），quality 1568 passed；spec 加 `Degrade-without-raise contract + misconfig feedback` requirement + dev route/空串 scenario
 
 ### 列 follow-up（不本 change 做）
 
@@ -52,3 +62,5 @@ TDD 顺序：先写测试（RED）→ 最小实现（GREEN）→ ruff 干净（�
 - model 值字符集早拒正则（security MED + silent-failure D6 MED，defense-in-depth）
 - stderr 透传脱敏（security MED，既有债务，与 external_state.sanitize 统一）
 - dev 全链 canary（silent-failure MED，SDK 源码 + persona canary 已间接证）
+- review R9 新增：文件值空串 warn（silent-failure M-1）/ `_load` 类型注解 `dict`→`dict[str,object]`（LOW）/ persona `log=None` 时 logging 兜底（LOW）/ `resolve()` 跟 symlink 自定位 defense-in-depth（security LOW-1）/ `build_env_for_sdk` 泄 `PA_DEV_MODEL` 到目标面 SDK（ADR-0001 边界，security LOW-3）
+- review architect 解耦演进（非阻断，本 change 外，architect 补派确认「主路径隔离」达成、「彻底职责剥离」是后续）：(a) 彻底拆 `PA_*_MODEL` 注入出 `_load_claude_settings_env`（当前认证函数仍持 `PA_*_MODEL` 命名规约 → 拆独立注入器或纯文件 + cron 显式 export，MED）；(b) `_KNOWN_KEYS` 从 `.claude/agents/pa-*.md` frontmatter 自动枚举 agent_name（当前硬编码 9 key 闭集 + 注释标明，新增路由要手改，MED）；(c) env→warn→fallback→log 解析模板抽 `resolve_route_with_override(env_key, file_value, label, log)` helper（dev 路径先 adopt，双胞胎 persona 保留显式同形可审计，MED）

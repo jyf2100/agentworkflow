@@ -203,6 +203,15 @@ def test_progress_contract_registered():
 # ─── per-agent model routing（add-per-agent-model-routing）──────────
 # equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 对 dash-leading value flag
 # 的安全惯例——单 token 绑定，消除 parser 把 `-foo` model value 当独立 flag 的灰色地带）。
+# 优先级：env PA_PERSONA_MODEL_<AGENT>（canary 覆盖）> config/model-routing.json（主配置）> roc 默认。
+@pytest.fixture(autouse=True)
+def _isolate_model_routing_file(tmp_path, monkeypatch):
+    """隔离文件层：默认指向不存在的临时文件 → resolve 返回 None（env 测试不受真实 config 干扰）。
+
+    文件兜底测试自行 monkeypatch _DEFAULT_PATH 指向有值临时文件覆盖此默认。"""
+    monkeypatch.setattr(persona_call.model_routing, "_DEFAULT_PATH", tmp_path / "isolated-empty.json")
+
+
 def _cmd_capturing_runner(captured: dict):
     """记下每次 subprocess.run 收到的 cmd（位置参 args[0]），再返合法两层 JSON 信封。"""
     def _run(*a, **k):
@@ -262,3 +271,29 @@ def test_persona_model_env_logs_route_for_observability(monkeypatch):
         "claude", "pa-progress", "P", max_turns=15, timeout=120,
         log=lambda m: captured["logs"].append(m))
     assert any("route" in m and "haiku" in m for m in captured["logs"])
+
+
+def test_persona_model_file_fallback_when_no_env(monkeypatch, tmp_path):
+    """env 未设 + config 配 pa-progress=haiku → cmd 含 --model=haiku（文件兜底，主配置源）。"""
+    for k in [k for k in os.environ if k.startswith("PA_PERSONA_MODEL_")]:
+        monkeypatch.delenv(k, raising=False)
+    cfg = tmp_path / "model-routing.json"
+    cfg.write_text(json.dumps({"pa-progress": "haiku"}), encoding="utf-8")
+    monkeypatch.setattr(persona_call.model_routing, "_DEFAULT_PATH", cfg)   # 覆盖 autouse 默认
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(persona_call.subprocess, "run", _cmd_capturing_runner(captured))
+    persona_call.run_persona_subproc("claude", "pa-progress", "P", max_turns=15, timeout=120)
+    assert any(x == "--model=haiku" for x in captured["cmds"][0])
+
+
+def test_persona_model_env_overrides_file(monkeypatch, tmp_path):
+    """env + 文件都配 → env 胜（canary 覆盖主配置，env > 文件）。"""
+    monkeypatch.setenv("PA_PERSONA_MODEL_PA_PROGRESS", "opus")
+    cfg = tmp_path / "model-routing.json"
+    cfg.write_text(json.dumps({"pa-progress": "haiku"}), encoding="utf-8")
+    monkeypatch.setattr(persona_call.model_routing, "_DEFAULT_PATH", cfg)
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(persona_call.subprocess, "run", _cmd_capturing_runner(captured))
+    persona_call.run_persona_subproc("claude", "pa-progress", "P", max_turns=15, timeout=120)
+    assert any(x == "--model=opus" for x in captured["cmds"][0])
+    assert not any(x == "--model=haiku" for x in captured["cmds"][0])

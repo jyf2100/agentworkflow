@@ -1,0 +1,11 @@
+{
+  "pa-fetch-deepresearch": "sonnet",
+  "pa-fetch-wechat-url": "haiku",
+  "pa-fetch-github-repo": "haiku",
+  "pa-radar": "haiku",
+  "pa-prd": "sonnet",
+  "pa-prd-critic": "sonnet",
+  "pa-verify": "sonnet",
+  "pa-progress": "haiku",
+  "dev": "sonnet"
+}

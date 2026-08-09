@@ -14,7 +14,16 @@ recover_iteration 接入与 budget 终止的门控逻辑在 run_daily.dispatch_o
 （``if _coord.flags.session_aware_retry ...``），由 test_dispatch_flag_integration / test_coordinator
 覆盖 flag→路径边界；本文件专注 _dev_cmd 的纯函数参数生成。
 """
+import pytest
+
 import run_daily
+
+
+@pytest.fixture(autouse=True)
+def _isolate_dev_model_routing(tmp_path, monkeypatch):
+    """隔离 dev model 路由：env 清 + 文件指向不存在（baseline 测试不受真实 config/env 干扰）。"""
+    monkeypatch.delenv("PA_DEV_MODEL", raising=False)
+    monkeypatch.setattr(run_daily.model_routing, "_DEFAULT_PATH", tmp_path / "isolated-empty.json")
 
 
 def _cmd(**kw) -> list:
@@ -66,3 +75,54 @@ def test_new_session_mode_emits_neither():
     cmd = _cmd(state_dir="/x", iteration_seq=2)
     assert "--resume-session" not in cmd
     assert "--fork-session" not in cmd
+
+
+# ─── per-agent model routing：_dev_cmd 文件透传（add-per-agent-model-routing）─────────
+# dev-agent 是 ADR-0006 纯调度器，不读控制面文件；config 的 "dev" key + env PA_DEV_MODEL
+# 经 _dev_cmd 解析成 --model flag 送达 dev-agent。优先级：env（canary 覆盖）> config 文件 > 不透传。
+def test_dev_model_file_routed_to_flag(tmp_path, monkeypatch):
+    """config 配 "dev": sonnet → _dev_cmd 透传 --model=sonnet（文件为主配置源）。"""
+    cfg = tmp_path / "model-routing.json"
+    cfg.write_text('{"dev": "sonnet"}', encoding="utf-8")
+    monkeypatch.setattr(run_daily.model_routing, "_DEFAULT_PATH", cfg)
+    cmd = _cmd()
+    assert "--model=sonnet" in cmd
+
+
+def test_dev_model_env_overrides_file(tmp_path, monkeypatch):
+    """env PA_DEV_MODEL + 文件都配 → env 胜（canary 覆盖主配置）。"""
+    monkeypatch.setenv("PA_DEV_MODEL", "haiku")
+    cfg = tmp_path / "model-routing.json"
+    cfg.write_text('{"dev": "sonnet"}', encoding="utf-8")
+    monkeypatch.setattr(run_daily.model_routing, "_DEFAULT_PATH", cfg)
+    cmd = _cmd()
+    assert "--model=haiku" in cmd
+    assert "--model=sonnet" not in cmd
+
+
+def test_dev_model_neither_env_nor_file_omits_flag(tmp_path, monkeypatch):
+    """env 未设 + 文件未配 dev → cmd 无 --model*（baseline byte-identical）。"""
+    monkeypatch.setattr(run_daily.model_routing, "_DEFAULT_PATH", tmp_path / "nope.json")
+    cmd = _cmd()
+    assert not any(x.startswith("--model") for x in cmd)
+
+
+# ─── review 2026-08-09 dev 对称性（⑤route log ⑥空串 warn，对称 persona run_persona）──
+def test_dev_model_env_empty_warns(capsys, monkeypatch):
+    """PA_DEV_MODEL="" → log warn（对称 persona 空串 warn；review ⑥）。"""
+    monkeypatch.setenv("PA_DEV_MODEL", "")
+    cmd = _cmd()
+    out = capsys.readouterr().out
+    assert "PA_DEV_MODEL 设为空串" in out
+    assert not any(x.startswith("--model") for x in cmd)
+
+
+def test_dev_model_route_logged(capsys, tmp_path, monkeypatch):
+    """dev model 命中（文件）→ log [dev] model route 审计行（对称 persona route log；review ⑤）。"""
+    cfg = tmp_path / "model-routing.json"
+    cfg.write_text('{"dev": "sonnet"}', encoding="utf-8")
+    monkeypatch.setattr(run_daily.model_routing, "_DEFAULT_PATH", cfg)
+    cmd = _cmd()
+    out = capsys.readouterr().out
+    assert "[dev] model route → sonnet" in out
+    assert "--model=sonnet" in cmd

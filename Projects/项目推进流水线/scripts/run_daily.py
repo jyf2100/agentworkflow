@@ -45,6 +45,7 @@ from pathlib import Path
 
 from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（消解 ADR-0004 #4 shadow；无依赖模块，顶部 import 不触发 sdk 连带加载拖垮 cron）
 from stage_contracts import validate_stage, render_repair_hint  # change 2026-07-28：stage 输出契约层（fail-open 校验 + 诊断重试提示；纯 stdlib，cron 安全）
+import model_routing  # add-per-agent-model-routing：per-agent 模型路由配置解析（config/model-routing.json，零依赖，cron 安全）
 from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
 from coordinator import build_coordinator, preflight  # task 2.1/2.5：runtime coordinator 边界 + flag 组合 preflight（design 决策#1；纯 stdlib，cron 安全）
 from feature_flags import resolve_flags  # add-cross-prd-learning-memory Section 7：learning flag 解析（V1 allowlist + env/profile 三态）
@@ -407,15 +408,17 @@ def run_persona(name: str, prompt: str, stage: str, label: str,
     allowed_tools：MCP 工具白名单透传（fetch 段调 exa 必须，--allowedTools 逗号分隔）。"""
     base_cmd = [resolve_claude_bin(), "--agent", name, "--output-format", "json",
                 "--max-turns", str(MAX_TURNS[stage])]
-    # add-per-agent-model-routing：per-persona env 查表 → --model（与 persona_call base_cmd 镜像；不设=零变更 baseline）
+    # add-per-agent-model-routing：per-persona 模型路由 → --model（与 persona_call base_cmd 镜像；不设=零变更 baseline）
+    # 优先级：env PA_PERSONA_MODEL_<AGENT>（canary 覆盖）> config/model-routing.json（主配置）> roc 默认。
     # equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 安全惯例）；空串 env 显式 warn。
     _env_key = f"PA_PERSONA_MODEL_{name.upper().replace('-', '_')}"
-    _model = os.environ.get(_env_key)
-    if _model == "":
-        log(f"[{label}] ⚠ {_env_key} 设为空串（忽略→走 roc 默认 glm-5.2）")
+    _env_model = os.environ.get(_env_key)
+    if _env_model == "":
+        log(f"[{label}] ⚠ {_env_key} 设为空串（忽略→走文件/roc 默认）")
+    _model = _env_model or model_routing.resolve_persona_model(name)
     if _model:
         base_cmd += [f"--model={_model}"]
-        log(f"[{label}] model route → {_model}（per-agent env）")
+        log(f"[{label}] model route → {_model}（{'env' if _env_model else 'config'}）")
     if allowed_tools:
         base_cmd += ["--allowedTools", ",".join(allowed_tools)]
     cur_prompt = prompt
@@ -1281,6 +1284,18 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
         cmd += ["--resume-session", resume_session]
     if fork_session:
         cmd += ["--fork-session"]
+    # add-per-agent-model-routing：dev loop 模型路由 → --model 透传（dev-agent 是 ADR-0006 纯调度器，
+    # 不读控制面文件；config/model-routing.json 的 "dev" key + env PA_DEV_MODEL 经此处解析成 flag 送达）。
+    # 优先级（run_daily 解析）：env PA_DEV_MODEL（canary 覆盖）> config 文件 > 不透传。
+    # dev-agent 内：flag（此处透传/手动 --model）> env（自查，cron 下被 flag 短路）> roc 默认。
+    # 配错反馈 + 审计 log（review 2026-08-09：对称 persona run_persona route log + 空串 warn）。
+    _dev_env = os.environ.get("PA_DEV_MODEL")
+    if _dev_env == "":
+        log("⚠ PA_DEV_MODEL 设为空串（忽略→走文件/roc 默认）")
+    _dev_model = _dev_env or model_routing.resolve_dev_model()
+    if _dev_model:
+        cmd += [f"--model={_dev_model}"]
+        log(f"[dev] model route → {_dev_model}（{'env' if _dev_env else 'config'}）")
     return cmd
 
 
@@ -3285,10 +3300,10 @@ def _load_claude_settings_env() -> None:
     cron 下 Mac 同样会崩（潜伏 bug，迁移 smoke 才暴露）。
 
     本函数在编排器启动时统一注入：(1) ANTHROPIC_* 认证；(2) add-per-agent-model-routing 的 PA_*_MODEL*
-    per-agent 路由（PA_PERSONA_MODEL_<AGENT> / PA_DEV_MODEL / 未来 PA_REFLECTION_MODEL）——让 settings.json
-    env block 成为 per-agent 路由的统一配置入口（与 ANTHROPIC_* 同处）。避开 OBSIDIAN_VAULT_PATH 等 Mac 专属
-    路径、及 PA_HEARTBEAT / PA_CLAUDE_BIN 等非路由 PA_* 项（仅 PA_*_MODEL* 模式）。setdefault：已在环境中
-    显式 export 的不覆盖（与 claude CLI 自身行为一致）。
+    per-agent 路由 env（generic 模式匹配，具体路由名见 model_routing.py）——作 **canary 覆盖通道**（日常主配置
+    走独立文件 config/model-routing.json，不经此函数；PA_*_MODEL env 仅在配 settings.json env block 时生效）。
+    避开 OBSIDIAN_VAULT_PATH 等 Mac 专属路径、及 PA_HEARTBEAT / PA_CLAUDE_BIN 等非路由 PA_* 项（仅 PA_*_MODEL*
+    模式）。setdefault：已在环境中显式 export 的不覆盖（与 claude CLI 自身行为一致）。
     """
     sf = Path.home() / ".claude" / "settings.json"
     if not sf.is_file():
