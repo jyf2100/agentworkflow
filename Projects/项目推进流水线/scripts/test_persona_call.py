@@ -17,6 +17,7 @@ AAA 结构（Arrange / Act / Assert）。
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -197,3 +198,67 @@ def test_progress_contract_registered():
     assert stage_contracts.validate_stage("progress", {"verdict": "off_track"}) == []
     issues = stage_contracts.validate_stage("progress", {"verdict": "maybe"})
     assert any(i.severity == "error" and i.field == "verdict" for i in issues)
+
+
+# ─── per-agent model routing（add-per-agent-model-routing）──────────
+# equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 对 dash-leading value flag
+# 的安全惯例——单 token 绑定，消除 parser 把 `-foo` model value 当独立 flag 的灰色地带）。
+def _cmd_capturing_runner(captured: dict):
+    """记下每次 subprocess.run 收到的 cmd（位置参 args[0]），再返合法两层 JSON 信封。"""
+    def _run(*a, **k):
+        captured["cmds"].append(list(a[0]))
+        return _FakeProc(stdout=json.dumps({"result": '{"ok": true}', "is_error": False}))
+    return _run
+
+
+def test_persona_model_env_injects_model_flag(monkeypatch):
+    """设 PA_PERSONA_MODEL_PA_PROGRESS=haiku → cmd 含 '--model=haiku'（equals 单 token 形式）。"""
+    monkeypatch.setenv("PA_PERSONA_MODEL_PA_PROGRESS", "haiku")
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(persona_call.subprocess, "run", _cmd_capturing_runner(captured))
+    persona_call.run_persona_subproc("claude", "pa-progress", "P", max_turns=15, timeout=120)
+    assert any(x == "--model=haiku" for x in captured["cmds"][0])
+
+
+def test_no_persona_model_env_omits_model_flag(monkeypatch):
+    """不设任何 PA_PERSONA_MODEL_* → cmd 无任何 --model*（baseline byte-identical）。"""
+    for k in [k for k in os.environ if k.startswith("PA_PERSONA_MODEL_")]:
+        monkeypatch.delenv(k, raising=False)
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(persona_call.subprocess, "run", _cmd_capturing_runner(captured))
+    persona_call.run_persona_subproc("claude", "pa-progress", "P", max_turns=15, timeout=120)
+    assert not any(x.startswith("--model") for x in captured["cmds"][0])
+
+
+def test_persona_model_env_key_dash_to_underscore(monkeypatch):
+    """agent_name='pa-fetch-github-repo' → 查 PA_PERSONA_MODEL_PA_FETCH_GITHUB_REPO（连字符→下划线+大写）。"""
+    monkeypatch.setenv("PA_PERSONA_MODEL_PA_FETCH_GITHUB_REPO", "sonnet")
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(persona_call.subprocess, "run", _cmd_capturing_runner(captured))
+    persona_call.run_persona_subproc("claude", "pa-fetch-github-repo", "P", max_turns=15, timeout=120)
+    assert any(x == "--model=sonnet" for x in captured["cmds"][0])
+
+
+def test_persona_model_env_empty_warns_and_omits(monkeypatch):
+    """空串 env（PA_PERSONA_MODEL_X=""）→ 经 log 回调 warn + cmd 不含 --model（走 roc 默认）。
+
+    review follow-up（3 人共识）：空串被静默当未设 = 配错无反馈。现显式 warn。"""
+    monkeypatch.setenv("PA_PERSONA_MODEL_PA_PROGRESS", "")
+    captured: dict = {"cmds": [], "logs": []}
+    monkeypatch.setattr(persona_call.subprocess, "run", _cmd_capturing_runner(captured))
+    persona_call.run_persona_subproc(
+        "claude", "pa-progress", "P", max_turns=15, timeout=120,
+        log=lambda m: captured["logs"].append(m))
+    assert not any(x.startswith("--model") for x in captured["cmds"][0])
+    assert any("空串" in m for m in captured["logs"]), "空串 env 须经 log 回调 warn"
+
+
+def test_persona_model_env_logs_route_for_observability(monkeypatch):
+    """设 env 命中 → 经 log 回调记审计行（cron 调试可观测性；review 2 人共识）。"""
+    monkeypatch.setenv("PA_PERSONA_MODEL_PA_PROGRESS", "haiku")
+    captured: dict = {"cmds": [], "logs": []}
+    monkeypatch.setattr(persona_call.subprocess, "run", _cmd_capturing_runner(captured))
+    persona_call.run_persona_subproc(
+        "claude", "pa-progress", "P", max_turns=15, timeout=120,
+        log=lambda m: captured["logs"].append(m))
+    assert any("route" in m and "haiku" in m for m in captured["logs"])

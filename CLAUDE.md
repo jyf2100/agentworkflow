@@ -87,7 +87,12 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 cron 会崩，所以调度是 journal-driven 的：`journal.py`（事件流）、`recovery_cli.py`（崩溃恢复，中部损坏 fail-closed 不静默跳过）、`reconcile.py`（crash 后 reconcile 远端副作用到 exactly-once）、`cutover.py`（feature flag 切换前的 shadow parity 证据）、`feature_flags.py` + `hook_adapter.py` + `container_sandbox.py` + `retry_policy.py`（会话感知重试）。`runtime_evidence.py` / `quality_evidence.py` 产出可复核的 rollout 证据。改这套要对照 `RUNBOOK.md` 和 `openspec/specs/durable-*`。
 
 ### 模型约定
-persona 调用**省略 model 参数** → 走 roc LiteLLM 代理默认（`glm-5.2`）。**切勿传裸 Anthropic model id**（会被代理拒绝）。
+persona 调用**默认省略 model 参数** → 走 roc LiteLLM 代理默认（`glm-5.2`）。**切勿传裸 Anthropic model id**（会被代理拒绝）。
+
+**per-agent 模型路由**（`add-per-agent-model-routing`，默认零变更）：每个 agent 可经 env 单独配模型，不设 = 走 roc 默认（baseline 不变）。
+- **persona**（8 个）：env `PA_PERSONA_MODEL_<AGENT>` → CLI `--model=<值>`（equals 单 token）。`<AGENT>` = `agent_name.upper().replace('-', '_')`（如 pa-progress → `PA_PERSONA_MODEL_PA_PROGRESS`、pa-fetch-github-repo → `PA_PERSONA_MODEL_PA_FETCH_GITHUB_REPO`）。两处 base_cmd 镜像（`scripts/persona_call.py` + `scripts/run_daily.py`）；空串 env warn、命中记 route 审计 log。
+- **dev loop**：`PA_DEV_MODEL` env（cron 经 subprocess 继承）或 `dev-agent.py --model`（手动/canary）；优先级 flag > env > roc 默认（flag 精确语义 `is not None`：空 flag 胜出不回退 env）。
+- **值约束**：roc fast alias（`haiku` / `sonnet` / `opus` / `fable`）或裸 `glm-*`。`haiku` = glm-5.1（更轻），其余 = glm-5.2[1M]。裸 Anthropic id 被 roc 拒（运行时）。详见 `openspec/changes/add-per-agent-model-routing/`。
 
 ## 开发约定
 

@@ -100,7 +100,9 @@ def parse_args(argv: list[str]) -> dict:
            # task 7.1a：shadow classify-only（--phase merge --classify-only 时用；CLEAN 也只判不 merge/push）
            "classify_only": False,
            # task 4.x：post-merge-test / revert phase 参数（--phase post-merge-test|revert 时用）
-           "test_cmd": None, "merge_commit": None, "timeout": None}
+           "test_cmd": None, "merge_commit": None, "timeout": None,
+           # add-per-agent-model-routing：per-dev model（手动 --model / canary；不设=走 PA_DEV_MODEL env→roc 默认）
+           "model": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -123,6 +125,7 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--test-cmd": out["test_cmd"] = argv[i + 1]; i += 1               # task 4.1：post-merge 全量测试命令（控制面传 verify 用过的）
         elif a == "--merge-commit": out["merge_commit"] = argv[i + 1]; i += 1       # task 4.3：待 revert 的单一 merge commit sha
         elif a == "--timeout": out["timeout"] = argv[i + 1]; i += 1                 # task 4.1：post-merge test wall-clock 上界（D10）
+        elif a == "--model": out["model"] = argv[i + 1]; i += 1                     # add-per-agent-model-routing：per-dev model（手动/canary；flag > PA_DEV_MODEL env > roc 默认）
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
     return out
@@ -829,9 +832,15 @@ async def main() -> int:
         # 违背 D5 fail-open（本机制从护栏变杀进程单点）；(2) 消除跨 leg 对象复用的隐性状态泄漏。
         # 纯重构、零行为变更（options 构造本就不在单测覆盖）。
         def _build_options(*, resume, fork_session):
+            # add-per-agent-model-routing：flag > PA_DEV_MODEL env > None(roc 默认 glm-5.2)；勿传裸 Anthropic model id（roc 拒）
+            #   flag 精确语义（review follow-up，3 人共识）：--model 设了（哪怕空串）= flag 胜
+            #   （空→model="" → SDK truthiness 跳过 → roc 默认）；仅 flag 缺省(None)才回退 env。
+            #   `is not None` 避免空 flag 经 `or` 静默回退 env（违 D4 flag 优先）。
+            _dev_flag = args.get("model")
+            _model = _dev_flag if _dev_flag is not None else os.environ.get("PA_DEV_MODEL")
             return ClaudeAgentOptions(
                 cwd=str(REPO_ROOT),
-                # model 刻意省略 → 走 roc 代理默认（glm-5.2）；勿传裸 Anthropic model id
+                model=_model,
                 permission_mode="acceptEdits",          # 编辑类自动过；Bash 不自动批 → 走 can_use_tool 闸（下）
                 can_use_tool=_can_use_tool,             # ADR-0006 #7：Bash 放行长效修法，摆脱机器本地 settings 依赖
                 setting_sources=["project"],            # 加载仓 CLAUDE.md(仓特定守则) + .claude/hooks

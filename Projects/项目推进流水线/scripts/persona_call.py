@@ -111,6 +111,17 @@ def run_persona_subproc(
     """
     base_cmd = [claude_bin, "--agent", agent_name, "--output-format", "json",
                 "--max-turns", str(max_turns)]
+    # add-per-agent-model-routing：per-persona env 查表 → --model（不设=零变更 baseline）
+    # equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 对 dash-leading
+    #   value flag 的安全惯例，单 token 绑定消 parser 灰色地带）；空串 env 显式 warn（配错反馈）。
+    _env_key = f"PA_PERSONA_MODEL_{agent_name.upper().replace('-', '_')}"
+    _model = os.environ.get(_env_key)
+    if _model == "" and log:
+        log(f"[{agent_name}] ⚠ {_env_key} 设为空串（忽略→走 roc 默认 glm-5.2）")
+    if _model:
+        base_cmd += [f"--model={_model}"]
+        if log:
+            log(f"[{agent_name}] model route → {_model}（per-agent env）")
     if allowed_tools:
         base_cmd += ["--allowedTools", ",".join(allowed_tools)]
     cur_prompt = prompt

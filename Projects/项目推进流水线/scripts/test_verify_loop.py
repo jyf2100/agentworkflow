@@ -513,6 +513,19 @@ def test_dev_agent_parse_args_feedback_artifact():
     assert da.parse_args(["--prd", "p.md"])["feedback_artifact"] is None
 
 
+def test_dev_agent_parse_args_model():
+    """add-per-agent-model-routing：dev-agent parse_args 解析 --model（手动/canary）。
+
+    review follow-up（code-review MED）：推翻 design「dev-agent 不可 import」论据——
+    test_verify_loop._dev_agent() 已用 importlib lazy 加载，parse_args --model 可直测。"""
+    da = _dev_agent()
+    assert da.parse_args(["--prd", "p.md", "--base", "main", "--model", "haiku"])["model"] == "haiku"
+    # baseline（无 --model）默认 None → 走 PA_DEV_MODEL env / roc 默认
+    assert da.parse_args(["--prd", "p.md"])["model"] is None
+    # 空 flag：--model "" → model="" （parse_args 层不吞；_build_options 用 is-not-None 精确语义）
+    assert da.parse_args(["--prd", "p.md", "--model", ""])["model"] == ""
+
+
 def test_dev_agent_build_prompt_injects_feedback_artifact(tmp_path):
     """task 3.4：build_prompt 在 args[feedback_artifact] 时 inject「上轮 verify 反馈」段（driven 模式
     PRD 不可变 task 3.2 摘除追加 → 反馈真源在 artifact，prompt 须从此读，非 PRD 反馈节）。"""

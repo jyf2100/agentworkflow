@@ -407,6 +407,15 @@ def run_persona(name: str, prompt: str, stage: str, label: str,
     allowed_tools：MCP 工具白名单透传（fetch 段调 exa 必须，--allowedTools 逗号分隔）。"""
     base_cmd = [resolve_claude_bin(), "--agent", name, "--output-format", "json",
                 "--max-turns", str(MAX_TURNS[stage])]
+    # add-per-agent-model-routing：per-persona env 查表 → --model（与 persona_call base_cmd 镜像；不设=零变更 baseline）
+    # equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 安全惯例）；空串 env 显式 warn。
+    _env_key = f"PA_PERSONA_MODEL_{name.upper().replace('-', '_')}"
+    _model = os.environ.get(_env_key)
+    if _model == "":
+        log(f"[{label}] ⚠ {_env_key} 设为空串（忽略→走 roc 默认 glm-5.2）")
+    if _model:
+        base_cmd += [f"--model={_model}"]
+        log(f"[{label}] model route → {_model}（per-agent env）")
     if allowed_tools:
         base_cmd += ["--allowedTools", ",".join(allowed_tools)]
     cur_prompt = prompt
