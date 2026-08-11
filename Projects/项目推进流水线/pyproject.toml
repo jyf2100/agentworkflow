@@ -26,6 +26,12 @@ dependencies = [
     # （与 0.2.121 一字不差），上游 PR #1106 OPEN 未合，故本地 ast 变异补丁根治 #1105。
     # #1106 合并后移除 sdk_compat_patch.py 并放宽上界（独立 follow-up change）。
     "claude-agent-sdk>=0.2.128,<0.2.130",
+    # langgraph-workflow-upgrade（openspec/changes/langgraph-workflow-upgrade）：编排层 StateGraph
+    # 表达 7 阶段拓扑（scripts/graph_pa*.py）。锁 >=1.2.10,<2——避被撤回的 1.2.3/1.1.7（PyPI 已 yank）。
+    # **不需要** langgraph-checkpoint-sqlite：design D2 journal 单写真源，不用 Checkpointer（依赖减负）。
+    # CVE 阈值（实证）：langgraph-checkpoint-sqlite<4.0.0=CVE-2026-27794、sqlite<3.0.1=CVE-2026-28277
+    # ——pa 不引 checkpoint-sqlite，sqlite 仅作间接依赖时关注。编排器侧守同步（D1），不引入 asyncio。
+    "langgraph>=1.2.10,<2",
 ]
 
 [project.optional-dependencies]
