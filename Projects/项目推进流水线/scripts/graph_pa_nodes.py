@@ -49,9 +49,13 @@ def _ik(state_or_ni: dict, stage: str) -> str:
 def _ni(state: dict, *, stage: str, **extra) -> C.NodeInput:
     """从 graph state 构造 NodeInput（node 入参）。绝对路径由调用方经 vault_root/state_dir 注入。"""
     ni: dict = {"run_id": state.get("run_id", ""), "thread_id": state.get("thread_id", ""),
-                "stamp": state.get("stamp", ""), "stage": stage, "config": state.get("config", {}),
-                "_project": state.get("_project", ""),   # per-project 标识（_ik + radar label 依赖）
-                "_src_name": state.get("_src_name", "")}   # per-source 标识（fetch label 依赖）
+                "stamp": state.get("stamp", ""), "stage": stage, "config": state.get("config", {})}
+    # 转发 state 的 `_` 前缀 str 标识字段（per-stage 标识：_project/_src_name/_prd_path/...），
+    # 供 _ik 幂等键 + per-stage label 解析；大对象（_profiles/_candidates/...）不进 ni
+    # （build_prompt/to_state 直接读 state，避免污染 NodeInput 契约）。
+    for k, v in state.items():
+        if k.startswith("_") and isinstance(v, str):
+            ni[k] = v
     ni.update(extra)
     return ni  # type: ignore[return-value]
 
@@ -73,12 +77,19 @@ def commit_node(kind: NodeKind, ni: C.NodeInput, out: C.NodeOutput) -> C.NodeOut
 
 
 # ── PersonaNode（控制面语义；唯一可写 verdict）──────────────────────────
+def _default_verdict_mapper(payload: dict) -> dict:
+    """默认 verdict 映射：payload.{verdict,reason,feedback} → NodeOutput.verdict。"""
+    return {"value": payload.get("verdict"), "reason": payload.get("reason", ""),
+            "feedback": payload.get("feedback", "")}
+
+
 def make_persona_node(*, agent_name: str, stage: str, label,
                      allowed_tools: list[str] | None = None,
                      build_prompt: Callable[[dict], str],
                      extract_artifacts: Callable[[dict, dict], list] | None = None,
                      expose_verdict: bool = False,
-                     to_state: Callable[[dict, dict], dict] | None = None):
+                     to_state: Callable[[dict, dict], dict] | None = None,
+                     verdict_mapper: Callable[[dict], dict] | None = None):
     """PersonaNode 工厂（唯一可写 verdict，D3/R6）。
 
     label: str | Callable[[NodeInput], str]   固定 label 或运行期按 ni（含 _project）算 label
@@ -100,10 +111,10 @@ def make_persona_node(*, agent_name: str, stage: str, label,
                      "idempotency_key": _ik(ni, stage)}
         out["artifacts"] = list(extract_artifacts(payload, ni) or []) if extract_artifacts else []
         if expose_verdict and isinstance(payload, dict):
-            v = payload.get("verdict")
-            if v:
-                out["verdict"] = {"value": v, "reason": payload.get("reason", ""),
-                                  "feedback": payload.get("feedback", "")}
+            vm = verdict_mapper or _default_verdict_mapper
+            v = vm(payload)
+            if v.get("value"):
+                out["verdict"] = v
         return commit_node(KIND_PERSONA, ni, out), payload   # type: ignore[return-value]
 
     def node(state: dict) -> dict:
@@ -321,3 +332,57 @@ def _inject_op(ni: dict, state: dict):
 
 
 node_inject = make_mechanical_node(stage="inject", op=_inject_op)
+
+
+# ── critic node 配置实例（任务 3.3，critic 子图的 PersonaNode 组件）─────────
+# critic 调 pa-prd-critic persona（PRD 对抗质量闸 = 控制面语义）→ PersonaNode（spec D3）。
+# critic 是首个 expose_verdict=True 的 PersonaNode（产 pass/revise/drop 语义判决，D3 唯一 verdict 写入）。
+# _critic_one L970 调用形态：run_persona("pa-prd-critic", critic_prompt(path,source_path,prof), "critic", f"critic:{stem}")
+# label per-prd f"critic:{stem}"（对齐 _critic_one L969）；allowed_tools=None。
+# verdict 提取供条件边路由（critic 子图 route_critic）；to_state 暂存 _critic_payload（含 revisions_needed 供 revise）。
+def _critic_build_prompt(state: dict) -> str:
+    import run_daily
+    return run_daily.critic_prompt(state["_prd_path"], state.get("_source_path", ""), state["_prof"])
+
+
+def _critic_label(ni: dict) -> str:
+    from pathlib import Path
+    return f"critic:{Path(ni.get('_prd_path', 'x')).stem}"   # 对齐 _critic_one L969
+
+
+def _critic_to_state(payload: dict, state: dict) -> dict:
+    return {"_critic_payload": payload, "_critic_verdict": payload.get("verdict")}
+
+
+def _critic_verdict_mapper(payload: dict) -> dict:
+    """critic payload.{verdict,summary,issues} → NodeOutput.verdict。
+    pa-prd-critic 吐 summary/issues（非 reason/feedback）；summary 作 reason（validate 要求非空），
+    issues join 作 feedback（revise 时 revisions_needed 已在 _critic_payload 供 revise node）。"""
+    return {"value": payload.get("verdict"),
+            "reason": payload.get("summary") or payload.get("verdict", ""),
+            "feedback": "; ".join(payload.get("issues") or []) or payload.get("summary", "")}
+
+
+node_critic = make_persona_node(
+    agent_name="pa-prd-critic", stage="critic", label=_critic_label,
+    build_prompt=_critic_build_prompt,
+    expose_verdict=True, to_state=_critic_to_state,
+    verdict_mapper=_critic_verdict_mapper)
+
+
+# ── prd revise node 配置实例（任务 3.3，critic 子图的 revise 回环节点）─────
+# revise 回环：critic verdict=revise → 调 pa-prd round2（按 revisions_needed 修订）→ 回 critic round2。
+# stage_critic L951-952 调用形态：run_persona("pa-prd", prd_prompt([], profiles, stamp, revise=rev), "prd", f"prd-revise:{proj}")
+# rev = {prd_path, revisions_needed}（来自 critic payload）；label per-project f"prd-revise:{proj}"。
+# 复用 node_prd 的 agent（pa-prd）；不产 verdict（prd 不产 verdict，critic 才产）。
+def _prd_revise_build_prompt(state: dict) -> str:
+    import run_daily
+    rev = {"prd_path": state["_prd_path"],
+           "revisions_needed": (state.get("_critic_payload") or {}).get("revisions_needed", [])}
+    return run_daily.prd_prompt([], state["_profiles"], state["stamp"], revise=rev)
+
+
+node_prd_revise = make_persona_node(
+    agent_name="pa-prd", stage="prd", label=lambda ni: f"prd-revise:{ni.get('_project', '')}",
+    build_prompt=_prd_revise_build_prompt,
+    expose_verdict=False, to_state=lambda p, s: {"_revised_prd": p})

@@ -32,6 +32,10 @@ class Violation(NamedTuple):
 # verdict 仅 PersonaNode 可写——这 3 个工厂函数体内绝不该出现 verdict 标识符
 NON_VERDICT_FACTORIES = ("make_mechanical_node", "make_gateway_node", "make_devloop_node")
 
+# no_bare_path 只扫 node I/O 契约 + artifact handle（路径契约层，D4）；
+# state TypedDict（GraphState/CriticSubState）的 path 字段是运行期状态传递，非 artifact 契约，不扫。
+CONTRACT_TYPES = ("NodeInput", "NodeOutput", "ArtifactHandle")
+
 
 def _verdict_refs(node: ast.AST) -> list[int]:
     """node 子树内所有 verdict 标识符引用的行号（Name/常量字典 key/keyword/Subscript 下标）。"""
@@ -61,10 +65,11 @@ def check_verdict_boundary(tree: ast.Module, filename: str) -> list[Violation]:
 
 
 def check_no_bare_path(tree: ast.Module, filename: str) -> list[Violation]:
-    """TypedDict 出现裸 <*path>: str 字段（非 ArtifactHandle.rel_path）→ 违规（D4）。"""
+    """契约 TypedDict（NodeInput/NodeOutput/ArtifactHandle）裸 <*path>: str → 违规（D4）。
+    state TypedDict 的 path 字段是运行期状态传递，非 artifact 契约，不扫。"""
     vs: list[Violation] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
+        if not isinstance(node, ast.ClassDef) or node.name not in CONTRACT_TYPES:
             continue
         for stmt in node.body:
             if not (isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)):

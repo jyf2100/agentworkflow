@@ -46,6 +46,13 @@ def test_bare_path_in_typeddict_rejected():
     assert len(vs) == 1 and vs[0].rule == "no_bare_path"
 
 
+def test_state_typeddict_path_allowed():
+    # state TypedDict（非契约）的 path 字段是运行期状态传递，不触发 no_bare_path（任务 3.3 CriticSubState._prd_path）
+    src = "class CriticSubState(TypedDict, total=False):\n    _prd_path: str\n    _source_path: str\n"
+    from check_boundary import check_source
+    assert check_source(src) == []
+
+
 def test_rel_path_is_allowed():
     # ArtifactHandle.rel_path 是合法字段（store+rel_path 可移植），不触发
     src = "class ArtifactHandle(TypedDict):\n    rel_path: str\n"

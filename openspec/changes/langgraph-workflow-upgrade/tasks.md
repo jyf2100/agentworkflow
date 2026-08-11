@@ -22,7 +22,7 @@
 
 - [x] 3.1 fetch node（3 个 persona 配置实例：github-repo/wechat-url/deepresearch）
 - [x] 3.2 inject + prd node（prd 配 `PersonaNode`，critic revise 回环先占位）
-- [ ] 3.3 critic 子图（`PersonaNode` + revise 回环 round2，复用 `_critic_one`）
+- [x] 3.3 critic 子图（`PersonaNode` + revise 回环 round2，复用 `_critic_one`）
 - [ ] 3.4 verify 子图（`PersonaNode` revise 闭环 + 跨节点条件边回环 + `VERIFY_MAX_ROUNDS` 用满 → interrupted_pr **enum 终态**（非 interrupt，D5 撤 / spec「升人工路径保持机械硬门」））；接 ArtifactHandle 传 `install_log`（见 4.1）
 - [ ] 3.5 dispatch 子图（`DevLoopNode` + SDK dev loop + worktree + session 续接；迁 single_flight/circuit_breaker/merge_loop/reconcile 协同，留 2 周，R4 / spec「特化容错作纯函数库」）
 - [ ] 3.6 report node（`MechanicalNode` 机械聚合所有 node 的 `obs` cost/turns/duration_ms/model/token_usage → 标准化可查询 metrics 文件，决策 M 路径 A / spec「统一 node I/O 契约」）
