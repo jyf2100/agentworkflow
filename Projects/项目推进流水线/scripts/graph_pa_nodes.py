@@ -46,6 +46,12 @@ def _ik(state_or_ni: dict, stage: str) -> str:
     return f"{state_or_ni.get('run_id', '?')}:{stage}:{proj}"
 
 
+# 轮次计数器（int，跨节点回环 label per-round 区分用——critic/verify 子图 label 含 round，
+# 对齐 run_daily _pa_verify_round L1420 f"verify:{slug}:r{round_n}" 的 per-round 标记）。
+# int 非 str、非 `_` 前缀，故 _ni 单独转发（不混入通用 str 规则）。
+_ROUND_KEYS = ("prd_round", "verify_round")
+
+
 def _ni(state: dict, *, stage: str, **extra) -> C.NodeInput:
     """从 graph state 构造 NodeInput（node 入参）。绝对路径由调用方经 vault_root/state_dir 注入。"""
     ni: dict = {"run_id": state.get("run_id", ""), "thread_id": state.get("thread_id", ""),
@@ -56,6 +62,10 @@ def _ni(state: dict, *, stage: str, **extra) -> C.NodeInput:
     for k, v in state.items():
         if k.startswith("_") and isinstance(v, str):
             ni[k] = v
+    # 轮次计数器转发（label per-round 区分，critic/verify 子图用；int 不走通用 str 规则）。
+    for k in _ROUND_KEYS:
+        if k in state:
+            ni[k] = state[k]
     ni.update(extra)
     return ni  # type: ignore[return-value]
 
@@ -386,3 +396,65 @@ node_prd_revise = make_persona_node(
     agent_name="pa-prd", stage="prd", label=lambda ni: f"prd-revise:{ni.get('_project', '')}",
     build_prompt=_prd_revise_build_prompt,
     expose_verdict=False, to_state=lambda p, s: {"_revised_prd": p})
+
+
+# ── verify node 配置实例（任务 3.4，verify 子图的 PersonaNode 组件）─────────
+# verify 调 pa-verify persona（dev 产出验证闸 = 控制面对抗语义）→ PersonaNode（spec D3，expose_verdict）。
+# _pa_verify_round L1420 调用形态：run_persona("pa-verify", verify_prompt(...), "verify", f"verify:{slug}:r{round_n}")
+# label per-round f"verify:{slug}:r{round_n}"（对齐 L1420，journal 事件 per-round 区分）；allowed_tools=None
+# （pa-verify 只 Read，不限制）。verdict=pass|revise（expose_verdict=True）；feedback_section → verdict.feedback
+# （revise 反馈四要素：定位/原因/怎么改/收尾门，供 dev redo 注入）。to_state 暂存 _verify_result + _verify_verdict。
+# install_log 接入（task 4.1 预留）：build_prompt 读 state._install_log（ArtifactHandle 形态），handle 在 → prompt
+# 追加 store+rel 段落（传递通道）；默认 None → byte-identical。resolve 绝对 + must_exist fail-closed 留 task 4.1
+# （graph state 不持绝对路径 R8，node 环境注入 vault_root/state_dir 在 task 4.1 接 independent_verify 上游实装时一并落）。
+def _verify_build_prompt(state: dict) -> str:
+    import run_daily
+    rnd = state.get("verify_round", 1)
+    prompt = run_daily.verify_prompt(
+        state["_prd_path"], state.get("_branch"), state.get("_base", ""),
+        state.get("_diff_path"), state.get("_verify_payload"), rnd, state["_prof"])
+    il = state.get("_install_log")                       # task 4.1 预留：install_log ArtifactHandle 传递通道
+    if isinstance(il, dict) and il.get("rel_path"):
+        prompt += (f"\n\n[install_log artifact] store={il.get('store')} rel={il.get('rel_path')}"
+                   f"（依赖安装日志；task 4.1 补 resolve 绝对 + Read 判安装）")
+    return prompt
+
+
+def _verify_label(ni: dict) -> str:
+    return f"verify:{ni.get('_slug', '')}:r{ni.get('verify_round', 1)}"   # 对齐 _pa_verify_round L1420
+
+
+def _verify_to_state(payload: dict, state: dict) -> dict:
+    return {"_verify_verdict": payload.get("verdict"), "_verify_result": payload}
+
+
+def _verify_verdict_mapper(payload: dict) -> dict:
+    """verify payload.{verdict,feedback_section,summary} → NodeOutput.verdict。
+    pa-verify 吐 feedback_section（修订反馈四要素）；summary 作 reason（validate 要求非空）；
+    feedback_section 作 feedback（供 dev redo 注入）。"""
+    return {"value": payload.get("verdict"),
+            "reason": payload.get("summary") or payload.get("verdict", ""),
+            "feedback": payload.get("feedback_section", "")}
+
+
+node_verify = make_persona_node(
+    agent_name="pa-verify", stage="verify", label=_verify_label,
+    build_prompt=_verify_build_prompt,
+    expose_verdict=True, to_state=_verify_to_state,
+    verdict_mapper=_verify_verdict_mapper)
+
+
+# ── dev redo node 配置实例（任务 3.4 stub，verify 子图的 revise 回环另一端；task 3.5 接 DevLoopNode）─
+# verify revise 回环：verify verdict=revise → 触发 dev 增量重做（带反馈重投）→ 回 verify round2。
+# 命令式里是 for-round continue（重跑 dev_agent + independent_verify + verify，stage_dispatch L2463-2509）。
+# task 3.4 stub：MechanicalNode 暂存 verify 反馈（_verify_result.feedback_section → _redo_feedback）供 task 3.5
+# dev 注入；真实 dev 增量重做（DevLoopNode + SDK dev loop + worktree + session 续接 + reconcile 协同）留 task 3.5
+# dispatch 子图（留 2 周，R4）。stage="dispatch"（dev loop 属 dispatch；对齐 make_devloop_node default）。
+def _dev_redo_op(ni: dict, state: dict):
+    vresult = state.get("_verify_result") or {}
+    feedback = vresult.get("feedback_section") or vresult.get("feedback") or ""
+    return ([], {"_redo_feedback": feedback},            # task 3.5 dev 注入用；stub 不真跑 dev loop
+            {"redo_stub": True, "has_feedback": bool(feedback)})
+
+
+node_dev_redo = make_mechanical_node(stage="dispatch", op=_dev_redo_op)
