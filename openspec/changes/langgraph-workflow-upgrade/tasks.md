@@ -20,7 +20,7 @@
 
 ## 3. Phase 2：7 stage 全迁 + journal 单写持久化（4 周，核心期）
 
-- [ ] 3.1 fetch node（3 个 persona 配置实例：github-repo/wechat-url/deepresearch）
+- [x] 3.1 fetch node（3 个 persona 配置实例：github-repo/wechat-url/deepresearch）
 - [ ] 3.2 inject + prd node（prd 配 `PersonaNode`，critic revise 回环先占位）
 - [ ] 3.3 critic 子图（`PersonaNode` + revise 回环 round2，复用 `_critic_one`）
 - [ ] 3.4 verify 子图（`PersonaNode` revise 闭环 + 跨节点条件边回环 + `VERIFY_MAX_ROUNDS` 用满 → interrupted_pr **enum 终态**（非 interrupt，D5 撤 / spec「升人工路径保持机械硬门」））；接 ArtifactHandle 传 `install_log`（见 4.1）

@@ -50,7 +50,8 @@ def _ni(state: dict, *, stage: str, **extra) -> C.NodeInput:
     """从 graph state 构造 NodeInput（node 入参）。绝对路径由调用方经 vault_root/state_dir 注入。"""
     ni: dict = {"run_id": state.get("run_id", ""), "thread_id": state.get("thread_id", ""),
                 "stamp": state.get("stamp", ""), "stage": stage, "config": state.get("config", {}),
-                "_project": state.get("_project", "")}   # per-project 标识（_ik + label 依赖）
+                "_project": state.get("_project", ""),   # per-project 标识（_ik + radar label 依赖）
+                "_src_name": state.get("_src_name", "")}   # per-source 标识（fetch label 依赖）
     ni.update(extra)
     return ni  # type: ignore[return-value]
 
@@ -223,3 +224,55 @@ node_radar = make_persona_node(
     agent_name="pa-radar", stage="radar", label=lambda ni: f"radar-{ni.get('_project', '')}",
     build_prompt=_radar_build_prompt, extract_artifacts=_radar_extract,
     expose_verdict=False, to_state=_radar_to_state)
+
+
+# ── fetch node 配置实例（任务 3.1：3 个 persona 配置实例）──────────────
+# fetch stage 按 source kind 分发 3 个 persona（stage_fetch L758-766 + FETCH_CONFIG L720-733）：
+#   agent-deepresearch（pa-fetch-deepresearch，exa tools，mode=single 一份合成 md）
+#   wechat-url（pa-fetch-wechat-url，web_reader+exa，mode=items N 篇）
+#   github-repo（pa-fetch-github-repo，Bash gh CLI，mode=items）
+# radar=1 个 persona、fetch=3 个 persona，均 PersonaNode（语义采集 = 控制面语义，spec D3）。
+# label per-source f"fetch-{src['name']}"（对齐 stage_fetch L766）；prompt 各自（延迟 import run_daily.*_prompt）。
+# 落盘（write_text）+ items 拆分（_payload_to_items）是机械活，留 MechanicalNode（Phase 2 后续 task）；
+# 此处 PersonaNode 只暂存 payload（同 node_radar 模式）。fetch 产物 store=vault → digest 强制（OQ3），
+# Phase 1 未落盘无文件可算 digest → extract_artifacts 不设（落盘 MechanicalNode 后产 ArtifactHandle）。
+_FETCH_TOOLS = {                                        # 工具白名单镜像 run_daily.FETCH_CONFIG（test_graph_fetch 校验一致性防漂移）
+    "agent-deepresearch": ["mcp__plugin_ecc_exa__web_search_exa", "mcp__plugin_ecc_exa__web_fetch_exa"],
+    "wechat-url": ["mcp__web_reader__webReader", "mcp__plugin_ecc_exa__web_fetch_exa"],
+    "github-repo": ["Bash"],
+}
+
+
+def _fetch_label(ni: dict) -> str:
+    return f"fetch-{ni.get('_src_name', '')}"           # 对齐 stage_fetch L766 f"fetch-{src['name']}"
+
+
+def _make_fetch_build(prompt_attr: str):
+    """build_prompt(state) → run_daily.<prompt_attr>(state['_src'])。延迟 import（monkeypatch 友好）。"""
+    def build(state: dict) -> str:
+        import run_daily
+        return getattr(run_daily, prompt_attr)(state["_src"])
+    return build
+
+
+def _fetch_to_state(payload: dict, state: dict) -> dict:
+    return {"_fetch_payload": payload}                  # Phase 1 暂存 payload（落盘留 MechanicalNode）
+
+
+node_fetch_deepresearch = make_persona_node(
+    agent_name="pa-fetch-deepresearch", stage="fetch", label=_fetch_label,
+    allowed_tools=_FETCH_TOOLS["agent-deepresearch"],
+    build_prompt=_make_fetch_build("fetch_prompt"),
+    expose_verdict=False, to_state=_fetch_to_state)
+
+node_fetch_wechat = make_persona_node(
+    agent_name="pa-fetch-wechat-url", stage="fetch", label=_fetch_label,
+    allowed_tools=_FETCH_TOOLS["wechat-url"],
+    build_prompt=_make_fetch_build("wechat_url_prompt"),
+    expose_verdict=False, to_state=_fetch_to_state)
+
+node_fetch_github = make_persona_node(
+    agent_name="pa-fetch-github-repo", stage="fetch", label=_fetch_label,
+    allowed_tools=_FETCH_TOOLS["github-repo"],
+    build_prompt=_make_fetch_build("github_repo_prompt"),
+    expose_verdict=False, to_state=_fetch_to_state)
