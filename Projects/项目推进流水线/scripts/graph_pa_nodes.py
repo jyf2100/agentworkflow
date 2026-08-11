@@ -121,17 +121,22 @@ def make_persona_node(*, agent_name: str, stage: str, label,
 
 
 # ── MechanicalNode（零 LLM 机械活；不产 verdict）────────────────────────
-def make_mechanical_node(*, stage: str, op: Callable[[dict], tuple]):
-    """op(ni)->(artifacts: list, state_extra: dict, obs: dict)。零 LLM；不产 verdict（D3）。"""
-    def invoke(ni: C.NodeInput):
-        artifacts, extra, obs = op(ni)
+def make_mechanical_node(*, stage: str, op: Callable[[dict, dict], tuple]):
+    """op(ni, state)->(artifacts: list, state_extra: dict, obs: dict)。零 LLM；不产 verdict（D3）。
+
+    op 收 (ni, state)：ni 是 NodeInput（run_id/stage/config/_project/_src_name 等标识），
+    state 是完整 graph state——机械活常需读 _profiles/_inject_prd/_candidates 等运行期输入
+    （Phase 1 骨架占位 op(ni)，Phase 2 接线 task 3.2 inject 需 state 访问，演进为 op(ni, state)）。
+    """
+    def invoke(ni: C.NodeInput, state: dict):
+        artifacts, extra, obs = op(ni, state)
         out: dict = {"status": C.STATUS_OK, "obs": obs or {}, "artifacts": list(artifacts or []),
                      "idempotency_key": _ik(ni, stage)}
         return commit_node(KIND_MECHANICAL, ni, out), (extra or {})
 
     def node(state: dict) -> dict:
         ni = _ni(state, stage=stage)
-        out, extra = invoke(ni)
+        out, extra = invoke(ni, state)
         update: dict = {"obs_log": [out["obs"]]}
         update.update(extra)
         return update
@@ -276,3 +281,43 @@ node_fetch_github = make_persona_node(
     allowed_tools=_FETCH_TOOLS["github-repo"],
     build_prompt=_make_fetch_build("github_repo_prompt"),
     expose_verdict=False, to_state=_fetch_to_state)
+
+
+# ── prd node 配置实例（任务 3.2）──────────────────────────────────────
+# prd 调 pa-prd persona（candidates × profile → 项目专属 PRD = 控制面语义）→ PersonaNode（spec D3）。
+# stage_prd L907 调用形态：run_persona("pa-prd", prd_prompt(candidates, profiles, stamp), "prd", "prd")
+# label 固定 "prd"（batch 翻译所有 candidates，非 per-project；对齐 stage_prd L907 第 4 参）。
+# prd 不产 verdict（pa-prd 产 prds/skipped；critic 才产 verdict，spec D3 verdict 仅对抗 persona）。
+# pa-prd persona 内部 Write 落盘 PRD md（.project-auto/state/prd/<proj>/<stamp>_<slug>.md，控制面 vault）；
+# manifest 落盘（prd_manifest_<stamp>.json）+ candidates 空跳过是机械活，留 MechanicalNode（Phase 2 后续）。
+# revise 入口（prd_prompt revise 参数）占位——critic revise 回环接 critic 子图（task 3.3）。
+def _prd_build_prompt(state: dict) -> str:
+    import run_daily
+    return run_daily.prd_prompt(state["_candidates"], state["_profiles"], state["stamp"])
+
+
+def _prd_to_state(payload: dict, state: dict) -> dict:
+    return {"_prd_manifest": payload}                  # Phase 1 暂存 manifest（落盘留 MechanicalNode）
+
+
+node_prd = make_persona_node(
+    agent_name="pa-prd", stage="prd", label="prd",      # label 固定（batch，对齐 stage_prd L907）
+    build_prompt=_prd_build_prompt,
+    expose_verdict=False, to_state=_prd_to_state)
+
+
+# ── inject node 配置实例（任务 3.2）───────────────────────────────────
+# inject 是手动注入入口（--inject-prd md → manifest），替 radar→prd 自动路径（stage_inject L1102）。
+# 纯机械活（零 LLM：frontmatter 解析 + slug + copy + manifest）→ MechanicalNode（spec D3）。
+# op 复用 run_daily.stage_inject（零重写逻辑主体）；stage_inject 内 sys.exit（输入错）穿透 node
+# （Phase 2 拓扑接线时包装为 graph 终态，task 3.9）。actual_stamp 可能自增（避碰），透传供下游对齐。
+def _inject_op(ni: dict, state: dict):
+    import run_daily
+    from argparse import Namespace
+    args = Namespace(inject_prd=state.get("_inject_prd"))   # stage_inject 只读 args.inject_prd（L1111）
+    manifest, actual = run_daily.stage_inject(args, state.get("_profiles", {}), ni.get("stamp", ""))
+    return ([], {"_prd_manifest": manifest, "_inject_stamp": actual},
+            {"inject_stamp": actual, "n_prds": len(manifest.get("prds", []))})
+
+
+node_inject = make_mechanical_node(stage="inject", op=_inject_op)

@@ -95,9 +95,9 @@ def test_persona_node_expose_verdict(monkeypatch):
 def test_mechanical_node():
     m = GN.make_mechanical_node(
         stage="report",
-        op=lambda ni: ([{"kind": "metrics", "store": "vault", "rel_path": "m.json",
-                         "digest": "sha256:x"}], {"report": {"done": True}}, {"turns": 0}))
-    out, extra = m.invoke({"run_id": "r", "stage": "report", "config": {}})
+        op=lambda ni, state: ([{"kind": "metrics", "store": "vault", "rel_path": "m.json",
+                                "digest": "sha256:x"}], {"report": {"done": True}}, {"turns": 0}))
+    out, extra = m.invoke({"run_id": "r", "stage": "report", "config": {}}, {})
     assert out["status"] == "ok" and extra == {"report": {"done": True}}
     assert out["artifacts"][0]["kind"] == "metrics"
 
