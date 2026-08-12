@@ -21,8 +21,9 @@ journal 单写（D2）：commit_node 内校验；append_event(fsync) 接线留 P
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import graph_pa_contracts as C
 
@@ -209,15 +210,93 @@ def parse_dev_exit(code: int) -> tuple[str | None, str | None]:
     return C.STATUS_TRIAGED, C.ERR_PERSONA_CRASH
 
 
-def make_devloop_node(*, stage: str = "dispatch"):
-    """DevLoopNode 工厂（Phase 1 骨架）。
+def make_devloop_node(*, stage: str = "dispatch",
+                      build_cmd: Callable[[dict], "list[str] | None"],
+                      resolve_cwd: Callable[[dict], tuple]):
+    """DevLoopNode 工厂（任务 3.5a 完整实装，R4）。
 
-    Phase 2 任务 3.5 完整：调 dev-agent.py subprocess + claude-agent-sdk dev loop + worktree + session
-    续接 + single_flight/circuit_breaker/merge_loop/reconcile 协同（留 2 周，R4）。store=worktree 只此 node 写。
+    目标面语义活的封装：subprocess 调 dev-agent.py（ADR-0006 唯一执行器）——SDK dev loop 在 dev-agent.py
+    subprocess 内（非控制面直跑），本 node 是 subprocess 调度 + JSON/exit 解析。store=worktree 唯一写目标仓
+    （ADR-0001：控制面不直接改目标面，经 dev-agent.py）。terminal 映射机械不替判（D6）。
+
+    build_cmd(state)->cmd:list[str]|None   构造 dev-agent cmd（复用 run_daily._dev_cmd；session retry +
+                                          model routing flag-gate）。None = DEV_AGENT_PY 缺失（安装异常）。
+    resolve_cwd(state)->(cwd:str, log_file:Path|None)   worktree 根 + dev log（ArtifactHandle→abs，R8）。
+
+    terminal 映射（对齐 dispatch_one L2216-2259，保 shadow parity）：
+      cmd None / _run_capture RuntimeError（wall-clock 超时）→ triaged（控制面/基建异常，升人工）
+      script_json.blocked_by_gate → blocked（dev exit 14 测试发布门；不进 verify/merge，对齐 L2216-2231）
+      script_json.off_track → triaged（dev exit 15 语义跑偏止损，对齐 L2251-2259）
+      其他（正常 / stalled / 无 JSON）→ 不 terminal，写 _dev_script+_dev_rc+dev 字段交 dev_post 判 has_commits
+      （stalled / branch 缺失 / 无 commit 经 dev_post→reconcile_pr 收尾，对齐 L2261-2275）。
+    无 JSON 时**不**用 parse_dev_exit(rc) 兜底——对齐 dispatch_one（无 stdout JSON → dev_killed 走 has_commits，
+    不查 exit code；shadow parity）。parse_dev_exit 作 utility 保留（exit code→terminal 机械映射，单测覆盖）。
     """
     def node(state: dict) -> dict:
-        raise NotImplementedError(
-            "DevLoopNode 完整迁移在 Phase 2 任务 3.5：dev-agent.py subprocess + 容错协同（留 2 周，R4）")
+        import run_daily
+        ni = _ni(state, stage=stage)
+        cmd = build_cmd(state)
+        cwd, log_file = resolve_cwd(state)
+        base_out: dict = {"artifacts": [], "idempotency_key": _ik(ni, stage)}
+
+        def _triage(err_code: str, msg: str, extra: dict) -> dict:
+            out = dict(base_out); out["status"] = C.STATUS_TRIAGED
+            out["obs"] = {"dev_rc": extra.get("_dev_rc"), "dev_fail": extra.get("_dev_fail")}
+            out["error"] = {"code": err_code, "message": msg}
+            commit_node(KIND_DEVLOOP, ni, out)
+            upd: dict = {"obs_log": [out["obs"]]}
+            upd.update(extra); upd["terminal"] = C.STATUS_TRIAGED
+            return upd
+
+        if cmd is None:
+            return _triage(C.ERR_CONTRACT_VIOLATION,
+                           "控制面 dev-agent.py 缺失（控制面安装异常）",
+                           {"_dev_fail": "no_dev_agent"})
+        try:
+            rc, stdout, _ = run_daily._run_capture(
+                cmd, cwd, run_daily.DEV_LOOP_TIMEOUT, f"[{ni.get('_slug', '')}:dev]", log_file)
+        except RuntimeError as e:
+            return _triage(C.ERR_TIMEOUT, f"dev loop wall-clock 超时: {e}",
+                           {"_dev_fail": "timeout", "_dev_rc": None, "_dev_script": None})
+        tail = (stdout or "").strip().splitlines()
+        try:
+            script = json.loads(tail[-1]) if tail else None
+        except json.JSONDecodeError:
+            script = None
+        # dev 字段写入（对齐 dispatch_one L2232-2247）
+        extra: dict = {"_dev_rc": rc, "_dev_script": script, "_dev_killed": script is None}
+        if script:
+            extra["_dev_cost"] = script.get("cost")
+            extra["_dev_turns"] = script.get("turns")
+            extra["_branch"] = script.get("branch")
+            extra["_dev_stalled"] = bool(script.get("stalled"))
+            extra["_dev_off_track"] = bool(script.get("off_track"))
+            extra["_dev_run_log"] = script.get("run_log")
+            extra["_dev_test_cmd"] = script.get("test_cmd")
+        # terminal 映射（机械，对齐 dispatch_one L2216-2259）
+        out = dict(base_out)
+        if script and script.get("blocked_by_gate"):
+            out["status"] = C.STATUS_BLOCKED
+            out["error"] = {"code": C.ERR_TEST_GATE,
+                            "message": f"测试发布门拦截: {script.get('gate_status')}"}
+            extra["_gate_status"] = script.get("gate_status")
+            extra["_gate_reason"] = script.get("gate_reason")
+            extra["_test_status"] = script.get("test_status")
+            extra["_evidence_fresh"] = script.get("evidence_fresh")
+        elif script and script.get("off_track"):
+            out["status"] = C.STATUS_TRIAGED
+            out["error"] = {"code": C.ERR_CONTRACT_VIOLATION, "message": "语义 off_track 止损"}
+        else:
+            out["status"] = C.STATUS_OK
+        out["obs"] = {"dev_rc": rc, "cost": extra.get("_dev_cost"),
+                      "turns": extra.get("_dev_turns"), "dev_killed": extra.get("_dev_killed")}
+        commit_node(KIND_DEVLOOP, ni, out)
+        update: dict = {"obs_log": [out["obs"]]}
+        update.update(extra)
+        if out["status"] != C.STATUS_OK:
+            update["terminal"] = out["status"]
+        return update
+
     node._kind = KIND_DEVLOOP; node._cfg = {"stage": stage}   # type: ignore[attr-defined]
     return node
 
@@ -442,6 +521,44 @@ node_verify = make_persona_node(
     build_prompt=_verify_build_prompt,
     expose_verdict=True, to_state=_verify_to_state,
     verdict_mapper=_verify_verdict_mapper)
+
+
+# ── node_dev 配置实例（任务 3.5a：DevLoopNode 完整实装）──────────────────
+# dev loop = 目标面语义活（dev-agent.py SDK dev loop）；DevLoopNode 是 subprocess 调度 + JSON/exit 解析。
+# 复用 run_daily._dev_cmd（cmd 构造，含 session-aware retry + model routing flag-gate）+ _run_capture（拿 rc）。
+# store=worktree 唯一写目标仓（ADR-0001：控制面经 dev-agent.py 改目标面，不直接写）。
+# terminal：blocked_by_gate→blocked / off_track→triaged / cmd None·超时→triaged；正常/stalled/无JSON→交 dev_post。
+def _dev_build_cmd(state: dict) -> list[str] | None:
+    """构造 dev-agent cmd（复用 _dev_cmd，对齐 dispatch_one L2200-2207）。
+    session_aware_retry flag-gate：off → baseline cmd（不注入 state_dir/session）；on → 注入 retry 参数。"""
+    import run_daily
+    prof = state["_prof"]
+    base = state.get("_cur_base") or state.get("_base") or "main"
+    src_abs = state.get("_src_abs", "")
+    prd_abs = state.get("_prd_abs") or state.get("_prd_path", "")
+    flags = state.get("_coord_flags")
+    if flags and getattr(flags, "session_aware_retry", False):
+        return run_daily._dev_cmd(
+            prof, prd_abs, base, src_abs,
+            feedback_artifact=state.get("_fb_artifact"),
+            state_dir=str(run_daily.STATE_DIR),
+            iteration_seq=state.get("verify_round", 0) + 1,
+            resume_session=state.get("_cur_resume_session"),
+            fork_session=bool(state.get("_cur_fork_session", False)),
+            lessons_artifact=state.get("_lessons_artifact"))
+    return run_daily._dev_cmd(
+        prof, prd_abs, base, src_abs,
+        feedback_artifact=state.get("_fb_artifact"),
+        lessons_artifact=state.get("_lessons_artifact"))
+
+
+def _dev_resolve_cwd(state: dict) -> tuple[str, Any]:
+    """resolve worktree + log_file（R8：state 持 ArtifactHandle 或 abs，node 内解析）。"""
+    wt = state.get("_worktree_abs") or state.get("_worktree") or ""
+    return (str(wt), state.get("_dev_log_file"))
+
+
+node_dev = make_devloop_node(stage="dispatch", build_cmd=_dev_build_cmd, resolve_cwd=_dev_resolve_cwd)
 
 
 # ── dev redo node 配置实例（任务 3.4 stub，verify 子图的 revise 回环另一端；task 3.5 接 DevLoopNode）─

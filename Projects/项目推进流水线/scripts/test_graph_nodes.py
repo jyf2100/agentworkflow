@@ -126,16 +126,7 @@ def test_gateway_node_blocked_yields_terminal():
     assert update["terminal"] == "blocked"
 
 
-# ── DevLoopNode（Phase 1 骨架）+ parse_dev_exit ──────────────────────
-def test_devloop_node_phase1_raises_not_implemented():
-    d = GN.make_devloop_node()
-    try:
-        d({"run_id": "r", "stage": "dispatch", "config": {}})
-        assert False
-    except NotImplementedError:
-        pass
-
-
+# ── parse_dev_exit（exit code→terminal 机械映射；DevLoopNode 完整实装见 test_graph_devloop.py）──
 def test_parse_dev_exit_mapping():
     assert GN.parse_dev_exit(0) == (None, None)
     assert GN.parse_dev_exit(14) == (C.STATUS_BLOCKED, C.ERR_TEST_GATE)
