@@ -664,17 +664,96 @@ def _dev_post_op(ni: dict, state: dict):
 node_dev_post = make_mechanical_node(stage="dispatch", op=_dev_post_op)
 
 
-# ── dev redo node 配置实例（任务 3.4 stub，verify 子图的 revise 回环另一端；task 3.5 接 DevLoopNode）─
-# verify revise 回环：verify verdict=revise → 触发 dev 增量重做（带反馈重投）→ 回 verify round2。
-# 命令式里是 for-round continue（重跑 dev_agent + independent_verify + verify，stage_dispatch L2463-2509）。
-# task 3.4 stub：MechanicalNode 暂存 verify 反馈（_verify_result.feedback_section → _redo_feedback）供 task 3.5
-# dev 注入；真实 dev 增量重做（DevLoopNode + SDK dev loop + worktree + session 续接 + reconcile 协同）留 task 3.5
-# dispatch 子图（留 2 周，R4）。stage="dispatch"（dev loop 属 dispatch；对齐 make_devloop_node default）。
-def _dev_redo_op(ni: dict, state: dict):
-    vresult = state.get("_verify_result") or {}
-    feedback = vresult.get("feedback_section") or vresult.get("feedback") or ""
-    return ([], {"_redo_feedback": feedback},            # task 3.5 dev 注入用；stub 不真跑 dev loop
-            {"redo_stub": True, "has_feedback": bool(feedback)})
+# ── admission node 配置实例（任务 3.5d，dispatch 准入 4 闸）──────────────────
+# 准入机械门（对齐 dispatch_one L2099-2137）：profile + branch_protection 三态 + already_dispatched 三态 +
+# count_inflight_prs 三态。任一三态 UNKNOWN → blocked_external_state（fail-safe，L2108/2117/2126）；
+# 条件不满足（profile/未保护/已投递/超额）→ skip（正常不投递，非 error）。过 → 不 terminal，进 worktree。
+# MechanicalNode（非 GatewayNode）：admission 有 pass/skip/blocked 三态出口，GatewayNode 二态太窄；op 内
+# 4 闸顺序短路，terminal 经 extra 透传（make_mechanical_node update.update(extra) → 条件边读 state.terminal）。
+# terminal 值：skip→"skip" / blocked→STATUS_BLOCKED；_exit_status 记原始 dispatch status（terminal_emit task 3.5e 用）。
+def _admission_op(ni: dict, state: dict):
+    """准入 4 闸（对齐 dispatch_one L2099-2137）。ni 转发 _slug/stamp；state 读 _prof/_base/_owner_repo/_worktree_abs/_coord_flags。"""
+    import run_daily
+    prof = state.get("_prof") or {}
+    base = state.get("_base", "main")
+    owner_repo = state.get("_owner_repo", "")
+    repo = state.get("_worktree_abs", "")
+    slug = ni.get("_slug", "")
+    devslug = run_daily.dev_slugify(slug)
+    flags = state.get("_coord_flags")
+
+    def _skip(reason):
+        return ([], {"terminal": "skip", "_exit_status": "skip", "_skip_reason": reason},
+                {"admission": "skip", "reason": reason})
+
+    def _blocked(check, reason):
+        return ([], {"terminal": C.STATUS_BLOCKED, "_exit_status": "blocked_external_state",
+                     "_blocked_check": check, "_skip_reason": reason},
+                {"admission": "blocked", "check": check, "reason": reason})
+
+    # ① profile 门（L2099-2102）
+    if not (prof.get("admission") and prof.get("dev_agent_ready") and prof.get("type") == "code"):
+        return _skip("profile 不满足（admission/dev_agent_ready/type≠code）")
+    # ② branch protection 三态（L2103-2114）
+    if not owner_repo:
+        return _skip("跳过-无 remote（取不到 owner/repo）")
+    prot = run_daily.check_branch_protection(owner_repo, base)
+    if prot.is_unknown:                                     # fail-safe：保护态不明 → 阻断（L2108）
+        return _blocked("branch_protection", f"阻断-分支保护态不明: {prot.reason}")
+    if prot.state is not run_daily.ExtState.FOUND or not prot.value:   # NOT_FOUND/兜底 → 拒投（L2112）
+        return _skip(f"跳过-{prot.reason}")
+    # ③ 幂等前置闸三态（L2115-2123）
+    idem = run_daily.already_dispatched(owner_repo, repo, devslug)
+    if idem.is_unknown:                                     # fail-safe：幂等态不明 → 阻断（L2117）
+        return _blocked("idempotency", f"阻断-幂等态不明: {idem.reason}")
+    if idem.state is run_daily.ExtState.FOUND:              # 明确已投递 → skip（L2121）
+        return _skip(f"跳过-{idem.reason}")
+    # ④ 在途 PR 限量三态（L2124-2137）
+    inflight_res = run_daily.count_inflight_prs(owner_repo)
+    if inflight_res.is_unknown:                             # fail-safe：在途数不明 → 阻断（L2126）
+        return _blocked("inflight_count", f"阻断-在途PR数不明: {inflight_res.reason}")
+    serial_shadow = bool(flags and getattr(flags, "single_flight_serial_shadow", False))
+    max_inflight = 1 if serial_shadow else int(prof.get("max_prs_in_flight", 2))   # L2134
+    inflight = inflight_res.value
+    if inflight >= max_inflight:
+        return _skip(f"跳过-超额（在途 {inflight} ≥ {max_inflight}）")
+    # 过 → 不 terminal（进 worktree）；写 _max_inflight 供下游观测
+    return ([], {"_max_inflight": max_inflight, "_admission_inflight": inflight},
+            {"admission": "passed", "inflight": inflight, "max_inflight": max_inflight})
 
 
-node_dev_redo = make_mechanical_node(stage="dispatch", op=_dev_redo_op)
+node_admission = make_mechanical_node(stage="dispatch", op=_admission_op)
+
+
+# ── worktree node 配置实例（任务 3.5d，detached worktree on base）─────────────
+# 投递前置（对齐 dispatch_one L2149-2161）：git worktree add --detach <repo>/.worktrees/<stamp>-<slug> <base>。
+# worktree 存在则先 remove --force（幂等）；_run_capture RuntimeError（建 wt 失败）→ terminal=fail。
+# 过 → 覆盖 _worktree_abs=wt（dev cwd / dev_post git -C 用；git worktree 共享 .git，has_commits/
+# independent_verify/reconcile_pr 结果同原始 repo，shadow parity 保持）。MechanicalNode（零 LLM，D3）。
+def _worktree_op(ni: dict, state: dict):
+    """建 detached worktree（对齐 L2149-2161）。ni 转发 _slug/stamp；state 读 _worktree_abs(原始 repo)/_base/_dev_log_file。"""
+    import run_daily
+    import subprocess
+    from pathlib import Path
+    repo = state.get("_worktree_abs", "")
+    slug = ni.get("_slug", "")
+    stamp = ni.get("stamp", "")
+    base = state.get("_base", "main")
+    log_file = state.get("_dev_log_file")
+    wt = Path(repo) / ".worktrees" / f"{stamp}-{slug}"
+    if wt.exists():                                         # 幂等：旧 wt 先 force remove（L2153-2155）
+        subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
+                       capture_output=True, text=True, timeout=60)
+    if log_file and not Path(str(log_file)).exists():
+        Path(str(log_file)).parent.mkdir(parents=True, exist_ok=True)   # L2150-2151
+    try:
+        run_daily._run_capture(
+            ["git", "-C", repo, "worktree", "add", "--detach", str(wt), base],
+            repo, 120, f"[{slug}:worktree]", log_file)
+    except RuntimeError as e:                               # 建 wt 失败 → fail（基建异常，升人工，L2159-2161）
+        return ([], {"terminal": "fail", "_exit_status": "fail", "_skip_reason": f"建 worktree 失败: {e}"},
+                {"worktree": "fail", "reason": str(e)})
+    return ([], {"_worktree_abs": str(wt)}, {"worktree": "ok", "wt": str(wt)})
+
+
+node_worktree = make_mechanical_node(stage="dispatch", op=_worktree_op)
