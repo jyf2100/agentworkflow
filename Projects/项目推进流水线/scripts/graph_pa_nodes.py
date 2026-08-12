@@ -21,6 +21,7 @@ journal 单写（D2）：commit_node 内校验；append_event(fsync) 接线留 P
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -1029,3 +1030,65 @@ def _publish_merge_op(ni: dict, state: dict):
 
 
 node_publish_merge = make_mechanical_node(stage="dispatch", op=_publish_merge_op)
+
+
+# ── report node（MechanicalNode：聚合 obs_log → 可查询 metrics，决策 M 路径 A / 任务 3.6）──
+def _aggregate_obs(obs_log: list, *, run_id: str, stamp: str) -> dict:
+    """机械聚合 obs_log（每 node 的 Obs 列表）→ 标准化可查询 metrics dict（决策 M 路径 A）。
+
+    obs_log 经 Annotated[list, operator.add] reducer 累加（4 类 node 工厂都 update={"obs_log":[obs]}，
+    spec「report_node 机械聚合所有 node 的 obs」）。Obs 是 drop-None dict（make_obs），缺字段 .get(,0)
+    容错；model 缺 → 'unknown' 桶。返回 {stamp, run_id, node_count, totals, by_model, nodes}：
+    totals 求和（cost/turns/duration_ms/input/output token）、by_model 分组、nodes 逐项明细（可 grep）。
+    """
+    totals = {"cost": 0.0, "turns": 0, "duration_ms": 0, "input_tokens": 0, "output_tokens": 0}
+    by_model: dict = {}
+    for obs in obs_log:
+        if not isinstance(obs, dict):
+            continue
+        cost = obs.get("cost") or 0.0
+        turns = obs.get("turns") or 0
+        dur = obs.get("duration_ms") or 0
+        tu = obs.get("token_usage") or {}
+        inp = tu.get("input") or 0
+        out = tu.get("output") or 0
+        totals["cost"] += cost
+        totals["turns"] += turns
+        totals["duration_ms"] += dur
+        totals["input_tokens"] += inp
+        totals["output_tokens"] += out
+        model = obs.get("model") or "unknown"
+        m = by_model.setdefault(model, {"calls": 0, "cost": 0.0, "input": 0, "output": 0})
+        m["calls"] += 1
+        m["cost"] += cost
+        m["input"] += inp
+        m["output"] += out
+    return {"stamp": stamp, "run_id": run_id, "node_count": len(obs_log),
+            "totals": totals, "by_model": by_model, "nodes": list(obs_log)}
+
+
+def _report_op(ni: dict, state: dict):
+    """聚合 state["obs_log"] → 写 metrics_<stamp>.json（固定名可查询）+ ArtifactHandle（store=vault）。
+
+    决策 M 路径 A：obs 标准化 schema + report node 机械聚合 + 可查询 metrics 文件（供 grep/脚本查询）。
+    metrics 文件固定名 metrics_<stamp>.json（**非** content-addressed）→ 「可查询」是核心，与 candidates_/
+    dispatch_ state JSON 同目录同 stamp 作用域（STATE_DIR，.gitignore 不入仓）。手算 sha256 digest 满足
+    store=vault 长期强契约（OQ3）。report node 自身无 LLM 调用，obs 吐 {node, node_count} 标识（非成本项）。
+    """
+    import run_daily
+    obs_log = state.get("obs_log") or []
+    stamp = ni.get("stamp", "")
+    metrics = _aggregate_obs(obs_log, run_id=ni.get("run_id", ""), stamp=stamp)
+    path = run_daily.STATE_DIR / f"metrics_{stamp}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(metrics, ensure_ascii=False, indent=2)
+    path.write_text(payload, encoding="utf-8")
+    digest = C.DIGEST_PREFIX + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    handle = {"kind": "metrics", "store": C.STORE_VAULT,
+              "rel_path": str(path.relative_to(run_daily.VAULT_ROOT)),
+              "digest": digest, "must_exist": True}
+    return ([handle], {"report": handle, "report_metrics": metrics},
+            {"node": "report", "node_count": len(obs_log)})
+
+
+node_report = make_mechanical_node(stage="report", op=_report_op)
