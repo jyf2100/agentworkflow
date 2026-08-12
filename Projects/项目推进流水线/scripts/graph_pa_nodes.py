@@ -279,6 +279,7 @@ def make_devloop_node(*, stage: str = "dispatch",
             out["status"] = C.STATUS_BLOCKED
             out["error"] = {"code": C.ERR_TEST_GATE,
                             "message": f"测试发布门拦截: {script.get('gate_status')}"}
+            extra["_exit_status"] = "blocked_test_gate"   # terminal_emit 精确映射（_SJ_TERMINAL_MAP 独立 event）
             extra["_gate_status"] = script.get("gate_status")
             extra["_gate_reason"] = script.get("gate_reason")
             extra["_test_status"] = script.get("test_status")
@@ -618,7 +619,7 @@ def _dev_post_op(ni: dict, state: dict):
         run_daily.reconcile_pr(repo, owner_repo, rec, cur_base, slug, interrupted=True)
         status = rec.get("status", "interrupted_pr")
         terminal = _RECONCILE_STATUS_TERMINAL.get(status, C.STATUS_INTERRUPTED)
-        extra = {"terminal": terminal, "_reconcile_status": status, "_pr_url": rec.get("pr_url")}
+        extra = {"terminal": terminal, "_exit_status": status, "_reconcile_status": status, "_pr_url": rec.get("pr_url")}
         if rec.get("skip_reason"):
             extra["_skip_reason"] = rec["skip_reason"]
         return ([], extra, {"reconcile_status": status, "pr_url": rec.get("pr_url"),
@@ -648,7 +649,7 @@ def _dev_post_op(ni: dict, state: dict):
             vj["evidence_ref"] = {"digest": ev.digest, "path": ev.path, "size": ev.size}
         except Exception as e:
             # blocked_evidence（不 reconcile_pr，L2287-2295；持久化失败的 green 不当 fresh evidence，防误判 published）
-            return ([], {"terminal": C.STATUS_BLOCKED,
+            return ([], {"terminal": C.STATUS_BLOCKED, "_exit_status": "blocked_evidence",
                          "_verify_payload": {**vj, "pass": False},
                          "_skip_reason": f"green test evidence 持久化失败: {e}"},
                     {"test_pass": True, "evidence_blocked": True, "has_commits": True, "reason": str(e)})
@@ -757,3 +758,94 @@ def _worktree_op(ni: dict, state: dict):
 
 
 node_worktree = make_mechanical_node(stage="dispatch", op=_worktree_op)
+
+
+# ── publication_reconcile node（任务 3.5e，verify pass 后 publication 前对账）────
+# task 4.4：publication 前结构化 reconcile（idempotency keys + KeyResolver 三态）。session_aware_retry 开 +
+#   coord.resolver → reconcile_side_effects 算 push/pr/test 幂等键 confirmed/pending/unknown；unknown 副作用 →
+#   fail-safe 阻断（不盲目 publish，L2344-2348）。baseline（flag off / 无 resolver）→ no-op（reconcile_pr 仍做
+#   真实 GitHub 对账，dispatch 决策零变化，L2327-2328）。MechanicalNode（零 LLM，D3）。
+def _publication_reconcile_op(ni: dict, state: dict):
+    import run_daily
+    import reconcile
+    flags = state.get("_coord_flags")
+    coord = state.get("_coord")
+    if not (flags and getattr(flags, "session_aware_retry", False)
+            and coord and getattr(coord, "resolver", None)):
+        return ([], {}, {"publication_reconcile": "baseline_noop"})   # flag off → no-op（L2327-2328）
+    targets = run_daily._publication_targets(
+        state.get("_owner_repo", ""),
+        {"branch": state.get("_branch")},
+        state.get("_verify_payload") or {})
+    report = reconcile.reconcile_side_effects(
+        iteration_id=state.get("_iter", ""), targets=targets, resolver=coord.resolver)
+    extra: dict = {"_publication_reconciliation": {
+        "confirmed": tuple(t.kind for t in report.confirmed),
+        "pending": tuple(t.kind for t in report.pending),
+        "unknown": tuple(t.kind for t in report.unknown),
+        "safe_to_publish": report.safe_to_retry}}
+    if not report.safe_to_retry:                            # unknown 副作用 → fail-safe 阻断（L2344-2348）
+        extra.update({"terminal": C.STATUS_BLOCKED, "_exit_status": "blocked_external_state",
+                      "_blocked_check": "publication_reconcile",
+                      "_skip_reason": "阻断-publication reconcile 有 unknown 副作用（不盲目 publish）"})
+    return ([], extra, {"publication_reconcile": "blocked" if not report.safe_to_retry else "passed"})
+
+
+node_publication_reconcile = make_mechanical_node(stage="dispatch", op=_publication_reconcile_op)
+
+
+# ── publish_baseline node（任务 3.5e，baseline 兜底开 PR）──────────────────
+# baseline 路（auto_merge off）：verify 绿 → reconcile_pr(interrupted=False) 兜底开正常 PR（治 baostock 式
+#   interrupted_pr；reconcile 查到 dev 自开 PR 则保持 pr_open，L2460）。reconcile_pr 设 rec.status（pr_open/
+#   interrupted_pr/blocked_external_state/fail/orphan_deleted）→ _exit_status 喂 terminal_emit。MechNode（D3）。
+def _publish_baseline_op(ni: dict, state: dict):
+    """baseline 兜底开 PR（对齐 L2460 reconcile_pr interrupted=False）。state 读 _worktree_abs/_owner_repo/_base/_branch/dev 字段。"""
+    import run_daily
+    repo = state.get("_worktree_abs", "")
+    owner_repo = state.get("_owner_repo", "")
+    base = state.get("_base", "main")
+    slug = ni.get("_slug", "")
+    rec = {"branch": state.get("_branch"), "dev_killed": state.get("_dev_killed", False),
+           "off_track": state.get("_dev_off_track", False), "stalled": state.get("_dev_stalled", False),
+           "run_log": state.get("_dev_run_log"), "prd_path": state.get("_prd_abs") or state.get("_prd_path")}
+    run_daily.reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=False)   # verify 绿 → 正常 PR
+    status = rec.get("status", "fail")
+    return ([], {"_exit_status": status, "_pr_url": rec.get("pr_url")},
+            {"publish_baseline": status, "pr_url": rec.get("pr_url")})
+
+
+node_publish_baseline = make_mechanical_node(stage="dispatch", op=_publish_baseline_op)
+
+
+# ── terminal_emit node（任务 3.5e，统一终态 journal emit）──────────────────
+# dispatch 所有出口的统一收尾（对齐 dispatch_one L2514 _sj_terminal）。读 _exit_status（原始 dispatch status；
+#   缺失则 terminal enum 映射）+ verify 信息构造 rec，调 _sj_terminal → published/revise/_SJ_TERMINAL_MAP event。
+#   flag 关（sj=None）→ no-op（ShadowJournal 契约 emit 内部 no-op；这里 short-circuit 避免构造 rec）。MechNode。
+_GRAPH_TERMINAL_TO_EXIT = {                       # graph enum terminal → dispatch status（_sj_terminal 词汇）
+    C.STATUS_BLOCKED: "blocked_external_state",
+    C.STATUS_TRIAGED: "triaged",
+    C.STATUS_INTERRUPTED: "interrupted_pr",
+    C.STATUS_HALTED: "halted",
+    C.STATUS_COOLDOWN: "cooldown",
+}
+
+
+def _terminal_emit_op(ni: dict, state: dict):
+    """统一终态 emit（对齐 L2514 _sj_terminal）。读 _exit_status/terminal/_skip_reason/_pr_url/verify 字段。"""
+    import run_daily
+    sj = state.get("_sj")
+    exit_status = state.get("_exit_status") or _GRAPH_TERMINAL_TO_EXIT.get(
+        state.get("terminal", ""), state.get("terminal") or "fail")
+    if sj is None:
+        return ([], {"_exit_status": exit_status}, {"terminal_emit": "no_sj", "status": exit_status})
+    rec = {"status": exit_status, "skip_reason": state.get("_skip_reason"),
+           "pr_url": state.get("_pr_url"), "verify_verdict": state.get("_verify_verdict"),
+           "verify": state.get("_verify_payload") or {}}
+    run_id = state.get("run_id", "")
+    artifact_root = run_daily.STATE_DIR / "artifacts" / run_id if run_id else None
+    run_daily._sj_terminal(sj, rec, state.get("_iter", ""), state.get("_prd", ""), artifact_root=artifact_root)
+    return ([], {"_exit_status": exit_status, "_terminal_emitted": True},
+            {"terminal_emit": exit_status})
+
+
+node_terminal_emit = make_mechanical_node(stage="dispatch", op=_terminal_emit_op)
