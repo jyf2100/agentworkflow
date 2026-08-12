@@ -849,3 +849,183 @@ def _terminal_emit_op(ni: dict, state: dict):
 
 
 node_terminal_emit = make_mechanical_node(stage="dispatch", op=_terminal_emit_op)
+
+
+# ── slot_acquire node（任务 3.5f，single-flight 准入 slot）──────────────────
+# serial_shadow on → acquire_slot（跨进程 flock + journal，对齐 _run_one L2779-2788）。
+#   acquired → 写 _slot_handle（slot_release/halt 用）；blocked: unknown→blocked_external_state（fail-safe），
+#   inflight/flock_busy/halted→skip（让位，对齐 _slot_blocked_record L2748-2754）。off/baseline/无 remote → no-op。
+#   MechanicalNode（需读 _coord_flags Namespace + 写 _slot_handle 句柄，GatewayNode check(ni) 不收 state 故不适用）。
+def _slot_acquire_op(ni: dict, state: dict):
+    import single_flight as SF
+    import run_daily
+    flags = state.get("_coord_flags")
+    if not (flags and getattr(flags, "single_flight_serial_shadow", False)):
+        return ([], {}, {"slot_acquire": "baseline_noop"})        # flag off → no-op（dispatch 决策零变化）
+    owner_repo = state.get("_owner_repo", "")
+    if not owner_repo:
+        return ([], {}, {"slot_acquire": "no_remote"})            # 无 remote → baseline 不串行
+    acq, handle = SF.acquire_slot(
+        run_daily.STATE_DIR, owner_repo, run_id=state.get("run_id", ""),
+        prd_id=state.get("_prd", ""), iteration_id=state.get("_iter", ""),
+        now_fn=run_daily._slot_now, stamp_fn=run_daily._now_iso)
+    if acq.acquired:
+        return ([], {"_slot_handle": handle}, {"slot_acquire": "acquired"})
+    reason = acq.blocked_reason or "unknown"
+    qreason = acq.query.reason if acq.query else ""
+    if reason == "unknown":                                       # fail-safe（L2749-2751）
+        return ([], {"terminal": C.STATUS_BLOCKED, "_exit_status": "blocked_external_state",
+                     "_blocked_check": "single_flight_slot",
+                     "_skip_reason": f"阻断-single-flight slot 状态不明: {qreason}"},
+                {"slot_acquire": "unknown_blocked"})
+    return ([], {"terminal": "skip", "_exit_status": "skip",       # inflight/flock_busy/halted → 让位（L2752-2754）
+                 "_skip_reason": f"跳过-single-flight slot 占用({reason}): {qreason}"},
+            {"slot_acquire": reason})
+
+
+node_slot_acquire = make_mechanical_node(stage="dispatch", op=_slot_acquire_op)
+
+
+# ── slot_release node（任务 3.5f，slot lifecycle 收尾）──────────────────────
+# 有 _slot_handle → release_slot（outcome 据终态；halt 场景 handle._halted 已由 publish 节点 halt_slot
+#   标记，release_slot 内部跳过 slot_released 保末事件 slot_halted，对齐 release_slot L249-262）。无 handle → no-op。
+def _slot_release_op(ni: dict, state: dict):
+    import single_flight as SF
+    import run_daily
+    handle = state.get("_slot_handle")
+    if handle is None:
+        return ([], {}, {"slot_release": "no_handle"})            # baseline 无 slot → no-op
+    terminal = state.get("terminal")
+    outcome = "halted" if terminal in (C.STATUS_HALTED, C.STATUS_COOLDOWN) else "done"
+    SF.release_slot(handle, stamp_fn=run_daily._now_iso, run_id=state.get("run_id", ""),
+                    prd_id=state.get("_prd", ""), iteration_id=state.get("_iter", ""),
+                    owner_repo=state.get("_owner_repo", ""), outcome=outcome)
+    return ([], {"_slot_handle": None, "_slot_released": True}, {"slot_release": outcome})
+
+
+node_slot_release = make_mechanical_node(stage="dispatch", op=_slot_release_op)
+
+
+def _halt_slot_safe_graph(state: dict, *, reason: str) -> None:
+    """graph 版 halt_slot（对齐 run_daily._halt_slot_safe L2693）。有 handle → halt_slot；无 → no-op。fail-open。"""
+    import single_flight as SF
+    import run_daily
+    handle = state.get("_slot_handle")
+    if handle is None:
+        return
+    try:
+        SF.halt_slot(handle, reason=reason, run_id=state.get("run_id", ""),
+                     prd_id=state.get("_prd", ""), iteration_id=state.get("_iter", ""),
+                     owner_repo=state.get("_owner_repo", ""), stamp_fn=run_daily._now_iso)
+    except Exception:
+        pass                    # fail-open（rec 已标 halted，须人工查 slot）
+
+
+# ── publish_gates node（任务 3.5f，auto_merge 容错门）──────────────────────
+# auto_merge on → 两道门（对齐 L2356-2377）：① is_in_cooldown（fail-open）→ triaged；
+#   ② has_open_intent（fail-safe）→ halted + halt_slot + CRITICAL（不重 merge）。off → no-op（走 publish_baseline）。
+def _publish_gates_op(ni: dict, state: dict):
+    import circuit_breaker as CB
+    import merge_loop as ML
+    import run_daily
+    flags = state.get("_coord_flags")
+    if not (flags and getattr(flags, "single_flight_auto_merge", False)):
+        return ([], {}, {"publish_gates": "baseline_noop"})       # auto_merge off → no-op
+    coord = state.get("_coord")
+    owner_repo = state.get("_owner_repo", "")
+    prd_id = state.get("_prd", "")
+    circuit_key = getattr(coord, "circuit_key", prd_id) if coord else prd_id
+    if CB.is_in_cooldown(run_daily.STATE_DIR, owner_repo, circuit_key, now_fn=run_daily._slot_now):
+        return ([], {"terminal": C.STATUS_TRIAGED, "_exit_status": "triaged",
+                     "_triage_reason": "cooldown_revert_loop"}, {"publish_gates": "cooldown"})
+    if ML.has_open_intent(run_daily.STATE_DIR, owner_repo, prd_id):   # fail-safe halt（L2370-2377）
+        _halt_slot_safe_graph(state, reason="merge_loop_open_intent")
+        run_daily._raise_critical_alert_safe(run_daily.STATE_DIR, owner_repo, prd_id,
+                                             reason="merge_loop_open_intent", stamp_fn=run_daily._now_iso)
+        return ([], {"terminal": C.STATUS_HALTED, "_exit_status": "halted",
+                     "_triage_reason": "merge_loop_open_intent"}, {"publish_gates": "open_intent_halt"})
+    return ([], {}, {"publish_gates": "passed"})
+
+
+node_publish_gates = make_mechanical_node(stage="dispatch", op=_publish_gates_op)
+
+
+# ── publish_merge node（任务 3.5f 骨架，auto_merge merge phase 串）─────────
+# auto_merge on → 完整 merge phase 串（对齐 L2378-2437）：merge_started → merge → post-merge →
+#   PASS merged / FAIL revert(REVERTED triaged / CONFLICT·UNKNOWN halt) / UNKNOWN halt；rebase fail → triaged abandoned。
+#   record_event 顺序 + terminal 映射 1:1 对齐 dispatch_one；真实 git merge/revert 经 _run_dev_agent（dev-agent
+#   机械层），canary（Phase 3 task 5.5）开 flag 真跑。off → no-op（baseline 走 publish_baseline）。
+def _publish_merge_op(ni: dict, state: dict):
+    import merge_phase as MP
+    import merge_loop as ML
+    import circuit_breaker as CB
+    import main_status as MS
+    import run_daily
+    flags = state.get("_coord_flags")
+    if not (flags and getattr(flags, "single_flight_auto_merge", False)):
+        return ([], {}, {"publish_merge": "baseline_noop"})       # auto_merge off → no-op
+    coord = state.get("_coord")
+    prof = state.get("_prof") or {}
+    owner_repo = state.get("_owner_repo", "")
+    prd_id = state.get("_prd", "")
+    circuit_key = getattr(coord, "circuit_key", prd_id) if coord else prd_id
+    base = state.get("_base", "main")
+    branch = state.get("_branch", "")
+    slug = ni.get("_slug", "")
+    wt = state.get("_worktree_abs", "")
+    log_file = state.get("_dev_log_file")
+    repo = state.get("_repo") or prof.get("repo", "")
+    python = run_daily._env_python(prof.get("conda_env", ""))
+    rec_pm = {"branch": branch, "prd_path": state.get("_prd_abs"), "verify": state.get("_verify_payload")}
+
+    def _run_agent(cmd):
+        return run_daily._run_dev_agent(cmd, wt, slug, log_file)
+
+    sd = run_daily.STATE_DIR
+    # ① merge phase（L2378-2383）
+    ML.record_event(sd, owner_repo, prd_id, "merge_started", stamp_fn=run_daily._now_iso, branch=branch, main_ref=base)
+    mr = MP.parse_merge_result(_run_agent(MP.build_merge_cmd(
+        python=python, dev_agent_py=run_daily.DEV_AGENT_PY, branch=branch, main_ref=base,
+        prd_id=prd_id, state_dir=str(sd))))
+    if not mr.merged:                                             # rebase_conflict/unknown/push_failed（L2433-2437）
+        ML.record_event(sd, owner_repo, prd_id, "merge_abandoned", stamp_fn=run_daily._now_iso, reason=mr.triage_reason)
+        return ([], {"terminal": C.STATUS_TRIAGED, "_exit_status": "triaged",
+                     "_triage_reason": mr.triage_reason}, {"publish_merge": "abandoned"})
+    # ② post-merge 闸（L2389-2398）
+    pmr = MP.parse_post_merge_result(_run_agent(MP.build_post_merge_cmd(
+        python=python, dev_agent_py=run_daily.DEV_AGENT_PY,
+        test_cmd=run_daily._post_merge_test_cmd(repo, rec_pm, prof) or "",
+        main_ref=base, prd_id=prd_id, state_dir=str(sd))))
+    MS.record_main_verified(sd, owner_repo, main_ref=base, merge_commit=mr.merge_commit,
+                            verdict=pmr.verdict.value, prd_id=prd_id, stamp_fn=run_daily._now_iso)
+    if pmr.verdict is MP.PostMergeVerdict.PASS:                    # merged（L2399-2402）
+        ML.record_event(sd, owner_repo, prd_id, "merge_completed", stamp_fn=run_daily._now_iso, merge_commit=mr.merge_commit)
+        return ([], {"_exit_status": "merged", "_merge_commit": mr.merge_commit,
+                     "_post_merge_verdict": pmr.verdict.value}, {"publish_merge": "merged"})
+    if pmr.verdict is MP.PostMergeVerdict.FAIL:                    # auto-revert（L2403-2425）
+        ML.record_event(sd, owner_repo, prd_id, "revert_started", stamp_fn=run_daily._now_iso, merge_commit=mr.merge_commit)
+        rvr = MP.parse_revert_result(_run_agent(MP.build_revert_cmd(
+            python=python, dev_agent_py=run_daily.DEV_AGENT_PY, merge_commit=mr.merge_commit,
+            main_ref=base, prd_id=prd_id, state_dir=str(sd))))
+        if rvr.outcome is MP.RevertOutcome.REVERTED:               # main 回绿 → triage（L2411-2418）
+            CB.record_revert(sd, owner_repo, circuit_key, stamp_fn=run_daily._now_iso)
+            ML.record_event(sd, owner_repo, prd_id, "revert_completed", stamp_fn=run_daily._now_iso,
+                            merge_commit=mr.merge_commit, revert_commit=rvr.revert_commit)
+            return ([], {"terminal": C.STATUS_TRIAGED, "_exit_status": "triaged",
+                         "_triage_reason": "post_merge_red_reverted", "_merge_commit": mr.merge_commit,
+                         "_revert_commit": rvr.revert_commit, "_reverted": True,
+                         "_post_merge_verdict": pmr.verdict.value}, {"publish_merge": "reverted"})
+        triage = f"post_merge_revert_{rvr.outcome.value}"          # CONFLICT/UNKNOWN → halt（L2419-2425）
+        _halt_slot_safe_graph(state, reason=triage)
+        run_daily._raise_critical_alert_safe(sd, owner_repo, prd_id, reason=triage, stamp_fn=run_daily._now_iso)
+        return ([], {"terminal": C.STATUS_HALTED, "_exit_status": "halted", "_triage_reason": triage,
+                     "_merge_commit": mr.merge_commit, "_post_merge_verdict": pmr.verdict.value},
+                {"publish_merge": "revert_failed_halt"})
+    _halt_slot_safe_graph(state, reason="post_merge_unknown")      # UNKNOWN → halt 不 auto-revert（L2426-2432）
+    run_daily._raise_critical_alert_safe(sd, owner_repo, prd_id, reason="post_merge_unknown", stamp_fn=run_daily._now_iso)
+    return ([], {"terminal": C.STATUS_HALTED, "_exit_status": "halted", "_triage_reason": "post_merge_unknown",
+                 "_merge_commit": mr.merge_commit, "_post_merge_verdict": pmr.verdict.value},
+            {"publish_merge": "post_merge_unknown_halt"})
+
+
+node_publish_merge = make_mechanical_node(stage="dispatch", op=_publish_merge_op)
