@@ -561,6 +561,109 @@ def _dev_resolve_cwd(state: dict) -> tuple[str, Any]:
 node_dev = make_devloop_node(stage="dispatch", build_cmd=_dev_build_cmd, resolve_cwd=_dev_resolve_cwd)
 
 
+# ── dev_post node 配置实例（任务 3.5b，verify 子图 dev→verify 之间的机械闸）────────
+# dev 之后、verify 之前：has_commits 三态判 + independent_verify + green evidence 持久化 + 写 _verify_payload
+# 喂 verify_prompt。对齐 dispatch_one L2261-2298（branch 缺失/has_commits/independent_verify/green evidence）
+# + L2510-2512（无产出 reconcile_pr interrupted 对账收尾）。MechanicalNode（零 LLM，D3）；terminal 经 extra
+# 透传（make_mechanical_node.node 的 update.update(extra) → 条件边读 state.terminal 机械路由，D6）。
+#
+# 出口（shadow parity dispatch_one）：
+#   ① 无 branch / 无 has_commits（UNKNOWN fail-safe 或 FOUND-False）→ reconcile_pr(interrupted=True) 对账
+#      + terminal（reconcile status→enum 映射；L2264/L2510-2512）。
+#   ② has_commits + independent_verify pass → green evidence artifact_store.store（L2281-2295）；store fail →
+#      terminal=blocked（不当 fresh green evidence，fail-closed 防 dual gate 误判 published；L2287-2295 不 reconcile_pr）。
+#   ③ has_commits（pass+evidence ok 或 红 test）→ 写 _verify_payload + _diff_path + _base=cur_base → verify（不 terminal）。
+#      红 test（pass=False）不 store evidence，直接交 pa-verify 审（L2281 if pass 才 store）。
+_RECONCILE_STATUS_TERMINAL = {
+    "interrupted_pr": C.STATUS_INTERRUPTED,
+    "pr_open": C.STATUS_INTERRUPTED,           # 远端已有 PR，对账收尾（非本轮 publish 成功）
+    "orphan_deleted": C.STATUS_TRIAGED,        # 无产出孤儿分支清理
+    "stalled": C.STATUS_TRIAGED,
+    "triaged": C.STATUS_TRIAGED,
+    "blocked_external_state": C.STATUS_BLOCKED,
+    "fail": C.STATUS_TRIAGED,
+}
+
+
+def _dev_post_op(ni: dict, state: dict):
+    """dev→verify 机械闸（对齐 dispatch_one L2261-2298 + L2510-2512）。
+
+    ni 转发：run_id/stamp/_project/_slug/verify_round（_ni _ROUND_KEYS + _ 前缀 str）。
+    state 读：_worktree_abs/_branch/_cur_base/_base/_dev_script/_prof/_owner_repo/_dev_log_file +
+              _dev_killed/_dev_off_track/_dev_stalled/_dev_run_log/_prd_abs（reconcile rec 构造）。
+    """
+    import run_daily
+    from pathlib import Path
+    import artifact_store
+    repo = state.get("_worktree_abs") or ""
+    branch = state.get("_branch")
+    cur_base = state.get("_cur_base") or state.get("_base") or "main"
+    script = state.get("_dev_script")
+    prof = state.get("_prof") or {}
+    slug = ni.get("_slug", "")
+    stamp = ni.get("stamp", "")
+    run_id = ni.get("run_id", "")
+    project = ni.get("_project", "")
+    owner_repo = state.get("_owner_repo", "")
+    log_file = state.get("_dev_log_file")
+    round_n = ni.get("verify_round") or 1
+
+    def _reconcile_terminal():
+        """无产出收尾：reconcile_pr interrupted 对账 + status→terminal 映射（L2264/L2510-2512）。"""
+        rec = {"branch": branch, "dev_killed": state.get("_dev_killed", False),
+               "off_track": state.get("_dev_off_track", False),
+               "stalled": state.get("_dev_stalled", False),
+               "run_log": state.get("_dev_run_log"),
+               "prd_path": state.get("_prd_abs") or state.get("_prd_path")}
+        run_daily.reconcile_pr(repo, owner_repo, rec, cur_base, slug, interrupted=True)
+        status = rec.get("status", "interrupted_pr")
+        terminal = _RECONCILE_STATUS_TERMINAL.get(status, C.STATUS_INTERRUPTED)
+        extra = {"terminal": terminal, "_reconcile_status": status, "_pr_url": rec.get("pr_url")}
+        if rec.get("skip_reason"):
+            extra["_skip_reason"] = rec["skip_reason"]
+        return ([], extra, {"reconcile_status": status, "pr_url": rec.get("pr_url"),
+                            "has_commits": False})
+
+    # ① 无 branch → 对账收尾（L2262-2264：dev 建分支前崩/超时）
+    if not branch:
+        return _reconcile_terminal()
+
+    # ② has_commits 三态（L2267-2270；UNKNOWN fail-safe 跳过独立验证，同 FOUND-False 走收尾）
+    commits = run_daily._has_commits(repo, cur_base, branch)
+    has_commits = commits.state is run_daily.ExtState.FOUND and bool(commits.value)
+    if commits.is_unknown or not has_commits:
+        return _reconcile_terminal()
+
+    # ③ independent_verify（L2271-2273；test_cmd_hint 取 dev 上报）
+    vj = run_daily.independent_verify(
+        repo, branch, stamp, slug, log_file, prof,
+        test_cmd_hint=(script.get("test_cmd") if script else None))
+
+    # ④ green evidence 持久化（L2281-2295；pass 才 store；fail-closed）
+    if vj.get("pass"):
+        try:
+            green_out = Path(vj["test_log"]).read_text(encoding="utf-8") if vj.get("test_log") else ""
+            ev = artifact_store.store(run_daily.STATE_DIR / "artifacts" / run_id, green_out,
+                                     kind="test_output", sensitivity="internal")
+            vj["evidence_ref"] = {"digest": ev.digest, "path": ev.path, "size": ev.size}
+        except Exception as e:
+            # blocked_evidence（不 reconcile_pr，L2287-2295；持久化失败的 green 不当 fresh evidence，防误判 published）
+            return ([], {"terminal": C.STATUS_BLOCKED,
+                         "_verify_payload": {**vj, "pass": False},
+                         "_skip_reason": f"green test evidence 持久化失败: {e}"},
+                    {"test_pass": True, "evidence_blocked": True, "has_commits": True, "reason": str(e)})
+
+    # ⑤ 写 _verify_payload + _diff_path + _base=cur_base → verify（L2303-2306；不 terminal）
+    diff_path = run_daily.STATE_DIR / "runs" / project / f"{stamp}_{slug}.r{round_n}.diff"
+    run_daily._dump_branch_diff(repo, cur_base, branch, diff_path)
+    return ([], {"_verify_payload": vj, "_diff_path": str(diff_path), "_base": cur_base},
+            {"test_pass": vj.get("pass"), "test_rc": vj.get("test_rc"),
+             "has_commits": True, "evidence_ref": vj.get("evidence_ref")})
+
+
+node_dev_post = make_mechanical_node(stage="dispatch", op=_dev_post_op)
+
+
 # ── dev redo node 配置实例（任务 3.4 stub，verify 子图的 revise 回环另一端；task 3.5 接 DevLoopNode）─
 # verify revise 回环：verify verdict=revise → 触发 dev 增量重做（带反馈重投）→ 回 verify round2。
 # 命令式里是 for-round continue（重跑 dev_agent + independent_verify + verify，stage_dispatch L2463-2509）。
