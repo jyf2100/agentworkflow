@@ -76,16 +76,64 @@ def commit_node(kind: NodeKind, ni: C.NodeInput, out: C.NodeOutput) -> C.NodeOut
     """通用 node 提交：校验 NodeInput/NodeOutput + verdict 边界运行时守（D3/R6）。
 
     verdict 边界：非 PersonaNode 产 verdict → raise（边界滑落）。这是运行时守；静态守由
-    check_boundary.py lint（扫「非 persona node 产 verdict」）。journal append_event(fsync) 接线
-    留 Phase 2 任务 3.7（node 内先 journal fsync 再 return state，D2 单写真源）。
+    check_boundary.py lint（扫「非 persona node 产 verdict」）。journal 单写（D2，task 3.7）：
+    commit_node 内 _journal_append(fsync) 先于 return state。
     """
     C.validate_node_input(ni)
     C.validate_node_output(out)
     if not kind.write_verdict and out.get("verdict") is not None:
         raise C.ContractError(
             f"{kind.name} node 产 verdict（边界滑落，D3/R6——仅 PersonaNode 可写语义判决）")
-    # TODO(phase2/3.7): journal.append_event(kind.name, ni, out, fsync=True)
+    _journal_append(kind, ni, out)               # task 3.7：journal 单写（D2，fsync 先于 return）
     return out
+
+
+def _journal_append(kind: NodeKind, ni: C.NodeInput, out: C.NodeOutput) -> None:
+    """task 3.7：node 提交时向 append-only journal 追加 node_committed 事件（D2 单写真源）。
+
+    观测层容错（对齐 ShadowJournal 三契约 loop_runtime.py:1-17）：无 _journal_path → no-op；
+    写入 I/O 异常吞不拖垮 node 控制流。**try 范围收窄到只裹 append_event**（import/JournalEvent 构造
+    在 try 外，让真代码缺陷如重命名/签名变动/f-string typo 正常报错，r2 review HIGH 修正：原实现把
+    构造期也裹进 try，比 ShadowJournal loop_runtime.py:80-85 更激进，会掩盖构建期 bug）；写失败经
+    stderr 暴露（守 CLAUDE.md「无静默失败」——D2 journal 是真相源非可弃影子，磁盘满/权限漂移致写失败
+    时崩溃恢复会重建错误状态，必须可观测）。event_type=node_committed 非 status（不在
+    _EVENT_STATUS_MAP，reducer no-op on status），与 _sj_terminal 的 status 终态事件语义正交
+    （节点级观测 vs 状态机级迁移，D3.3「一个 node 可吐多条事件」分层）。
+
+    event_id = ``nc-<node_id>-<_ik>-r<round>``：node_id 来自工厂 name 参数（NodeInput 已定义字段
+    graph_pa_contracts.py:141，r2 review CRITICAL 修正——dispatch 子图 9 个 mechanical 节点原共享
+    byte-identical event_id，崩溃恢复无法定位执行点；现每节点唯一 node_id）。fallback 链
+    node_id → obs.node → kind.name。重放同节点同 id → reducer dedup（D3.1 幂等靠 reconcile+幂等键）；
+    round 区分 critic/verify round2 不撞 round1（dict.get 默认值语义，显式 round=0 与缺失可区分）。
+    """
+    path = ni.get("_journal_path")
+    if not path:
+        return                                   # no-op（无 journal path = 不写，flag gating 自然）
+    import run_daily
+    import journal
+    from loop_state import JournalEvent, JOURNAL_SCHEMA_VERSION
+    obs = out.get("obs") or {}
+    node = ni.get("node_id") or obs.get("node") or kind.name
+    stage = ni.get("stage", "")
+    round_n = ni.get("prd_round", ni.get("verify_round", 0))
+    event_id = f"nc-{node}-{_ik(ni, stage)}-r{round_n}"
+    event = JournalEvent(
+        schema_version=JOURNAL_SCHEMA_VERSION,
+        event_id=event_id,
+        timestamp=run_daily._now_iso(),
+        iteration_id=ni.get("_iter", ""),
+        run_id=ni.get("run_id", ""),
+        prd_id=ni.get("_prd", ""),
+        event_type="node_committed",
+        payload={"base": "", "kind": kind.name, "stage": stage, "node": node,
+                 "verdict": out.get("verdict")},     # terminal 删（恒 None 死数据，r2 review MED）
+    )
+    try:
+        journal.append_event(path, event)            # O_APPEND + fsync（journal.py:71-84）
+    except Exception as e:                           # 观测层 I/O 容错（ShadowJournal 三契约）
+        import sys
+        print(f"[graph_pa] journal append failed (path={path}, node={node}, "
+              f"stage={stage}, err={type(e).__name__}: {e})", file=sys.stderr)
 
 
 # ── PersonaNode（控制面语义；唯一可写 verdict）──────────────────────────
@@ -95,7 +143,7 @@ def _default_verdict_mapper(payload: dict) -> dict:
             "feedback": payload.get("feedback", "")}
 
 
-def make_persona_node(*, agent_name: str, stage: str, label,
+def make_persona_node(*, name: str, agent_name: str, stage: str, label,
                      allowed_tools: list[str] | None = None,
                      build_prompt: Callable[[dict], str],
                      extract_artifacts: Callable[[dict, dict], list] | None = None,
@@ -130,7 +178,7 @@ def make_persona_node(*, agent_name: str, stage: str, label,
         return commit_node(KIND_PERSONA, ni, out), payload   # type: ignore[return-value]
 
     def node(state: dict) -> dict:
-        ni = _ni(state, stage=stage)
+        ni = _ni(state, stage=stage, node_id=name)
         out, payload = invoke(ni, build_prompt(state))
         update: dict = {"obs_log": [out["obs"]]}
         if to_state:
@@ -144,7 +192,7 @@ def make_persona_node(*, agent_name: str, stage: str, label,
 
 
 # ── MechanicalNode（零 LLM 机械活；不产 verdict）────────────────────────
-def make_mechanical_node(*, stage: str, op: Callable[[dict, dict], tuple]):
+def make_mechanical_node(*, name: str, stage: str, op: Callable[[dict, dict], tuple]):
     """op(ni, state)->(artifacts: list, state_extra: dict, obs: dict)。零 LLM；不产 verdict（D3）。
 
     op 收 (ni, state)：ni 是 NodeInput（run_id/stage/config/_project/_src_name 等标识），
@@ -158,7 +206,7 @@ def make_mechanical_node(*, stage: str, op: Callable[[dict, dict], tuple]):
         return commit_node(KIND_MECHANICAL, ni, out), (extra or {})
 
     def node(state: dict) -> dict:
-        ni = _ni(state, stage=stage)
+        ni = _ni(state, stage=stage, node_id=name)
         out, extra = invoke(ni, state)
         update: dict = {"obs_log": [out["obs"]]}
         update.update(extra)
@@ -169,7 +217,7 @@ def make_mechanical_node(*, stage: str, op: Callable[[dict, dict], tuple]):
 
 
 # ── GatewayNode（fail-safe 门；UNKNOWN→blocked；不产 verdict）────────────
-def make_gateway_node(*, stage: str, check: Callable[[dict], tuple]):
+def make_gateway_node(*, name: str, stage: str, check: Callable[[dict], tuple]):
     """check(ni)->(passed: bool, error: dict|None)。passed=False/三态 UNKNOWN → status=blocked（机械硬门，D6）。"""
     def invoke(ni: C.NodeInput):
         passed, error = check(ni)
@@ -180,7 +228,7 @@ def make_gateway_node(*, stage: str, check: Callable[[dict], tuple]):
         return commit_node(KIND_GATEWAY, ni, out)
 
     def node(state: dict) -> dict:
-        ni = _ni(state, stage=stage)
+        ni = _ni(state, stage=stage, node_id=name)
         out = invoke(ni)
         update: dict = {"obs_log": [out["obs"]]}
         if out["status"] != C.STATUS_OK:
@@ -211,7 +259,7 @@ def parse_dev_exit(code: int) -> tuple[str | None, str | None]:
     return C.STATUS_TRIAGED, C.ERR_PERSONA_CRASH
 
 
-def make_devloop_node(*, stage: str = "dispatch",
+def make_devloop_node(*, name: str, stage: str = "dispatch",
                       build_cmd: Callable[[dict], "list[str] | None"],
                       resolve_cwd: Callable[[dict], tuple]):
     """DevLoopNode 工厂（任务 3.5a 完整实装，R4）。
@@ -235,7 +283,7 @@ def make_devloop_node(*, stage: str = "dispatch",
     """
     def node(state: dict) -> dict:
         import run_daily
-        ni = _ni(state, stage=stage)
+        ni = _ni(state, stage=stage, node_id=name)
         cmd = build_cmd(state)
         cwd, log_file = resolve_cwd(state)
         base_out: dict = {"artifacts": [], "idempotency_key": _ik(ni, stage)}
@@ -328,6 +376,7 @@ def _radar_to_state(payload: dict, state: dict) -> dict:
 
 # label 运行期对齐 stage_radar 的 f"radar-{proj}"（调用形态一致，任务 2.6）
 node_radar = make_persona_node(
+    name="radar",
     agent_name="pa-radar", stage="radar", label=lambda ni: f"radar-{ni.get('_project', '')}",
     build_prompt=_radar_build_prompt, extract_artifacts=_radar_extract,
     expose_verdict=False, to_state=_radar_to_state)
@@ -367,18 +416,21 @@ def _fetch_to_state(payload: dict, state: dict) -> dict:
 
 
 node_fetch_deepresearch = make_persona_node(
+    name="fetch_deepresearch",
     agent_name="pa-fetch-deepresearch", stage="fetch", label=_fetch_label,
     allowed_tools=_FETCH_TOOLS["agent-deepresearch"],
     build_prompt=_make_fetch_build("fetch_prompt"),
     expose_verdict=False, to_state=_fetch_to_state)
 
 node_fetch_wechat = make_persona_node(
+    name="fetch_wechat",
     agent_name="pa-fetch-wechat-url", stage="fetch", label=_fetch_label,
     allowed_tools=_FETCH_TOOLS["wechat-url"],
     build_prompt=_make_fetch_build("wechat_url_prompt"),
     expose_verdict=False, to_state=_fetch_to_state)
 
 node_fetch_github = make_persona_node(
+    name="fetch_github",
     agent_name="pa-fetch-github-repo", stage="fetch", label=_fetch_label,
     allowed_tools=_FETCH_TOOLS["github-repo"],
     build_prompt=_make_fetch_build("github_repo_prompt"),
@@ -403,6 +455,7 @@ def _prd_to_state(payload: dict, state: dict) -> dict:
 
 
 node_prd = make_persona_node(
+    name="prd",
     agent_name="pa-prd", stage="prd", label="prd",      # label 固定（batch，对齐 stage_prd L907）
     build_prompt=_prd_build_prompt,
     expose_verdict=False, to_state=_prd_to_state)
@@ -422,7 +475,7 @@ def _inject_op(ni: dict, state: dict):
             {"inject_stamp": actual, "n_prds": len(manifest.get("prds", []))})
 
 
-node_inject = make_mechanical_node(stage="inject", op=_inject_op)
+node_inject = make_mechanical_node(name="inject", stage="inject", op=_inject_op)
 
 
 # ── critic node 配置实例（任务 3.3，critic 子图的 PersonaNode 组件）─────────
@@ -455,6 +508,7 @@ def _critic_verdict_mapper(payload: dict) -> dict:
 
 
 node_critic = make_persona_node(
+    name="critic",
     agent_name="pa-prd-critic", stage="critic", label=_critic_label,
     build_prompt=_critic_build_prompt,
     expose_verdict=True, to_state=_critic_to_state,
@@ -474,6 +528,7 @@ def _prd_revise_build_prompt(state: dict) -> str:
 
 
 node_prd_revise = make_persona_node(
+    name="prd_revise",
     agent_name="pa-prd", stage="prd", label=lambda ni: f"prd-revise:{ni.get('_project', '')}",
     build_prompt=_prd_revise_build_prompt,
     expose_verdict=False, to_state=lambda p, s: {"_revised_prd": p})
@@ -519,6 +574,7 @@ def _verify_verdict_mapper(payload: dict) -> dict:
 
 
 node_verify = make_persona_node(
+    name="verify",
     agent_name="pa-verify", stage="verify", label=_verify_label,
     build_prompt=_verify_build_prompt,
     expose_verdict=True, to_state=_verify_to_state,
@@ -560,7 +616,7 @@ def _dev_resolve_cwd(state: dict) -> tuple[str, Any]:
     return (str(wt), state.get("_dev_log_file"))
 
 
-node_dev = make_devloop_node(stage="dispatch", build_cmd=_dev_build_cmd, resolve_cwd=_dev_resolve_cwd)
+node_dev = make_devloop_node(name="dev", stage="dispatch", build_cmd=_dev_build_cmd, resolve_cwd=_dev_resolve_cwd)
 
 
 # ── dev_post node 配置实例（任务 3.5b，verify 子图 dev→verify 之间的机械闸）────────
@@ -663,7 +719,7 @@ def _dev_post_op(ni: dict, state: dict):
              "has_commits": True, "evidence_ref": vj.get("evidence_ref")})
 
 
-node_dev_post = make_mechanical_node(stage="dispatch", op=_dev_post_op)
+node_dev_post = make_mechanical_node(name="dev_post", stage="dispatch", op=_dev_post_op)
 
 
 # ── admission node 配置实例（任务 3.5d，dispatch 准入 4 闸）──────────────────
@@ -724,7 +780,7 @@ def _admission_op(ni: dict, state: dict):
             {"admission": "passed", "inflight": inflight, "max_inflight": max_inflight})
 
 
-node_admission = make_mechanical_node(stage="dispatch", op=_admission_op)
+node_admission = make_mechanical_node(name="admission", stage="dispatch", op=_admission_op)
 
 
 # ── worktree node 配置实例（任务 3.5d，detached worktree on base）─────────────
@@ -758,7 +814,7 @@ def _worktree_op(ni: dict, state: dict):
     return ([], {"_worktree_abs": str(wt)}, {"worktree": "ok", "wt": str(wt)})
 
 
-node_worktree = make_mechanical_node(stage="dispatch", op=_worktree_op)
+node_worktree = make_mechanical_node(name="worktree", stage="dispatch", op=_worktree_op)
 
 
 # ── publication_reconcile node（任务 3.5e，verify pass 后 publication 前对账）────
@@ -792,7 +848,7 @@ def _publication_reconcile_op(ni: dict, state: dict):
     return ([], extra, {"publication_reconcile": "blocked" if not report.safe_to_retry else "passed"})
 
 
-node_publication_reconcile = make_mechanical_node(stage="dispatch", op=_publication_reconcile_op)
+node_publication_reconcile = make_mechanical_node(name="publication_reconcile", stage="dispatch", op=_publication_reconcile_op)
 
 
 # ── publish_baseline node（任务 3.5e，baseline 兜底开 PR）──────────────────
@@ -815,7 +871,7 @@ def _publish_baseline_op(ni: dict, state: dict):
             {"publish_baseline": status, "pr_url": rec.get("pr_url")})
 
 
-node_publish_baseline = make_mechanical_node(stage="dispatch", op=_publish_baseline_op)
+node_publish_baseline = make_mechanical_node(name="publish_baseline", stage="dispatch", op=_publish_baseline_op)
 
 
 # ── terminal_emit node（任务 3.5e，统一终态 journal emit）──────────────────
@@ -849,7 +905,7 @@ def _terminal_emit_op(ni: dict, state: dict):
             {"terminal_emit": exit_status})
 
 
-node_terminal_emit = make_mechanical_node(stage="dispatch", op=_terminal_emit_op)
+node_terminal_emit = make_mechanical_node(name="terminal_emit", stage="dispatch", op=_terminal_emit_op)
 
 
 # ── slot_acquire node（任务 3.5f，single-flight 准入 slot）──────────────────
@@ -884,7 +940,7 @@ def _slot_acquire_op(ni: dict, state: dict):
             {"slot_acquire": reason})
 
 
-node_slot_acquire = make_mechanical_node(stage="dispatch", op=_slot_acquire_op)
+node_slot_acquire = make_mechanical_node(name="slot_acquire", stage="dispatch", op=_slot_acquire_op)
 
 
 # ── slot_release node（任务 3.5f，slot lifecycle 收尾）──────────────────────
@@ -904,7 +960,7 @@ def _slot_release_op(ni: dict, state: dict):
     return ([], {"_slot_handle": None, "_slot_released": True}, {"slot_release": outcome})
 
 
-node_slot_release = make_mechanical_node(stage="dispatch", op=_slot_release_op)
+node_slot_release = make_mechanical_node(name="slot_release", stage="dispatch", op=_slot_release_op)
 
 
 def _halt_slot_safe_graph(state: dict, *, reason: str) -> None:
@@ -948,7 +1004,7 @@ def _publish_gates_op(ni: dict, state: dict):
     return ([], {}, {"publish_gates": "passed"})
 
 
-node_publish_gates = make_mechanical_node(stage="dispatch", op=_publish_gates_op)
+node_publish_gates = make_mechanical_node(name="publish_gates", stage="dispatch", op=_publish_gates_op)
 
 
 # ── publish_merge node（任务 3.5f 骨架，auto_merge merge phase 串）─────────
@@ -1029,7 +1085,7 @@ def _publish_merge_op(ni: dict, state: dict):
             {"publish_merge": "post_merge_unknown_halt"})
 
 
-node_publish_merge = make_mechanical_node(stage="dispatch", op=_publish_merge_op)
+node_publish_merge = make_mechanical_node(name="publish_merge", stage="dispatch", op=_publish_merge_op)
 
 
 # ── report node（MechanicalNode：聚合 obs_log → 可查询 metrics，决策 M 路径 A / 任务 3.6）──
@@ -1091,4 +1147,4 @@ def _report_op(ni: dict, state: dict):
             {"node": "report", "node_count": len(obs_log)})
 
 
-node_report = make_mechanical_node(stage="report", op=_report_op)
+node_report = make_mechanical_node(name="report", stage="report", op=_report_op)

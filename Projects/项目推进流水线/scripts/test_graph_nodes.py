@@ -85,7 +85,7 @@ def test_persona_node_expose_verdict(monkeypatch):
     monkeypatch.setattr(run_daily, "run_persona",
                         lambda *a, **k: ({"verdict": "revise", "reason": "缺验收标准",
                                           "feedback": "补 AC"}, {"cost": 0, "turns": 1}))
-    critic = GN.make_persona_node(agent_name="pa-prd-critic", stage="critic", label="critic",
+    critic = GN.make_persona_node(name="critic_test", agent_name="pa-prd-critic", stage="critic", label="critic",
                                   build_prompt=lambda s: "p", expose_verdict=True)
     out, _ = critic.invoke({"run_id": "r", "stage": "critic", "config": {}}, "p")
     assert out["verdict"] == {"value": "revise", "reason": "缺验收标准", "feedback": "补 AC"}
@@ -94,7 +94,7 @@ def test_persona_node_expose_verdict(monkeypatch):
 # ── MechanicalNode（零 LLM，不产 verdict）────────────────────────────
 def test_mechanical_node():
     m = GN.make_mechanical_node(
-        stage="report",
+        name="mech_test", stage="report",
         op=lambda ni, state: ([{"kind": "metrics", "store": "vault", "rel_path": "m.json",
                                 "digest": "sha256:x"}], {"report": {"done": True}}, {"turns": 0}))
     out, extra = m.invoke({"run_id": "r", "stage": "report", "config": {}}, {})
@@ -115,13 +115,13 @@ def test_mechanical_node_cannot_produce_verdict():
 
 # ── GatewayNode（fail-safe 门，UNKNOWN→blocked）──────────────────────
 def test_gateway_node_pass():
-    gw = GN.make_gateway_node(stage="pre_dispatch", check=lambda ni: (True, None))
+    gw = GN.make_gateway_node(name="gw_pass", stage="pre_dispatch", check=lambda ni: (True, None))
     out = gw.invoke({"run_id": "r", "stage": "pre_dispatch", "config": {}})
     assert out["status"] == "ok"
 
 
 def test_gateway_node_blocked_yields_terminal():
-    gw = GN.make_gateway_node(stage="pre_dispatch", check=lambda ni: (False, None))
+    gw = GN.make_gateway_node(name="gw_blocked", stage="pre_dispatch", check=lambda ni: (False, None))
     update = gw({"run_id": "r", "stage": "pre_dispatch", "config": {}})
     assert update["terminal"] == "blocked"
 

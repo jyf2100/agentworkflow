@@ -62,6 +62,8 @@ class DispatchSubState(VerifySubState, total=False):
     _post_merge_verdict: str
     _publication_reconciliation: dict
     _terminal_emitted: bool
+    # journal 单写注入（task 3.7，调用方设；commit_node 经 _ni str 转发读，空则 no-op）
+    _journal_path: str       # journal 落盘绝对路径（dispatch = _coord.journal.path）
 
 
 # ── 条件边路由（机械，D6：读 state.terminal，不替判）──────────────────────
