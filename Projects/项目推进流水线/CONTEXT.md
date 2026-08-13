@@ -87,3 +87,26 @@ _Avoid_: merge request、patch、diff、变更说明。
 **学习记忆 (Learning Memory)**:
 控制面在 terminal PRD 之后做的「经验沉淀 + 跨 PRD 复用」子系统。terminal 后跑 read-only SDK reflection 抽 candidate lesson → cross-PRD 等价 recurrence ≥2 后 promote → 之后相关 PRD dispatch 时注入 ≤5 条 lesson 进 dev prompt → terminal 后用 effectiveness loop 评估（followed/contradicted/unknown）→ 据此调整 confidence 与 active/retired 状态。**state 全在 ``.project-auto/state/lessons/``（candidates/events/usage JSONL + catalog projection），绝不入目标仓/commit/PR/immutable PRD**（ADR-0001 控制/目标面隔离）。**fail-open by construction**：任何 reflection/injection/catalog/effectiveness 故障都不改 PRD 结果/dispatch terminal outcome/verify verdict/publish gate。两个 disabled-by-default flag（``PA_LEARNING_SHADOW`` / ``PA_LEARNING_INJECTION``）+ profile ``learning_memory.enabled`` 项目级 canary 标记共同 gate（V1 project-only scope）。两级 rollback：关 injection 保留 shadow candidate generation；关 shadow 停 reflection（existing candidate facts inert + rebuildable）。
 _Avoid_: memory、cache、knowledge base（太泛）、RAG（V1 明确 Non-Goal）。
+
+## 编排拓扑（LangGraph 重构后引入）
+
+> 以下术语随 `langgraph-workflow-upgrade` 重构落地引入（见 `openspec/changes/langgraph-workflow-upgrade/`）。重构前 `drop`/`triaged` 已用于 `run_daily.py`，此处为机械/语义边界精化。
+
+**node 内回环 (intra-node loop)**:
+回环的「判官」= 同一 node 的输出契约校验（机械、确定性）时，回环走节点函数体内部（普通 Python 循环），graph 只看最终 NodeOutput。例：PersonaNode 契约不合规补 repair-hint 重调 1 次；DevLoopNode 整个 dev loop（含 in-loop checkpoint / session retry / off_track break+重发，`dev-agent.py` 进程黑盒）。
+_Avoid_: 把 dev loop 内部循环拆成 graph 边（违 ADR-0006 + claude runtime 零改动）。
+
+**跨节点回环 (cross-node loop)**:
+回环的「判官」= 不同语义角色（critic 判 prd / verify 判 dev）时，回环走 graph 条件边（router 读 state 轮次计数器判上限）。例：critic revise（prd↔critic）/ verify revise（dispatch↔verify）。跨节点回环节点必须幂等（靠 [[reconcile]] + idempotency_key）。
+_Avoid_: 用 node 内循环表达跨语义角色的回环（掩埋拓扑、损 graph 可读性）。
+
+**drop**:
+[[PRD 质量闸]] / verify 闭环中，**对抗 persona 独占**的语义排除判决（PRD 不进 dispatch / dev 产出判死）。编排器（graph node/edge）**从不产生 drop**——遇 persona 输出残缺只产 [[triaged]]（升人工，不替判死）。守「机械层不替语义层判结论」。
+_Avoid_: 编排器硬判 drop（边界滑落，见 `orchestrator-boundary-audit-2026-08-11.md` 层 2）。
+
+**triaged**:
+编排器（机械层）的终端状态——遇 persona 输出残缺（prd 缺 path / critic 漏吐 verdict / revise 异常）或循环用尽（verify 用满 / dev off_track 连续 2 次）时，编排器**不替判死**，defer 给人 review。与 [[drop]]（persona 语义判决）严格区分：triaged = 升人工待审，drop = 已判排除。
+_Avoid_: 把 triaged 当 drop（编排器替判死）。
+
+**node（消歧）**:
+重构后「node」指 LangGraph StateGraph 图节点（4 类配置实例：PersonaNode/DevLoopNode/MechanicalNode/GatewayNode）。**与 pa 现有「node」= Node.js/npm 项目无关**（后者见 `orchestrator-boundary-audit-2026-08-11.md`，指被控仓的技术栈）。二者仅同词，无语义关联。
