@@ -45,11 +45,19 @@ class CriticSubState(TypedDict, total=False):
     _critic_verdict: str     # pass/revise/drop（critic node 写，route 读）
     _critic_payload: dict    # critic 完整 payload（含 revisions_needed 供 revise）
     _revised_prd: dict       # revise node 产物
+    _revise_failed: bool     # revise 异常标记（task 5.7：critic round2 短路 + route done）
     entries: list            # 累积 critic entries（对齐 stage_critic 返回 list[dict]）
 
 
 def _critic_fn(state: dict) -> dict:
-    """critic node：调 node_critic + 累积 entry（带 round/revised 标记）。"""
+    """critic node：调 node_critic + 累积 entry（带 round/revised 标记）。
+
+    task 5.7：``_revise_failed`` 短路——revise 异常后回 critic round2，不再调 persona（drop entry 已在
+    entries，``_critic_verdict=drop`` 由 _revise_fn 设，route_critic → done）。对齐 stage_critic L959-962
+    （revise 失败按 drop，不再过闸）。
+    """
+    if state.get("_revise_failed"):
+        return {}                                     # 短路 no-op（无 persona 调用无 obs）
     update = GN.node_critic(state)                    # {obs_log, _critic_payload, _critic_verdict}
     rnd = state.get("prd_round", 1)
     payload = update.get("_critic_payload") or {}
@@ -61,10 +69,32 @@ def _critic_fn(state: dict) -> dict:
 
 
 def _revise_fn(state: dict) -> dict:
-    """revise node：调 pa-prd round2 + bump prd_round（→ 下一轮 critic 是 round2）。"""
-    update = GN.node_prd_revise(state)               # {obs_log, _revised_prd}
-    update["prd_round"] = 2                           # revise 后回 critic 是 round2（1 次修订上限）
-    return update
+    """revise node：调 pa-prd round2 + bump prd_round + 同步 _prd_path（→ critic round2 读修订后 PRD）。
+
+    task 5.7 对齐 stage_critic L951-962：① 修订后 PRD 可能写新 path（rev_prd.path），critic round2 须读新 path
+    （否则 round2 还过闸旧 PRD = 失去修订意义，镜像 L953-954 rev_path）；② revise 异常 → drop entry + 设
+    ``_revise_failed``/``_critic_verdict=drop``（回 critic round2 短路 + route done，镜像 L959-962 try/except
+    不穿透子图，invoke 正常返回保 round1 entry 不丢）。
+    """
+    try:
+        update = GN.node_prd_revise(state)               # {obs_log, _revised_prd}
+        update["prd_round"] = 2                           # revise 后回 critic 是 round2（1 次修订上限）
+        # 同步修订后 PRD path（镜像 stage_critic L953-954 rev_path = rev_prd.get("path", path)）
+        revised = update.get("_revised_prd") or {}
+        rev_prds = revised.get("prds") or []
+        if rev_prds and rev_prds[0].get("path"):
+            update["_prd_path"] = rev_prds[0]["path"]
+        return update
+    except Exception as e:
+        # revise 异常 → drop entry + 强制 done（镜像 stage_critic L959-962，不穿透子图保 round1 entry）
+        import sys
+        print(f"[critic-sub] revise 失败，按 drop：{e}", file=sys.stderr)
+        path = state.get("_prd_path", "")
+        proj = state.get("_project", "")
+        drop = {"prd_path": path, "project": proj, "verdict": "drop",
+                "summary": f"revise 失败：{e}", "round": 2, "revised": True}
+        return {"entries": list(state.get("entries", [])) + [drop],
+                "_revise_failed": True, "_critic_verdict": "drop", "prd_round": 2}
 
 
 def route_critic(state: dict) -> str:

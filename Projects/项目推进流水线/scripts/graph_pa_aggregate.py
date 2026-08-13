@@ -11,9 +11,9 @@ langgraph-workflow-upgrade 批 1（task 3.9 + 5.2 前置）。主图 node 拆 2 
   ``dispatch_one``（~485 行）替换为 ``build_dispatch_subgraph``（graph 化核心价值）。``_subgraph_result_to_record``
   映射子图 state → rec schema（21 字段，喂 dispatch_{stamp}.json + stage_report）。
 
-critic 批 1 **包装 stage_critic**（不循环 ``build_critic_subgraph``）——因子图 verdict 缺失 / revise 异常边界
-与 stage_critic 有差异（stage_critic 缺 path→drop / 漏吐 verdict→drop / revise 异常→drop），镜像复杂；
-包装 stage_critic byte-identical 自动保证。critic 切子图留 follow-up（task 5.2）。
+critic 聚合 **循环 build_critic_subgraph**（task 5.7，替批 1 包装 stage_critic）——三边界（缺 path→drop /
+漏吐 verdict→drop / revise 异常→drop）在聚合层 + 子图 ``_revise_fn`` 全镜像 stage_critic，prd_gate 内容
+semantic-identical。critic 段全 graph 化（D6 完整）。
 
 不变式（守 design D1/D7/R8 + plan 关键约束）：
 - D1 claude runtime 零改动；编排器侧守同步不引 asyncio。
@@ -93,29 +93,81 @@ node_inject_main = make_mechanical_node(name="inject", stage="inject", op=_injec
 
 
 def _critic_main_op(ni: dict, state: dict):
-    """critic 包装：镜像 _run_pipeline L3397-3406（skip_critic 全 pass + stage_critic）。
+    """critic 聚合：复用门 + skip_critic 全 pass + 循环 build_critic_subgraph（每 PRD invoke）。
 
-    批 1 包装 stage_critic（byte-identical 自动保证），不循环 build_critic_subgraph——因子图 verdict
-    缺失 / revise 异常边界与 stage_critic 有差异（stage_critic 缺 path→drop / 漏吐 verdict→drop / revise
-    异常→drop），镜像复杂。critic 切子图留 follow-up（task 5.2）。复用门 ``prd_gate_{stamp}.json`` 在
-    stage_critic 内部。
+    task 5.7（替批 1 包装 stage_critic）：critic 段全 graph 化（D6 完整）。镜像 stage_critic L915-965：
+    skip_critic 全 pass（canary/演练，优先）→ 复用门 prd_gate_{stamp}.json（--force 跳）→ 循环单 PRD
+    critic 子图（round1 + revise round2 回环 + 三边界全在子图/本 op）。shadow parity：prd_gate 内容与
+    stage_critic semantic-identical（子图 entry = dict(payload) 同 _critic_one payload 来源 pa-prd-critic；
+    round/revised 字段对齐 stage_critic L956-957/L973-974）。
+
+    三边界（对齐 stage_critic）：① 缺 path→drop 预过滤（L934-937，子图前）；② 漏吐 verdict→drop 后处理
+    （L940-943，子图 route 对 None 静默 done，最后 entry 缺 verdict 时降级）；③ revise 异常→drop 在子图
+    _revise_fn（graph_pa_critic，保 round1 entry 不丢）。
     """
     import run_daily
+    import graph_pa_critic as GC
     args = state["_args"]
     stamp = ni["stamp"]
     manifest = state.get("prd_manifest") or {"prds": []}
+    gate_file = run_daily.STATE_DIR / f"prd_gate_{stamp}.json"
+
     if getattr(args, "skip_critic", False):
         gate = [{"prd_path": e.get("path", ""), "project": e.get("project", ""),
                  "verdict": "pass", "summary": "--skip-critic 直 pass（canary/演练）",
                  "round": 1, "revised": False, "issues": []} for e in manifest.get("prds", [])]
-        (run_daily.STATE_DIR / f"prd_gate_{stamp}.json").write_text(
-            json.dumps(gate, ensure_ascii=False, indent=2), encoding="utf-8")
-        run_daily.log(f"[critic] ⏭ skip（--skip-critic）：{len(gate)} 条 PRD 直 pass（canary/演练，绕质量闸）")  # 镜像 run_daily:3413（r-review I2）
-    else:
-        gate = run_daily.stage_critic(args, manifest, state["_profiles"], stamp)
-    return ([], {"critic_results": gate},
-            {"stage": "critic", "n_gate": len(gate),
-             "n_pass": sum(1 for e in gate if e.get("verdict") == "pass")})
+        gate_file.write_text(json.dumps(gate, ensure_ascii=False, indent=2), encoding="utf-8")
+        run_daily.log(f"[critic] ⏭ skip（--skip-critic）：{len(gate)} 条 PRD 直 pass（canary/演练，绕质量闸）")
+        return ([], {"critic_results": gate},
+                {"stage": "critic", "n_gate": len(gate),
+                 "n_pass": sum(1 for e in gate if e.get("verdict") == "pass")})
+
+    # 复用门（镜像 stage_critic L916-919，仅 skip_critic=False 时；skip 优先保 canary/演练语义）
+    if gate_file.is_file() and not getattr(args, "force", False):
+        run_daily.log(f"[critic] 复用已有 {gate_file.name}（--force 重跑）")
+        gate = json.loads(gate_file.read_text(encoding="utf-8"))
+        return ([], {"critic_results": gate},
+                {"stage": "critic", "n_gate": len(gate),
+                 "n_pass": sum(1 for e in gate if e.get("verdict") == "pass")})
+
+    # 循环 build_critic_subgraph（每 PRD invoke，替 stage_critic 命令式 for 循环 + revise 回环）
+    profiles = state["_profiles"]
+    entries: list = []
+    for prd in manifest.get("prds", []):
+        proj = prd.get("project")
+        prof = profiles.get(proj, {})
+        path = prd.get("path")
+        src = prd.get("source_path", "")
+        # 边界①缺 path → drop 预过滤（镜像 stage_critic L934-937）
+        if not path:
+            run_daily.log(f"[critic] ⚠ prd 缺 path（project={proj}）→ 降级 drop")
+            entries.append({"prd_path": path, "project": proj, "verdict": "drop",
+                            "summary": "prd manifest 缺 path，无法过闸"})
+            continue
+        sub_state = {
+            "run_id": state.get("run_id", ""), "stamp": stamp, "config": {},
+            "_prd_path": path, "_source_path": src, "_project": proj,
+            "_prof": prof, "_profiles": profiles,
+            "prd_round": 1, "entries": [],
+        }
+        result = GC.build_critic_subgraph().invoke(sub_state)
+        sub_entries = result.get("entries", [])
+        # 边界②漏吐 verdict → drop 后处理（镜像 stage_critic L940-943：critic 输出缺 verdict 字段降级）。
+        # 子图 route_critic 对 _critic_verdict=None 静默 done（不进 revise），最后 entry 可能缺 verdict。
+        if sub_entries:
+            last = sub_entries[-1]
+            if "verdict" not in last:
+                run_daily.log(f"[critic] ⚠ critic 漏吐 verdict（{path}）→ 降级 drop")
+                last.setdefault("prd_path", path)
+                last.setdefault("project", proj)
+                last["verdict"] = "drop"
+                last.setdefault("summary", "critic 输出缺 verdict 字段，降级")
+        entries.extend(sub_entries)
+
+    gate_file.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    return ([], {"critic_results": entries},
+            {"stage": "critic", "n_gate": len(entries),
+             "n_pass": sum(1 for e in entries if e.get("verdict") == "pass")})
 
 
 node_critic_main = make_mechanical_node(name="critic", stage="critic", op=_critic_main_op)
