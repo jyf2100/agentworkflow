@@ -58,10 +58,10 @@
 
 ## 7. 文档 + 收尾
 
-- [ ] 7.1 `CLAUDE.md` 高层架构小节补 LangGraph 编排层（graph_pa*.py + feature_flag 分流 + journal 单写持久化 + 秒回退）
-- [ ] 7.2 `RUNBOOK.md` 加 graph 恢复（`recovery_cli` over journal）+ shadow parity drill + 秒回退步骤
-- [ ] 7.3 新增测试套全绿（test_graph_cron_path / test_graph_radar / test_graph_topology / test_graph_state_serialize / test_check_boundary / test_artifact_handle / test_shadow_parity）
-- [ ] 7.4 `bash scripts/quality.sh` 最终全绿（compileall + pytest + ruff）+ OQ1-OQ4 决策落档（OQ1/OQ2 已决、OQ3 待 Phase 1、OQ4 撤）
+- [x] 7.1 `CLAUDE.md` 高层架构小节补 LangGraph 编排层（graph_pa*.py + feature_flag 分流 + journal 单写持久化 + 秒回退）— 完成（commit 9092afa）：「单一编排器」小节后加「LangGraph 编排层（渐进迁移）」小节（主图 + 聚合/包装 node + 子图清单 + feature_flag 物理隔离 D7 + run_cron 分流 + 秒回退 + 不用 Checkpointer journal 单写 + shadow parity canary + cutover 发布门条件性硬 gate）
+- [x] 7.2 `RUNBOOK.md` 加 graph 恢复（`recovery_cli` over journal）+ shadow parity drill + 秒回退步骤 — 完成（commit 9092afa）：§9「LangGraph 编排层 cutover」四子节——§9.1 graph 崩溃恢复（journal-driven 复用 §1 recovery_cli，非 graph state 重建）+ §9.2 shadow parity canary（canary_graph_cutover.sh prep/shadow-run/parity/verify + 判据 a/b/c/d）+ §9.3 cutover 发布门（run_full_cutover_suite 9 维度 + 条件性硬 gate 语义）+ §9.4 秒回退（unset PA_GRAPH_ORCHESTRATOR，双路径同 schema 无需迁移）
+- [x] 7.3 新增测试套全绿（test_graph_cron_path / test_graph_radar / test_graph_topology / test_graph_state_serialize / test_check_boundary / test_artifact_handle / test_shadow_parity）— 完成（**超额**）：计划 7 个测试文件全绿，实际建 **28+ 个** test_graph_*（admission/contracts/critic/cron_path/devloop/dev_post/dispatch/dispatch_e2e/fetch/inject/journal/main_e2e/nodes/prd/publication/publication_auto/radar/recovery/report/slot/state/state_serialize/topology/verify/worktree）+ test_check_boundary + test_shadow_parity + test_subgraph_to_record_mapping。`test_artifact_handle` 未单独建——ArtifactHandle 逻辑在 6 处覆盖（test_check_boundary / test_graph_state_serialize / test_graph_contracts / test_graph_state / test_graph_verify / test_graph_report）。quality 1879 passed + 5 xfailed 全绿
+- [x] 7.4 `bash scripts/quality.sh` 最终全绿（compileall + pytest + ruff）+ OQ1-OQ4 决策落档（OQ1/OQ2 已决、OQ3 待 Phase 1、OQ4 撤）— 完成：quality **1879 passed + 5 xfailed + ruff clean**（2026-08-13 终绿）。OQ1-OQ4 决策已在 design.md L180-183 落档：OQ1 已决（GatewayNode 独立，突出 fail-safe 语义）+ OQ2 已决（TypedDict + 中心化验证，守纯 stdlib）+ OQ3 待 Phase 1（digest 长期强制 / tmp 可选，倾向 tmp 可选省成本）+ OQ4 撤（D2 不用 Checkpointer，SqliteSaver/PostgresSaver 之争失效）
 
 ## 8. follow-up（重构落地后，不在本期）
 
