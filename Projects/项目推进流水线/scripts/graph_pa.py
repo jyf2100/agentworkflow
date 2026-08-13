@@ -102,6 +102,8 @@ def _run_pipeline_graph(args) -> None:
         config = {"lo": lo, "hi": hi, "inject_prd": getattr(args, "inject_prd", None)}
         build_main_graph(config).invoke(state)
     except (RuntimeError, ImportError) as e:   # r-review I3：RuntimeError=stage 业务异常；ImportError=langgraph 未装（shadow 路径误开 grafeno）
+        import traceback
+        traceback.print_exc()                  # python-review H3：ImportError 也会被真 import bug 触发，须见 traceback 区分「环境缺 langgraph」vs「代码 bug」
         run_daily.log(f"✗ {e}")
         run_daily.log("（state 产物已落盘，修参后可 --from-stage 续跑）")
         sys.exit(1)

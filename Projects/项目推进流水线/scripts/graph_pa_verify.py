@@ -162,8 +162,8 @@ def _redo_fn(state: dict) -> dict:
         driven = bool(flags and getattr(flags, "journal_driven_dispatch", False))
         try:
             run_daily._append_verify_feedback(prd_abs, feedback, round_n, driven=driven)
-        except Exception:
-            pass   # fail-open：反馈追加失败不阻断 verify 闭环（_append_verify_feedback shadow 契约）
+        except Exception as e:   # fail-open + log（对齐 run_daily._halt_slot_safe fail-open 语义；守「无静默失败」——silent-failure-hunter/python-reviewer M2）
+            run_daily.log(f"  ⚠️ verify 反馈追加失败: {e}（fail-open 不阻断 verify 闭环）")
     # ② session retry flag-gate（对齐 L2476-2508；flag on + _coord → recover_iteration 据 mode 设 session）
     update.update(_redo_session_retry(state, branch))
     return update

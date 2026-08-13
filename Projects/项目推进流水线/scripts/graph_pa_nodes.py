@@ -974,8 +974,8 @@ def _halt_slot_safe_graph(state: dict, *, reason: str) -> None:
         SF.halt_slot(handle, reason=reason, run_id=state.get("run_id", ""),
                      prd_id=state.get("_prd", ""), iteration_id=state.get("_iter", ""),
                      owner_repo=state.get("_owner_repo", ""), stamp_fn=run_daily._now_iso)
-    except Exception:
-        pass                    # fail-open（rec 已标 halted，须人工查 slot）
+    except Exception as e:      # fail-open + log（对齐 run_daily._halt_slot_safe L2704-2705；守「无静默失败」——silent-failure-hunter/python-reviewer M2）
+        run_daily.log(f"  ⚠️ halt_slot 失败（{reason}）: {e}（rec 已标 halted，须人工查 slot）")
 
 
 # ── publish_gates node（任务 3.5f，auto_merge 容错门）──────────────────────

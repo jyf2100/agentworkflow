@@ -255,7 +255,10 @@ def resolve_handle(handle: ArtifactHandle, *, vault_root: str | None = None,
         base = state_dir
     if not base:
         raise ContractError(f"store={store} 需对应 root（vault_root/state_dir/worktree_root）未提供")
-    abs_path = os.path.join(base, rel)
+    abs_path = os.path.normpath(os.path.join(base, rel))
+    _norm_base = os.path.normpath(base)
+    if os.path.commonpath([abs_path, _norm_base]) != _norm_base:   # 纵深防御：拒 path traversal（security-review M1；当前 rel 全编排器控无 live exploit，接线即受护）
+        raise ContractError(f"path traversal 拒绝: store={store} rel={rel} → {abs_path} 越出 {_norm_base}")
     if handle.get("must_exist") and not os.path.exists(abs_path):
         raise MissingArtifactError(f"must_exist artifact 缺失: store={store} rel={rel} → {abs_path}")
     return abs_path
