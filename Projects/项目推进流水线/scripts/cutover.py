@@ -53,11 +53,24 @@ class ShadowParityReport:
 
     ``matched=True`` ⇔ 历史 dispatch 终态分布 == journal-reducer 终态分布（迁移未改行为）。
     ``mismatches`` 列出每个不一致桶（供「解决每一个 mismatch」，design 8.1）。
+
+    r-review I-2（type-design-analyzer）：``__post_init__`` 强制双重不变式——``matched ⇔
+    dispatch_counts == journal_counts`` 且 ``matched ⇔ mismatches 空``。防 C-1 类复发（伪造空 counts
+    让 counts 相等却 matched=False 会在构造时抛 ValueError，而非静默带病传播；load 失败应用 LoadFailureReport）。
     """
     dispatch_counts: dict
     journal_counts: dict
     matched: bool
     mismatches: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        counts_match = self.dispatch_counts == self.journal_counts
+        if self.matched != counts_match:
+            raise ValueError(
+                f"ShadowParityReport counts 不变式违规：matched={self.matched} 但 "
+                f"dispatch_counts==journal_counts → {counts_match}（load 失败用 LoadFailureReport，勿伪造空 counts）")
+        if self.matched != (len(self.mismatches) == 0):
+            raise ValueError(f"ShadowParityReport mismatches 不变式违规：matched={self.matched} 但 {len(self.mismatches)} mismatches")
 
 
 def run_shadow_parity_drill(dispatch_records: list[dict],
@@ -764,6 +777,262 @@ def resolve_learning_injections_source(*, injection_flag, shadow_flag, project_i
     # 全过 → learning injection 开仓
     return DispatchCutoverResult(
         driven_by="learning_injection", terminal_state=terminal_state, fallback_reason="")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# langgraph-workflow-upgrade task 5.3 + 3.10：graph orchestrator cutover gate + 双源 shadow parity
+# ════════════════════════════════════════════════════════════════════════════
+# graph 主图（graph_pa.py）cutover 的安全门 + parity 验证。design D7（flag 物理隔离）+ R7（shadow parity
+# 前置）+ RUNBOOK §8（shadow→drill→canary→全量）。批 3 实现纯函数 + evidence + outcome 提取器；接入
+# run_full_cutover_suite runner（CutoverDrillBundle 字段 / outcomes 元组 / _ALLOWED_OPEN_ITEMS 软 open item）
+# 留批 4 task 5.6——与 canary 真双源数据一起接入，避免批 3 改 8 维度 suite + 白名单 + 无真数据致 red。
+
+
+def resolve_graph_orchestrator_source(*, orchestrator_flag, shadow_flag, project_id, allowlist,
+                                      parity_passed) -> DispatchCutoverResult:
+    """langgraph-workflow-upgrade task 5.3a：graph orchestrator 四重 gate 纯函数。
+
+    镜像 ``resolve_learning_injections_source`` 的 shadow→parity→allowlist→flag 四重 gate（orchestrator
+    是编排层切换，不涉 learning 的 quality gate；preflight 已静态阻断 orchestrator=on,shadow=off）。
+    design D7/R7：orchestrator cutover（cron 分流 graph_pa.py）必须先 shadow parity + 单项目 allowlist
+    rollout。gate 任一不过 → fallback（reason 指明未开闸维度），cron 仍走 run_daily（秒回退）。
+
+    四重 gate 按序短路（任一不过即 fallback）：
+        ① ``shadow_flag`` off → fallback（orchestrator gated on shadow，preflight 亦静态阻断）
+        ② ``parity_passed`` False → fallback（cutover 前置：双源终态分布须一致）
+        ③ ``project_id`` 不在 ``allowlist`` → fallback（单项目 rollout）
+        ④ ``orchestrator_flag`` off → fallback（前置全过但开关关 = shadow 可旁路跑，cron 未分流）
+
+    全过 → ``driven_by='graph_orchestrator'``（cron 分流 graph_pa.py）。
+
+    **纯函数零 IO**（cutover.py 约束）：不在内分流 cron、不读文件、不调 SDK。r-review I3：不设
+    ``journal_events``/``legacy_records`` 占位参数（graph 路径无 journal reducer 驱动——D2 journal 单写
+    真源 + 直接 invoke，占位参数永不被消费只会误导 API 消费者；与 ``resolve_dispatch_source`` 的
+    DispatchCutoverResult 返回对称已足够）。
+    """
+    allow = set(allowlist or ())
+    terminal_state = ""      # gate 判定阶段无 terminal state
+    # ① shadow 前置（design D7：orchestrator gated on shadow；preflight 静态阻断 orchestrator=on,shadow=off）
+    if not shadow_flag:
+        return DispatchCutoverResult(
+            driven_by="graph_orchestrator_shadow_off", terminal_state=terminal_state,
+            fallback_reason="pa_graph_shadow off (orchestrator gated on shadow)")
+    # ② parity（cutover 前置：双源终态分布一致，R7）
+    if not parity_passed:
+        return DispatchCutoverResult(
+            driven_by="graph_orchestrator_parity_failed", terminal_state=terminal_state,
+            fallback_reason="graph shadow parity not passed (run_daily vs graph_pa 终态分布不一致)")
+    # ③ allowlist（单项目 rollout，与 dispatch/learning allowlist 解耦）
+    if project_id not in allow:
+        return DispatchCutoverResult(
+            driven_by="graph_orchestrator_not_allowlisted", terminal_state=terminal_state,
+            fallback_reason=f"project {project_id!r} not in graph orchestrator allowlist (single-project rollout)")
+    # ④ orchestrator_flag 关：前置全过但开关仍关 → fallback（shadow 已可旁路跑，cron 未分流 graph_pa.py）
+    if not orchestrator_flag:
+        return DispatchCutoverResult(
+            driven_by="graph_orchestrator_flag_off", terminal_state=terminal_state,
+            fallback_reason="pa_graph_orchestrator flag off (shadow 旁路可跑，cron 未分流)")
+    # 全过 → graph orchestrator 开仓（run_cron.sh 分流 graph_pa.py）
+    return DispatchCutoverResult(
+        driven_by="graph_orchestrator", terminal_state=terminal_state, fallback_reason="")
+
+
+def run_graph_shadow_parity_drill(daily_records: list[dict],
+                                  graph_records: list[dict]) -> ShadowParityReport:
+    """langgraph-workflow-upgrade task 5.3b：双源 run_daily vs graph_pa 终端记录 shadow parity。
+
+    镜像 ``run_shadow_parity_drill``（L63-79），但两源都是 dispatch records（run_daily ``dispatch_{stamp}.json``
+    vs graph_pa ``dispatch_{stamp}.json``），都用 ``CR.summarize_terminal`` 比终态分布。``matched`` ⇔ 两源
+    终态分布一致（graph 主图未改 dispatch 行为，R7 前置）。
+
+    注：复用 ``ShadowParityReport``（dispatch_counts=daily 终态、journal_counts=graph 终态——字段名沿袭
+    run_shadow_parity_drill 的 dispatch/journal 命名，graph 语境下 journal_counts 语义=graph_counts）。
+    终态 Counter 比对是快速 parity；逐 stage byte-identical（防 Counter 假绿，R7）见
+    ``run_graph_shadow_parity_drill_per_stage``（task 3.10）。
+    """
+    dc: Counter = CR.summarize_terminal(daily_records)
+    gc: Counter = CR.summarize_terminal(graph_records)
+    keys = sorted(set(dc) | set(gc), key=lambda s: getattr(s, "value", str(s)))
+    mismatches = tuple(
+        f"{getattr(k, 'value', k)}: daily={dc.get(k, 0)} graph={gc.get(k, 0)}"
+        for k in keys if dc.get(k, 0) != gc.get(k, 0)
+    )
+    return ShadowParityReport(dispatch_counts=dict(dc), journal_counts=dict(gc),
+                              matched=not mismatches, mismatches=mismatches)
+
+
+@dataclass(frozen=True)
+class LoadFailureReport:
+    """r-review C-1（type-design-analyzer Critical）：loader 失败态专用 report（evidence 短路用）。
+
+    不伪造 ShadowParityReport 空 counts——那违反其不变式 ``matched ⇔ dispatch_counts == journal_counts``
+    （空 counts 相等却 matched=False 是 C-1 反模式）。load 失败是独立语义：无真实终态分布可比。本类型暴露
+    ``.matched``（恒 False）+ ``.mismatches``（source_load_error 诊断），让消费者 ``_graph_shadow_parity_outcome``
+    鸭子类型兼容 ShadowParityReport（两者都只被读 .matched/.mismatches），无需 None-check。
+    """
+    mismatches: tuple[str, ...]
+    matched: bool = False            # 恒 False（load 失败永不一致）
+
+    def __post_init__(self):
+        if self.matched:
+            raise ValueError("LoadFailureReport.matched 恒 False（load 失败永不 match）")
+        if not self.mismatches:
+            raise ValueError("LoadFailureReport 必须带 source_load_error 诊断 mismatches")
+
+
+@dataclass(frozen=True)
+class GraphShadowParityEvidence:
+    """task 5.3b：run_daily vs graph_pa 双源 shadow parity 可归档证据（design#6 archive passing evidence）。
+
+    ``parity.matched`` ⇔ 同 stamp 同 PRD 输入下，run_daily 与 graph_pa 两条路径产出的 dispatch 终态分布
+    一致（graph 主图 byte-identical 复刻 run_daily 编排，R7）。批 4 canary（task 5.5）真实双跑产出 evidence。
+
+    r-review C-1：loader 失败时 ``parity`` 为 ``LoadFailureReport``（非伪造空 counts 的 ShadowParityReport）。
+    ``n_daily``/``n_graph`` 即使另一源失败也保留成功方的真实记录数（诊断诚实，不矛盾 mismatch 的 daily=ok）。
+    """
+    parity: ShadowParityReport | LoadFailureReport
+    stamp: str
+    n_daily: int
+    n_graph: int
+
+
+# r-review Q1（silent-failure-hunter Critical）：loader 哨兵。双源同损坏/同缺失时 `[]` vs `[]` 或 None vs None
+# 会被当"一致"（假绿 matched=True），打通 gate ② parity。哨兵区分"load 失败"与"load 成功得空"，drill/evidence
+# 检测任一源哨兵即 matched=False（不把双源同失败当一致）。
+_LOAD_FAILED = object()
+
+
+@dataclass(frozen=True)
+class StageParityReport:
+    """task 3.10：逐 stage JSON 内容一致性报告（语义 ≠ ShadowParityReport 的终态 Counter 分布）。
+
+    r-review C1（type-design-analyzer Critical）：per_stage 不再重载 ShadowParityReport 伪造空 counts
+    （违反其隐含不变式 ``matched ⇔ dispatch_counts == journal_counts``）。专用类型表达"逐 stage JSON
+    反序列化后 == 比较"——``stages_checked`` 记比了哪些 stage，``mismatches`` 列不一致 stage（含 Q1
+    load_failed 行），``matched`` ⇔ mismatches 为空。
+
+    r-review I-2：``__post_init__`` 强制 ``matched ⇔ mismatches 空``（构造时校验，防未来调用点算错 matched）。
+    """
+    stages_checked: tuple[str, ...]
+    mismatches: tuple[str, ...]
+    matched: bool
+
+    def __post_init__(self):
+        if self.matched != (len(self.mismatches) == 0):
+            raise ValueError(f"StageParityReport 不变式违规：matched={self.matched} 但 {len(self.mismatches)} mismatches")
+
+
+def _load_status(v: object) -> str:
+    """loader 结果状态（Q1 哨兵诊断）：failed / ok。"""
+    return "failed" if v is _LOAD_FAILED else "ok"
+
+
+def _load_dispatch_json(path):
+    """读 dispatch_{stamp}.json。失败（缺/损坏/非 list）→ ``_LOAD_FAILED`` 哨兵（Q1：区分 'load 失败' vs
+    '成功得空'，防双源同失败被 drill 当一致假绿）。成功 → list[dict]。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else _LOAD_FAILED
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _LOAD_FAILED
+
+
+def run_graph_shadow_parity_evidence(*, daily_state_dir, graph_state_dir, stamp) -> GraphShadowParityEvidence:
+    """task 5.3b：读两 state_dir 的 ``dispatch_{stamp}.json``，跑 ``run_graph_shadow_parity_drill``。
+
+    production wiring（design 决策#1）：把 ``run_graph_shadow_parity_drill`` 从纯函数连成可重复运行的
+    evidence 命令。批 4 canary（task 5.5）隔离 state 双跑 run_daily 与 graph_pa 后，本函数比对其 dispatch
+    产物。
+
+    r-review Q1：loader 失败（缺/损坏）→ ``_LOAD_FAILED`` 哨兵短路 ``matched=False``（mismatches 标注
+    source_load_error），不把"双源都 load 失败"当一致假绿。单源失败亦报 red。
+    """
+    dailyp = Path(daily_state_dir) / f"dispatch_{stamp}.json"
+    graphp = Path(graph_state_dir) / f"dispatch_{stamp}.json"
+    daily_raw = _load_dispatch_json(dailyp)
+    graph_raw = _load_dispatch_json(graphp)
+    if daily_raw is _LOAD_FAILED or graph_raw is _LOAD_FAILED:
+        # r-review C-1：用 LoadFailureReport（非伪造空 counts 的 ShadowParityReport，避免违反其不变式）。
+        # r-review Important（silent-failure-hunter）：n_daily/n_graph 保留成功方真实记录数（单源失败时
+        # 不丢弃另一方数量，避免与 mismatch 的 "daily=ok" 诊断矛盾）。
+        reason = f"source_load_error: daily={_load_status(daily_raw)} graph={_load_status(graph_raw)}"
+        return GraphShadowParityEvidence(
+            parity=LoadFailureReport(mismatches=(reason,)), stamp=stamp,
+            n_daily=len(daily_raw) if daily_raw is not _LOAD_FAILED else 0,
+            n_graph=len(graph_raw) if graph_raw is not _LOAD_FAILED else 0)
+    parity = run_graph_shadow_parity_drill(daily_raw, graph_raw)
+    return GraphShadowParityEvidence(parity=parity, stamp=stamp,
+                                     n_daily=len(daily_raw), n_graph=len(graph_raw))
+
+
+# 每 stage 产物文件名（byte-identical 比对，R7 防 Counter 假绿；run_daily 与 graph_pa 都写这些 {stage}_{stamp}.json）
+# r-review Q2-report（silent-failure-hunter Important）：report_{stamp}.md 不在此列——含时间戳非 byte-stable，
+# 且 report node（graph_pa.py node_report_main）是 graph 路径自有逻辑节点（模板/聚合/SMTP 可能独立漂移），
+# 非前序 stage 纯函数。report 漂移是已知盲区，留批 4 canary 真数据 + report 规范化比对（剥时间戳/SMTP header 后 diff）。
+_GRAPH_PARITY_STAGE_FILES: tuple[str, ...] = ("candidates", "prd_manifest", "prd_gate", "dispatch")
+
+
+def _load_json_any(path):
+    """读任意 JSON 产物（非 dispatch，可能是 dict 如 candidates/prd_manifest/prd_gate）。失败 → ``_LOAD_FAILED``
+    哨兵（Q1，同 _load_dispatch_json：防双源同失败假绿）。"""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _LOAD_FAILED
+
+
+def _describe_value(v) -> str:
+    """mismatch 诊断：type + keys/len 摘要（不 dump 全量，控日志噪声）。Q1 哨兵标 load_failed。"""
+    if v is _LOAD_FAILED:
+        return "load_failed"
+    if v is None:
+        return "null_json"
+    if isinstance(v, list):
+        return f"list[{len(v)}]"
+    if isinstance(v, dict):
+        return f"dict(keys={sorted(v)[:5]})"
+    return type(v).__name__
+
+
+def run_graph_shadow_parity_drill_per_stage(*, daily_state_dir, graph_state_dir,
+                                            stamp) -> StageParityReport:
+    """langgraph-workflow-upgrade task 3.10：每 stage 产物 byte-identical（不只比终态 Counter，R7 防假绿）。
+
+    ``run_graph_shadow_parity_drill`` 只比终态分布（Counter）——同分布可能掩盖字段漂移（R7 风险：假绿，
+    如 graph 路径 rec 漏 blocked_check 但终态 status 分布恰好一致）。本 drill 逐 stage 比
+    candidates/prd_manifest/prd_gate/dispatch JSON 内容（semantic-identical：JSON 反序列化后 ``==``，
+    非裸字节，容许 key 顺序/空白差异）。
+
+    r-review C1（type-design-analyzer）：返回专用 ``StageParityReport``（语义 ≠ 终态 Counter 分布），不再
+    重载 ShadowParityReport 伪造空 counts 违反其不变式。r-review Q1：loader 失败（哨兵）≠ 成功得空，双源
+    同失败不当一致。report/fetch 漂移是已知盲区（见 ``_GRAPH_PARITY_STAGE_FILES`` 注释，留批 4 canary）。
+
+    Phase 2 判据（R7）：``matched=True`` + stage byte-identical。4 JSON stage 覆盖 7 逻辑 stage（fetch 走
+    磁盘中转无 JSON 产物、inject 覆盖 prd_manifest、critic=prd_gate，故 candidates/prd_manifest/prd_gate/
+    dispatch 全覆盖 fetch→dispatch 的可比产物）。
+    """
+    daily = Path(daily_state_dir)
+    graph = Path(graph_state_dir)
+    mismatches: list[str] = []
+    for stage in _GRAPH_PARITY_STAGE_FILES:
+        dp = daily / f"{stage}_{stamp}.json"
+        gp = graph / f"{stage}_{stamp}.json"
+        dv = _load_dispatch_json(dp) if stage == "dispatch" else _load_json_any(dp)
+        gv = _load_dispatch_json(gp) if stage == "dispatch" else _load_json_any(gp)
+        # Q1：loader 失败（哨兵）≠ 成功得空。双源都失败不能当一致（防假绿）。
+        if dv is _LOAD_FAILED or gv is _LOAD_FAILED:
+            mismatches.append(f"{stage}: load_failed (daily={_load_status(dv)} graph={_load_status(gv)})")
+        elif dv != gv:
+            mismatches.append(f"{stage}: 内容不一致 (daily={_describe_value(dv)} graph={_describe_value(gv)})")
+    return StageParityReport(stages_checked=_GRAPH_PARITY_STAGE_FILES,
+                             mismatches=tuple(mismatches), matched=not mismatches)
+
+
+def _graph_shadow_parity_outcome(ev: GraphShadowParityEvidence) -> DrillOutcome:
+    """task 5.3b：GraphShadowParityEvidence → DrillOutcome（run_full_cutover_suite runner 批 4 接入用）。"""
+    return DrillOutcome("graph_shadow_parity", ev.parity.matched,
+                        f"matched={ev.parity.matched}; parity_type={type(ev.parity).__name__}; "
+                        f"mismatches={len(ev.parity.mismatches)}; n_daily={ev.n_daily} n_graph={ev.n_graph}")
 
 
 # ════════════════════════════════════════════════════════════════════════════

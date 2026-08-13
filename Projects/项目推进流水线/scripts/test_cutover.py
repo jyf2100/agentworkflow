@@ -627,6 +627,306 @@ def test_dispatch_legacy_fallback_when_reducer_fails_under_full_gate():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# langgraph-workflow-upgrade task 5.3 + 3.10：graph orchestrator 四重 gate + 双源 shadow parity
+# 镜像 dispatch gate 范式（L582-627）+ shadow parity 范式（L97-121）。
+# design D7（flag 物理隔离）+ R7（shadow parity 前置，不只比终态 Counter，防假绿）。
+# ════════════════════════════════════════════════════════════════════════════
+def test_graph_orchestrator_driven_when_shadow_parity_allowlist_flag_all_pass():
+    """四重 gate 全过 → driven_by='graph_orchestrator'（cron 分流 graph_pa.py）。"""
+    r = CT.resolve_graph_orchestrator_source(
+        orchestrator_flag=True, shadow_flag=True, project_id="cc-web-control",
+        allowlist=("cc-web-control",), parity_passed=True)
+    assert r.driven_by == "graph_orchestrator"
+    assert r.fallback_reason == ""
+    assert r.terminal_state == ""                      # gate 判定阶段无 terminal state
+
+
+def test_graph_orchestrator_fallback_when_shadow_off():
+    """① shadow off → fallback（即使 orchestrator on + parity 过 + 白名单）。D7：orchestrator gated on shadow。"""
+    r = CT.resolve_graph_orchestrator_source(
+        orchestrator_flag=True, shadow_flag=False, project_id="cc-web-control",
+        allowlist=("cc-web-control",), parity_passed=True)
+    assert r.driven_by != "graph_orchestrator"
+    assert "shadow" in r.fallback_reason.lower()
+
+
+def test_graph_orchestrator_fallback_when_parity_not_passed():
+    """② parity 未过 → fallback（即使 shadow on + 白名单）。R7 cutover 前置。"""
+    r = CT.resolve_graph_orchestrator_source(
+        orchestrator_flag=True, shadow_flag=True, project_id="cc-web-control",
+        allowlist=("cc-web-control",), parity_passed=False)
+    assert r.driven_by != "graph_orchestrator"
+    assert "parity" in r.fallback_reason.lower()
+
+
+def test_graph_orchestrator_fallback_when_project_not_allowlisted():
+    """③ 非白名单项目 → fallback（即使 shadow on + parity 过）。单项目 rollout。"""
+    r = CT.resolve_graph_orchestrator_source(
+        orchestrator_flag=True, shadow_flag=True, project_id="proj-beta",
+        allowlist=("cc-web-control",), parity_passed=True)
+    assert r.driven_by != "graph_orchestrator"
+    assert "allowlist" in r.fallback_reason.lower()
+
+
+def test_graph_orchestrator_fallback_when_orchestrator_flag_off():
+    """④ orchestrator flag 关 → fallback（前置全过但开关关 = shadow 可旁路跑，cron 未分流）。"""
+    r = CT.resolve_graph_orchestrator_source(
+        orchestrator_flag=False, shadow_flag=True, project_id="cc-web-control",
+        allowlist=("cc-web-control",), parity_passed=True)
+    assert r.driven_by != "graph_orchestrator"
+    assert "flag off" in r.fallback_reason.lower()
+
+
+def test_graph_orchestrator_gate_order_shadow_before_parity():
+    """gate 按序短路：shadow off 时即使 parity 未过也报 shadow（① 在 ② 前，不混报）。"""
+    r = CT.resolve_graph_orchestrator_source(
+        orchestrator_flag=True, shadow_flag=False, project_id="cc-web-control",
+        allowlist=("cc-web-control",), parity_passed=False)
+    assert "shadow" in r.fallback_reason.lower()       # ① 先短路，不报 parity
+
+
+# task 5.3b：双源 run_daily vs graph_pa 终态 shadow parity
+def test_graph_shadow_parity_matched_when_same_distribution():
+    """双源同终态分布 → matched=True。"""
+    daily = [{"status": "pr_open", "project": "p", "slug": "a"},
+             {"status": "fail", "project": "p", "slug": "b"}]
+    graph = [{"status": "pr_open", "project": "p", "slug": "a"},
+             {"status": "fail", "project": "p", "slug": "b"}]
+    rep = CT.run_graph_shadow_parity_drill(daily, graph)
+    assert rep.matched is True
+    assert rep.mismatches == ()
+
+
+def test_graph_shadow_parity_mismatch_when_distribution_differs():
+    """双源终态分布不一致 → matched=False，mismatches 列出每个漂移 bucket。"""
+    daily = [{"status": "pr_open"}, {"status": "fail"}]     # pr_open=1, fail=1
+    graph = [{"status": "pr_open"}, {"status": "pr_open"}]  # pr_open=2, fail=0
+    rep = CT.run_graph_shadow_parity_drill(daily, graph)
+    assert rep.matched is False
+    assert len(rep.mismatches) == 2                          # REVISE + FAILED 两 bucket 都漂移（逐 bucket 比对）
+    assert any("revise" in m for m in rep.mismatches)        # pr_open 无 verify→REVISE（dual gate 降级），daily=1 graph=2
+    assert any("failed" in m for m in rep.mismatches)        # fail→FAILED，daily=1 graph=0
+    assert all("daily=" in m and "graph=" in m for m in rep.mismatches)  # 格式（诊断用）
+
+
+def test_graph_shadow_parity_matched_when_both_empty():
+    """双源皆空 → matched=True（无 PRD 输入的诚实一致，非假绿——空对空是真一致）。"""
+    rep = CT.run_graph_shadow_parity_drill([], [])
+    assert rep.matched is True
+
+
+def test_graph_shadow_parity_evidence_reads_dispatch_json(tmp_path):
+    """evidence 命令读两 state_dir 的 dispatch_{stamp}.json 跑 drill。"""
+    daily_dir = tmp_path / "daily_state"
+    graph_dir = tmp_path / "graph_state"
+    daily_dir.mkdir(); graph_dir.mkdir()
+    rec = [{"status": "pr_open", "project": "p", "slug": "a"}]
+    (daily_dir / "dispatch_20260813.json").write_text(_json.dumps(rec), encoding="utf-8")
+    (graph_dir / "dispatch_20260813.json").write_text(_json.dumps(rec), encoding="utf-8")
+    ev = CT.run_graph_shadow_parity_evidence(daily_state_dir=str(daily_dir),
+                                             graph_state_dir=str(graph_dir), stamp="20260813")
+    assert ev.parity.matched is True
+    assert ev.n_daily == 1 and ev.n_graph == 1
+    assert ev.stamp == "20260813"
+
+
+def test_graph_shadow_parity_evidence_missing_file_reports_mismatch(tmp_path):
+    """单源文件缺 → loader 哨兵短路 matched=False（诚实 red，不静默假绿）。Q1 回归保护。"""
+    daily_dir = tmp_path / "d"; graph_dir = tmp_path / "g"
+    daily_dir.mkdir(); graph_dir.mkdir()
+    (daily_dir / "dispatch_20260813.json").write_text(_json.dumps([{"status": "pr_open"}]), encoding="utf-8")
+    # graph_dir 无文件 → _LOAD_FAILED 哨兵（不再静默返回 [] 当成功）
+    ev = CT.run_graph_shadow_parity_evidence(daily_state_dir=str(daily_dir),
+                                             graph_state_dir=str(graph_dir), stamp="20260813")
+    assert ev.parity.matched is False
+    assert ev.n_graph == 0
+    assert ev.n_daily == 1                              # r-review：成功方记录数保留（不因 graph 失败清零）
+    assert isinstance(ev.parity, CT.LoadFailureReport)  # C-1：load 失败用专用类型（非伪造空 counts）
+    assert any("source_load_error" in m for m in ev.parity.mismatches)   # Q1 哨兵诊断标记
+
+
+def test_graph_shadow_parity_evidence_both_sources_load_failed_no_false_green(tmp_path):
+    """Q1 核心（silent-failure-hunter Critical）：双源同文件缺 → 不当一致假绿。
+
+    bug 场景（修复前）：双源都 load 失败返回 []，``[] == []`` → ``matched=True`` 假绿，打通 gate ② parity。
+    修复后：双源都返回 ``_LOAD_FAILED`` 哨兵 → 短路 ``matched=False`` + mismatch 标 ``daily=failed graph=failed``。
+    """
+    daily_dir = tmp_path / "d"; graph_dir = tmp_path / "g"
+    daily_dir.mkdir(); graph_dir.mkdir()                       # 双源都无 dispatch 文件
+    ev = CT.run_graph_shadow_parity_evidence(daily_state_dir=str(daily_dir),
+                                             graph_state_dir=str(graph_dir), stamp="20260813")
+    assert ev.parity.matched is False                          # 不当一致假绿
+    assert ev.n_daily == 0 and ev.n_graph == 0
+    assert any("source_load_error" in m and "failed" in m for m in ev.parity.mismatches)
+
+
+def test_graph_shadow_parity_outcome_extracts_drill_outcome():
+    """GraphShadowParityEvidence → DrillOutcome（name/passed/detail，runner 批 4 接入用）。"""
+    rep = CT.ShadowParityReport(dispatch_counts={"pr_open": 1}, journal_counts={"pr_open": 1},
+                                matched=True, mismatches=())
+    ev = CT.GraphShadowParityEvidence(parity=rep, stamp="20260813", n_daily=1, n_graph=1)
+    out = CT._graph_shadow_parity_outcome(ev)
+    assert out.name == "graph_shadow_parity"
+    assert out.passed is True
+    assert "matched=True" in out.detail
+
+
+def test_graph_shadow_parity_evidence_single_source_failure_keeps_other_count(tmp_path):
+    """r-review Important（silent-failure-hunter）：单源失败时保留成功方真实记录数。
+
+    bug 场景：短路分支曾硬编码 n_daily=0/n_graph=0，单源失败丢弃成功方数量 → 与 mismatch 的
+    "daily=ok" 诊断矛盾。修复后 daily 成功 N 条、graph 失败 → n_daily=N, n_graph=0。
+    """
+    daily_dir = tmp_path / "d"; graph_dir = tmp_path / "g"
+    daily_dir.mkdir(); graph_dir.mkdir()
+    recs = [{"status": "pr_open"}, {"status": "fail"}, {"status": "skip"}]
+    (daily_dir / "dispatch_20260813.json").write_text(_json.dumps(recs), encoding="utf-8")
+    ev = CT.run_graph_shadow_parity_evidence(daily_state_dir=str(daily_dir),
+                                             graph_state_dir=str(graph_dir), stamp="20260813")
+    assert ev.n_daily == 3 and ev.n_graph == 0          # 成功方 3 条保留，失败方 0
+    assert ev.parity.matched is False
+    assert "daily=ok" in ev.parity.mismatches[0] and "graph=failed" in ev.parity.mismatches[0]
+
+
+def test_graph_shadow_parity_evidence_daily_failure_keeps_graph_count(tmp_path):
+    """r-review R3 M2（silent-failure-hunter）：对称分支——daily 失、graph OK 也保留成功方数量。
+
+    锁 n_daily/n_graph 三元的 daily 侧（防笔误成 len(graph_raw) if daily_raw is not _LOAD_FAILED）。
+    """
+    daily_dir = tmp_path / "d"; graph_dir = tmp_path / "g"
+    daily_dir.mkdir(); graph_dir.mkdir()
+    recs = [{"status": "pr_open"}, {"status": "fail"}]
+    (graph_dir / "dispatch_20260813.json").write_text(_json.dumps(recs), encoding="utf-8")
+    ev = CT.run_graph_shadow_parity_evidence(daily_state_dir=str(daily_dir),
+                                             graph_state_dir=str(graph_dir), stamp="20260813")
+    assert ev.n_daily == 0 and ev.n_graph == 2          # daily 失 0，graph 成功 2 条保留
+    assert ev.parity.matched is False
+    assert "daily=failed" in ev.parity.mismatches[0] and "graph=ok" in ev.parity.mismatches[0]
+
+
+def test_graph_shadow_parity_evidence_corrupt_json_reports_mismatch(tmp_path):
+    """r-review Minor（silent-failure-hunter）：损坏 JSON（JSONDecodeError 路径）→ 哨兵短路 matched=False。
+
+    锁住 except json.JSONDecodeError 分支，防未来重构静默丢弃该 except 子句。
+    """
+    daily_dir = tmp_path / "d"; graph_dir = tmp_path / "g"
+    daily_dir.mkdir(); graph_dir.mkdir()
+    (daily_dir / "dispatch_20260813.json").write_text('{"CORRUPT": not valid', encoding="utf-8")
+    (graph_dir / "dispatch_20260813.json").write_text('{"CORRUPT": not valid', encoding="utf-8")
+    ev = CT.run_graph_shadow_parity_evidence(daily_state_dir=str(daily_dir),
+                                             graph_state_dir=str(graph_dir), stamp="20260813")
+    assert ev.parity.matched is False
+    assert isinstance(ev.parity, CT.LoadFailureReport)
+    assert "daily=failed" in ev.parity.mismatches[0] and "graph=failed" in ev.parity.mismatches[0]
+
+
+def test_load_failure_report_invariant_matched_must_be_false():
+    """r-review C-1 + I-2：LoadFailureReport.matched 恒 False + 必须带诊断 mismatches（构造时强制）。"""
+    assert CT.LoadFailureReport(mismatches=("source_load_error: x",)).matched is False
+    with pytest.raises(ValueError):
+        CT.LoadFailureReport(mismatches=("x",), matched=True)      # matched=True 非法（load 失败永不 match）
+    with pytest.raises(ValueError):
+        CT.LoadFailureReport(mismatches=())                         # 空 mismatches 非法（无诊断）
+
+
+def test_shadow_parity_report_invariant_rejects_fake_empty_counts():
+    """r-review I-2 + C-1：ShadowParityReport 拒绝伪造空 counts（counts 相等却 matched=False = C-1 反模式）。
+
+    __post_init__ 在构造时抛 ValueError，防 C-1 类静默带病传播（load 失败应用 LoadFailureReport）。
+    """
+    with pytest.raises(ValueError):
+        CT.ShadowParityReport(dispatch_counts={}, journal_counts={}, matched=False,
+                              mismatches=("fake",))     # 空计数相等却 matched=False → C-1 反模式，构造即拒
+    ok = CT.ShadowParityReport(dispatch_counts={"a": 1}, journal_counts={"a": 1}, matched=True)
+    assert ok.matched is True
+
+
+def test_shadow_parity_report_invariant_rejects_counts_mismatch_with_matched_true():
+    """r-review R3 M-1（type-design-analyzer）：counts 不等却 matched=True 也是不变式违例。
+
+    runtime_evidence.py real_cutover_suite 曾伪造 counts（I-1 形态）——__post_init__ 拒绝，防 pre-existing
+    伪造代码带病传播。
+    """
+    with pytest.raises(ValueError):
+        CT.ShadowParityReport(dispatch_counts={"a": 1}, journal_counts={"a": 2},
+                              matched=True)            # counts 不等却 matched=True → I-1 形态，构造即拒
+
+
+def test_stage_parity_report_invariant_rejects_inconsistent_matched():
+    """r-review R3 M-2（type-design-analyzer）：StageParityReport 反例——matched 与 mismatches 不一致即拒。"""
+    with pytest.raises(ValueError):
+        CT.StageParityReport(stages_checked=("a",), mismatches=("a: bad",), matched=True)  # 有 mismatch 却 True
+    with pytest.raises(ValueError):
+        CT.StageParityReport(stages_checked=("a",), mismatches=(), matched=False)          # 无 mismatch 却 False
+
+
+# task 3.10：每 stage byte-identical（不只比终态 Counter，R7 防 Counter 假绿）
+def test_graph_shadow_parity_per_stage_matched_when_identical(tmp_path):
+    """双 state_dir 每 stage JSON 内容一致 → matched=True。"""
+    daily = tmp_path / "d"; graph = tmp_path / "g"
+    daily.mkdir(); graph.mkdir()
+    for stage in ("candidates", "prd_manifest", "prd_gate"):
+        payload = {"x": stage, "items": [1, 2, 3]}
+        (daily / f"{stage}_20260813.json").write_text(_json.dumps(payload), encoding="utf-8")
+        (graph / f"{stage}_20260813.json").write_text(_json.dumps(payload), encoding="utf-8")
+    rec = [{"status": "pr_open"}]
+    (daily / "dispatch_20260813.json").write_text(_json.dumps(rec), encoding="utf-8")
+    (graph / "dispatch_20260813.json").write_text(_json.dumps(rec), encoding="utf-8")
+    rep = CT.run_graph_shadow_parity_drill_per_stage(
+        daily_state_dir=str(daily), graph_state_dir=str(graph), stamp="20260813")
+    assert rep.matched is True
+    assert rep.mismatches == ()
+
+
+def test_graph_shadow_parity_per_stage_detects_field_drift(tmp_path):
+    """终态 Counter 假绿（同 status 分布）但某 stage 字段漂移 → per_stage 抓住（R7 核心）。"""
+    daily = tmp_path / "d"; graph = tmp_path / "g"
+    daily.mkdir(); graph.mkdir()
+    # candidates 内容漂移（daily 多一个 item），但 dispatch 终态分布恰好一致 → Counter 假绿
+    (daily / "candidates_20260813.json").write_text(_json.dumps({"items": [1, 2]}), encoding="utf-8")
+    (graph / "candidates_20260813.json").write_text(_json.dumps({"items": [1]}), encoding="utf-8")
+    rec = [{"status": "pr_open"}]
+    (daily / "dispatch_20260813.json").write_text(_json.dumps(rec), encoding="utf-8")
+    (graph / "dispatch_20260813.json").write_text(_json.dumps(rec), encoding="utf-8")
+    daily_recs = _json.loads((daily / "dispatch_20260813.json").read_text())
+    graph_recs = _json.loads((graph / "dispatch_20260813.json").read_text())
+    assert CT.run_graph_shadow_parity_drill(daily_recs, graph_recs).matched is True   # 假绿
+    rep = CT.run_graph_shadow_parity_drill_per_stage(
+        daily_state_dir=str(daily), graph_state_dir=str(graph), stamp="20260813")
+    assert rep.matched is False
+    assert any("candidates" in m for m in rep.mismatches)
+
+
+def test_graph_shadow_parity_per_stage_missing_file_reports_mismatch(tmp_path):
+    """单源某 stage 文件缺 → load_failed mismatch（诚实 red）。C1：返回 StageParityReport。"""
+    daily = tmp_path / "d"; graph = tmp_path / "g"
+    daily.mkdir(); graph.mkdir()
+    (daily / "candidates_20260813.json").write_text(_json.dumps({"x": 1}), encoding="utf-8")
+    # graph 无 candidates 文件 → _LOAD_FAILED 哨兵 → load_failed（不再 None≠dict）
+    rep = CT.run_graph_shadow_parity_drill_per_stage(
+        daily_state_dir=str(daily), graph_state_dir=str(graph), stamp="20260813")
+    assert isinstance(rep, CT.StageParityReport)              # C1 专用类型（非 ShadowParityReport）
+    assert rep.matched is False
+    assert rep.stages_checked == CT._GRAPH_PARITY_STAGE_FILES
+    assert any("candidates" in m and "load_failed" in m for m in rep.mismatches)
+
+
+def test_graph_shadow_parity_per_stage_both_sources_missing_no_false_green(tmp_path):
+    """Q1（per_stage 视角）：双源某 stage 都缺 → 不当一致假绿。
+
+    bug 场景（修复前）：双源 ``_load_json_any`` 都返 None，``None == None`` → matched 假绿。
+    修复后：双源都返 ``_LOAD_FAILED`` 哨兵 → load_failed mismatch（即使 4 stage 都双缺，仍 red）。
+    """
+    daily = tmp_path / "d"; graph = tmp_path / "g"
+    daily.mkdir(); graph.mkdir()                              # 双源全空（4 stage 文件都缺）
+    rep = CT.run_graph_shadow_parity_drill_per_stage(
+        daily_state_dir=str(daily), graph_state_dir=str(graph), stamp="20260813")
+    assert rep.matched is False                               # 双源同失败不当一致
+    assert len(rep.mismatches) == len(CT._GRAPH_PARITY_STAGE_FILES)   # 4 stage 全 load_failed
+    assert all("load_failed" in m for m in rep.mismatches)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 8.8 quality gate + evidence archive
 # ════════════════════════════════════════════════════════════════════════════
 def test_quality_gate_passes_when_green_and_evidence_archived(tmp_path):

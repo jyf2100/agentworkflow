@@ -1276,14 +1276,23 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
     ]
 
     # 2) 真实 bundle——4 维真实 drill 映射 evidence，3 维真实 run_*
+    # r-review R3 I-1（type-design-analyzer Important）：shadow_parity counts 镜像 parity_passed 让
+    # ShadowParityReport 不变式（matched ⇔ dispatch_counts == journal_counts）自洽。R2 __post_init__ 暴露了
+    # 原 hardcoded counts 伪造——{"planned":1} 与 real_dispatch_journal_events 不保证相等却配 matched=parity_passed，
+    # 生产 cutover 时 __post_init__ 会抛 ValueError 卡死。真实判定 = parity_passed（decision_unchanged ∧
+    # reached_skip_dev_planned）；此 lambda 无真实 records 列表（仅 count+bool），counts 非真实终态分布，
+    # 从真实 records 推导（run_shadow_parity_drill）留 follow-up。
+    _shadow_parity_rep = CT.ShadowParityReport(
+        dispatch_counts={"planned": 1},
+        journal_counts={"planned": 1} if parity_passed else {"planned": 0},
+        matched=parity_passed,
+        mismatches=() if parity_passed else (
+            f"dispatch/journal terminal mismatch (real_dispatch_journal_events="
+            f"{allowlist.get('real_dispatch_journal_events', 1)})",))
     bundle = CT.CutoverDrillBundle(
         # shadow_parity 走真实 dispatch（P1-2 fix：非 NO_WRITE_DRY_RUN_FLOW fixture）
         shadow_parity=lambda: CT.ShadowParityEvidence(
-            parity=CT.ShadowParityReport(
-                dispatch_counts={"planned": 1},
-                journal_counts={"planned": allowlist.get("real_dispatch_journal_events", 1)},
-                matched=parity_passed,
-                mismatches=() if parity_passed else ("dispatch/journal terminal mismatch",)),
+            parity=_shadow_parity_rep,
             dry_run_terminal=allowlist.get("gate_all_pass_dispatch_journal_terminal_state", "planned"),
             dry_run_run_id="real_dispatch_skip_dev"),
         # sdk_canary：r2 P0-5——真实 SDK query（real_sdk_canary 调真实 claude_agent_sdk.query 证明 lifecycle
