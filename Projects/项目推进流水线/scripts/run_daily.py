@@ -2796,13 +2796,18 @@ def _run_one(entry: dict, prof: dict | None, stamp: str, args) -> dict:
         _learn(rec); return rec
 
 
-def _dispatch_serial_by_repo(passed: list[dict], profiles: dict, stamp: str, args) -> list[dict]:
+def _dispatch_serial_by_repo(passed: list[dict], profiles: dict, stamp: str, args, *, worker=None) -> list[dict]:
     """single-flight-auto-merge task 2.1：同 owner_repo 串行单飞投递（一次一个 PRD 走完 _run_one 闭环才下一个）、
     跨 owner_repo 并行。flag gated（serial_shadow on → stage_dispatch 走此路径；off → 现有全并行 baseline）。
 
     D1/D9：消灭「merge 时 main 被并发动过」冲突前提——同仓 PRD 顺序投递不重叠。跨进程 flock（task 2.2）
     在此分组结构上加，slot = journal + flock（D9）；当前阶段（无 merge/revert 闭环）= dev→verify。
-    DISPATCH_LOCKS（threading.Lock）仍由 _run_one 内取，兜底防 in-process TOCTOU（task 2.2 flock 前的串行保证）。"""
+    DISPATCH_LOCKS（threading.Lock）仍由 _run_one 内取，兜底防 in-process TOCTOU（task 2.2 flock 前的串行保证）。
+
+    task 3.9（langgraph 主图）：``worker`` hook——默认 ``_run_one``（legacy byte-identical），graph 路径经
+    ``stage_dispatch(..., worker=<graph worker>)`` 注入子图 invoke（D7：run_daily 不 import graph_pa_*，
+    callable 由调用方传；flag off 仍走 ``_run_one``）。"""
+    _worker = worker or _run_one   # task 3.9 worker hook（默认 legacy _run_one，byte-identical）
     # 按 owner_repo 分组（保提交序；无 remote 的归 "" 组，彼此并行）
     groups: dict[str, list[dict]] = {}
     for e in passed:
@@ -2815,7 +2820,7 @@ def _dispatch_serial_by_repo(passed: list[dict], profiles: dict, stamp: str, arg
         recs: list[dict] = []
         for e in entries:   # 同组顺序：前一个 _run_one return 才下一个（single-flight，不重叠）
             try:
-                recs.append(_run_one(e, profiles.get(e.get("project")), stamp, args))
+                recs.append(_worker(e, profiles.get(e.get("project")), stamp, args))
             except Exception as ex:
                 log(f"  ✗ {e.get('prd_path')}: dispatch 异常 {ex}")
                 recs.append({"project": e.get("project"), "prd_path": e.get("prd_path"),
@@ -2887,8 +2892,12 @@ def release_run_lock() -> None:
         pass
 
 
-def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str) -> list[dict]:
-    """dispatch 段顶层：取过闸 pass PRD → 按 project 准入+投递+对账+验证 → 写 dispatch_<stamp>.json。"""
+def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str, *, worker=None) -> list[dict]:
+    """dispatch 段顶层：取过闸 pass PRD → 按 project 准入+投递+对账+验证 → 写 dispatch_<stamp>.json。
+
+    task 3.9（langgraph 主图）：``worker`` hook——默认 ``_run_one``（legacy byte-identical），graph 路径
+    注入子图 invoke worker（D7：run_daily 不 import graph_pa_*，callable 由调用方传）。"""
+    _worker = worker or _run_one   # task 3.9 worker hook（默认 legacy _run_one，byte-identical）
     disp_file = STATE_DIR / f"dispatch_{stamp}.json"
     if disp_file.is_file() and not args.force:
         log(f"[dispatch] 复用已有 {disp_file.name}（--force 重跑）")
@@ -2940,11 +2949,11 @@ def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str) -> list[d
     records: list[dict] = []
     if _serial_shadow:
         log(f"[dispatch] single-flight 串行单飞：{len(passed)} 份按 owner_repo 分组串行投递")
-        records = _dispatch_serial_by_repo(passed, profiles, stamp, args)
+        records = _dispatch_serial_by_repo(passed, profiles, stamp, args, worker=_worker)
     else:
         # 并行投递（ThreadPoolExecutor，sync subprocess.run 释放 GIL）；dict 保提交序、per-future 异常隔离（#26）
         with ThreadPoolExecutor(max_workers=max(1, args.max_concurrent)) as exe:
-            fut_to_entry = {exe.submit(_run_one, e, profiles.get(e.get("project")), stamp, args): e
+            fut_to_entry = {exe.submit(_worker, e, profiles.get(e.get("project")), stamp, args): e
                             for e in passed}
             for fut in fut_to_entry:          # 按提交序收集（.result() 阻塞到该 future 完，其余仍并行）
                 e = fut_to_entry[fut]

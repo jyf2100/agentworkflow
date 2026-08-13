@@ -52,6 +52,12 @@ class GraphState(TypedDict, total=False):
     side_effect_log: Annotated[list[dict], operator.add]  # 喂 reconcile
     # 恢复上下文（崩溃恢复：recovery_cli 重建 initial state，D2 / 任务 3.8）
     recovery: dict
+    # journal 单写注入（task 3.7 r2 P2④提前做：_journal_path 提升到基础 GraphState）。
+    # top-level node 默认 ""（no-op——run_daily 主流程无 top-level journal，commit_node 读 ni._journal_path
+    # 空则 no-op）；dispatch 聚合 per-PRD 注入 coord.journal.path（对齐 graph_pa_recovery._rebuild_dispatch_state:152）。
+    # _ 前缀运行期注入字段（同子图 SubState 的 _prd_path/_prof 族），total=False 接受，不经 langgraph reducer
+    # 序列化（node 返回的 update 不含它；崩溃恢复不重建，task 3.8 范围）。
+    _journal_path: str
 
 
 def initial_state(*, run_id: str, thread_id: str, stamp: str) -> GraphState:

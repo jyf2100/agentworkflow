@@ -106,7 +106,7 @@ def test_serial_shadow_on_routes_to_serial_dispatch_path(tmp_path, monkeypatch):
     import feature_flags as FF
     called = {"serial": False}
 
-    def _fake_serial(passed, profiles, stamp, args):
+    def _fake_serial(passed, profiles, stamp, args, *, worker=None):
         called["serial"] = True
         return [{"project": e.get("project"), "prd_path": e.get("prd_path"), "status": "pr_open"} for e in passed]
     monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
