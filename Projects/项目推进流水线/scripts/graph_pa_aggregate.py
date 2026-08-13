@@ -235,9 +235,14 @@ def _subgraph_result_to_record(result: dict, entry: dict, prof: dict) -> dict:
     """dispatch 子图 invoke 返回的 state → dispatch_one rec schema（21 字段，对齐 L2046-2056）。
 
     子图 state 字段（``_`` 前缀运行期）→ rec key（无前缀）。喂 ``dispatch_{stamp}.json`` + stage_report。
-    缺失字段 → None/False（对齐 dispatch_one rec 初始默认值）。verify_anchors/verify_bundles/learning_memory
-    等扩展字段：learning_memory 由 ``_dispatch_one_graph`` 的 _attach_learning_memory 后处理填（对齐 _run_one）；
-    anchors/bundles 留 follow-up（子图 verify 节点 state 字段待核对，shadow parity 报告驱动补）。
+    缺失字段 → None/False（对齐 dispatch_one rec 初始默认值）。**路径依赖扩展字段**（仅特定 dispatch_one 路径
+    rec.update 写，否则字段不存在）留 follow-up，**Phase 4 真 dev cutover（flag 默认 on + 非 skip-dev）前须补**：
+    ① ``off_track``（legacy L2236 dev 成功路径，子图 state ``_dev_off_track`` 已声明未映射）
+    ② ``publication_reconciliation``（legacy L2332，子图 state ``_publication_reconciliation`` 已声明未映射）
+    ③ verify_anchors/verify_bundles（子图 verify 节点 state 字段待核对）。**canary 盲区**（code-review M1）：本期
+    canary 用 ``--dispatch-skip-dev``（零 outward + 零 LLM），dev 循环整体跳过 → legacy 也不写 ①② → 双源同缺
+    假性 match，per_stage shadow parity 报告驱动不了这俩字段补全；须 Phase 4 非 skip-dev canary 或单测守护。
+    learning_memory 由 ``_dispatch_one_graph`` 的 _attach_learning_memory 后处理填（对齐 _run_one）。
     """
     rec = {
         "project": prof.get("name", "?"),
