@@ -93,7 +93,7 @@ def _run_pipeline_graph(args) -> None:
     stamp = args.stamp                                     # inject 段可能自增（node 写回 state["stamp"]）
     try:
         state = {
-            "run_id": "", "thread_id": f"run_{stamp}", "stamp": stamp,
+            "run_id": stamp, "thread_id": f"run_{stamp}", "stamp": stamp,   # run_id 非空（对齐 run_daily run_id=stamp + contract validate_node_input 要求；task 5.8 主图 invoke smoke 暴露原 "" 占位触发 ContractError）
             "prd_round": 0, "verify_round": 0,
             "obs_log": [], "side_effect_log": [],
             "_args": args, "_sources": sources, "_profiles": profiles,

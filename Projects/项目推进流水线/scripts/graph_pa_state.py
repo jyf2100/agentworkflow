@@ -56,8 +56,14 @@ class GraphState(TypedDict, total=False):
     # top-level node 默认 ""（no-op——run_daily 主流程无 top-level journal，commit_node 读 ni._journal_path
     # 空则 no-op）；dispatch 聚合 per-PRD 注入 coord.journal.path（对齐 graph_pa_recovery._rebuild_dispatch_state:152）。
     # _ 前缀运行期注入字段（同子图 SubState 的 _prd_path/_prof 族），total=False 接受，不经 langgraph reducer
-    # 序列化（node 返回的 update 不含它；崩溃恢复不重建，task 3.8 范围）。
+    # 序列化（node 返回的 update 不含它们；崩溃恢复不重建，task 3.8 范围）。**须在此声明**：langgraph
+    # StateGraph 只透传 GraphState 声明的字段（未声明字段 invoke 时被丢）——task 5.8 主图 invoke smoke 暴露
+    # 此缺陷（_args/_sources/_profiles 原未声明 → fetch node state["_args"] KeyError，主图 invoke 从未真跑通）。
+    # 无 Annotated reducer → 默认 last-value-wins 覆盖（node 不写它们 → 保持 graph_pa.py L95-99 invoke 注入值）。
     _journal_path: str
+    _args: object       # argparse Namespace（run_daily.main 产；node 内读 args.force/dry_run/skip_critic/...）
+    _sources: list      # load_sources() 产物（fetch/radar 包装 node 读）
+    _profiles: dict     # load_profiles() 产物（radar/prd/critic/dispatch/report 包装 node 读）
 
 
 def initial_state(*, run_id: str, thread_id: str, stamp: str) -> GraphState:
