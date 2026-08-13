@@ -1422,6 +1422,62 @@ def test_run_full_cutover_suite_telemetry_red_keeps_overall_green_with_open_item
     assert len(m.structured()["open_items"]) >= 1
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# task 5.6 #82（批 4 → r-review M1 防窗口）：graph_shadow_parity 条件性硬 gate 守护。
+# 真 ShadowParityReport matched=False（双源都产 dispatch.json 但终态分布漂移）→ 硬 gate（进 drill_ok，
+# overall 红）；LoadFailureReport（baseline PA_GRAPH_* off 无真双源）→ 软 open（移出 drill_ok + open_items，
+# overall 不阻断）。判据 = outcome.detail 的 parity_type 标记（_gsp_is_load_failure）。
+# ════════════════════════════════════════════════════════════════════════════
+def test_run_full_cutover_suite_gsp_real_mismatch_blocks_overall(tmp_path):
+    """#82 条件性硬 gate（M1 防窗口）：真 ShadowParityReport(matched=False)（双源 dispatch counts 分布漂移）
+    → overall_passed=False（硬 gate，**不**进 open_items 软 open）。
+
+    r-review M1 反例：canary ≥3 cron 已坐实 matched=True，故生产 ShadowParityReport 漂移 = 真实编排回归，
+    必须硬阻断 overall。若被软 open 吞 → overall 假绿 → 带病移硬 gate / 带病归档。
+    counts 不等满足 ShadowParityReport 不变式（matched ⇔ counts 相等），不抛 ValueError。
+    """
+    from dataclasses import replace
+    # 真 ShadowParityReport matched=False：dispatch vs graph 终态 Counter 偏差（counts 不等 + mismatches 非空，
+    # 满足双重不变式 matched ⇔ counts 相等 / matched ⇔ mismatches 空，不抛 ValueError）
+    real_drift = lambda: CT.GraphShadowParityEvidence(
+        parity=CT.ShadowParityReport(dispatch_counts={"planned": 1}, journal_counts={"published": 1},
+                                      matched=False, mismatches=("planned=1 vs published=1",)),
+        stamp="2026-08-13", n_daily=1, n_graph=1)
+    drift_bundle = replace(_green_bundle(), graph_shadow_parity=real_drift)
+    m = CT.run_full_cutover_suite(drills=drift_bundle, artifact_root=str(tmp_path / "suite"))
+    assert m.overall_passed is False, "真 ShadowParityReport matched=False 未硬阻断 overall——M1 防窗口缺失"
+    gsp_o = next(o for o in m.outcomes if o.name == "graph_shadow_parity")
+    assert gsp_o.passed is False, "真 parity 漂移 outcome 假绿"
+    assert "parity_type=ShadowParityReport" in gsp_o.detail, "detail 缺 parity_type 标记（条件性硬 gate 判据失效）"
+    # 真 ShadowParityReport 不进 open_items（仅 LoadFailureReport 软 open）——防真漂移被软 open 吞
+    oi = next((i for i in m.open_items if i.get("item") == "graph_shadow_parity"), None)
+    assert oi is None, "真 ShadowParityReport 漂移进了 open_items——被软 open 吞（M1 防窗口失效）"
+
+
+def test_run_full_cutover_suite_gsp_load_failure_keeps_overall_green(tmp_path):
+    """#82 条件性硬 gate（baseline 语义）：LoadFailureReport（baseline PA_GRAPH_* off 无真双源，双源
+    dispatch_{stamp}.json load 失败）→ overall_passed 不阻断（软 open）+ open_items 记 graph_shadow_parity。
+
+    与 telemetry 软 open 同语义：baseline 未启用 graph 路径 → 无真双源 → LoadFailureReport 诚实红非漂移，
+    不应阻断 overall（否则 baseline 套件永红停摆）。Phase 4 flag 默认 on 后 LoadFailureReport 不再出现。
+    此测试与上一条共同守护条件性分流：LoadFailureReport 软 / 真 ShadowParityReport 硬（同 outcome 名，按类型分）。
+    """
+    from dataclasses import replace
+    load_fail = lambda: CT.GraphShadowParityEvidence(
+        parity=CT.LoadFailureReport(
+            mismatches=("source_load_error: daily dispatch_20260813.json missing (PA_GRAPH_* off 无真双源)",)),
+        stamp="2026-08-13", n_daily=0, n_graph=0)
+    lf_bundle = replace(_green_bundle(), graph_shadow_parity=load_fail)
+    m = CT.run_full_cutover_suite(drills=lf_bundle, artifact_root=str(tmp_path / "suite"))
+    assert m.overall_passed is True, "LoadFailureReport 阻断 overall——baseline 套件永红停摆（软 open 缺失）"
+    gsp_o = next(o for o in m.outcomes if o.name == "graph_shadow_parity")
+    assert gsp_o.passed is False, "LoadFailureReport outcome 假绿"
+    assert "parity_type=LoadFailureReport" in gsp_o.detail
+    oi = next((i for i in m.open_items if i.get("item") == "graph_shadow_parity"), None)
+    assert oi is not None and oi["passed"] is False and oi["limitation"], (
+        "LoadFailureReport 未进 open_items——软 open 诚实报告缺失")
+
+
 def test_run_full_cutover_suite_green_archives_manifest(tmp_path):
     """runner 自行执行各 drill → 全绿 → overall_passed + 归档 manifest digest（archive immutable evidence）。"""
     m = CT.run_full_cutover_suite(drills=_green_bundle(), artifact_root=str(tmp_path / "suite"))

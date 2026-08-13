@@ -1075,6 +1075,22 @@ def _graph_shadow_parity_outcome(ev: GraphShadowParityEvidence) -> DrillOutcome:
                         f"mismatches={len(ev.parity.mismatches)}; n_daily={ev.n_daily} n_graph={ev.n_graph}")
 
 
+def _gsp_is_load_failure(o) -> bool:
+    """task 5.6 #82 条件性硬 gate：graph_shadow_parity outcome 是否为 LoadFailureReport。
+
+    区分两种 matched=False（drill_ok 软/硬分流的核心）：
+      - ``LoadFailureReport``（baseline ``PA_GRAPH_*`` off，无真双源）→ 软 open（移出 drill_ok + 进 open_items，
+        不挂 overall；baseline 诚实红非漂移）。
+      - 真 ``ShadowParityReport`` matched=False（双源都产了 dispatch.json 但终态分布漂移）→ 硬 gate
+        （纳入 drill_ok，overall 红；r-review M1 防窗口：canary 真跑后真实 parity 故障不被软 open 吞）。
+
+    判据 = ``_graph_shadow_parity_outcome`` detail 里的 ``parity_type=LoadFailureReport`` 标记
+    （``type(ev.parity).__name__``，格式自控稳定；canary ≥3 cron 已坐实 matched=True，故生产 ShadowParityReport
+    漂移即真故障）。"""
+    return o is not None and getattr(o, "name", "") == "graph_shadow_parity" \
+        and "parity_type=LoadFailureReport" in getattr(o, "detail", "")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 8.8 full repository quality gate + archive passing evidence
 # ════════════════════════════════════════════════════════════════════════════
@@ -1804,8 +1820,11 @@ def _verify_sub_evidence_complete(outcomes: "tuple[DrillOutcome, ...]",
 # 项（同 P1-1/P1-6 known-limitation 语义，不阻断 overall）。read-back step 7 只允许白名单内的 red 项从
 # ``all()`` 排除；非白名单 red 项进 open_items → read-back fail（杜绝「任意红色 outcome 塞进 open_items
 # 即从 overall 排除」的假绿——如 quality_gate 真 red 被偷排）。
-# task 5.6（批 4）：加 graph_shadow_parity——LangGraph 迁移 canary 未双跑时诚实软 open（LoadFailureReport
-# matched=False 非漂移），canary matched=True 后移出变硬 gate。同 telemetry known-limitation 语义。
+# task 5.6（批 4 → #82 条件性硬 gate）：graph_shadow_parity 留白名单——**仅 LoadFailureReport**（baseline
+# PA_GRAPH_* off 无真双源）软 open（进 open_items 不阻断 overall）；真 ShadowParityReport matched=False
+# （双源漂移）走硬 gate（drill_ok 纳入，不进 open_items，overall 红）。canary ≥3 cron 已坐实 matched=True
+# （task 5.5/#81），故生产 ShadowParityReport 漂移即真故障（r-review M1 防窗口）。Phase 4 flag 默认 on 后
+# LoadFailureReport 不再出现，届时可整体删本项（白名单 + runner drill_ok 分流 + open_items 块，三处同步）。
 _ALLOWED_OPEN_ITEMS: frozenset[str] = frozenset({"telemetry", "graph_shadow_parity"})
 
 
@@ -2296,9 +2315,15 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
     # r6 P1-6（评审）：telemetry 移出 overall all()——真实 OTLP/degradation suite 未接入，作硬 gate 会让
     # headless 永远红。telemetry outcome 仍执行+归档子证据（evidence_ok 仍查 8 维度），但 passed 不进 drill_ok，
     # 进 open_items（诚实报告 red/open + known limitation，不阻断 overall，同 P1-1 语义）。
-    # task 5.6（批 4）：graph_shadow_parity 同 telemetry 移出 drill_ok——canary 未双跑时 LoadFailureReport
-    # 诚实红，作软 open 不阻断 overall（canary matched=True 坐实后移回，变硬 gate，follow-up）。
-    drill_ok = all(o.passed for o in outcomes if o.name not in ("telemetry", "graph_shadow_parity"))
+    # task 5.6（批 4 → #82 条件性硬 gate）：graph_shadow_parity 的软/硬由 parity 类型决定（非裸 matched）。
+    # 真 ShadowParityReport matched=False（双源都产 dispatch.json 但终态分布漂移）→ 硬 gate：纳入 drill_ok，
+    # overall 红（r-review M1 防窗口——canary ≥3 cron 已坐实 matched=True，故生产 ShadowParityReport 漂移即真故障，
+    # 不被软 open 吞）。LoadFailureReport（baseline PA_GRAPH_* off 无真双源）→ 软 open：移出 drill_ok + 进 open_items，
+    # 不挂 overall（baseline 诚实红非漂移；Phase 4 flag 默认 on 后 LoadFailureReport 不再出现）。
+    _gsp_o = next((o for o in outcomes if o.name == "graph_shadow_parity"), None)
+    _gsp_load_fail = _gsp_is_load_failure(_gsp_o)
+    _drill_ok_excluded = {"telemetry"} | ({"graph_shadow_parity"} if _gsp_load_fail else set())
+    drill_ok = all(o.passed for o in outcomes if o.name not in _drill_ok_excluded)
     evidence_ok, evidence_reason = _verify_sub_evidence_complete(outcomes, artifact_root)
     _telemetry_o = next((o for o in outcomes if o.name == "telemetry"), None)
     _open_items: tuple[dict, ...] = ()
@@ -2310,16 +2335,14 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
         _open_items = ({"item": "telemetry", "passed": False,
                         "limitation": "真实 OTLP/degradation suite 未接入（_otlp_export_verified 实际 export 失败："
                                       "无 OTEL endpoint 或 collector 不可达）；仅 SDK callback 维度可验"},)
-    # task 5.6（批 4）：graph_shadow_parity 软 open——canary 未双跑（task 5.5）→ LoadFailureReport（matched=False
-    # 诚实红非漂移）。canary ≥3 cron 双 state_dir 双跑 matched=True 后移出软 open 变硬 gate（follow-up）。
-    # ⚠️ 移硬 gate 须**原子**（三件套同步删：_ALLOWED_OPEN_ITEMS 本项 + 上方 drill_ok not-in 元组本项 + 本 open_items
-    # 块）+ 加测试守护「真 ShadowParityReport(matched=False) → overall_passed=False」——否则 canary 真跑后真实 parity
-    # 故障会被软 open 吞进 open_items 而非阻断 overall（r-review M1 防窗口；production 现 LoadFailureReport 不触发此路径）。
-    _gsp_o = next((o for o in outcomes if o.name == "graph_shadow_parity"), None)
-    if _gsp_o is not None and not _gsp_o.passed:
+    # task 5.6（批 4 → #82）：graph_shadow_parity 软 open **仅** LoadFailureReport（baseline 未启用 graph）。
+    # 真 ShadowParityReport matched=False 不进 open_items（已纳入 drill_ok 硬 gate）——防 canary 真漂移被软 open 吞。
+    if _gsp_o is not None and _gsp_load_fail:
         _open_items = _open_items + ({"item": "graph_shadow_parity", "passed": False,
-                        "limitation": "LangGraph 迁移 canary 未启动（待 task 5.5 ≥3 cron 双 state_dir 双跑坐实）；"
-                                      "run_graph_shadow_parity_evidence 走 LoadFailureReport（无真双源，诚实红非漂移）"},)
+                        "limitation": "LangGraph 迁移 baseline 未启用（PA_GRAPH_* off，无真双源）；"
+                                      "run_graph_shadow_parity_evidence 走 LoadFailureReport（诚实红非漂移）。"
+                                      "canary ≥3 cron 已坐实 matched=True（task 5.5/#81）；"
+                                      "真 ShadowParityReport 漂移走硬 gate（drill_ok 纳入）"},)
     manifest = CutoverManifest(outcomes=outcomes,
                                overall_passed=(drill_ok and evidence_ok),
                                sub_evidence_refs=sub_refs,
