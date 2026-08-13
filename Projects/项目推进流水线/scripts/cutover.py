@@ -1688,6 +1688,10 @@ class CutoverDrillBundle:
     # r5 P1-3（评审）：telemetry 维度——SDK 遥测通道 gate（callback_invocations/lifecycle_types/无降级）。
     # runner 调用本 callable 执行 telemetry 证据采集，由 _telemetry_outcome 判 pass/fail（明确谓词 gate）。
     telemetry: Callable[[], "TelemetryEvidence"]
+    # task 5.3b/5.6（批 4）：graph_shadow_parity 维度——LangGraph 迁移双源 shadow parity（daily vs graph_pa
+    # 终态）。镜像 telemetry 软 open 语义：canary 未双跑（task 5.5）→ LoadFailureReport（诚实红，非漂移）
+    # → 软 open 不阻断 overall；canary ≥3 cron 双 state_dir 双跑 matched=True 后移入硬 gate（follow-up）。
+    graph_shadow_parity: Callable[[], "GraphShadowParityEvidence"]
 
 
 def _archive_sub_evidence(artifact_root: str, name: str, ev) -> tuple[str, ...]:
@@ -1716,9 +1720,11 @@ def _archive_sub_evidence(artifact_root: str, name: str, ev) -> tuple[str, ...]:
 
 # r3 P0-2 完整性门：passing manifest 必须引用全部子 drill 的可解析、可读、digest 匹配的证据。
 # r5 P1-3（评审）：补 telemetry 维度（8 个）——SDK 遥测通道 gate，杜绝 telemetry 仅归档不判的假绿。
+# task 5.6（批 4）：补 graph_shadow_parity（第 9 维）——LangGraph 迁移双源 shadow parity（软 open）。
 _EXPECTED_DRILL_NAMES: frozenset[str] = frozenset({
     "shadow_parity", "sdk_canary", "crash_reconciliation",
     "recovery", "sandbox", "dispatch_cutover", "quality_gate", "telemetry",
+    "graph_shadow_parity",
 })
 
 
@@ -1758,7 +1764,9 @@ def _verify_sub_evidence_complete(outcomes: "tuple[DrillOutcome, ...]",
 # 项（同 P1-1/P1-6 known-limitation 语义，不阻断 overall）。read-back step 7 只允许白名单内的 red 项从
 # ``all()`` 排除；非白名单 red 项进 open_items → read-back fail（杜绝「任意红色 outcome 塞进 open_items
 # 即从 overall 排除」的假绿——如 quality_gate 真 red 被偷排）。
-_ALLOWED_OPEN_ITEMS: frozenset[str] = frozenset({"telemetry"})
+# task 5.6（批 4）：加 graph_shadow_parity——LangGraph 迁移 canary 未双跑时诚实软 open（LoadFailureReport
+# matched=False 非漂移），canary matched=True 后移出变硬 gate。同 telemetry known-limitation 语义。
+_ALLOWED_OPEN_ITEMS: frozenset[str] = frozenset({"telemetry", "graph_shadow_parity"})
 
 
 def _read_back_manifest(artifact_root: str, archive_digest: str) -> tuple[bool, str]:
@@ -2049,6 +2057,7 @@ _SUB_EVIDENCE_ALLOWLIST_BY_KIND: dict[str, frozenset[str]] = {
     "telemetry": _dc_field_names(TelemetryEvidence),
     "recovery": _dc_field_names(RecoveryDrillResult),      # list 元素字段
     "sandbox": _dc_field_names(SandboxDrillResult),        # list 元素字段
+    "graph_shadow_parity": _dc_field_names(GraphShadowParityEvidence),   # task 5.6（批 4）
 }
 # 所有 drill 字段名并集（drill 未知时兜底诊断 + 未来嵌套校验参考）
 _ALL_DRILL_FIELD_NAMES: frozenset[str] = frozenset().union(*_SUB_EVIDENCE_ALLOWLIST_BY_KIND.values())
@@ -2237,6 +2246,9 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
         # r5 P1-3（评审）：telemetry 升为独立 gate 维度——_telemetry_outcome 以明确谓词判 SDK 遥测通道
         # 在线/未降级（非旧"仅归档进 evidence_items"），SDK 降级为 no-op 即 telemetry 红 → overall 红。
         _exec(drills.telemetry, _telemetry_outcome, "telemetry"),
+        # task 5.6（批 4）：graph_shadow_parity 第 9 维——LangGraph 迁移双源 shadow parity。软 open（drill_ok
+        # 排除 + open_items）：canary 未双跑→LoadFailureReport 诚实红不阻断 overall；matched=True 坐实后移回硬 gate
+        _exec(drills.graph_shadow_parity, _graph_shadow_parity_outcome, "graph_shadow_parity"),
     )
     sub_refs = tuple(d for o in outcomes for d in o.evidence_digests)
     # r3 P0-2：overall_passed = 全维度业务 passed **且** 子证据完整性门通过（7 outcome 均有可解析、
@@ -2244,7 +2256,9 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
     # r6 P1-6（评审）：telemetry 移出 overall all()——真实 OTLP/degradation suite 未接入，作硬 gate 会让
     # headless 永远红。telemetry outcome 仍执行+归档子证据（evidence_ok 仍查 8 维度），但 passed 不进 drill_ok，
     # 进 open_items（诚实报告 red/open + known limitation，不阻断 overall，同 P1-1 语义）。
-    drill_ok = all(o.passed for o in outcomes if o.name != "telemetry")
+    # task 5.6（批 4）：graph_shadow_parity 同 telemetry 移出 drill_ok——canary 未双跑时 LoadFailureReport
+    # 诚实红，作软 open 不阻断 overall（canary matched=True 坐实后移回，变硬 gate，follow-up）。
+    drill_ok = all(o.passed for o in outcomes if o.name not in ("telemetry", "graph_shadow_parity"))
     evidence_ok, evidence_reason = _verify_sub_evidence_complete(outcomes, artifact_root)
     _telemetry_o = next((o for o in outcomes if o.name == "telemetry"), None)
     _open_items: tuple[dict, ...] = ()
@@ -2256,6 +2270,16 @@ def run_full_cutover_suite(*, drills: CutoverDrillBundle,
         _open_items = ({"item": "telemetry", "passed": False,
                         "limitation": "真实 OTLP/degradation suite 未接入（_otlp_export_verified 实际 export 失败："
                                       "无 OTEL endpoint 或 collector 不可达）；仅 SDK callback 维度可验"},)
+    # task 5.6（批 4）：graph_shadow_parity 软 open——canary 未双跑（task 5.5）→ LoadFailureReport（matched=False
+    # 诚实红非漂移）。canary ≥3 cron 双 state_dir 双跑 matched=True 后移出软 open 变硬 gate（follow-up）。
+    # ⚠️ 移硬 gate 须**原子**（三件套同步删：_ALLOWED_OPEN_ITEMS 本项 + 上方 drill_ok not-in 元组本项 + 本 open_items
+    # 块）+ 加测试守护「真 ShadowParityReport(matched=False) → overall_passed=False」——否则 canary 真跑后真实 parity
+    # 故障会被软 open 吞进 open_items 而非阻断 overall（r-review M1 防窗口；production 现 LoadFailureReport 不触发此路径）。
+    _gsp_o = next((o for o in outcomes if o.name == "graph_shadow_parity"), None)
+    if _gsp_o is not None and not _gsp_o.passed:
+        _open_items = _open_items + ({"item": "graph_shadow_parity", "passed": False,
+                        "limitation": "LangGraph 迁移 canary 未启动（待 task 5.5 ≥3 cron 双 state_dir 双跑坐实）；"
+                                      "run_graph_shadow_parity_evidence 走 LoadFailureReport（无真双源，诚实红非漂移）"},)
     manifest = CutoverManifest(outcomes=outcomes,
                                overall_passed=(drill_ok and evidence_ok),
                                sub_evidence_refs=sub_refs,
@@ -2299,7 +2323,9 @@ def real_cutover_drills(*, state_dir, stamp_fn, resolver, sandbox_runs,
                         dispatch_events, dispatch_legacy, test_counts,
                         evidence_items, artifact_root,
                         sdk_callback_proven: tuple[str, ...] = (),
-                        telemetry_proven: bool = False) -> CutoverDrillBundle:
+                        telemetry_proven: bool = False,
+                        daily_state_dir=None, graph_state_dir=None,
+                        graph_stamp=None) -> CutoverDrillBundle:
     """离线 bundle 工厂（测试/design 入口，**非生产执行器**）：用 cutover 自身各 ``run_*`` drill 构造 bundle。
 
     生产执行走 ``real_cutover_suite``（runtime_evidence.py，真实 SDK query via ``real_sdk_canary``）；
@@ -2339,6 +2365,19 @@ def real_cutover_drills(*, state_dir, stamp_fn, resolver, sandbox_runs,
         return TelemetryEvidence(
             callback_invocations=(), lifecycle_types_seen=(), num_turns=None, query_error=None,
             summary="[offline bundle] 无真实 SDK query → telemetry 诚实红（生产填真值见 real_cutover_suite）")
+    def _graph_shadow_parity(_dsd=daily_state_dir, _gsd=graph_state_dir, _gst=graph_stamp,
+                             _sd=state_dir, _sf=stamp_fn):
+        # task 5.6（批 4）：双源 shadow parity。graph_state_dir=None（生产/canary 前）→ graph 路径未双跑 →
+        # 诚实 LoadFailureReport（软 open，matched=False 非漂移）。canary 传真实双 state_dir → 真对比
+        # dispatch_{stamp}.json。绝不默认同 dir 假 matched（生产无双源 = 诚实红，非自比假绿）。
+        _stamp = _gst if _gst is not None else _sf()
+        if _gsd is None:
+            return GraphShadowParityEvidence(
+                parity=LoadFailureReport(mismatches=(
+                    "graph_state_dir 未提供：LangGraph canary 未双跑（task 5.5）；诚实软 open 非漂移",)),
+                stamp=_stamp, n_daily=0, n_graph=0)
+        _daily = _dsd if _dsd is not None else _sd
+        return run_graph_shadow_parity_evidence(daily_state_dir=_daily, graph_state_dir=_gsd, stamp=_stamp)
     return CutoverDrillBundle(
         shadow_parity=lambda: run_shadow_parity_evidence(state_dir=state_dir, stamp_fn=stamp_fn),
         sdk_canary=_sdk_canary,
@@ -2350,4 +2389,5 @@ def real_cutover_drills(*, state_dir, stamp_fn, resolver, sandbox_runs,
             journal_driven=True, journal_events=dispatch_events, legacy_records=dispatch_legacy),
         quality_gate=lambda: run_quality_gate(
             test_counts=test_counts, evidence_items=evidence_items, artifact_root=artifact_root),
+        graph_shadow_parity=_graph_shadow_parity,
     )

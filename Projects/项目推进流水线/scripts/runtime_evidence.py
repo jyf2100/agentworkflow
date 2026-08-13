@@ -1354,6 +1354,14 @@ def real_cutover_suite(workdir: Path, gh_repo: str = "jyf2100/agentworkflow",
         quality_gate=lambda _p=_qpassed: CT.run_quality_gate(
             test_counts={"passed": _p, "failed": len(_qdims) - _p},
             evidence_items=evidence_items, artifact_root=str(artifact_root)),
+        # task 5.6（批 4）：graph_shadow_parity 维度——生产 real_cutover_suite 无 LangGraph canary 双跑
+        # （task 5.5），诚实 LoadFailureReport 软 open（matched=False 非漂移，stamp="" 诊断元数据）。canary
+        # 双 state_dir 双跑后由 canary harness 坐实（专用 wiring 或 real_cutover_drills(graph_state_dir=...)）。
+        graph_shadow_parity=lambda: CT.GraphShadowParityEvidence(
+            parity=CT.LoadFailureReport(mismatches=(
+                "生产 real_cutover_suite 无 LangGraph canary 双跑（task 5.5）；graph_shadow_parity 诚实软 open，"
+                "canary 双 state_dir 双跑后坐实 matched=True")),
+            stamp="", n_daily=0, n_graph=0),
     )
 
     # 3) run_full_cutover_suite（真实 runner）编排执行 bundle callable → manifest → 全绿归档

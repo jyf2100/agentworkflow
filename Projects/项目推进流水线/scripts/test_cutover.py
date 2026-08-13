@@ -1310,11 +1310,17 @@ def _green_bundle():
         dispatch_cutover=lambda: CT.DispatchCutoverResult("journal", "published", ""),
         quality_gate=lambda: CT.QualityGateResult(
             tests_total=10, tests_failed=0, passed=True, evidence_digests=("d",), detail="10/10 pass"),
+        # task 5.6（批 4）：graph_shadow_parity 维度绿（ShadowParityReport matched=True，counts 一致满足不变式）
+        graph_shadow_parity=lambda: CT.GraphShadowParityEvidence(
+            parity=CT.ShadowParityReport(dispatch_counts={"planned": 1}, journal_counts={"planned": 1},
+                                          matched=True),
+            stamp="2026-07-23", n_daily=1, n_graph=1),
     )
 
 
 _EXPECTED_OUTCOME_NAMES = {"shadow_parity", "sdk_canary", "crash_reconciliation", "recovery",
-                           "sandbox", "dispatch_cutover", "quality_gate", "telemetry"}   # r5 P1-3：8 维度
+                           "sandbox", "dispatch_cutover", "quality_gate", "telemetry",
+                           "graph_shadow_parity"}   # r5 P1-3：8 维度 + task 5.6 批 4 graph_shadow_parity（9 维）
 
 
 def test_run_full_cutover_suite_telemetry_red_keeps_overall_green_with_open_item(tmp_path):
@@ -1843,7 +1849,8 @@ def test_run_full_cutover_suite_red_does_not_archive(tmp_path):
         telemetry=green.telemetry,
         crash_reconciliation=green.crash_reconciliation, recovery=green.recovery,
         sandbox=lambda: (CT.SandboxDrillResult("python", "local_worktree", 1, False, True),),
-        dispatch_cutover=green.dispatch_cutover, quality_gate=green.quality_gate)
+        dispatch_cutover=green.dispatch_cutover, quality_gate=green.quality_gate,
+        graph_shadow_parity=green.graph_shadow_parity)
     m = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(tmp_path / "suite"))
     assert m.overall_passed is False
     assert m.archive_digest is None                   # red 套件不归档
@@ -1870,9 +1877,10 @@ def test_run_full_cutover_suite_invokes_every_drill(tmp_path):
         sandbox=wrap("sandbox", green.sandbox()),
         dispatch_cutover=wrap("dispatch_cutover", green.dispatch_cutover()),
         quality_gate=wrap("quality_gate", green.quality_gate()),
+        graph_shadow_parity=wrap("graph_shadow_parity", green.graph_shadow_parity()),
     )
     m = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(tmp_path / "suite"))
-    assert len(calls) == 8                            # 每个 drill 都被真实调用一次
+    assert len(calls) == 9                            # 每个 drill 都被真实调用一次（task 5.6 批 4：+graph_shadow_parity）
     assert set(calls) == _EXPECTED_OUTCOME_NAMES
     assert m.overall_passed is True
 
@@ -1895,6 +1903,62 @@ def test_real_cutover_drills_orchestrates_real_drills(tmp_path):
     assert m.overall_passed is True
     assert m.archive_digest is not None
     assert {o.name for o in m.outcomes} == _EXPECTED_OUTCOME_NAMES
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# task 5.6（批 4）：graph_shadow_parity 第 9 维接入 run_full_cutover_suite（软 open，镜像 telemetry）
+# ════════════════════════════════════════════════════════════════════════════
+def test_graph_shadow_parity_soft_open_does_not_block_overall(tmp_path):
+    """task 5.6：graph_shadow_parity 软 open——LoadFailureReport（matched=False，canary 未双跑）不阻断
+    overall_passed（镜像 telemetry known-limitation），但诚实进 open_items（非偷排假绿）。"""
+    green = _green_bundle()
+    bundle = CT.CutoverDrillBundle(
+        shadow_parity=green.shadow_parity, sdk_canary=green.sdk_canary, telemetry=green.telemetry,
+        crash_reconciliation=green.crash_reconciliation, recovery=green.recovery, sandbox=green.sandbox,
+        dispatch_cutover=green.dispatch_cutover, quality_gate=green.quality_gate,
+        graph_shadow_parity=lambda: CT.GraphShadowParityEvidence(
+            parity=CT.LoadFailureReport(mismatches=("canary 未双跑",)),
+            stamp="2026-07-23", n_daily=0, n_graph=0))
+    m = CT.run_full_cutover_suite(drills=bundle, artifact_root=str(tmp_path / "suite"))
+    assert m.overall_passed is True                       # 软 open 不阻断（drill_ok 排除 graph_shadow_parity）
+    assert m.archive_digest is not None                   # overall 绿仍归档
+    _gsp = next(o for o in m.outcomes if o.name == "graph_shadow_parity")
+    assert _gsp.passed is False                           # 诚实红（LoadFailureReport matched=False）
+    assert any(it["item"] == "graph_shadow_parity" for it in m.open_items)   # 诚实 open（非偷排）
+
+
+def test_real_cutover_drills_graph_shadow_parity_defaults_soft_open(tmp_path):
+    """task 5.6：real_cutover_drills 不传 graph_state_dir（生产/canary 前）→ graph_shadow_parity callable
+    返回 LoadFailureReport（诚实软 open），**非**默认同 dir 自比假 matched。canary 传真实双 dir 才真对比。"""
+    bundle = CT.real_cutover_drills(
+        state_dir=tmp_path, stamp_fn=lambda: "2026-07-23T00:00:00Z",
+        resolver=FakeResolver(True),
+        sandbox_runs=(CT.SandboxDrillResult("python", "local_worktree", 0, False, True),),
+        dispatch_events=[_ev("running", eid="e1")], dispatch_legacy=None,
+        test_counts={"passed": 1, "failed": 0}, evidence_items=[("test_output", "ok")],
+        artifact_root=str(tmp_path / "q"),
+        sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS, telemetry_proven=True)   # 不传 graph_state_dir
+    ev = bundle.graph_shadow_parity()
+    assert isinstance(ev.parity, CT.LoadFailureReport)    # 诚实软 open（非 ShadowParityReport 自比假绿）
+    assert ev.parity.matched is False
+    assert ev.n_daily == 0 and ev.n_graph == 0
+
+
+def test_real_cutover_drills_graph_shadow_parity_dual_dir_reads_both(tmp_path):
+    """task 5.6：real_cutover_drills 传 daily/graph 双 state_dir → run_graph_shadow_parity_evidence 读双
+    dispatch_{stamp}.json。双源文件均缺失 → LoadFailureReport（source_load_error，非自比假绿）。"""
+    bundle = CT.real_cutover_drills(
+        state_dir=tmp_path, stamp_fn=lambda: "2026-07-23T00:00:00Z",
+        resolver=FakeResolver(True),
+        sandbox_runs=(CT.SandboxDrillResult("python", "local_worktree", 0, False, True),),
+        dispatch_events=[_ev("running", eid="e1")], dispatch_legacy=None,
+        test_counts={"passed": 1, "failed": 0}, evidence_items=[("test_output", "ok")],
+        artifact_root=str(tmp_path / "q"),
+        sdk_callback_proven=CT.SDK_CALLBACK_REQUIRED_SCENARIOS, telemetry_proven=True,
+        daily_state_dir=tmp_path / "daily", graph_state_dir=tmp_path / "graph", graph_stamp="20260723")
+    ev = bundle.graph_shadow_parity()
+    assert isinstance(ev.parity, CT.LoadFailureReport)    # 双源缺失 → LoadFailureReport（非自比）
+    assert "source_load_error" in ev.parity.mismatches[0]
 
 
 def test_run_full_cutover_suite_archive_is_content_addressed(tmp_path):
