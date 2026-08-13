@@ -313,3 +313,48 @@ marker，复刻 dispatch 形态，可被 `revert -m 1`）push 到 main → 触�
 **工作区（无需清）**：cc-web-control 主工作区当前有 effort 功能删除重构（16 文件，并行真实工作，**勿 stash/
 discard**）。canary 全程用 dispatch 独立 worktree（`.worktrees/` 或 `inject-red` 的 mktemp worktree），不碰主工作区。
 唯一注意：main 在主工作目录检出 + 脏，但 merge/revert phase 的 detached/ref 级操作（59e780a/0437031）已避开双检出。
+
+## 9. LangGraph 编排层 cutover（graph_pa 渐进迁移，`langgraph-workflow-upgrade`）
+`graph_pa.py`（LangGraph 主图）与 `run_daily.py`（legacy）并行存在，`PA_GRAPH_SHADOW`/`PA_GRAPH_ORCHESTRATOR`
+两 flag 物理隔离（flag off = run_daily 完整保留，graph_pa 不被 import）。`run_cron.sh` 分流：`PA_GRAPH_ORCHESTRATOR=1`
+→ `graph_pa.py`，else `run_daily.py`。**秒回退 = `unset PA_GRAPH_ORCHESTRATOR`**（下个 cron 回 legacy）。
+
+### 9.1 graph 崩溃恢复（journal-driven，非 graph state 重建）
+graph 路径**不用 Checkpointer**（D2），持久化走 journal 单写：commit_node 接 `append_event`+`fsync`。崩溃恢复
+**复用 §1 的 `recovery_cli.py` over journal**（`graph_pa_recovery.py` 重建 `_REQUIRED_SHELL` 续跑前置，但终态以 journal 为准）：
+```bash
+# 同 §1：exit 0 = 可 --from-stage 续跑 / exit 2 = manual_block（中部损坏 fail-closed，不静默跳过）
+python recovery_cli.py <state_dir>/runs/<proj>/<stamp>_<slug>.journal.jsonl
+# 续跑（graph 路径）：复用已落盘 state 产物
+PA_GRAPH_ORCHESTRATOR=1 PA_GRAPH_SHADOW=1 python graph_pa.py --from-stage <stage> ...
+```
+
+### 9.2 Shadow parity canary（`canary_graph_cutover.sh`，双源 byte-identical 验证）
+双源（legacy `run_daily` vs `graph_pa`）同 PRD 输入下 dispatch 终态 byte-identical 验证。默认 `--dispatch-skip-dev`
+（零 outward + 零 LLM 成本，守 `pa-test-no-dirty-data`：隔离双 state_dir + 临时 log + unset PA_HEARTBEAT）：
+```bash
+bash scripts/canary_graph_cutover.sh prep          # 无害前置（flag 注册 + graph 套件绿 + profile）
+bash scripts/canary_graph_cutover.sh shadow-run    # 双跑（legacy + graph）隔离 state + skip-dev
+bash scripts/canary_graph_cutover.sh parity        # 对照双 dispatch_{stamp}.json（matched 判据）
+bash scripts/canary_graph_cutover.sh verify        # 汇总判据 + ≥3 cron 提示
+STAMP=20260813 bash scripts/canary_graph_cutover.sh shadow-run   # 指定 stamp（多 cron 周期）
+```
+判据（全过才移硬 gate）：(a) `parity.matched=True`〔**硬 gate**，终态 Counter 分布一致〕+ (c) `load_ok=True`
+〔**硬 gate**，双源 dispatch_{stamp}.json 都成功 load，非双失败假绿〕；诊断维度 (b) per_stage byte-identical
+（双 state_dir 路径前缀 + verify_round 初始值预期 mismatch，须人工确认无语义漂移）+ (d) ≥3 cron 周期。
+
+### 9.3 Cutover 发布门（`run_full_cutover_suite`，9 维度）
+graph 路径移硬 gate 前必过 cutover suite（9 维度 overall_passed）：含 `graph_shadow_parity` 条件性硬 gate——
+真 `ShadowParityReport` matched=False（双源都产 dispatch.json 但终态分布漂移 = 真实编排回归）**硬阻断** overall；
+`LoadFailureReport`（baseline flag off 无真双源）**软 open**（不阻断 baseline，进 open_items 诚实报告）。
+```bash
+# 9 维度全绿 → overall_passed=True + 归档 immutable manifest digest（design 决策#6）
+PYTHONPATH=scripts python -c "import cutover as C; print(C.run_full_cutover_suite(drills=C.CutoverDrillBundle(...), artifact_root='...').overall_passed)"
+```
+
+### 9.4 Rollback（秒回退 = unset flag）
+两级回退（同 §8.2 哲学）：关 `PA_GRAPH_ORCHESTRATOR` 回 legacy 编排；再关 `PA_GRAPH_SHADOW` 回无 shadow。
+```bash
+unset PA_GRAPH_ORCHESTRATOR PA_GRAPH_SHADOW     # run_cron.sh 下个 cron 秒回 run_daily.py（graph_pa 不被 import）
+# state 产物（dispatch_{stamp}.json / journal）双路径同 schema，回退无需迁移
+```

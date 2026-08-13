@@ -60,6 +60,14 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 - **critic**：对抗质量闸（pa-prd-critic），pass / drop / revise + 1 次修订回环
 - **dispatch**：触发目标仓 `dev-agent.py`（SDK dev loop）+ 独立验证；后接 report（落报告 + SMTP 简讯）
 
+### LangGraph 编排层（渐进迁移，`openspec/changes/langgraph-workflow-upgrade`）
+`graph_pa.py` 是 LangGraph 版主图入口（7 阶段 `StateGraph` 严格线性组装，byte-identical 复刻 `run_daily.py` 编排），与 `run_daily.py`（legacy）**并行存在、flag-gated 渐进 cutover**，非替换。核心积木：
+- **主图 + 聚合**：`graph_pa.py`（`build_main_graph` 7 node 线性拓扑 + `main()` 入口镜像 run_daily argparse）+ `graph_pa_aggregate.py`（2 聚合 node：critic 顺序 for-prd / dispatch ThreadPool per-PRD 真循环；5 包装 node：fetch/radar/prd/inject/report 直调 `stage_X`）。子图：`graph_pa_{contracts,state,nodes,critic,verify,dispatch,recovery}.py` + `check_boundary`。
+- **物理隔离（D7）**：`PA_GRAPH_SHADOW` / `PA_GRAPH_ORCHESTRATOR` 两 env flag（`feature_flags.py`）。flag off = `run_daily.py` 完整保留，`graph_pa.py` **不被 run_daily import**（零耦合，卸 flag 秒回退）。`run_cron.sh` 分流：`PA_GRAPH_ORCHESTRATOR=1` → `graph_pa.py`，else `run_daily.py`。
+- **不动 claude runtime（D1）/ 编排器侧不引 asyncio（asyncio 只在 dev-agent.py 子进程内）/ 不用 Checkpointer（D2）**。持久化走 journal 单写：commit_node 接 `append_event`+`fsync`，崩溃恢复 `recovery_cli.py` over journal（非 graph state 重建）。
+- **shadow parity canary（`canary_graph_cutover.sh`）**：双源（legacy `run_daily` vs `graph_pa`）同 PRD 输入下 dispatch 终态 byte-identical 验证；默认 `--dispatch-skip-dev`（零 outward + 零 LLM 成本）。≥3 cron 周期坐实 `matched=True` 后移硬 gate。
+- **cutover 发布门（`run_full_cutover_suite`，9 维度）**：`graph_shadow_parity` 条件性硬 gate——真 `ShadowParityReport` matched=False（双源都产 dispatch.json 但终态分布漂移 = 真实编排回归）硬阻断 overall；`LoadFailureReport`（baseline flag off 无真双源）软 open。详见 `openspec/changes/langgraph-workflow-upgrade/`。
+
 ### 机械活 vs 语义活（关键职责切分）
 - **机械活**（确定性、零 LLM、纯 Python）：今日新文件发现、date-marker、文件读写、去重清单、journal 事件、副作用的 exactly-once reconcile。
 - **语义活**（交给 headless persona）：抽信号 / 翻译 PRD / 对抗审 PRD / 审 dev 产出。
