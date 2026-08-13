@@ -47,4 +47,13 @@ export PA_HEARTBEAT=1
 #    走 DavMail 中继，并需 DavMail 常驻）
 # sina 凭据缺（macOS Keychain / Linux pass 未写授权码）则邮件失败 rc=2、但报告仍落盘（_smtp_notify 退化不阻塞）。
 
-exec python3 "$VAULT/Projects/项目推进流水线/scripts/run_daily.py" --to-stage report
+# langgraph-workflow-upgrade task 5.2：编排器渐进 cutover 分流点（D7 flag 物理隔离）。
+# PA_GRAPH_ORCHESTRATOR=1 → cron 走 graph 主图 graph_pa.py（须经 shadow parity + canary 门控；
+#   coordinator.preflight 强制 orchestrator⇒shadow 依赖，orchestrator on 但 shadow off → blocked）。
+# unset / =0 → 仍走 run_daily.py（baseline 不变）。秒回退：unset PA_GRAPH_ORCHESTRATOR 下个 cron
+# 立即回 legacy run_daily（flag off = run_daily 完整保留，graph_pa.py 不被 run_daily import）。
+if [ "${PA_GRAPH_ORCHESTRATOR:-}" = "1" ]; then
+    exec python3 "$VAULT/Projects/项目推进流水线/scripts/graph_pa.py" --to-stage report
+else
+    exec python3 "$VAULT/Projects/项目推进流水线/scripts/run_daily.py" --to-stage report
+fi

@@ -346,6 +346,11 @@ _FLAG_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
      "lifecycle_hooks requires journal_shadow (hooks must persist events to journal)"),
     ("single_flight_auto_merge", "single_flight_serial_shadow",
      "single_flight_auto_merge requires single_flight_serial_shadow (auto-merge needs serial single-flight admission first)"),
+    # langgraph-workflow-upgrade task 5.4：graph 编排器 cutover 必须先 shadow parity（镜像
+    # auto_merge⇒serial_shadow / driven⇒shadow；orchestrator on 但 shadow off = 跳过 parity 直接分流 =
+    # graph 主图未经双源对照验证，违 R7 shadow parity 前置）。
+    ("pa_graph_orchestrator", "pa_graph_shadow",
+     "pa_graph_orchestrator requires pa_graph_shadow (graph cutover needs shadow+parity first)"),
 )
 
 

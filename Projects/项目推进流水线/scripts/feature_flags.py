@@ -47,6 +47,11 @@ class LoopFlags:
         ``verify_anchor_evidence`` — pa-verify revise 反馈注入机械行级锚点（testout→anchor→diff hunk）。
                                      off → anchor 推导零执行、prompt 零变化（baseline 行为不变，design 迁移
                                      flag-gated rollout）。独立能力域（pa-verify 质量闸），非 loop runtime 6 面。
+
+    langgraph-workflow-upgrade task 5.1（双 flag，镜像 shadow→driven / serial_shadow→auto_merge 模式）：
+        ``pa_graph_shadow``       — 旁路跑 graph 主图双源 shadow parity（不改 cron 真路径，仍走 run_daily）。
+        ``pa_graph_orchestrator`` — cron 真分流到 graph_pa.py（run_cron.sh 分流点）。gated on shadow +
+                                    parity + canary。off → cron 仍走 run_daily.py（baseline 不变，D7）。
     """
     __test__ = False   # 显式声明非测试类，免 pytest 收集告警（与 evidence.TestEvidence 一致；名 Loop* 不命中但保持一致）
 
@@ -61,6 +66,8 @@ class LoopFlags:
     single_flight_serial_shadow: bool = False     # single-flight-auto-merge task 1.1：串行单飞消费（shadow：merge/revert 只 log 不改 main）
     single_flight_auto_merge: bool = False        # single-flight-auto-merge task 1.1：真实 merge/revert 闭环（gated on shadow+parity+canary；破坏性，改目标仓 main）
     verify_anchor_evidence: bool = False          # harden-pa-verify-determinism task 4.0（flag-gated rollout）
+    pa_graph_shadow: bool = False                 # langgraph-workflow-upgrade task 5.1：graph 主图 shadow parity 开关。批 2 声明性（仅 preflight orchestrator⇒shadow 依赖占位 + run_cron 不读它）；批 3 task 5.3/3.10 实装 run_graph_shadow_parity_drill 才真正消费（不改 cron 真路径，仍走 run_daily）
+    pa_graph_orchestrator: bool = False           # langgraph-workflow-upgrade task 5.1：cron 分流 graph_pa.py（gated on shadow+parity+canary；D7 flag off = run_daily 完整保留）
 
 
 # flag 名 → 环境变量名（运维/CI 文档化的稳定开关名）。改这些 = 改对外契约。
@@ -83,6 +90,10 @@ FLAGS_ENV_MAP: dict[str, str] = {
     # harden-pa-verify-determinism task 4.0：**不带 PA_LOOP_ prefix，域切割**——pa-verify 质量闸是独立
     # 能力域（机械锚点 + bundle 覆盖），不属于 loop runtime 6 大渐进启用面。env 名稳定，改 = 改对外契约。
     "verify_anchor_evidence": "PA_VERIFY_ANCHOR_EVIDENCE",
+    # langgraph-workflow-upgrade task 5.1：graph 编排器双 flag（域切割，PA_GRAPH_ 前缀——编排器主图
+    # 切换是独立能力域，不属于 loop runtime 6 大渐进启用面）。env 名稳定（运维/CI 文档化的开关名），改 = 改对外契约。
+    "pa_graph_shadow": "PA_GRAPH_SHADOW",
+    "pa_graph_orchestrator": "PA_GRAPH_ORCHESTRATOR",
 }
 
 # 真值集合（strip + lower 后判定）。其余一律 False（保守：未知字符串不开）。

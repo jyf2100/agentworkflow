@@ -217,6 +217,29 @@ def test_preflight_accepts_auto_merge_with_serial_shadow():
     assert r.blocked is None
 
 
+# ═══ langgraph-workflow-upgrade task 5.4：orchestrator⇒shadow preflight 安全门（D7 cutover 前置）═══
+def test_preflight_rejects_graph_orchestrator_without_shadow():
+    """task 5.4：orchestrator=on, shadow=off = 禁用组合 → blocked（graph cutover 须先 shadow parity）。
+
+    orchestrator 真把 cron 分流到 graph_pa.py 必须先经 shadow 双源 parity 验证——无 shadow = graph 主图
+    未经双源对照 = 违 R7 shadow parity 前置。preflight 硬依赖链拦截，防误配「orchestrator on 但 shadow off」
+    直接分流到未验证的 graph 主图（镜像 auto_merge⇒serial_shadow / driven⇒shadow）。"""
+    flags = LoopFlags(pa_graph_orchestrator=True, pa_graph_shadow=False)
+    r = CO.preflight(flags)
+    assert not r.is_ok
+    assert r.blocked is not None
+    assert any("pa_graph_orchestrator requires pa_graph_shadow" in v
+               for v in r.blocked.violations)
+
+
+def test_preflight_accepts_graph_orchestrator_with_shadow():
+    """task 5.4：合法组合 orchestrator=on + shadow=on → preflight 放行（依赖满足）。"""
+    flags = LoopFlags(pa_graph_orchestrator=True, pa_graph_shadow=True)
+    r = CO.preflight(flags)
+    assert r.is_ok
+    assert r.blocked is None
+
+
 def test_preflight_records_all_violations_structured():
     """task 2.5「record a structured blocked reason」：多条依赖同时违 → violations 全列出（不漏报）。"""
     # Arrange — driven + retry + hooks 全开但 shadow 关（3 条依赖链全违）

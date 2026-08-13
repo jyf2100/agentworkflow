@@ -82,6 +82,10 @@ def test_all_env_names_mapped():
         "single_flight_auto_merge": "PA_SINGLE_FLIGHT_AUTO_MERGE",
         # harden-pa-verify-determinism task 4.0：verify 锚点域切割（不带 PA_LOOP_ prefix）
         "verify_anchor_evidence": "PA_VERIFY_ANCHOR_EVIDENCE",
+        # langgraph-workflow-upgrade task 5.1：graph 编排器双 flag（域切割，PA_GRAPH_ 前缀——
+        # 编排器主图切换是独立能力域，不属于 loop runtime 6 大渐进启用面）
+        "pa_graph_shadow": "PA_GRAPH_SHADOW",
+        "pa_graph_orchestrator": "PA_GRAPH_ORCHESTRATOR",
     }
 
 
@@ -230,3 +234,53 @@ def test_single_flight_env_overrides_profile():
     flags = resolve_flags(env={"PA_SINGLE_FLIGHT_AUTO_MERGE": "false"},
                           profile={"loop": {"single_flight_auto_merge": True}})
     assert flags.single_flight_auto_merge is False
+
+
+# ════════════════════════════════════════════════════════════════════════
+# langgraph-workflow-upgrade task 5.1：graph 编排器双 flag（默认关）
+# design 决策#8 + D7：两 flag 镜像 single_flight / learning 模式——pa_graph_shadow 先旁路跑 graph 主图
+# 双源 shadow parity（不改 cron 真路径，仍走 run_daily）；pa_graph_orchestrator 经 shadow + parity +
+# canary 门控后才真把 cron 分流到 graph_pa.py（run_cron.sh 分流点）。两 flag 默认 False = baseline 不变
+# （cron 仍走 run_daily.py，D7 flag off = run_daily 完整保留）。域切割：PA_GRAPH_* 前缀（编排器主图切换
+# 是独立能力域，非 loop runtime 6 大渐进启用面）。
+# ════════════════════════════════════════════════════════════════════════
+def test_graph_flags_default_false():
+    """task 5.1：两 flag 默认 False——cron 仍走 run_daily.py，行为零变化（design 决策#8 / D7）。"""
+    flags = resolve_flags(env={})
+    assert flags.pa_graph_shadow is False
+    assert flags.pa_graph_orchestrator is False
+
+
+def test_graph_flags_env_names_mapped():
+    """task 5.1：FLAGS_ENV_MAP 含两 flag，env 名 PA_GRAPH_SHADOW / PA_GRAPH_ORCHESTRATOR
+    （域切割，非 PA_LOOP_ 前缀——编排器主图切换是独立能力域）。"""
+    assert FLAGS_ENV_MAP["pa_graph_shadow"] == "PA_GRAPH_SHADOW"
+    assert FLAGS_ENV_MAP["pa_graph_orchestrator"] == "PA_GRAPH_ORCHESTRATOR"
+    # 域切割：确认是 PA_GRAPH_* 前缀（防误归类为 loop runtime flag）
+    assert "PA_GRAPH_SHADOW" in FLAGS_ENV_MAP.values()
+    assert "PA_LOOP_GRAPH" not in " ".join(FLAGS_ENV_MAP.values())
+
+
+def test_graph_shadow_env_truthy():
+    """task 5.1：PA_GRAPH_SHADOW=1/on/true → pa_graph_shadow=True（旁路 shadow parity）。"""
+    for v in ["1", "true", "TRUE", "yes", "on"]:
+        assert resolve_flags(env={"PA_GRAPH_SHADOW": v}).pa_graph_shadow is True, f"{v} 应 truthy"
+
+
+def test_graph_orchestrator_env_truthy():
+    """task 5.1：PA_GRAPH_ORCHESTRATOR=1 → pa_graph_orchestrator=True（cron 分流 graph_pa.py）。"""
+    assert resolve_flags(env={"PA_GRAPH_ORCHESTRATOR": "1"}).pa_graph_orchestrator is True
+
+
+def test_graph_shadow_via_profile():
+    """task 5.1：profile.loop.pa_graph_shadow=True → 开（per-project canary）。"""
+    flags = resolve_flags(env={}, profile={"loop": {"pa_graph_shadow": True}})
+    assert flags.pa_graph_shadow is True
+    assert flags.pa_graph_orchestrator is False
+
+
+def test_graph_env_overrides_profile():
+    """task 5.1：env 显式设置压过 profile（运维 kill switch 一键关回 legacy run_daily）。"""
+    flags = resolve_flags(env={"PA_GRAPH_ORCHESTRATOR": "false"},
+                          profile={"loop": {"pa_graph_orchestrator": True}})
+    assert flags.pa_graph_orchestrator is False
