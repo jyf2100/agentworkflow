@@ -994,6 +994,40 @@ def _describe_value(v) -> str:
     return type(v).__name__
 
 
+def _normalize_state_dir_prefix(obj, *state_dir_names):
+    """递归把 state_dir basename 替换为 ``<STATE_DIR>`` 占位符（task 5.5 canary 发现的隔离副产物）。
+
+    双 state_dir canary（``--state-dir canary-graph-legacy`` vs ``canary-graph``）下，records 里 prd_path
+    等路径含各自 state_dir 名（PRD 写入各自 state_dir 子树），非真实编排漂移。规范化使双源可比；真实
+    路径漂移（占位符外的差异）仍抓。纯函数（无 IO，可单测）。
+    """
+    if isinstance(obj, str):
+        for name in state_dir_names:
+            if name:
+                obj = obj.replace(name, "<STATE_DIR>")
+        return obj
+    if isinstance(obj, list):
+        return [_normalize_state_dir_prefix(x, *state_dir_names) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _normalize_state_dir_prefix(v, *state_dir_names) for k, v in obj.items()}
+    return obj
+
+
+def _normalize_initial_verify_round(obj):
+    """递归归一 ``verify_round=None``→``1``（task 5.5 canary 发现的初始值约定差异）。
+
+    legacy ``dispatch_one`` rec 初始 verify_round=None，graph ``_build_dispatch_shell`` 初始 1；skip-dev
+    canary 下皆未真正跑 verify 停初始态，非真实漂移。归一 None→1 使可比；真实 verify 递增（1 vs 2 vs …）
+    仍抓（graph shell 固定 1 不会 None，故 None→1 仅作用于 legacy 初始态，不掩盖 graph 侧真实漂移）。
+    """
+    if isinstance(obj, dict):
+        return {k: (1 if k == "verify_round" and v is None else _normalize_initial_verify_round(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_initial_verify_round(x) for x in obj]
+    return obj
+
+
 def run_graph_shadow_parity_drill_per_stage(*, daily_state_dir, graph_state_dir,
                                             stamp) -> StageParityReport:
     """langgraph-workflow-upgrade task 3.10：每 stage 产物 byte-identical（不只比终态 Counter，R7 防假绿）。
@@ -1013,6 +1047,7 @@ def run_graph_shadow_parity_drill_per_stage(*, daily_state_dir, graph_state_dir,
     """
     daily = Path(daily_state_dir)
     graph = Path(graph_state_dir)
+    dn, gn = daily.name, graph.name      # canary 双 state_dir basename（剥路径前缀用）
     mismatches: list[str] = []
     for stage in _GRAPH_PARITY_STAGE_FILES:
         dp = daily / f"{stage}_{stamp}.json"
@@ -1022,8 +1057,13 @@ def run_graph_shadow_parity_drill_per_stage(*, daily_state_dir, graph_state_dir,
         # Q1：loader 失败（哨兵）≠ 成功得空。双源都失败不能当一致（防假绿）。
         if dv is _LOAD_FAILED or gv is _LOAD_FAILED:
             mismatches.append(f"{stage}: load_failed (daily={_load_status(dv)} graph={_load_status(gv)})")
-        elif dv != gv:
-            mismatches.append(f"{stage}: 内容不一致 (daily={_describe_value(dv)} graph={_describe_value(gv)})")
+            continue
+        # 规范化双 state_dir canary 隔离副产物（task 5.5 canary 发现：prd_path 路径前缀 +
+        # verify_round 初始值 None vs 1，皆非真实编排漂移）。真实字段漂移（占位符外差异 + verify 递增）仍抓。
+        dv_n = _normalize_initial_verify_round(_normalize_state_dir_prefix(dv, dn, gn))
+        gv_n = _normalize_initial_verify_round(_normalize_state_dir_prefix(gv, dn, gn))
+        if dv_n != gv_n:
+            mismatches.append(f"{stage}: 内容不一致 (daily={_describe_value(dv_n)} graph={_describe_value(gv_n)})")
     return StageParityReport(stages_checked=_GRAPH_PARITY_STAGE_FILES,
                              mismatches=tuple(mismatches), matched=not mismatches)
 

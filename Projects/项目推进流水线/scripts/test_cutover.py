@@ -926,6 +926,72 @@ def test_graph_shadow_parity_per_stage_both_sources_missing_no_false_green(tmp_p
     assert all("load_failed" in m for m in rep.mismatches)
 
 
+def test_per_stage_normalizes_state_dir_prefix(tmp_path):
+    """task 5.5 follow-up：双 state_dir canary 下 prd_path 含各自 state_dir 名 → 规范化后 matched=True。"""
+    daily = tmp_path / "canary-graph-legacy"; graph = tmp_path / "canary-graph"
+    daily.mkdir(); graph.mkdir()
+    for stage in ("candidates", "prd_manifest", "prd_gate"):
+        (daily / f"{stage}_20260813.json").write_text(_json.dumps({"k": 1}), encoding="utf-8")
+        (graph / f"{stage}_20260813.json").write_text(_json.dumps({"k": 1}), encoding="utf-8")
+    # records 里 prd_path 含各自 state_dir 名（canary --state-dir 副产物，非真实编排漂移）
+    (daily / "dispatch_20260813.json").write_text(
+        _json.dumps([{"prd_path": "canary-graph-legacy/state/prd/x/p.md", "status": "pr_open"}]), encoding="utf-8")
+    (graph / "dispatch_20260813.json").write_text(
+        _json.dumps([{"prd_path": "canary-graph/state/prd/x/p.md", "status": "pr_open"}]), encoding="utf-8")
+    rep = CT.run_graph_shadow_parity_drill_per_stage(
+        daily_state_dir=str(daily), graph_state_dir=str(graph), stamp="20260813")
+    assert rep.matched is True                       # state_dir 前缀规范化后一致
+
+
+def test_per_stage_normalizes_verify_round_none_vs_one(tmp_path):
+    """task 5.5 follow-up：verify_round 初始值 legacy None vs graph 1 → 规范化后 matched=True。"""
+    daily = tmp_path / "d"; graph = tmp_path / "g"
+    daily.mkdir(); graph.mkdir()
+    for stage in ("candidates", "prd_manifest", "prd_gate"):
+        (daily / f"{stage}_20260813.json").write_text(_json.dumps({"k": 1}), encoding="utf-8")
+        (graph / f"{stage}_20260813.json").write_text(_json.dumps({"k": 1}), encoding="utf-8")
+    (daily / "dispatch_20260813.json").write_text(
+        _json.dumps([{"status": "pr_open", "verify_round": None}]), encoding="utf-8")    # legacy None
+    (graph / "dispatch_20260813.json").write_text(
+        _json.dumps([{"status": "pr_open", "verify_round": 1}]), encoding="utf-8")       # graph 1
+    rep = CT.run_graph_shadow_parity_drill_per_stage(
+        daily_state_dir=str(daily), graph_state_dir=str(graph), stamp="20260813")
+    assert rep.matched is True                       # verify_round None vs 1 归一
+
+
+def test_per_stage_normalization_preserves_real_drift(tmp_path):
+    """规范化不掩盖真实字段漂移（status 不同 → 仍 mismatch）。"""
+    daily = tmp_path / "d"; graph = tmp_path / "g"
+    daily.mkdir(); graph.mkdir()
+    for stage in ("candidates", "prd_manifest", "prd_gate"):
+        (daily / f"{stage}_20260813.json").write_text(_json.dumps({"k": 1}), encoding="utf-8")
+        (graph / f"{stage}_20260813.json").write_text(_json.dumps({"k": 1}), encoding="utf-8")
+    (daily / "dispatch_20260813.json").write_text(
+        _json.dumps([{"status": "pr_open", "verify_round": None}]), encoding="utf-8")
+    (graph / "dispatch_20260813.json").write_text(
+        _json.dumps([{"status": "blocked_test_gate", "verify_round": 1}]), encoding="utf-8")   # 真实漂移
+    rep = CT.run_graph_shadow_parity_drill_per_stage(
+        daily_state_dir=str(daily), graph_state_dir=str(graph), stamp="20260813")
+    assert rep.matched is False
+    assert any("dispatch" in m for m in rep.mismatches)
+
+
+def test_per_stage_normalization_preserves_real_verify_round_increment(tmp_path):
+    """verify_round 真实递增（1 vs 2）→ 规范化不掩盖（None→1 仅归一初始态，不吞递增漂移）。"""
+    daily = tmp_path / "d"; graph = tmp_path / "g"
+    daily.mkdir(); graph.mkdir()
+    for stage in ("candidates", "prd_manifest", "prd_gate"):
+        (daily / f"{stage}_20260813.json").write_text(_json.dumps({"k": 1}), encoding="utf-8")
+        (graph / f"{stage}_20260813.json").write_text(_json.dumps({"k": 1}), encoding="utf-8")
+    (daily / "dispatch_20260813.json").write_text(
+        _json.dumps([{"status": "pr_open", "verify_round": 1}]), encoding="utf-8")
+    (graph / "dispatch_20260813.json").write_text(
+        _json.dumps([{"status": "pr_open", "verify_round": 2}]), encoding="utf-8")       # 真实递增漂移
+    rep = CT.run_graph_shadow_parity_drill_per_stage(
+        daily_state_dir=str(daily), graph_state_dir=str(graph), stamp="20260813")
+    assert rep.matched is False                       # 1 vs 2 真实漂移，不归一
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 8.8 quality gate + evidence archive
 # ════════════════════════════════════════════════════════════════════════════
