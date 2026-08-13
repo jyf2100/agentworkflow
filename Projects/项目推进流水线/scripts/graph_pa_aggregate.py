@@ -239,7 +239,7 @@ def _subgraph_result_to_record(result: dict, entry: dict, prof: dict) -> dict:
     等扩展字段：learning_memory 由 ``_dispatch_one_graph`` 的 _attach_learning_memory 后处理填（对齐 _run_one）；
     anchors/bundles 留 follow-up（子图 verify 节点 state 字段待核对，shadow parity 报告驱动补）。
     """
-    return {
+    rec = {
         "project": prof.get("name", "?"),
         "prd_path": entry.get("prd_path"),
         "slug": result.get("_slug") or Path(entry.get("prd_path", "")).stem or "unknown",
@@ -261,12 +261,19 @@ def _subgraph_result_to_record(result: dict, entry: dict, prof: dict) -> dict:
         "reverted": result.get("_reverted", False),
         "triage_reason": result.get("_triage_reason"),
         "post_merge_verdict": result.get("_post_merge_verdict"),
-        # langgraph r-review I1：子图产 _blocked_check/_gate_status/_gate_reason（graph_pa_nodes 749/846/935/332-333），
-        #   提升到 rec 供 stage_report（run_daily.py:3164-3167）消费——否则 report「🚫 阻断/测试发布门」分桶降级 '?'。
-        "blocked_check": result.get("_blocked_check"),
-        "gate_status": result.get("_gate_status"),
-        "gate_reason": result.get("_gate_reason"),
     }
+    # langgraph r-review I1 + canary 坐实修正：子图产 _blocked_check/_gate_status/_gate_reason 仅在
+    #   blocked_external_state / 测试发布门路径（graph_pa_nodes 749/846/935）。对齐 dispatch_one 条件性
+    #   rec.update（L2109/2219 等，仅 blocked/gate 路径写，否则字段不存在）：无条件写入致 skip/正常路径多
+    #   3 个 None → shadow parity per_stage dispatch 漂移（canary shadow-run 坐实）。非 None 才写，
+    #   report（run_daily.py:3164-3167）在 blocked/gate 路径仍能分桶（.get(...) or '?' 兼容字段缺失）。
+    for _src, _dst in (("_blocked_check", "blocked_check"),
+                       ("_gate_status", "gate_status"),
+                       ("_gate_reason", "gate_reason")):
+        _v = result.get(_src)
+        if _v is not None:
+            rec[_dst] = _v
+    return rec
 
 
 def _invoke_dispatch_subgraph(entry: dict, prof: dict, stamp: str, owner_repo: str, *, slot_handle) -> dict:

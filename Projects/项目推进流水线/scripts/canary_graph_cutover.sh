@@ -115,7 +115,7 @@ shadow_run() {
 
   log "▸ legacy 路径（run_daily.py，PA_GRAPH_* off）→ $STATE_LEGACY …"
   unset PA_GRAPH_SHADOW PA_GRAPH_ORCHESTRATOR
-  python3 "$RUN_DAILY" --from-stage inject --to-stage dispatch \
+  python3 "$RUN_DAILY" --from-stage inject --to-stage dispatch --stamp "$STAMP" \
     --inject-prd "$GREEN_PRD" --project "$PROJECT" --state-dir "$STATE_LEGACY" \
     --no-notify --skip-critic --dispatch-skip-dev 2>&1 | tee "$CANARY_LOG"
   [ -f "$STATE_LEGACY/dispatch_$STAMP.json" ] && log "  ✅ legacy 产 dispatch_$STAMP.json" || \
@@ -123,7 +123,7 @@ shadow_run() {
 
   log "▸ graph 路径（graph_pa.py，PA_GRAPH_SHADOW=1 PA_GRAPH_ORCHESTRATOR=1）→ $STATE_GRAPH …"
   export PA_GRAPH_SHADOW=1 PA_GRAPH_ORCHESTRATOR=1
-  python3 "$GRAPH_PA" --from-stage inject --to-stage dispatch \
+  python3 "$GRAPH_PA" --from-stage inject --to-stage dispatch --stamp "$STAMP" \
     --inject-prd "$GREEN_PRD" --project "$PROJECT" --state-dir "$STATE_GRAPH" \
     --no-notify --skip-critic --dispatch-skip-dev 2>&1 | tee -a "$CANARY_LOG"
   [ -f "$STATE_GRAPH/dispatch_$STAMP.json" ] && log "  ✅ graph 产 dispatch_$STAMP.json" || \

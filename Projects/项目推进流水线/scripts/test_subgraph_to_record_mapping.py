@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """test_subgraph_to_record_mapping.py — _subgraph_result_to_record 字段映射测试（task 3.9）。
 
-验证 dispatch 子图 state → dispatch_one rec schema 1:1（shadow parity 核心，R7）。dispatch_one rec 字段
-= 初始 21 key（run_daily L2046-2056）+ 运行中动态 3 key（blocked_check/gate_status/gate_reason，stage_report
-L3164-3167 消费）== _subgraph_result_to_record key 集合。任一字段漂移会让 shadow parity 报告（批 3
-run_graph_shadow_parity_drill）失配，此测试作前置闸。
+验证 dispatch 子图 state → dispatch_one rec schema 1:1（shadow parity 核心，R7）。dispatch_one rec 基础
+21 key（run_daily L2046-2056）恒在；运行中动态 3 key（blocked_check/gate_status/gate_reason）路径依赖——仅
+blocked_external_state / 测试发布门路径 rec.update（L2109/2219-2220），否则字段不存在。
+_subgraph_result_to_record 条件性写入（非 None 才写）对齐之（canary shadow-run 坐实：无条件 None 致
+shadow parity per_stage dispatch 漂移）。任一字段漂移会让 shadow parity 报告失配，此测试作前置闸。
 """
 import os
 import sys
@@ -14,19 +15,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import graph_pa_aggregate as AGG
 
 
-# dispatch_one rec 字段集（run_daily 真源，shadow parity 对照基准）：初始 21（L2046-2056）+ 运行中动态 3
-# （blocked_check/gate_status/gate_reason，L2109/2219-2220 等 rec.update，stage_report L3164-3167 消费）。
-_DISPATCH_ONE_REC_KEYS = {
+# dispatch_one rec 基础字段集（恒在，run_daily L2046-2056 初始 rec，shadow parity 对照基准）。
+_BASE_REC_KEYS = {
     "project", "prd_path", "slug", "base", "status", "pr_url", "branch",
     "dev_killed", "stalled", "run_log", "dev_cost", "dev_turns", "verify",
     "skip_reason", "dev_test_cmd", "verify_verdict", "verify_round",
     "merge_commit", "reverted", "triage_reason", "post_merge_verdict",
-    "blocked_check", "gate_status", "gate_reason",
 }
+# 运行中动态字段（路径依赖）：仅 blocked_external_state（L2109 等）/ 测试发布门（L2219-2220）路径 rec.update，
+# 否则字段不存在（stage_report L3164-3167 用 .get(...) or '?' 兼容缺失）。canary shadow-run 坐实：graph
+# 无条件写 None 致 skip/正常路径多 3 字段 → shadow parity per_stage dispatch 漂移，故条件性写入对齐。
+_CONDITIONAL_KEYS = {"blocked_check", "gate_status", "gate_reason"}
 
 
 def test_record_schema_matches_dispatch_one():
-    """_subgraph_result_to_record key 集合 == dispatch_one rec 完整字段集（初始 21 + 动态 3，shadow parity 1:1）。"""
+    """基础 21 字段恒在（对齐 dispatch_one L2046-2056 初始 rec）；条件 3 字段子图未产则不写（对齐
+    dispatch_one 仅 blocked/gate 路径 rec.update）。shadow parity 1:1 要求 graph rec 与 legacy rec
+    逐字段一致——legacy skip/正常路径只产基础 21，graph 亦应只产基础 21。"""
     result = {"_exit_status": "pr_open", "_pr_url": "https://x", "_branch": "pa-dev-x",
               "_dev_cost": 0.5, "_dev_turns": 12, "_verify_verdict": "pass",
               "_verify_payload": {"x": 1}, "verify_round": 1, "_slug": "x",
@@ -34,8 +39,21 @@ def test_record_schema_matches_dispatch_one():
     entry = {"prd_path": "state/prd/x/p.md", "source_path": "src.md"}
     prof = {"name": "proj", "default_branch": "main"}
     rec = AGG._subgraph_result_to_record(result, entry, prof)
-    assert set(rec.keys()) == _DISPATCH_ONE_REC_KEYS
-    assert len(rec) == 24                          # 显式 24 字段（21 初始 + 3 动态，防静默增减）
+    assert set(rec.keys()) == _BASE_REC_KEYS       # 基础 21（子图未产条件字段，不写）
+    assert _CONDITIONAL_KEYS.isdisjoint(rec.keys())  # 条件字段未触发（对齐 legacy skip/正常路径）
+    assert len(rec) == 21
+
+
+def test_record_conditional_fields_when_subgraph_produces():
+    """子图产 _blocked_check/_gate_status/_gate_reason（blocked/gate 路径）→ rec 条件写入（对齐 dispatch_one
+    rec.update L2109/2219-2220）；stage_report L3164-3167 分桶消费。非 None 才写，None 不污染 schema。"""
+    result = {"_exit_status": "blocked_external_state", "_blocked_check": "inflight_count",
+              "_gate_status": "test_failed", "_gate_reason": "x"}
+    rec = AGG._subgraph_result_to_record(result, {"prd_path": "p.md"}, {"name": "p"})
+    assert rec["blocked_check"] == "inflight_count"
+    assert rec["gate_status"] == "test_failed"
+    assert rec["gate_reason"] == "x"
+    assert _CONDITIONAL_KEYS.issubset(rec.keys())  # 3 条件字段全触发
 
 
 def test_field_mapping_state_to_rec():
