@@ -4,7 +4,7 @@
 
 验证（对齐 dispatch_one L2149-2161）：
 ① 配置（KIND_MECHANICAL, stage=dispatch）
-② 成功 → _worktree_abs 覆盖为 wt 路径（<repo>/.worktrees/<stamp>-<slug>，dev cwd 用）
+② 成功 → _worktree_abs 覆盖为 wt 路径（<repo>/.worktrees/<devslug>，A3 跟 slug 不跟 stamp，dev cwd 用）
 ③ _run_capture RuntimeError → terminal=fail（基建异常升人工，L2159-2161）
 ④ wt.exists → git worktree remove --force 调（幂等，L2153-2155）
 ⑤ log_file 不存在 → mkdir parent（L2150-2151）
@@ -44,7 +44,7 @@ def test_worktree_success_overrides_worktree_abs(monkeypatch, tmp_path):
     _mock_capture(monkeypatch)
     s = dict(_BASE); s["_worktree_abs"] = str(repo)
     upd = GN.node_worktree(s)
-    expected_wt = str(repo / ".worktrees" / "20260811-x")
+    expected_wt = str(repo / ".worktrees" / "x")   # A3：dev_slugify(slug)，无 stamp 前缀
     assert upd["_worktree_abs"] == expected_wt
     assert not upd.get("terminal")
 
@@ -60,7 +60,7 @@ def test_worktree_fail_terminal(monkeypatch):
 # ── 幂等 remove（wt.exists）──────────────────────────────────────────────
 def test_worktree_existing_removed(monkeypatch, tmp_path):
     repo = tmp_path / "repo"; repo.mkdir()
-    wt = repo / ".worktrees" / "20260811-x"; wt.mkdir(parents=True)   # 旧 wt 存在
+    wt = repo / ".worktrees" / "x"; wt.mkdir(parents=True)   # 同 slug 旧 wt 存在（A3：路径跟 slug）
     calls = []
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: calls.append(a[0]))
     _mock_capture(monkeypatch)

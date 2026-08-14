@@ -603,11 +603,13 @@ def _dev_build_cmd(state: dict) -> list[str] | None:
             iteration_seq=state.get("verify_round", 0) + 1,
             resume_session=state.get("_cur_resume_session"),
             fork_session=bool(state.get("_cur_fork_session", False)),
-            lessons_artifact=state.get("_lessons_artifact"))
+            lessons_artifact=state.get("_lessons_artifact"),
+            round_n=state.get("verify_round", 1))   # verify-loop-discipline A4：轮次 marker（commit 边界锚）
     return run_daily._dev_cmd(
         prof, prd_abs, base, src_abs,
         feedback_artifact=state.get("_fb_artifact"),
-        lessons_artifact=state.get("_lessons_artifact"))
+        lessons_artifact=state.get("_lessons_artifact"),
+        round_n=state.get("verify_round", 1))   # verify-loop-discipline A4：轮次 marker（commit 边界锚）
 
 
 def _state_log_path(state: dict) -> Any:
@@ -698,6 +700,15 @@ def _dev_post_op(ni: dict, state: dict):
     if not branch:
         return _reconcile_terminal()
 
+    # ①b verify-loop-discipline R3-A F2（graph 同步，对齐 dispatch_one L2342-2353）：round≥2 dev 零新
+    #    commit（publish no_changes）→ no_progress 提前终止。否则 A4 同分支累积后 has_commits 恒 True，
+    #    白跑 independent_verify 耗尽 rounds。reconcile 只管 PR 对账副作用；终态归门——零增量停非错误 → triaged。
+    if round_n > 1 and script and script.get("no_changes"):
+        events, extra, obs = _reconcile_terminal()
+        extra = {**extra, "terminal": C.STATUS_TRIAGED, "_exit_status": "no_progress",
+                 "_skip_reason": f"round{round_n} dev 零新 commit（同分支累积无增量，不空转 verify）"}
+        return (events, extra, {**obs, "no_progress": True, "verify_round": round_n})
+
     # ② has_commits 三态（L2267-2270；UNKNOWN fail-safe 跳过独立验证，同 FOUND-False 走收尾）
     commits = run_daily._has_commits(repo, cur_base, branch)
     has_commits = commits.state is run_daily.ExtState.FOUND and bool(commits.value)
@@ -708,6 +719,17 @@ def _dev_post_op(ni: dict, state: dict):
     vj = run_daily.independent_verify(
         repo, branch, stamp, slug, log_file, prof,
         test_cmd_hint=(script.get("test_cmd") if script else None))
+
+    # ③b verify-loop-discipline B2（graph 同步，对齐 dispatch_one L2364-2377）：install 基建失败
+    #    （install_rc≠0，三态 UNKNOWN——系统无法判定代码是否正确）→ blocked_infra 升人工，
+    #    **不进 revise loop、不喂 verify**（dev 修不了环境问题；基建失败绝不当 revise 信号）。
+    #    reconcile 保留分支对账；终态归门——UNKNOWN 升人工 → blocked。
+    if vj.get("install_rc") not in (None, 0):
+        events, extra, obs = _reconcile_terminal()
+        extra = {**extra, "terminal": C.STATUS_BLOCKED, "_exit_status": "blocked_infra",
+                 "_skip_reason": f"install_rc={vj['install_rc']}（{vj.get('note') or '基建失败'}，非代码红）"}
+        return (events, extra, {**obs, "test_pass": False, "install_rc": vj.get("install_rc"),
+                                "infra_blocked": True, "has_commits": True})
 
     # ④ green evidence 持久化（L2281-2295；pass 才 store；fail-closed）
     if vj.get("pass"):
@@ -807,10 +829,10 @@ def _worktree_op(ni: dict, state: dict):
     from pathlib import Path
     repo = state.get("_worktree_abs", "")
     slug = ni.get("_slug", "")
-    stamp = ni.get("stamp", "")
     base = state.get("_base", "main")
     log_file = _state_log_path(state)
-    wt = Path(repo) / ".worktrees" / f"{stamp}-{slug}"
+    wt = Path(repo) / ".worktrees" / run_daily.dev_slugify(slug)   # verify-loop-discipline A3：worktree 跟 devslug
+    #   （非 stamp-slug；与分支名 auto/<devslug> 一致 + 同 PRD 各轮同路径确定性清理）
     if wt.exists():                                         # 幂等：旧 wt 先 force remove（L2153-2155）
         subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
                        capture_output=True, text=True, timeout=60)

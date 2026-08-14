@@ -26,3 +26,21 @@ def dev_slugify(stem: str) -> str:
     共用——两者必须产同一 slug，否则已投递检查静默失效。本函数是唯一源头，禁止复刻。
     """
     return re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")[:48]
+
+
+def make_branch(prefix: str, slug: str) -> str:
+    """slug → feature 分支名（verify-loop-discipline change task A1）。
+
+    branch = ``f"{prefix}/{slug}"``，**不含 stamp**。verify revise 各轮重调 dev-agent 是独立进程，
+    旧 ``f"{prefix}/{stamp}-{slug}"``（stamp 含时分）→ 每轮不同分支 → 每轮新 PR（#55/#56 根因）。
+    本函数从源头保证「需求（slug）不变 → branch 不变」：同 slug → 同 branch（跨进程确定性），使
+    **同一 PRD 文件**的 verify revise 各轮 + 崩溃恢复重入 checkout 复用同分支、commits 累积进同一 PR。
+    ⚠️ 收敛边界（R3-A F7）：slug 来自 PRD 文件名 stem（含日期前缀）——跨 cron 同一需求生成新 PRD 文件
+    → 新 slug → 新分支/新 PR；跨 cron 防重不靠本函数，靠 already_dispatched 前置闸（substring 匹配）。
+
+    **不二次 slugify**：``slug`` 须由 caller 先经 ``dev_slugify`` 规整（职责单一——本函数只拼 prefix，
+    规整归 ``dev_slugify``）。
+
+    被 dev-agent.py 分支命名（ADR-0006 #5 单一源头延伸）。
+    """
+    return f"{prefix}/{slug}"

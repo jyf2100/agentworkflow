@@ -219,3 +219,56 @@ def test_dev_post_cur_base_round2(monkeypatch):
     s = dict(_BASE); s["_cur_base"] = "pa-dev-round1"; s["verify_round"] = 2
     upd = GN.node_dev_post(s)
     assert upd["_base"] == "pa-dev-round1"                    # 不是默认 main
+
+
+# ── verify-loop-discipline graph 同步门（R3-A F2 no_progress + B2 blocked_infra）──
+def test_dev_post_round2_no_changes_no_progress(monkeypatch):
+    """round≥2 + dev 上报 no_changes → no_progress 提前终止（对齐 dispatch_one L2342-2353）。
+
+    reconcile 对账保留分支（reconcile 只管副作用）；终态归门：terminal=triaged（零增量停，非错误）+
+    _exit_status=no_progress。否则同分支累积后 has_commits 恒 True，白跑 independent_verify 耗尽 rounds。
+    """
+    import run_daily
+    seen = []
+
+    def fake(repo, owner_repo, rec, base, slug, interrupted=True):
+        seen.append(interrupted); rec["status"] = "interrupted_pr"   # reconcile 覆盖门终态（dispatch 侧同型）
+    monkeypatch.setattr(run_daily, "reconcile_pr", fake)
+    _mock_has_commits(monkeypatch, run_daily.found(True))
+    _mock_independent(monkeypatch, {"pass": True, "test_rc": 0, "test_cmd": "pytest"})
+    s = dict(_BASE); s["verify_round"] = 2; s["_dev_script"] = {"test_cmd": "pytest", "no_changes": True}
+    upd = GN.node_dev_post(s)
+    assert seen == [True]                                      # interrupted 对账收尾
+    assert upd["terminal"] == C.STATUS_TRIAGED                 # reconcile 后重设（终态归门）
+    assert upd["_exit_status"] == "no_progress"
+    assert "零新 commit" in upd["_skip_reason"]
+    assert "_verify_payload" not in upd                        # 不进 verify（不喂 pa-verify）
+
+
+def test_dev_post_round1_no_changes_not_gated(monkeypatch):
+    """round1 no_changes 不触发 no_progress 门（round1 无增量 = 无可验证，走 has_commits 三态自然收尾）。"""
+    import run_daily
+    _mock_has_commits(monkeypatch, run_daily.found(True))
+    _mock_independent(monkeypatch, {"pass": False, "test_rc": 1, "test_cmd": "pytest"})
+    _mock_dump(monkeypatch)
+    s = dict(_BASE); s["_dev_script"] = {"test_cmd": "pytest", "no_changes": True}
+    upd = GN.node_dev_post(s)
+    assert not upd.get("terminal")                             # 正常进 verify
+
+
+def test_dev_post_install_fail_blocked_infra(monkeypatch):
+    """install 基建失败（install_rc≠0，UNKNOWN）→ blocked_infra 升人工，不进 revise、不喂 verify（B2）。"""
+    import run_daily
+    seen = []
+
+    def fake(repo, owner_repo, rec, base, slug, interrupted=True):
+        seen.append(interrupted); rec["status"] = "interrupted_pr"
+    monkeypatch.setattr(run_daily, "reconcile_pr", fake)
+    _mock_has_commits(monkeypatch, run_daily.found(True))
+    _mock_independent(monkeypatch, {"pass": False, "install_rc": 2, "note": "npm ci 失败", "test_cmd": "npm test"})
+    upd = GN.node_dev_post(dict(_BASE))
+    assert seen == [True]                                      # 对账保留分支
+    assert upd["terminal"] == C.STATUS_BLOCKED                 # 升人工
+    assert upd["_exit_status"] == "blocked_infra"
+    assert "install_rc=2" in upd["_skip_reason"]
+    assert "_verify_payload" not in upd                        # 不喂 pa-verify（非代码红）

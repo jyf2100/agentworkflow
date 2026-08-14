@@ -57,7 +57,7 @@ from claude_agent_sdk import (
     PermissionResultDeny,
 )
 
-from slug_utils import dev_slugify   # ADR-0006 #5：dev_slugify 单一源头（无依赖模块，避免顶部 import 触发 sdk 连带加载拖垮 cron）
+from slug_utils import dev_slugify, make_branch   # ADR-0006 #5：dev_slugify 单一源头 + verify-loop-discipline A1 make_branch（均无依赖，避免顶部 import 触发 sdk 连带加载拖垮 cron）
 from bash_allowlist import decide_bash   # ADR-0006 #7：Bash 命令放行判定（无依赖模块，同上）
 from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # OpenSpec verified-dev-execution：结构化测试证据 + 发布硬门（无依赖模块，同上）
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
@@ -95,6 +95,10 @@ def parse_args(argv: list[str]) -> dict:
            #   写成 content-addressed artifact，path 透传给目标面 dev-agent（与 --feedback-artifact 完全对称）。
            #   baseline / injection=off → None（build_prompt 跳过注入，prompt byte-identical baseline）。
            "lessons_artifact": None,
+           # verify-loop-discipline A4：verify 闭环轮次（控制面 --round 透传）——只进 commit message marker
+           # （``pa-dev: round N``，git log --grep 定位轮边界供 commit 级回滚），**无 session/journal 副作用**
+           # （区别于 --iteration-seq：那是 session-aware retry 的 distinct iteration 分配，开 flag 才传）。
+           "round": 0,
            # task 3.2：merge phase 参数（--phase merge 时用；默认 phase=dev = 原 dev loop 路径零变化，design 决策#8）
            "phase": "dev", "branch": None, "main_ref": "main", "prd_id": "",
            # task 7.1a：shadow classify-only（--phase merge --classify-only 时用；CLEAN 也只判不 merge/push）
@@ -113,6 +117,7 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--feedback-artifact": out["feedback_artifact"] = argv[i + 1]; i += 1   # task 3.4：driven retry 反馈源
         elif a == "--lessons-artifact": out["lessons_artifact"] = argv[i + 1]; i += 1     # Section 5：learning memory lesson block 源
         elif a == "--iteration-seq": out["iteration_seq"] = int(argv[i + 1]); i += 1     # task 3.3：revise/resume/fork/new-session 衍生 iteration
+        elif a == "--round": out["round"] = int(argv[i + 1]); i += 1     # verify-loop-discipline A4：verify 闭环轮次（commit marker 源）
         elif a == "--resume-session": out["resume_session"] = argv[i + 1]; i += 1        # task 3.3：retry 同 session resume（SDK ResultMessage.session_id）
         elif a == "--fork-session": out["fork_session"] = True                           # task 3.3：fork 新 session（context 污染/compaction）
         elif a == "--state-dir": out["state_dir"] = argv[i + 1]; i += 1                  # task 3.3 P0-3：控制面注入 state_dir（SessionStore 统一）
@@ -191,6 +196,93 @@ def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> str:
     gh(["pr", "merge", pr_num, "--merge", "--subject", title, "--body", body])
     git(["fetch", "origin", main_ref])
     return git(["rev-parse", f"origin/{main_ref}"])
+
+
+def _ensure_feature_branch(branch: str, base: str) -> None:
+    """确保 worktree 检出 feature 分支（verify-loop-discipline A1a，r1 P1-1 阻塞项）。
+
+    分支已存在（verify revise round2+ 上轮已建；A1 后 branch 跟 slug 跨进程确定性 → 同名）→
+    ``git checkout branch`` 复用（同分支累积，单 PR 基石）；不存在（round1）→ ``checkout -b branch base`` 新建。
+    旧代码无条件 ``-b`` → round2 同 worktree 崩 ``fatal: branch already exists`` → exit 13 → 单 PR 目标
+    物理不可达。show-ref 直走 subprocess（rc=1 是预期「不存在」非错误，不能经会抛 RuntimeError 的 git()）。
+    """
+    r = subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                       cwd=REPO_ROOT, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode == 0:
+        git(["checkout", branch])               # round2+：复用已存在分支（commits 累积进同一 PR）
+    else:
+        git(["checkout", "-b", branch, base])   # round1：从 base 新建
+
+
+def run_checkout_phase(args: dict) -> int:
+    """checkout phase 主编排：确保 feature 分支检出（verify-loop-discipline A1a）。
+
+    机械 phase（同 merge/revert 范式：早期分叉、不经 SDK loop、守 D6），供 subprocess+CLI 离线测
+    （dev-agent.py 连字符不可 import）。main dev 流程复用 `_ensure_feature_branch` 同一逻辑（零漂移）。
+    """
+    branch, base = args.get("branch"), args.get("base")
+    if not branch or not base:   # R3-A F5：缺参会真建名为 "None" 的分支（git 字符串化），fail-fast
+        sys.stderr.write("✗ checkout phase 缺 --branch/--base 参数\n")
+        print(json.dumps({"ok": False, "error": "checkout phase requires --branch and --base"}, ensure_ascii=False))
+        return 10
+    try:
+        _ensure_feature_branch(branch, base)
+    except Exception as e:
+        sys.stderr.write(f"✗ 建分支失败: {e}\n")
+        print(json.dumps({"ok": False, "error": str(e), "branch": branch, "base": base}, ensure_ascii=False))
+        return 13
+    print(json.dumps({"ok": True, "branch": branch, "base": base}, ensure_ascii=False))
+    return 0
+
+
+def run_publish_phase(args: dict, *, dev_out: dict | None = None,
+                      on_success: dict | None = None, on_no_changes: dict | None = None,
+                      on_error: dict | None = None) -> int:
+    """publish phase 主编排：commit + push + 开 PR（**幂等**，verify-loop-discipline A2）。
+
+    A2 幂等：``gh pr create`` 前查重——镜像同文件 ``_pr_automerge`` 的已验证幂等模板
+    （``gh pr list --head <branch> --state open`` → 空 create / 非空复用，经 ``gh()`` fail-loud）：
+    branch 已有 open PR → 只 push（GitHub 同 head 自动并入已 open PR），无才 create。旧代码无条件
+    create → verify revise 每轮新 PR（#55/#56 堵满在途上限 9 天根因之一）。
+
+    main dev 流程经 ``dev_out``（cost/turns/test_cmd）+ ``on_success`` / ``on_no_changes`` / ``on_error``
+    （test_passed / gate_status 等分支字段）透传 dev-loop 摘要（三分支对称，error 也带 test_passed——
+    R3 契约完整性），输出与抽离前语义一致；``--phase publish`` 单独跑时省略（无 dev loop 上下文），
+    可 subprocess+fake-gh 离线测。
+    """
+    dev_out = dev_out or {}
+    branch, base = args.get("branch"), args.get("base")
+    if not branch or not base:   # R3-A F5：缺参 fail-fast（否则 git 字符串化 "None" 分支/push 目标）
+        sys.stderr.write("✗ publish phase 缺 --branch/--base 参数\n")
+        print(json.dumps({"ok": False, "error": "publish phase requires --branch and --base",
+                          **dev_out}, ensure_ascii=False))
+        return 10
+    title = Path(args["prd"]).stem if args.get("prd") else branch
+    try:
+        git(["add", "-A"])
+        diff_stat = git(["diff", "--cached", "--stat"])
+        if not diff_stat:
+            print(json.dumps({"ok": True, "no_changes": True, "branch": branch,
+                              "base": base, **dev_out, **(on_no_changes or {})}, ensure_ascii=False))
+            return 0
+        git(["commit", "-m", f"feat(pa-dev): {title}",
+             "-m", f"项目推进流水线 dev-agent（控制面标准执行器，ADR-0005）自治产出（基点 {base}）。"]
+            + (["-m", f"pa-dev: round {args['round']}"] if args.get("round") else []))   # verify-loop-discipline A4：轮边界 marker（同分支累积后 commit 级回滚锚）
+        git(["push", "-u", "origin", branch])
+        existing = gh(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url"])
+        prs = json.loads(existing) if existing.strip() else []
+        pr_reused = bool(prs)
+        pr_url = prs[0]["url"] if prs else gh(["pr", "create", "--base", base, "--head", branch,
+                                               "--title", f"pa-dev: {title}",
+                                               "--body", "自治 dev agent 产出（PRD 见任务投递）。验证闸（dev-agent 自治）已绿。"])
+        print(json.dumps({"ok": True, "branch": branch, "base": base, "pr_url": pr_url,
+                          "pr_reused": pr_reused, **dev_out, **(on_success or {})}, ensure_ascii=False))
+        return 0
+    except Exception as e:
+        sys.stderr.write(f"✗ git/push/PR 阶段失败: {e}\n")
+        print(json.dumps({"ok": False, "error": str(e), "branch": branch,
+                          "base": base, **dev_out, **(on_error or {})}, ensure_ascii=False))
+        return 13
 
 
 def stamp() -> str:
@@ -783,6 +875,12 @@ async def main() -> int:
         return run_post_merge_test(args)
     if args.get("phase") == "revert":
         return run_revert(args)
+    # verify-loop-discipline A1a/A2：checkout/publish phase 早期分叉（机械执行，不经 SDK loop；
+    # 守 D6——publish 供 subprocess+fake-gh 离线测 PR 幂等，checkout 供测 round2 分支复用）
+    if args.get("phase") == "checkout":
+        return run_checkout_phase(args)
+    if args.get("phase") == "publish":
+        return run_publish_phase(args)
     if not args["prd"]:
         sys.stderr.write("✗ 缺 --prd（控制面投递的 PRD）\n" + HELP + "\n"); return 10
 
@@ -792,13 +890,13 @@ async def main() -> int:
 
     base = args["base"]
     slug = dev_slugify(Path(args["prd"]).stem)
-    s = stamp()                      # task 2.3b：一次 stamp，coordinator/branch/run_log 复用（stamp() 含时分不可预测，多次调用会漂）
-    branch = f"{args['branch_prefix']}/{s}-{slug}"
+    s = stamp()                      # task 2.3b：一次 stamp，coordinator/run_log 复用（stamp() 含时分不可预测，多次调用会漂）
+    branch = make_branch(args["branch_prefix"], slug)   # verify-loop-discipline A1：branch 跟 slug 不跟 stamp（同需求跨 verify revise 轮 / 跨进程同分支 → 单 PR 累积）；stamp s 仍用于 run_log(L809)/coordinator(L817)，不进 branch
 
     # 1. 建 feature 分支（dry-run 不切，改动留工作树）
     if not args["dry_run"]:
         try:
-            git(["checkout", "-b", branch, base])
+            _ensure_feature_branch(branch, base)   # verify-loop-discipline A1a：round2+ 分支已存在 → checkout 复用（同分支累积）
         except Exception as e:
             sys.stderr.write(f"✗ 建分支失败: {e}\n"); return 13
 
@@ -959,33 +1057,17 @@ async def main() -> int:
                           "evidence_fresh": bool(ev and ev.fresh)}, ensure_ascii=False))
         return 14
 
-    # 5. commit + push + 开 PR（branch protection 要求走 PR）
-    try:
-        git(["add", "-A"])
-        diff_stat = git(["diff", "--cached", "--stat"])
-        if not diff_stat:
-            print(json.dumps({"ok": True, "no_changes": True, "branch": branch,
-                              "base": base, "cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd"), "test_passed": state.get("last_test") == "green"}, ensure_ascii=False))
-            return 0
-        title = Path(args["prd"]).stem
-        git(["commit", "-m", f"feat(pa-dev): {title}",
-             "-m", f"项目推进流水线 dev-agent（控制面标准执行器，ADR-0005）自治产出（基点 {base}）。"])
-        git(["push", "-u", "origin", branch])
-        pr_url = gh(["pr", "create", "--base", base, "--head", branch,
-                     "--title", f"pa-dev: {title}",
-                     "--body", "自治 dev agent 产出（PRD 见任务投递）。验证闸（dev-agent 自治）已绿。"])
-        ev = state.get("test_evidence")
-        # 发布门已放行 → test_passed=True 现为可证（新鲜绿色证据），并补结构化 gate/test 字段（2.5 truthful JSON）
-        print(json.dumps({"ok": True, "branch": branch, "base": base, "pr_url": pr_url,
-                          "cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd"),
-                          "test_passed": True, "test_status": "green",
-                          "gate_status": GATE_PUBLISH, "evidence_fresh": bool(ev and ev.fresh)}, ensure_ascii=False))
-        return 0
-    except Exception as e:
-        sys.stderr.write(f"✗ git/push/PR 阶段失败: {e}\n")
-        print(json.dumps({"ok": False, "error": str(e), "branch": branch,
-                          "base": base, "cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd"), "test_passed": state.get("last_test") == "green"}, ensure_ascii=False))
-        return 13
+    # 5. commit + push + 开 PR（branch protection 要求走 PR；verify-loop-discipline A2 开 PR 幂等）
+    #    抽至 run_publish_phase（--phase publish 同一逻辑，零漂移）；dev-loop 摘要经 dev_out/on_* 透传。
+    ev = state.get("test_evidence")
+    return run_publish_phase(
+        {**args, "branch": branch},
+        dev_out={"cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd")},
+        # 发布门已放行 → test_passed=True 现为可证（新鲜绿色证据），补结构化 gate/test 字段（2.5 truthful JSON）
+        on_success={"test_passed": True, "test_status": "green",
+                    "gate_status": GATE_PUBLISH, "evidence_fresh": bool(ev and ev.fresh)},
+        on_no_changes={"test_passed": state.get("last_test") == "green"},
+        on_error={"test_passed": state.get("last_test") == "green"})   # R3：error 路径对称带 test_passed（契约完整性）
 
 
 if __name__ == "__main__":

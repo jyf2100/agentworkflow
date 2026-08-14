@@ -36,6 +36,7 @@
    - 判绿 → **兜底开 PR 收尾**（治 baostock 式 interrupted_pr）。
    - 判红 → **反馈写进 PRD** → 打回增量重做。
 2. **增量重做**：第 1 次 `--base master`；判红第 2 次 `--base <上次dev分支>`。纯控制面换参（`_run_one` L772/774 已传 `--base`），**目标仓零改动、不越界 ADR-0002**。
+   > **演进注记（2026-08，openspec change `verify-loop-discipline` A4）**：增量重投已改**同分支累积**——base 恒项目默认分支，round2 dev-agent checkout 复用同分支、commits 累积进同一 PR（轮边界靠 commit marker `pa-dev: round N`）。本节保留为当时决策记录。
 3. **2 次机会**：判红时**保留 dev 分支做下次 base**（现状 stalled/orphan 才删，需改为"判红待重做不删"）；2 次用满降级 `interrupted_pr`（**不 drop**，dev 半成品可能有价值）。
 4. **反馈形态**：醒目独立节追加进原 PRD 末尾（`## ⚠️ 审核反馈（verify 第N轮·非需求变更，未重过 critic 闸）`），四要素：①红的定位（文件/测试/断言行）②红的原因 ③该怎么改（可执行）④收尾门（全量 `npm test` 绿才算过）。**不重新过 critic 闸**（反馈是施工指引、非需求变更）。
 5. **PRD 拆分前置**（实证后新增）：`pa-prd` 控制单 PR 规模，大需求拆成 N 个**小到 glm-5.2 能过**的 PRD。**verify 闭环只对匹配模型能力的小任务有效**——大任务不拆，谁来 verify 都救不了。

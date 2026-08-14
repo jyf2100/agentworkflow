@@ -115,7 +115,7 @@ STAGES = ["fetch", "radar", "prd", "inject", "critic", "dispatch", "report"]
 DEV_LOOP_TIMEOUT = 3600          # 触发 dev-agent.mjs（SDK maxTurns 150）外包超时（≈60min；maxTurns 在 glm-5.2 下约 12-37min，原 30min 偏紧会误杀正常 dev loop）
 VERIFY_INSTALL_TIMEOUT = 600     # 独立验证 npm ci
 VERIFY_TEST_TIMEOUT = 600        # 独立验证 npm test
-VERIFY_MAX_ROUNDS = 2            # pa-verify 判红增量重做机会（verify 闭环，docs/verify-commit-loop-design.md §3-③）
+VERIFY_MAX_ROUNDS = 2            # pa-verify 判红同分支累积重做机会（verify 闭环，docs/verify-commit-loop-design.md §3-③）
 CONDA_ENVS_DIR = Path("/home/ubuntu/miniconda3/envs")   # conda env 根（控制面主机固定）；Python 仓 dev-agent.py / 独立验证闸用
 DEV_AGENT_PY = PROJECT_DIR / "scripts" / "dev-agent.py"  # 控制面标准执行器（ADR-0006：dispatch 唯一调用源；仓内遗留 dev-agent.{py,mjs} 不再使用）
 
@@ -629,14 +629,73 @@ def _derive_verify_bundles(diff_path: Path, prof: dict) -> list:
         return []   # fail-open
 
 
+# verify-loop-discipline B3/SHALL2：PRD 验收点稳定 id（slug-derived，跨 verify revise 轮稳定——
+# 同一 PRD 文件同序号；反馈追加节不改验收节 → 序号不漂）。非测试缺陷锚此 id（spec scenario）。
+_ACCEPT_HEADING = re.compile(r"^#{1,3}\s*.*验收", re.M)
+_AC_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(.+)$")
+
+
+def _extract_acceptance_ids(prd_path: Path | str, slug: str) -> list[dict]:
+    """提取 PRD 验收点并分配稳定 id（机械活，零 LLM）。
+
+    找含「验收」的节，取其下直到下一标题的列表项；id = ``{dev_slugify(slug)}:ac{n}``。
+    无验收节 / 文件不可读 → 空 list（fail-open，prompt 无 id 块）。
+    """
+    try:
+        text = Path(prd_path).read_text(encoding="utf-8")
+    except Exception:
+        return []
+    m = _ACCEPT_HEADING.search(text)
+    if not m:
+        return []
+    rest = text[m.end():]
+    nxt = re.search(r"^#{1,3}\s", rest, re.M)
+    section = rest[:nxt.start()] if nxt else rest
+    prefix = dev_slugify(slug)
+    out = []
+    for line in section.splitlines():
+        im = _AC_ITEM.match(line)
+        if im and im.group(1).strip():
+            out.append({"id": f"{prefix}:ac{len(out) + 1}", "text": im.group(1).strip()})
+    return out
+
+
+# verify-loop-discipline B4/SHALL4：质量达标维度集按 profile 裁剪（frontend 含 UX/响应式；纯后端省略）。
+_DIM_FRONTEND = ["UX 可用性", "响应式布局", "安全", "性能", "兼容性"]
+_DIM_BACKEND = ["安全", "性能", "兼容性"]
+_UI_HINTS = ("react", "vue", "next", "svelte", "angular", "antd", "vite", "tailwind")
+
+
+def _review_dimensions(prof: dict | None) -> list[str]:
+    """profile.review_profile 显式优先（frontend/backend）；缺省机械探测——repo 的 package.json
+    dependencies/devDependencies 含 UI 框架关键词 → frontend，否则 backend（Python 仓恒 backend）。"""
+    rp = (prof or {}).get("review_profile")
+    if rp == "frontend":
+        return _DIM_FRONTEND
+    if rp == "backend":
+        return _DIM_BACKEND
+    repo = (prof or {}).get("repo")
+    if repo and (Path(repo) / "package.json").is_file():
+        try:
+            pkg = json.loads((Path(repo) / "package.json").read_text(encoding="utf-8"))
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+            if any(any(h in d for h in _UI_HINTS) for d in deps):
+                return _DIM_FRONTEND
+        except Exception:
+            pass   # fail-open：探测失败按 backend
+    return _DIM_BACKEND
+
+
 def verify_prompt(prd_path: str, branch: str | None, base: str, diff_path: Path,
                   verify: dict | None, round_n: int, prof: dict,
                   anchors: list | None = None, bundles: list | None = None) -> str:
     """pa-verify prompt（docs/verify-commit-loop-design.md §5-② 契约）：喂 PRD+分支+base+diff+测试输出+round+锚点+bundle。
 
-    base 在 round≥2 是「上次 dev 分支」（增量重投）；verify 是 independent_verify 的产物（含 test_rc/test_log），
-    None 表示测试未跑（dev 未报 test_cmd / 仓无 scripts.test）。anchors = 机械行级锚点；bundles = 大 diff 文件打包。
-    两者 None/空/单 bundle = baseline（flag 关或小 diff），prompt 行为不变。"""
+    base 恒项目默认分支（verify-loop-discipline A4 同分支累积：round≥2 不再增量 base=上次 dev 分支）；
+    diff 是**全量累积**（默认分支..branch 含全部轮次 commits），本轮增量按 commit marker ``pa-dev: round N``
+    定位。verify 是 independent_verify 的产物（含 test_rc/test_log），None 表示测试未跑（dev 未报 test_cmd /
+    仓无 scripts.test）。anchors = 机械行级锚点；bundles = 大 diff 文件打包。两者 None/空/单 bundle = baseline
+    （flag 关或小 diff），prompt 行为不变。"""
     test_rc = (verify or {}).get("test_rc")
     if test_rc == 0:
         test_state = "绿（test_rc=0，全量测试过）"
@@ -645,6 +704,11 @@ def verify_prompt(prd_path: str, branch: str | None, base: str, diff_path: Path,
     else:
         test_state = "未跑（dev 未报 test_cmd 或仓无 scripts.test → independent_verify 跳过）"
     test_log = (verify or {}).get("test_log")
+    # B3/SHALL1-2：验收点稳定 id 列表注入（非测试缺陷锚）；B4/SHALL4：维度集按 profile 裁剪
+    acs = _extract_acceptance_ids(prd_path, Path(prd_path).stem)
+    ac_block = ("\n".join(f"- {a['id']}: {a['text'][:80]}" for a in acs) if acs else "（PRD 无可提取验收点列表）")
+    ac_section = (f"PRD 验收点（稳定 id——**非测试缺陷锚此 id**，勿用自由文本描述锚）：\n{ac_block}\n\n")
+    dims = " / ".join(_review_dimensions(prof))
     anchor_block = _render_anchor_block(anchors or [])
     bundle_block = _render_bundle_block(bundles or [])
     anchor_section = (anchor_block + "\n\n") if anchor_block else ""
@@ -657,17 +721,19 @@ def verify_prompt(prd_path: str, branch: str | None, base: str, diff_path: Path,
         bundle_guidance = ("- 大 diff 已按 bundle 打包：revise 时逐 bundle 核对 PRD 验收标准，并在 feedback "
                            "产 criteria_coverage（每条 criterion: covered/not-covered-in-bundle）；"
                            "green 时逐 bundle quick sanity 即可（不穷尽 accounting）。\n")
-    return f"""[verify 第{round_n}轮] 项目={prof.get('name')} 分支={branch} base={base}（round≥2 为增量：上次 dev 分支）
+    return f"""[verify 第{round_n}轮] 项目={prof.get('name')} 分支={branch} base={base}（round≥2 同分支累积：base=项目默认分支，diff 含全部累积 commits，按 commit marker「pa-dev: round N」定位本轮增量）
 
 PRD（验收标准在此）：{prd_path}
 git diff（{base}..{branch}）：{diff_path}
 测试输出（independent_verify 全量重跑的 stdout）：{test_log or '（无；测试未跑）'}
 测试结论：{test_state}
 
-{anchor_section}{bundle_section}按你的 persona 输出契约：Read PRD 验收标准 + diff + 测试输出，判「验证绿且无回归」。
-{bundle_guidance}- 测试绿 → verdict=pass（快速确认 diff 与验收标准大致对应、无重大跑题即可）。
-- 测试红 → verdict=revise，写 feedback_section 四要素：{locate_hint} ②原因 ③怎么改（可执行）④收尾门（全量测试绿才算过）。
-- round=2 表示 dev 已按上轮反馈增量重做过一次，重点看反馈是否被落实。
+{anchor_section}{bundle_section}{ac_section}按你的 persona 输出契约：Read PRD 验收标准（上方稳定 id 列表）+ diff + 测试输出，做**三维度综合审查**（verdict 由你合成，编排器不替判——测试结论只是证实输入之一，绿≠自动 pass）：
+- **功能对齐**：diff 是否实现各验收点（对照 id 列表；绿轻红重——测试绿 quick sanity 即可，测试红须逐项核对）。
+- **开发遗漏**：验收点是否被静默丢弃（id 列表有而 diff 无对应实现且无说明）。
+- **质量达标（{dims}）**：是否存在阻塞性硬缺陷（绿测试不豁免）。
+{bundle_guidance}- 三维度全过 → verdict=pass；任一维度有阻塞性缺陷 → verdict=revise，写 feedback_section 四要素：{locate_hint}（非测试缺陷锚验收点 id 或 diff 位置；测试缺陷锚失败测试位置） ②原因 ③怎么改（可执行）④收尾门（全量测试绿才算过）。
+- round=2 表示 dev 已按上轮反馈在同分支上累积重做过一次，重点看反馈是否被落实（marker 定位本轮增量）。
 只吐那一行 JSON，多一个字都算失败。"""
 
 
@@ -1246,7 +1312,8 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
              feedback_artifact: str | None = None, *,
              state_dir: str | None = None, iteration_seq: int = 0,
              resume_session: str | None = None, fork_session: bool = False,
-             lessons_artifact: str | None = None) -> list[str] | None:
+             lessons_artifact: str | None = None,
+             round_n: int = 0) -> list[str] | None:
     """构造 dev-agent 触发命令（ADR-0006：控制面标准执行器为唯一源）。
 
     始终调用控制面 ``scripts/dev-agent.py``（DEV_AGENT_PY）——执行器贴目标仓跑（cwd=调用方传入的
@@ -1255,7 +1322,10 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
     （legacy ignored，OpenSpec verified-dev-execution）——``dev_agent_source`` 旧 profile 字段保留读取兼容
     （不报错），但其值不再分支：无论 vault 还是 repo，都走控制面执行器。
 
-    --base 由 verify 闭环调用方按轮次传入（round1=默认分支；round≥2=上次 dev 分支，增量重投）。
+    --base 由 verify 闭环调用方传入（verify-loop-discipline A4：**恒项目默认分支**——同分支累积，dev-agent
+        checkout 复用同分支（A1a）+ 开 PR 幂等（A2）→ 单 PR；旧「round≥2=上次 dev 分支增量重投」已废）。
+    --round（verify-loop-discipline A4）：verify 闭环轮次（1 起）→ dev-agent commit message 加
+        ``pa-dev: round N`` marker（轮边界锚，commit 级回滚）；0=不标（手动单轮零噪声）。
     --feedback-artifact（task 3.4）：driven（``journal_driven_dispatch``）模式 retry（round≥2）从 immutable
         PRD + journal feedback artifact 构 prompt——传 round_n 的 ``verifier_feedback`` artifact path
         （``build_recovery_context`` 从 journal 抽），dev-agent 读它 inject prompt（baseline 照旧读 PRD 反馈节）。
@@ -1274,6 +1344,8 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
         cmd += ["--feedback-artifact", feedback_artifact]
     if lessons_artifact:     # Section 5 接线：lesson block artifact path（None=不注入，dev-agent baseline prompt）
         cmd += ["--lessons-artifact", lessons_artifact]
+    if round_n > 0:          # verify-loop-discipline A4：轮次 marker（commit 边界锚；0=不标）
+        cmd += ["--round", str(round_n)]
     # task 3.3 P0-3：session-aware retry 参数（run_daily 据 RetryPolicy.decide 生成 → dev-agent 透传 SDK）。
     #   state_dir=控制面 STATE_DIR → dev-agent session_store 与控制面同一（retry 读 dev-agent 持久化 session_id）。
     if state_dir:
@@ -2149,7 +2221,11 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
     # ── 投递：detached worktree on main → 触发控制面 dev-agent.py（ADR-0006 vault-only 执行器）
     if not log_file.exists():
         log_file.parent.mkdir(parents=True, exist_ok=True)
-    wt = Path(repo) / ".worktrees" / f"{stamp}-{slug}"
+    wt = Path(repo) / ".worktrees" / devslug   # verify-loop-discipline A3：worktree 名跟 devslug（非 stamp-slug）——
+    #   同 PRD 各轮 / 崩溃恢复重入确定性清理（同 slug → 同路径 → remove-if-exists 自清；跨 cron 新 PRD
+    #   新 slug，见 slug_utils.make_branch 收敛边界注）+ 与分支名一致（A1 branch=auto/<devslug>，
+    #   故用 devslug 非原始 stem——stem 含下划线，与分支名会漂）。
+    #   worktree 本就跨 verify 轮复用（循环外建一次），此处只改名（R2-A-7）。
     if wt.exists():
         subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
                        capture_output=True, text=True, timeout=60)
@@ -2160,10 +2236,10 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         rec.update(status="fail", skip_reason=f"建 worktree 失败: {e}")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
 
-    # ── verify 闭环（docs/verify-commit-loop-design.md §3）：dev→独立验证→pa-verify 裁判；判红保留分支+反馈进 PRD+增量重投；判绿兜底开 PR
+    # ── verify 闭环（docs/verify-commit-loop-design.md §3，A4 后同分支累积）：dev→独立验证→pa-verify 裁判；判红保留分支+反馈进 PRD+同分支累积重投；判绿兜底开 PR
     #    同构模板：stage_critic revise loop（§4.3）。reconcile 顺位后移到「裁定后收尾」——不预先为中间红的分支补开 PR。
     #    执行器选源已固化（ADR-0006）：控制面 scripts/dev-agent.py 唯一，不再探测仓内 dev-agent.{py,mjs}。
-    cur_base = base
+    cur_base = base   # verify-loop-discipline A4：恒项目默认分支（同分支累积；round≥2 不再切上轮分支）
     _parent_iter: str | None = None       # task 3.3：prior iteration（revise→next attempt 引用，spec Iteration identity）
     # task 3.3 P0-3：session-aware retry 参数（revise→RetryPolicy.decide 生成；baseline flag 关=保持 None/False）
     cur_resume_session: str | None = None
@@ -2201,10 +2277,10 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
                            state_dir=str(STATE_DIR), iteration_seq=round_n,
                            resume_session=cur_resume_session, fork_session=cur_fork_session,
-                           lessons_artifact=_lessons_artifact)
+                           lessons_artifact=_lessons_artifact, round_n=round_n)
         else:
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
-                           lessons_artifact=_lessons_artifact)
+                           lessons_artifact=_lessons_artifact, round_n=round_n)
         if cmd is None:
             rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
             _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
@@ -2263,6 +2339,18 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
             log(f"  ✗ {slug}: dev r{round_n} 未吐 branch（建分支前崩/超时）→ 对账收尾")
             reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True); break
 
+        # verify-loop-discipline R3-A F2：round≥2 dev 零新 commit（publish no_changes）→ no_progress 提前终止。
+        #   同分支累积（A4）后 has_commits(main,branch) 恒 True（上轮 commits 在）→ 不加此门会白跑一轮
+        #   verify（同一全量 diff 大概率重复 revise）→ 耗尽 rounds 退化 interrupted_pr。
+        if round_n > 1 and script_json and script_json.get("no_changes"):
+            log(f"  ⏸ {slug}: r{round_n} 零增量（dev 未产出新 commit）→ no_progress 对账收尾")
+            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True)
+            # reconcile 后重设终态（reconcile 只管 PR 对账副作用；终态归门——无代码红/无中断语义，是零增量停）
+            rec["verify_round"] = round_n
+            rec["status"] = "no_progress"
+            rec["skip_reason"] = f"round{round_n} dev 零新 commit（同分支累积无增量，不空转 verify）"
+            break
+
         # 独立验证（门=branch+相对 cur_base 有 commit；与 reconcile status 解耦——闭环内 verify 先于对账）
         commits = _has_commits(repo, cur_base, branch)
         has_commits = commits.state is ExtState.FOUND and bool(commits.value)
@@ -2272,8 +2360,22 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
             rec["verify"] = independent_verify(repo, branch, stamp, slug, log_file, prof,
                                                test_cmd_hint=(script_json.get("test_cmd") if script_json else None))
         else:
-            rec["verify"] = None              # 无新增 commit（如 round2 dev 未动）→ 无可验证
+            rec["verify"] = None              # 无新增 commit → 无可验证（round≥2 dev 未动已由上方 no_progress 门终止，此处剩 round1 无产出）
         _vj = rec.get("verify") or {}
+        # verify-loop-discipline B2：install 基建失败（install_rc≠0，三态 UNKNOWN——系统无法判定代码是否
+        # 正确）→ blocked_infra 升人工，**不进 revise loop**（dev 修不了环境问题；spec verified-dev-execution：
+        # 基建失败绝不当 revise 信号）。收尾对齐 no_progress 门（reconcile 保留分支 + 循环后 terminal）。
+        if _vj.get("install_rc") not in (None, 0):
+            log(f"  🧱 {slug}: 独立验证基建失败 → blocked_infra（不进 revise，升人工）")
+            _sj.emit("test", _iter, _prd, payload={
+                "round": round_n, "test_pass": False, "install_rc": _vj.get("install_rc"),
+                "infra_blocked": True})
+            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True)
+            # reconcile 后重设终态（reconcile 只管 PR 对账副作用；终态归门——基建失败是 UNKNOWN 升人工，非 verify 红）
+            rec["verify_round"] = round_n
+            rec["status"] = "blocked_infra"
+            rec["skip_reason"] = f"install_rc={_vj['install_rc']}（{_vj.get('note') or '基建失败'}，非代码红）"
+            break
         # task 4.2 evidence integrity：green test result（机械绿）必须持久化为 content-addressed artifact
         # （valid digest），否则不当 fresh green evidence → blocked_evidence（spec verified-publication-integrity
         # 「Test artifact write fails」：无法持久化/校验的 green result 不得成 complete fresh green evidence，
@@ -2301,6 +2403,8 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         vinfo: dict | None = None
         if has_commits:
             diff_path = STATE_DIR / "runs" / proj / f"{stamp}_{slug}.r{round_n}.diff"
+            # A4a③：cur_base 恒默认分支 → diff = 默认分支..branch **全量累积**（含全部轮次 commits），
+            #   pa-verify 审全量、按 commit marker「pa-dev: round N」定位本轮增量（旧 round2 增量 diff 已废）
             _dump_branch_diff(repo, cur_base, branch, diff_path)
             try:
                 vinfo = _pa_verify_round(rec, prof, prd_abs, cur_base, diff_path, round_n, slug)
@@ -2461,15 +2565,18 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
                 reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=False)
             break
         if vinfo and vinfo.get("verdict") == "revise" and round_n < VERIFY_MAX_ROUNDS:
-            # 判红（机会未用满）：保留分支做下次 base + 反馈追加进 PRD + 增量 --base=<上次分支> 重投
-            log(f"  🔴 {slug}: verify 红（r{round_n}）→ 保留 {branch} 做下次 base，反馈进 PRD，增量重投 r{round_n + 1}")
+            # 判红（机会未用满）：反馈追加进 PRD + 同分支累积重投（verify-loop-discipline A4：base 恒项目默认分支，
+            #   dev-agent（A1a）checkout 复用同分支 → commits 累积进同一 PR（A2 幂等）；轮边界靠 commit marker
+            #   ``pa-dev: round N`` 定位（commit 级回滚），失分支级隔离是有意取舍——换「PR 跟需求不变」不变式）
+            log(f"  🔴 {slug}: verify 红（r{round_n}）→ 反馈进 PRD，同分支累积重投 r{round_n + 1}（base 恒 {base}）")
             _fb_digest = _append_verify_feedback(prd_abs, vinfo.get("feedback_section", ""), round_n,
                                      sj=_sj, iter_id=_iter, prd_id=_prd,
                                      artifact_root=STATE_DIR / "artifacts" / _run,
                                      driven=_coord.flags.journal_driven_dispatch)   # task 3.2：driven→摘 PRD 追加
             _parent_iter = _iter              # task 3.3：next attempt（round_n+1）引用 prior iteration
             _parent_fb_digest = _fb_digest    # task 3.3：next attempt 引用 round_n feedback artifact digest
-            cur_base = branch
+            # verify-loop-discipline A4：**不再** cur_base = branch（旧增量重投语义）——cur_base 恒项目默认
+            #   分支 → 下轮 --base=默认分支 + dev-agent checkout 复用同分支（A1a）→ 同分支累积单 PR（A2）。
             # task 3.3 P0-3：session-aware retry 闭环——run_daily 驱动 RetryPolicy（recover_iteration 内
             #   reconcile 副作用 + decide）→ 据 mode 生成 dev-agent session 参数 + emit journal 决策事件 +
             #   消耗 retry 预算。baseline（flag 关）→ 跳过，走原增量 --base 重投（dispatch 决策零变化）。
@@ -2582,6 +2689,13 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
                  "--title", title, "--body", body],
                 capture_output=True, text=True, timeout=30)
             if r.returncode != 0:   # fail-safe：补开 PR 失败 → 保留分支不臆断成功（旧版无视 rc → 空 url 却标 pr_open=幻影绿 PR）
+                # verify-loop-discipline A5：create 撞并发已开的同 branch open PR（TOCTOU：lookup 后、create 前
+                # 另一进程开了——graph 路径/并发 cron）→ 重查复用（对齐 A2 幂等语义），仍无才 blocked。
+                recheck = _lookup_pr(owner_repo, branch)
+                if recheck.state is ExtState.FOUND and recheck.value.get("state") == "OPEN":
+                    rec["pr_url"] = recheck.value.get("url"); rec["status"] = new_status
+                    log(f"  ♻ {slug}: 补开撞并发 open PR，复用 {rec['pr_url']}（A5 幂等对齐）")
+                    return
                 rec.update(status="blocked_external_state", blocked_check="pr_create",
                            skip_reason=f"保留分支-补开PR失败(rc={r.returncode}): {sanitize(r.stderr)}")
                 log(f"  ⛔ {slug}: {rec['skip_reason']}"); return
@@ -2653,12 +2767,26 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
                 out["note"] = "npm ci 失败"; return out
             trc, test_out, _ = _run_capture(["npm", "test"], str(vt), VERIFY_TEST_TIMEOUT, f"[{slug}:npm-test]", log_file)
         else:
-            # Python：deps 在 conda env（无 install 闸）。重放 dev-agent 上报的 test_cmd（bash -c），PATH 注入 env bin
-            # ——让命令里的裸 python / run_tests.py 的子进程都落到 env python（launching 基建，非测试逻辑）
-            out["install_rc"] = 0
+            # Python install 闸（verify-loop-discipline B2a，r1 F-B2）：旧版硬编码 install_rc=0（无 install 步骤）
+            # → 缺依赖时 test_rc≠0 被当代码红喂 revise = B2 要消除的回环对 Python 仓失效。install_cmd 优先
+            # profile（项目自治），fallback 仓有打包文件（pyproject.toml/setup.py）→ pip install -e '.[dev]'
+            # （装进 conda env：_env_python 绝对路径 + PATH 注入，与 test 重放同构）。
             venv = dict(os.environ)
             if prof and prof.get("conda_env"):
                 venv["PATH"] = str(CONDA_ENVS_DIR / prof["conda_env"] / "bin") + os.pathsep + venv.get("PATH", "")
+            install_cmd = (prof or {}).get("install_cmd") or (
+                f"{_env_python((prof or {}).get('conda_env', ''))} -m pip install -e '.[dev]'"
+                if (Path(vt) / "pyproject.toml").exists() or (Path(vt) / "setup.py").exists() else None)
+            if install_cmd:
+                irc, _, _ = _run_capture(["bash", "-c", install_cmd], str(vt), VERIFY_INSTALL_TIMEOUT,
+                                         f"[{slug}:py-install]", log_file, env=venv or None)
+                out["install_rc"] = irc
+                if irc != 0:
+                    out["note"] = "Python install 失败（基建，非代码红）"; return out
+            else:
+                out["install_rc"] = 0   # 仓无打包文件且 profile 未配 install_cmd → 无 install 步骤
+            # 重放 dev-agent 上报的 test_cmd（bash -c），PATH 注入 env bin——让命令里的裸 python /
+            # run_tests.py 的子进程都落到 env python（launching 基建，非测试逻辑）
             trc, test_out, _ = _run_capture(["bash", "-c", test_cmd_hint], str(vt), VERIFY_TEST_TIMEOUT,
                                      f"[{slug}:py-test]", log_file, env=venv or None)
         out["test_rc"] = trc; out["pass"] = (trc == 0)

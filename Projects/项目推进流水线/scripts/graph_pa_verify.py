@@ -3,7 +3,7 @@
 """graph_pa_verify.py — verify 子图（任务 3.4 立 + 3.5c 升级为完整 dev↔verify 闭环）。
 
 design D3 L73 + D5（撤 interrupt，升人工路径保持机械硬门）：verify 闭环（dev→独立验证→pa-verify 裁判；
-判红保留分支+反馈进 PRD+增量重投；判绿 publish 接）迁为 LangGraph StateGraph 条件边回环。命令式真源是
+判红保留分支+反馈进 PRD+同分支累积重投；判绿 publish 接）迁为 LangGraph StateGraph 条件边回环。命令式真源是
 dispatch_one L2163-2512（for-round：dev→independent_verify→pa-verify；revise→redo；pass→publish）。
 
 子图拓扑（任务 3.5c 升级）：
@@ -62,7 +62,7 @@ class VerifySubState(TypedDict, total=False):
     _iter: str               # iteration_id（recover_iteration / _append_verify_feedback iter_id）
     _prd: str                # prd_id（recover_iteration / _append_verify_feedback prd_id）
     # dev node 写（任务 3.5a）
-    _branch: str             # dev 分支（verify_prompt base..branch + redo cur_base=branch 增量重投）
+    _branch: str             # dev 分支（verify_prompt base..branch + session retry recover_iteration base 用）
     _dev_script: dict        # dev-agent JSON（test_cmd 喂 independent_verify）
     _dev_rc: int
     _dev_killed: bool
@@ -75,7 +75,7 @@ class VerifySubState(TypedDict, total=False):
     _reconcile_status: str   # reconcile_pr 收尾 status（无产出时）
     _pr_url: str
     # redo 写（任务 3.5c）
-    _cur_base: str           # round2 base = round1 dev 分支（增量重投，L2472）
+    _cur_base: str           # A4 后 redo 不再写（cur_base 恒项目默认分支，同分支累积）；字段留作旧 state 读兼容
     _redo_feedback: str      # redo 暂存 verify feedback（dev round2 注入用）
     _cur_resume_session: str  # session retry RESUME 模式（dev cmd --resume-session）
     _cur_fork_session: bool   # session retry FORK 模式（dev cmd --fork-session）
@@ -110,7 +110,7 @@ def _redo_session_retry(state: dict, branch: str) -> dict:
     baseline（session_aware_retry off / 无 _coord / 无 _sj）→ 空更新（走原增量 --base 重投，决策零变化）。
     flag on → reconcile.recover_iteration 据 mode 设 _cur_resume_session/_cur_fork_session；
     BLOCK/STOP → terminal=triaged（升人工，对齐 L2491-2495 retry_blocked/budget_exhausted）。
-    fail-open：recover_iteration 异常 → 空更新（不阻断 verify 闭环，走 baseline 增量重投）。
+    fail-open：recover_iteration 异常 → 空更新（不阻断 verify 闭环，走 baseline 同分支累积重投）。
     """
     flags = state.get("_coord_flags")
     coord = state.get("_coord")
@@ -144,16 +144,18 @@ def _redo_session_retry(state: dict, branch: str) -> dict:
 
 
 def _redo_fn(state: dict) -> dict:
-    """redo：verify revise → 注入反馈 + 设 round2 base + session retry 决策 + bump verify_round → dev(round2)。
+    """redo：verify revise → 注入反馈 + bump verify_round → dev(round2)（同分支累积）。
 
-    对齐 dispatch_one L2463-2508（判红未用满：保留分支做下次 base + 反馈追加 PRD + 增量 --base 重投）。
+    对齐 dispatch_one revise 分支（verify-loop-discipline A4：cur_base **恒项目默认分支**——不再
+    `_cur_base = branch`（旧增量重投语义）；round2 dev-agent checkout 复用同分支 → commits 累积进同一 PR，
+    轮边界靠 commit marker ``pa-dev: round N``）。
     """
     import run_daily
     vinfo = state.get("_verify_result") or {}
     feedback = vinfo.get("feedback_section") or vinfo.get("feedback") or ""
     round_n = state.get("verify_round", 1)
     branch = state.get("_branch")
-    update: dict = {"_redo_feedback": feedback, "_cur_base": branch,   # round2 base = round1 dev 分支
+    update: dict = {"_redo_feedback": feedback,   # A4：_cur_base 不再切上轮分支（同分支累积；_dev_build_cmd 兜底 _base）
                     "verify_round": round_n + 1}
     # ① _append_verify_feedback（PRD 追加反馈节，baseline；driven flag 摘 PRD 追加，对齐 L2466-2471）
     prd_abs = state.get("_prd_abs") or state.get("_prd_path")

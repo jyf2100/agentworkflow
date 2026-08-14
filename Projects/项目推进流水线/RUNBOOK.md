@@ -358,3 +358,27 @@ PYTHONPATH=scripts python -c "import cutover as C; print(C.run_full_cutover_suit
 unset PA_GRAPH_ORCHESTRATOR PA_GRAPH_SHADOW     # run_cron.sh 下个 cron 秒回 run_daily.py（graph_pa 不被 import）
 # state 产物（dispatch_{stamp}.json / journal）双路径同 schema，回退无需迁移
 ```
+
+## 10. verify 闭环单 PR 语义（verify-loop-discipline，change 2026-08）
+
+branch/worktree 去 stamp（跟 slug）后的两条一次性运维：
+
+### 10.1 旧 stamp worktree / 分支清理（一次性）
+A1/A3 上线前产生的旧命名残留（`<stamp>-<slug>` worktree、`auto/<stamp>-<slug>` 分支/PR）不会被新
+remove-if-exists 自清（路径不同）。一次性清理（各目标仓）：
+```bash
+git -C <repo> worktree list | grep -E '\.worktrees/[0-9]{8}-[0-9]{4}-'   # 旧 stamp 命名 worktree
+git -C <repo> worktree remove --force <path>
+git -C <repo> branch --list 'auto/*' | grep -E 'auto/[0-9]{8}-[0-9]{4}-'  # 对应旧分支（PR 处理见 §10.2 注）
+```
+遗留 open PR 按需求处置（同 slug 新 PR 已开则关旧的；见 change E1 惯例）。
+
+### 10.2 `_ensure_feature_branch` show-ref 本地盲区恢复
+分支存在性查 `git show-ref`（**本地**）——若本地分支被误删但 origin 仍有（或换 clone 后本地缺失），
+checkout 会 `-b` 新建导致与远端分叉。恢复路径：
+```bash
+git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<branch>   # 重建本地引用
+# 或让 dev-agent checkout fallback：git checkout -b <branch> origin/<branch>（follow-up，暂手动）
+```
+判据：dev log 出现 `already exists` 反复失败 / PR diff 突然缩水（新分支只含本轮 commit）→ 查
+`git rev-parse <branch>` vs `origin/<branch>` 是否同 SHA。

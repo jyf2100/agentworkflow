@@ -88,7 +88,7 @@ def test_verify_prompt_red_round2(tmp_path):
     assert "第2轮" in p and "auto/b" in p
     assert str(tmp_path / "d.diff") in p
     assert "红（test_rc=1" in p
-    assert "增量" in p          # round≥2 标注「增量：上次 dev 分支」
+    assert "同分支累积" in p    # verify-loop-discipline A4a：round≥2 标注「同分支累积」（base=默认分支、diff 全量）
 
 
 def test_verify_prompt_test_not_run(tmp_path):
@@ -363,11 +363,11 @@ def test_dispatch_green_evidence_artifact_failure_blocks_not_published(tmp_path,
 
 
 def test_dispatch_red_then_green(tmp_path, monkeypatch):
-    # Arrange：r1 判红→增量重投 r2→判绿
+    # Arrange：r1 判红→同分支累积重投 r2→判绿（verify-loop-discipline A4：round2 base 恒默认分支）
     _setup(tmp_path, monkeypatch)
     _admit(monkeypatch)
     repo = _repo(tmp_path)
-    branches = iter(["auto/r1", "auto/r2"])
+    branches = iter(["auto/r1", "auto/r1"])   # A4：同分支累积（r2 复用同 branch）
     monkeypatch.setattr(run_daily, "_run_dev_agent",
                         lambda *a, **k: {"branch": next(branches), "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
     monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
@@ -379,7 +379,7 @@ def test_dispatch_red_then_green(tmp_path, monkeypatch):
     monkeypatch.setattr(run_daily, "run_persona", lambda *a, **k: (next(verdicts), {"cost": 0.0, "turns": 1}))
     recon_calls, fake_rec = _recon_recorder()
     monkeypatch.setattr(run_daily, "reconcile_pr", fake_rec)
-    # spy：捕获每轮 --base（验证 r2 增量 base=上次 dev 分支）
+    # spy：捕获每轮 --base（verify-loop-discipline A4：r2 base 恒项目默认分支——同分支累积，非增量 base=上轮分支）
     bases: list[str] = []
     real = run_daily._dev_cmd
 
@@ -391,8 +391,8 @@ def test_dispatch_red_then_green(tmp_path, monkeypatch):
 
     # Act
     rec = run_daily.dispatch_one(_entry(), _prof(repo), "20260718", _args())
-    # Assert：r2 用 r1 分支做 base；r1 红未 reconcile；r2 绿兜底开 PR；反馈进了 PRD
-    assert bases == ["main", "auto/r1"]
+    # Assert：r2 base=main（同分支累积；旧增量语义 auto/r1 已废）；r1 红未 reconcile；r2 绿兜底开 PR；反馈进了 PRD
+    assert bases == ["main", "main"]
     assert rec["verify_round"] == 2 and rec["verify_verdict"] == "pass"
     assert recon_calls == [False]               # 只在判绿时收尾一次
     prd_text = (tmp_path / "state" / "prd" / PROJ / "20260718_test.md").read_text(encoding="utf-8")
@@ -409,7 +409,7 @@ def test_dispatch_revise_creates_distinct_iteration_referencing_prior(tmp_path, 
     import journal as J
     # Arrange — 同 revise→pass 闭环，但 journal_shadow 开（emit 落盘可观测 iteration）
     _setup(tmp_path, monkeypatch); _admit(monkeypatch); repo = _repo(tmp_path)
-    branches = iter(["auto/r1", "auto/r2"])
+    branches = iter(["auto/r1", "auto/r1"])   # A4：同分支累积（r2 复用同 branch）
     monkeypatch.setattr(run_daily, "_run_dev_agent",
                         lambda *a, **k: {"branch": next(branches), "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
     monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
@@ -452,7 +452,7 @@ def test_dispatch_driven_retry_injects_feedback_artifact(tmp_path, monkeypatch):
     baseline（driven 关）retry 命令无 ``--feedback-artifact``（照旧读 PRD 反馈节）。"""
     # Arrange — driven 开（preflight⇒shadow 开）+ revise→pass 闭环
     _setup(tmp_path, monkeypatch); _admit(monkeypatch); repo = _repo(tmp_path)
-    branches = iter(["auto/r1", "auto/r2"])
+    branches = iter(["auto/r1", "auto/r1"])   # A4：同分支累积（r2 复用同 branch）
     monkeypatch.setattr(run_daily, "_run_dev_agent",
                         lambda *a, **k: {"branch": next(branches), "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
     monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
@@ -464,23 +464,23 @@ def test_dispatch_driven_retry_injects_feedback_artifact(tmp_path, monkeypatch):
     monkeypatch.setattr(run_daily, "reconcile_pr", lambda *a, **k: None)
     prof = _prof(repo)
     prof["loop"] = {"journal_shadow": True, "journal_driven_dispatch": True}
-    # spy _dev_cmd：捕获每轮命令（base=main 是 round1；base=auto/r1 是 round2 retry）
-    cmds: list[tuple[str, list[str]]] = []
+    # spy _dev_cmd：捕获每轮命令（verify-loop-discipline A4 后 base 恒 main，轮次按 round_n 区分）
+    cmds: list[tuple[int, list[str]]] = []
     real_cmd = run_daily._dev_cmd
 
     def _spy(*a, **kw):
         c = real_cmd(*a, **kw)
-        cmds.append((kw.get("base", a[2] if len(a) > 2 else "?"), list(c or [])))
+        cmds.append((kw.get("round_n", 0), list(c or [])))
         return c
     monkeypatch.setattr(run_daily, "_dev_cmd", _spy)
 
     # Act
     run_daily.dispatch_one(_entry(), prof, "20260718", _args())
 
-    # Assert — round2（retry，base=auto/r1）inject --feedback-artifact；round1（base=main）无
+    # Assert — round2（retry）inject --feedback-artifact；round1 无
     assert len(cmds) >= 2, "revise→重投应触发两轮 _dev_cmd"
-    r2_cmd = [c for base, c in cmds if base != "main"][0]
-    r1_cmd = [c for base, c in cmds if base == "main"][0]
+    r2_cmd = [c for rnd, c in cmds if rnd == 2][0]
+    r1_cmd = [c for rnd, c in cmds if rnd == 1][0]
     assert "--feedback-artifact" in r2_cmd, "task 3.4：driven retry 从 feedback artifact 构 prompt"
     # feedback artifact path 是 round1 verifier_feedback 的 artifact path（recovery context 从 journal 抽）
     fa_idx = r2_cmd.index("--feedback-artifact") + 1
@@ -552,7 +552,7 @@ def test_dispatch_red_used_up(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     _admit(monkeypatch)
     repo = _repo(tmp_path)
-    branches = iter(["auto/r1", "auto/r2"])
+    branches = iter(["auto/r1", "auto/r1"])   # A4：同分支累积（r2 复用同 branch）
     monkeypatch.setattr(run_daily, "_run_dev_agent",
                         lambda *a, **k: {"branch": next(branches), "cost": 0.1, "turns": 5, "test_cmd": "npm test"})
     monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))

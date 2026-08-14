@@ -262,14 +262,18 @@ def test_subgraph_revise_exhausted_interrupted(monkeypatch):
 
 # ── redo 行为（feedback 暂存 + cur_base + bump + session retry）──────────
 def test_subgraph_redo_carries_feedback_and_base(monkeypatch):
-    """redo：暂存 round1 revise feedback → _redo_feedback + _cur_base=branch + bump round（baseline，flag off）。"""
+    """redo：暂存 round1 revise feedback → _redo_feedback + bump round（baseline，flag off）。
+
+    verify-loop-discipline A4：不再 `_cur_base = branch`（旧增量重投）——cur_base 恒项目默认分支，
+    round2 dev-agent checkout 复用同分支（同分支累积进同一 PR）。
+    """
     _mock_dev(monkeypatch)
     _mock_dev_post_ok(monkeypatch)
     _mock_verify_seq(monkeypatch, ["revise", "pass"])
     _no_prd_write(monkeypatch)
     result = GV.build_verify_subgraph().invoke(dict(_BASE))
     assert result.get("_redo_feedback") == "fix"       # round1 revise feedback
-    assert result["_cur_base"] == "pa-dev-x"           # round1 branch 作 round2 base（L2472）
+    assert "_cur_base" not in result                   # A4：cur_base 恒默认分支，redo 不切上轮分支
     assert result["verify_round"] == 2
 
 
