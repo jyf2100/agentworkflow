@@ -12,6 +12,7 @@
 import os
 import sys
 import subprocess
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import graph_pa_nodes as GN
@@ -88,3 +89,33 @@ def test_worktree_log_file_mkdir(monkeypatch, tmp_path):
     s = dict(_BASE); s["_worktree_abs"] = str(repo); s["_dev_log_file"] = str(log_file)
     GN.node_worktree(s)
     assert log_file.parent.exists()                                # mkdir parents
+
+
+# ── 回归：state._dev_log_file(str) → 运行期 Path（langgraph state 序列化 vs run_daily 签名要 Path）──
+def test_worktree_passes_path_to_run_capture(monkeypatch, tmp_path):
+    """回归（切轨真跑暴露）：state._dev_log_file 是 str（langgraph state 序列化要求，aggregate
+    _build_dispatch_shell L229 存 str），worktree op 必须转 Path 传 run_daily._run_capture（签名要
+    Path；内部 log_file.parent.mkdir 在 str 上崩 'str' object has no attribute 'parent'）。
+    旧测 _mock_capture 替换整个 _run_capture 故漏（mock 不调 .parent）；真跑 dispatch 才暴露。
+    dev/dev_post/publication 同款经 _state_log_path helper 同治。"""
+    import run_daily
+    repo = tmp_path / "repo"; repo.mkdir()
+    log_file = tmp_path / "runs" / "x.log"
+    received = {}
+
+    def spy(*a, **kw):
+        received["log_file"] = a[4] if len(a) > 4 else kw.get("log_file")   # _run_capture 第 5 参
+        return (0, "", "")
+    monkeypatch.setattr(run_daily, "_run_capture", spy)
+    s = dict(_BASE); s["_worktree_abs"] = str(repo); s["_dev_log_file"] = str(log_file)
+    GN.node_worktree(s)
+    assert isinstance(received["log_file"], Path), \
+        f"_run_capture 须收 Path 非 str（实际 {type(received.get('log_file')).__name__}）"
+
+
+def test_state_log_path_helper():
+    """_state_log_path：str→Path（langgraph state 序列化值）/ None→None / 缺 key→None。
+    graph 轨固有边界单点（4 消费点共用：dev/dev_post/worktree/publication）。"""
+    assert GN._state_log_path({"_dev_log_file": "/a/b.log"}) == Path("/a/b.log")
+    assert GN._state_log_path({"_dev_log_file": None}) is None
+    assert GN._state_log_path({}) is None

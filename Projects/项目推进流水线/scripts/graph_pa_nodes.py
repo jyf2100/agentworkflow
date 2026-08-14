@@ -610,10 +610,22 @@ def _dev_build_cmd(state: dict) -> list[str] | None:
         lessons_artifact=state.get("_lessons_artifact"))
 
 
+def _state_log_path(state: dict) -> Any:
+    """state._dev_log_file（str，langgraph state 序列化要求）→ 运行期 Path。
+
+    graph 轨固有边界：shell 经 langgraph state 传值要可序列化 → _dev_log_file 存 str（aggregate
+    _build_dispatch_shell L229）；但 run_daily._run_capture / independent_verify / _run_dev_agent 签名
+    要 Path（内部 .parent.mkdir 在 str 上崩 'str' object has no attribute 'parent'）。故 dev /
+    dev_post / worktree / publication 四处 _dev_log_file 消费点经此 helper 转 Path。None 透传。"""
+    from pathlib import Path
+    lf = state.get("_dev_log_file")
+    return Path(lf) if lf else None
+
+
 def _dev_resolve_cwd(state: dict) -> tuple[str, Any]:
     """resolve worktree + log_file（R8：state 持 ArtifactHandle 或 abs，node 内解析）。"""
     wt = state.get("_worktree_abs") or state.get("_worktree") or ""
-    return (str(wt), state.get("_dev_log_file"))
+    return (str(wt), _state_log_path(state))
 
 
 node_dev = make_devloop_node(name="dev", stage="dispatch", build_cmd=_dev_build_cmd, resolve_cwd=_dev_resolve_cwd)
@@ -663,7 +675,7 @@ def _dev_post_op(ni: dict, state: dict):
     run_id = ni.get("run_id", "")
     project = ni.get("_project", "")
     owner_repo = state.get("_owner_repo", "")
-    log_file = state.get("_dev_log_file")
+    log_file = _state_log_path(state)
     round_n = ni.get("verify_round") or 1
 
     def _reconcile_terminal():
@@ -797,13 +809,13 @@ def _worktree_op(ni: dict, state: dict):
     slug = ni.get("_slug", "")
     stamp = ni.get("stamp", "")
     base = state.get("_base", "main")
-    log_file = state.get("_dev_log_file")
+    log_file = _state_log_path(state)
     wt = Path(repo) / ".worktrees" / f"{stamp}-{slug}"
     if wt.exists():                                         # 幂等：旧 wt 先 force remove（L2153-2155）
         subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
                        capture_output=True, text=True, timeout=60)
-    if log_file and not Path(str(log_file)).exists():
-        Path(str(log_file)).parent.mkdir(parents=True, exist_ok=True)   # L2150-2151
+    if log_file and not log_file.exists():
+        log_file.parent.mkdir(parents=True, exist_ok=True)   # L2150-2151
     try:
         run_daily._run_capture(
             ["git", "-C", repo, "worktree", "add", "--detach", str(wt), base],
@@ -1030,7 +1042,7 @@ def _publish_merge_op(ni: dict, state: dict):
     branch = state.get("_branch", "")
     slug = ni.get("_slug", "")
     wt = state.get("_worktree_abs", "")
-    log_file = state.get("_dev_log_file")
+    log_file = _state_log_path(state)
     repo = state.get("_repo") or prof.get("repo", "")
     python = run_daily._env_python(prof.get("conda_env", ""))
     rec_pm = {"branch": branch, "prd_path": state.get("_prd_abs"), "verify": state.get("_verify_payload")}
