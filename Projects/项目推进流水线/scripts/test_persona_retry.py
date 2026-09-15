@@ -145,6 +145,18 @@ def test_success_adds_cost_from_meta(monkeypatch, _no_sleep):
     assert costs[0][2] == "prd" and costs[0][3] == 0.42   # (state_dir, stamp, stage, amount)
 
 
+def test_success_feeds_both_cost_ledgers(monkeypatch, _no_sleep):
+    """双账不变式：成功一次，CK.add_cost（报告账）与 SB.add_cost（熔丝2 账）**都**收到 cost——
+    干跑①暴露的缺口：漏喂 SB.add_cost 时 PA_CHECKPOINT off 的成本熔丝失聪。"""
+    _fake_persona(monkeypatch, [None], meta={"cost": 0.5})
+    ck_costs, sb_costs = [], []
+    monkeypatch.setattr(run_daily.CK, "add_cost", lambda *a, **k: ck_costs.append(a))
+    monkeypatch.setattr(run_daily.SB, "add_cost", lambda *a, **k: sb_costs.append(a))
+    run_daily.run_persona_with_backoff("pa-prd", "p", "prd", "prd")
+    assert len(ck_costs) == 1 and len(sb_costs) == 1
+    assert ck_costs[0][3] == 0.5 and sb_costs[0][2] == 0.5   # CK(state,stamp,stage,amount) / SB(state,stamp,amount)
+
+
 def test_allowed_tools_passthrough_shapes(monkeypatch, _no_sleep):
     """allowed_tools=None → 4 参调用形状；带 list → 5 参透传（保直通语义 + 既有 fake 兼容）。"""
     calls = _fake_persona(monkeypatch, [None, None])

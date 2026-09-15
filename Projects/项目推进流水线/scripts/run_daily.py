@@ -525,6 +525,8 @@ def run_persona_with_backoff(name: str, prompt: str, stage: str, label: str,
         raise
     SB.record_success(STATE_DIR, _current_stamp(), stage, now_fn=_now_iso)
     CK.add_cost(STATE_DIR, _current_stamp(), stage, meta.get("cost"), now_fn=_now_iso)
+    SB.add_cost(STATE_DIR, _current_stamp(), meta.get("cost"), now_fn=_now_iso)   # 熔丝2 记账（双账独立：
+    # PA_CHECKPOINT off 时熔丝2 仍须工作，故不读 checkpoint 账）。放最后：cap 触发 trip 时两账均已落。
     return payload, meta
 
 
