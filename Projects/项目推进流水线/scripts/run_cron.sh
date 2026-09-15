@@ -35,6 +35,14 @@ CLAUDE_BIN="$(command -v claude || true)"
 # 手动跑 run_daily.py 不设此 env，行为不变（全绿不发）。
 export PA_HEARTBEAT=1
 
+# pa-hardening 灰度观察（2026-09-15 启用；方案/实施报告见 Mac vault 产品分析/advance-pipeline/）：
+# PA_BREAKER=1 + OBSERVE=1 → 段级熔断器只记 journal 不真熔，用真实 cron 数据校准成本 cap（观察期 1-2 周）。
+# 期满收紧：去 PA_BREAKER_OBSERVE 即真熔，或调 PA_BREAKER_COST_CAP。
+# 秒回退：注释掉下面三行，下个 cron 即回 baseline（flag off = 全 no-op，零行为变化）。
+export PA_BREAKER=1
+export PA_BREAKER_OBSERVE=1
+export PA_BREAKER_COST_CAP=1.0   # ≈观测值 $0.30 的 3 倍，观察期校准后收紧
+
 # 临时降噪（#1105，memory pa-target-plane-dev-exec-lock）：claude CLI 子进程 stdio
 # can_use_tool 权限协议 bug，致 cc-web-control 等 node 项目 dispatch 反复 test_failed。
 # 此 env 命中项目跳过 dispatch 段（过闸 PRD 落 status=skip，report 段可见，非静默丢弃）。
