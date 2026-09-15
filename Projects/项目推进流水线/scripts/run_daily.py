@@ -39,6 +39,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import time      # pa-hardening P1：退避睡眠（_persona_sleep/_net_sleep 注入点，测试 monkeypatch 防真睡）
+import random    # pa-hardening P1-1：退避 ±20% jitter（防整点对齐风暴）
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -335,11 +337,11 @@ def fetch_dedup_list(profiles: dict) -> dict:
                 m = re.search(r"[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
                 if m:
                     owner_repo = m.group(1)
-                    js = subprocess.run(
+                    js = _net_gate(lambda: subprocess.run(
                         ["gh", "pr", "list", "-R", owner_repo, "--state", "open",
                          "--limit", "30", "--json", "title"],
                         capture_output=True, text=True, timeout=20,
-                    )
+                    ), "dedup_pr_list")
                     for pr in json.loads(js.stdout or "[]"):
                         items.append(f"PR:{pr.get('title', '')}")
             except Exception as e:
@@ -512,10 +514,9 @@ def run_persona_with_backoff(name: str, prompt: str, stage: str, label: str,
     """
     SB.check(STATE_DIR, _current_stamp(), stage)
     try:
-        if allowed_tools is None:   # 保直通语义：不带 allowed_tools 的调用点（radar/prd/critic/verify）与原 4 参调用形状一致
-            payload, meta = run_persona(name, prompt, stage, label)
-        else:
-            payload, meta = run_persona(name, prompt, stage, label, allowed_tools)
+        payload, meta = _persona_call_with_backoff(name, prompt, stage, label, allowed_tools)
+    except SB.CircuitBreakerTripped:
+        raise   # pa-hardening P1-1：熔断终态非 persona 失败（重试前 SB.check 抛出场景），干净穿透不记账
     except TransientPersonaError:
         SB.record_failure(STATE_DIR, _current_stamp(), stage, label, "transient", now_fn=_now_iso)
         raise
@@ -525,6 +526,52 @@ def run_persona_with_backoff(name: str, prompt: str, stage: str, label: str,
     SB.record_success(STATE_DIR, _current_stamp(), stage, now_fn=_now_iso)
     CK.add_cost(STATE_DIR, _current_stamp(), stage, meta.get("cost"), now_fn=_now_iso)
     return payload, meta
+
+
+# ─── pa-hardening P1-1：persona 瞬态退避重试（PA_PERSONA_RETRY 默认 off）─────────
+PERSONA_RETRY_FLAG = "PA_PERSONA_RETRY"
+#: 瞬态退避序列（秒）：2 次重试 60s/300s，±20% jitter，总等待 ≤6min。只熬**分钟级**抖动（网络闪断/
+#: 短时限流窗口）；小时级限流（故障① 5h 场景）由 P0-1 熔断止损——这是「重试」与「熔断」的分界线，
+#: 不做长退避硬熬。瞬态类=TimeoutExpired/非零退出（进程被杀，token 基本未产出→重试不重复烧钱）；
+#: 非瞬态（is_error 业务失败已花完钱 / JSON 契约失败已有 run_persona 内 for attempt (1,2) 两轮）不重试。
+BACKOFF_DELAYS: tuple[float, ...] = (60.0, 300.0)
+_persona_sleep = time.sleep   # 睡眠注入点（单测 monkeypatch 防真睡；默认真睡）
+
+
+def _env_truthy(key: str) -> bool:
+    """env flag 真值判定（strip+lower，集合同 feature_flags._TRUTHY——本地复制避免反向耦合 loop flag 体系）。"""
+    v = os.environ.get(key)
+    return isinstance(v, str) and v.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _jitter(base: float) -> float:
+    """±20% 抖动（防多 worker 整点对齐重试风暴）。"""
+    return base * (0.8 + 0.4 * random.random())
+
+
+def _persona_call_with_backoff(name: str, prompt: str, stage: str, label: str,
+                               allowed_tools: list[str] | None):
+    """P1-1 瞬态退避内循环（run_persona_with_backoff 专用）：TransientPersonaError → 按序列退避重试。
+
+    ``PA_PERSONA_RETRY`` off（默认）→ 首次瞬态失败即上抛（零行为变化）；on → 最多 2 次重试，重试前
+    ``SB.check`` 复查（长睡期间他线程可能已熔断，快速失败止损）。重试耗尽 → 上抛交 wrapper 的 except 臂
+    ``record_failure``（重试与熔断职责分离：重试熬抖动，熔断裁决趋势）。"""
+    delays = BACKOFF_DELAYS if _env_truthy(PERSONA_RETRY_FLAG) else ()
+    attempt = 0
+    while True:
+        try:
+            if allowed_tools is None:   # 保直通语义：不带 allowed_tools 的调用点与原 4 参调用形状一致
+                return run_persona(name, prompt, stage, label)
+            return run_persona(name, prompt, stage, label, allowed_tools)
+        except TransientPersonaError as e:
+            if attempt >= len(delays):
+                raise
+            SB.check(STATE_DIR, _current_stamp(), stage)   # 退避期间熔断可能已 trip：重试前快速失败
+            wait = _jitter(delays[attempt])
+            log(f"[{stage}] ⚡ 瞬态失败（{label}）：{e} → 退避 {wait:.0f}s 后重试"
+                f"（{attempt + 1}/{len(delays)}，PA_PERSONA_RETRY）")
+            _persona_sleep(wait)
+            attempt += 1
 
 
 # ─── 三段 prompt 构造 ────────────────────────────────────────────────
@@ -1114,6 +1161,63 @@ def _env_python(env_name: str) -> str:
     return "python3"
 
 
+# ─── pa-hardening P1-2：对账网络调用统一治理（PA_NET_CONCURRENCY / PA_NET_STRICT 默认 off）──
+NET_CONCURRENCY_ENV = "PA_NET_CONCURRENCY"
+NET_STRICT_FLAG = "PA_NET_STRICT"
+#: 对账查询 UNKNOWN 退避重试序列（秒；固定值无 jitter——量级小且调用串行）。限连/闪断多在分钟内自愈。
+_NET_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0)
+_net_sems: dict[int, threading.Semaphore] = {}   # 按 env 值缓存的信号量（值变化自动换新，测试改 env 不受陈旧实例影响）
+_net_sleep = time.sleep                          # P1-2b 查询退避注入点（单测 monkeypatch 防真睡）
+
+
+def _net_semaphore() -> threading.Semaphore | None:
+    """PA_NET_CONCURRENCY 进程内网络信号量（惰性构造；unset/非法/<1 → None=不限流零行为变化）。
+
+    与方案差异：蓝本默认 "2"，本实施 unset=不限流——任务红线「flag off=baseline 零行为变化」优先。"""
+    raw = os.environ.get(NET_CONCURRENCY_ENV, "").strip()
+    n = 0
+    if raw:
+        try:
+            n = int(raw)
+        except ValueError:
+            n = 0
+    if n < 1:
+        return None
+    return _net_sems.setdefault(n, threading.Semaphore(n))
+
+
+def _net_gate(fn, label: str):
+    """P1-2a：外呼子进程统一限流入口——锁窗口覆盖子进程整个运行期（含 20-30s timeout 上限）。
+
+    对症故障②：dispatch 4 worker × 每次 1-2 个网络子进程 → 瞬时连接压到 ≤N。包的是「发起网络调用」
+    动作本身，只包 gh/git ls-remote/git push 等真外呼，本地 git（log/diff/worktree）不包。"""
+    sem = _net_semaphore()
+    if sem is None:
+        return fn()
+    with sem:
+        return fn()
+
+
+def _retry_unknown(fn, label: str) -> ExtResult:
+    """P1-2b：对账远程查询 UNKNOWN 退避重试（dispatch_one 准入 2/3/4 三个三态查询的统一前置）。
+
+    ``PA_NET_STRICT`` off（默认）→ 直查一次零行为变化；on → UNKNOWN 睡 5s/15s 重查（限连闪断多在
+    分钟内自愈，滤掉瞬态误阻断），FOUND/NOT_FOUND 即返。重试耗尽仍 UNKNOWN → 原样返回，交准入既有
+    ``blocked_external_state`` 阻断——184 仓已把「UNKNOWN≠成功」落成 fail-safe 三态（方案所述「失败
+    容忍当成功」在 baseline 不存在），故语义升级收敛为「重试滤瞬态」，终态沿用阻断桶（report 独立
+    「阻断（未投递）」节可见，运维 triage 面**强于**方案原案并入 skip 桶——差异记入实施报告）。"""
+    res = fn()
+    if not _env_truthy(NET_STRICT_FLAG):
+        return res
+    for delay in _NET_RETRY_DELAYS:
+        if res.state is not ExtState.UNKNOWN:
+            return res
+        log(f"[net] ⚠ {label} 查询态不明（{res.reason[:80]}）→ {delay:.0f}s 后重查（PA_NET_STRICT）")
+        _net_sleep(delay)
+        res = fn()
+    return res
+
+
 def check_branch_protection(owner_repo: str, base: str) -> ExtResult:
     """运行时实查 main 分支保护（SPEC §4.4：protection 是平台态可被外部改动，故运行时实查、不进静态 profile）。
 
@@ -1122,10 +1226,10 @@ def check_branch_protection(owner_repo: str, base: str) -> ExtResult:
       NOT_FOUND    404 → 明确未保护（拒投，属「可决断」非阻断态）；
       UNKNOWN      超时/非零/缺 gh/异常 → 状态不明，fail-safe：准入见之即 blocked_external_state。"""
     try:
-        r = subprocess.run(
+        r = _net_gate(lambda: subprocess.run(
             ["gh", "api", f"repos/{owner_repo}/branches/{base}/protection", "--silent",
              "-H", "Accept: application/vnd.github+json"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=20), "branch_protection")
         if r.returncode == 0:
             return found(True, "已保护")
         if "404" in (r.stderr or ""):
@@ -1145,9 +1249,9 @@ def count_inflight_prs(owner_repo: str) -> ExtResult:
     三态：FOUND(count) 查询成功（0 个开放 PR 亦为 FOUND(0)，可决断）；UNKNOWN 查询失败。
     旧版「失败返 0（容忍）」是 fail-open——可能超额投递；现改 fail-safe：UNKNOWN → 准入阻断。"""
     try:
-        js = subprocess.run(
+        js = _net_gate(lambda: subprocess.run(
             ["gh", "pr", "list", "-R", owner_repo, "--state", "open", "--limit", "50", "--json", "number"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=20), "inflight_prs")
         if js.returncode != 0:
             return unknown(f"gh pr list rc={js.returncode}: {(js.stderr or '').strip()[:120]}")
         return found(len(json.loads(js.stdout or "[]")))
@@ -1300,10 +1404,10 @@ def already_dispatched(owner_repo: str, repo: str, devslug: str) -> ExtResult:
 def _scan_pr_list_for_slug(owner_repo: str, devslug: str) -> tuple[str | None, str | None]:
     """gh pr list(all state) 里找含 devslug 的分支名。返回 (err, hit_reason)；成功无命中→(None, None)。"""
     try:
-        js = subprocess.run(
+        js = _net_gate(lambda: subprocess.run(
             ["gh", "pr", "list", "-R", owner_repo, "--state", "all", "--limit", "100",
              "--json", "number,headRefName,state"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=20), "pr_scan")
         if js.returncode != 0:
             return f"gh pr list rc={js.returncode}: {(js.stderr or '').strip()[:80]}", None
         for pr in json.loads(js.stdout or "[]"):
@@ -1323,8 +1427,8 @@ def _scan_pr_list_for_slug(owner_repo: str, devslug: str) -> tuple[str | None, s
 def _scan_remote_branches_for_slug(repo: str, devslug: str) -> tuple[str | None, str | None]:
     """git ls-remote origin 里找 auto/* 且含 devslug 的分支。返回 (err, hit_reason)；成功无命中→(None, None)。"""
     try:
-        out = subprocess.run(["git", "-C", repo, "ls-remote", "--heads", "origin"],
-                             capture_output=True, text=True, timeout=20)
+        out = _net_gate(lambda: subprocess.run(["git", "-C", repo, "ls-remote", "--heads", "origin"],
+                                               capture_output=True, text=True, timeout=20), "ls_remote")
         if out.returncode != 0:
             return f"ls-remote rc={out.returncode}: {(out.stderr or '').strip()[:80]}", None
         for line in out.stdout.splitlines():
@@ -1456,10 +1560,10 @@ def _lookup_pr(owner_repo: str, branch: str) -> ExtResult:
 
     三态：FOUND(pr_dict) 命中；NOT_FOUND 明确无；UNKNOWN 查询失败（reconcile 见之即保留分支不补开/删除）。"""
     try:
-        js = subprocess.run(
+        js = _net_gate(lambda: subprocess.run(
             ["gh", "pr", "list", "-R", owner_repo, "--head", branch, "--state", "all",
              "--limit", "5", "--json", "number,url,state"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=20), "pr_lookup")
         if js.returncode != 0:
             return unknown(f"gh pr list rc={js.returncode}: {(js.stderr or '').strip()[:120]}")
         prs = json.loads(js.stdout or "[]")
@@ -2226,7 +2330,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
     if not owner_repo:
         rec.update(status="skip", skip_reason="跳过-无 remote（取不到 owner/repo）")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
-    prot = check_branch_protection(owner_repo, base)
+    prot = _retry_unknown(lambda: check_branch_protection(owner_repo, base), "branch_protection")
     if prot.is_unknown:   # fail-safe：保护态不明 → 阻断，不起 dev loop（OpenSpec fail-safe-dispatch / tasks 4.3）
         rec.update(status="blocked_external_state", blocked_check="branch_protection",
                    skip_reason=f"阻断-分支保护态不明: {prot.reason}")
@@ -2235,7 +2339,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         rec.update(status="skip", skip_reason=f"跳过-{prot.reason}")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 3：幂等前置闸（SPEC #30 ④ / ADR-0004 §4：投递前去重，已投递→skip 不起 dev loop，省 SDK 启动+$）
-    idem = already_dispatched(owner_repo, repo, devslug)
+    idem = _retry_unknown(lambda: already_dispatched(owner_repo, repo, devslug), "idempotency")
     if idem.is_unknown:   # fail-safe：幂等态不明 → 阻断（旧版容忍可能重复投递）
         rec.update(status="blocked_external_state", blocked_check="idempotency",
                    skip_reason=f"阻断-幂等态不明: {idem.reason}")
@@ -2244,7 +2348,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         rec.update(status="skip", skip_reason=f"跳过-{idem.reason}")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 4：在途 PR 限量（R1）
-    inflight_res = count_inflight_prs(owner_repo)
+    inflight_res = _retry_unknown(lambda: count_inflight_prs(owner_repo), "inflight_count")
     if inflight_res.is_unknown:   # fail-safe：在途数不明 → 阻断（旧版返 0 容忍可能超额投递）
         rec.update(status="blocked_external_state", blocked_check="inflight_count",
                    skip_reason=f"阻断-在途PR数不明: {inflight_res.reason}")
@@ -2734,10 +2838,10 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
                 body = (f"dev-agent 产出经 pa-verify 判绿（verify 闭环收尾）。commit 在 `{branch}`。"
                         f"PRD：{rec.get('prd_path')}")
                 new_status = "pr_open"
-            r = subprocess.run(
+            r = _net_gate(lambda: subprocess.run(
                 ["gh", "pr", "create", "-R", owner_repo, "--base", base, "--head", branch,
                  "--title", title, "--body", body],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=30), "pr_create")
             if r.returncode != 0:   # fail-safe：补开 PR 失败 → 保留分支不臆断成功（旧版无视 rc → 空 url 却标 pr_open=幻影绿 PR）
                 # verify-loop-discipline A5：create 撞并发已开的同 branch open PR（TOCTOU：lookup 后、create 前
                 # 另一进程开了——graph 路径/并发 cron）→ 重查复用（对齐 A2 幂等语义），仍无才 blocked。
@@ -2760,8 +2864,8 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
     # 3) 无 PR 无 commit → 删分支（本地+远端，容错）。区分 stalled（dev-agent 主动刹车）vs orphan（啥都没干）
     subprocess.run(["git", "-C", repo, "branch", "-D", branch],
                    capture_output=True, text=True, timeout=20)
-    subprocess.run(["git", "-C", repo, "push", "origin", "--delete", branch],
-                   capture_output=True, text=True, timeout=30)
+    _net_gate(lambda: subprocess.run(["git", "-C", repo, "push", "origin", "--delete", branch],
+                                     capture_output=True, text=True, timeout=30), "push_delete")
     if rec.get("off_track"):
         rec["status"] = "triaged"
         rec["triage_reason"] = "semantic_off_track"
