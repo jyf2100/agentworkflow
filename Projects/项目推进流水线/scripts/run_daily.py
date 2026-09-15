@@ -64,6 +64,8 @@ import single_flight as SF                 # single-flight-auto-merge task 2.2/2
 import circuit_breaker as CB               # single-flight-auto-merge task 4.4：revert 循环熔断（同幂等键 PRD cooldown 窗口内禁再 auto-merge→triage；纯 stdlib journal，cron 安全）
 import critical_alert as CA                # single-flight-auto-merge task 4.5：CRITICAL 告警 durable 化（halt→独立 alerts journal，不受 flag gating，crash 不丢；纯 stdlib，cron 安全）
 import main_status as MS                   # single-flight-auto-merge task 4.6：main 瞬态红契约 + 可查询 post-merge 验证状态（per-owner_repo journal，不受 flag gating；纯 stdlib，cron 安全）
+import run_checkpoint as CK                # pa-hardening P0-2/P2-1：run 级 checkpoint 快照 + 当日断点续跑 + 成本聚合（PA_CHECKPOINT/PA_AUTO_RESUME 默认 off=no-op；纯 stdlib，cron 安全）
+import stage_breaker as SB                 # pa-hardening P0-1：段级熔断器——同段 persona 连续失败 + 当日成本双熔丝（PA_BREAKER 默认 off=no-op；纯 stdlib+journal，cron 安全；与 CB（revert cooldown）键空间/语义不重叠）
 import merge_loop as ML                    # single-flight-auto-merge task 6.x 方案 C：merge/revert 闭环 crash 安全门（intent→push→confirm 写顺序；has_open_intent 阻盲目重 merge；纯 stdlib journal，cron 安全）
 # add-cross-prd-learning-memory Section 7 接线（控制面纯 stdlib 模块，cron 隔离不变）：
 #   envelope 构造（journal events → sanitized TerminalEnvelope）+ reflection（read-only SDK，mock-SDK 可注入）+
@@ -123,6 +125,7 @@ DEV_AGENT_PY = PROJECT_DIR / "scripts" / "dev-agent.py"  # 控制面标准执行
 MAX_RUN_WALL = DEV_LOOP_TIMEOUT + 1800     # run 锁陈旧阈值（≈90min）：PID 失活 OR 锁龄超此 → 自动接管
 RUN_LOCK = STATE_DIR / ".run.lock"         # run 级互斥锁（cron ↔ wka，包整个 main）
 LOG_LOCK = threading.Lock()                # log() 线程安全（多 worker 并发 print 不交错）
+_RUN_STAMP: str | None = None              # pa-hardening P0-2/P0-1：当前 run stamp（_run_pipeline 起点置位，CK/SB 状态文件命名用；direct stage 调用/单测走 _current_stamp 兜底）
 DISPATCH_LOCKS: dict[str, threading.Lock] = {}   # per-owner_repo 串行锁（修 count_inflight_prs TOCTOU；同仓串行/跨仓并行）
 
 
@@ -429,9 +432,9 @@ def run_persona(name: str, prompt: str, stage: str, label: str,
             proc = subprocess.run(cmd, capture_output=True, text=True,
                                   timeout=TIMEOUT[stage], stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"[{label}] wall-clock 超时（{TIMEOUT[stage]}s），已 kill")
+            raise TransientPersonaError(f"[{label}] wall-clock 超时（{TIMEOUT[stage]}s），已 kill")
         if proc.returncode != 0:
-            raise RuntimeError(f"[{label}] claude 退出 {proc.returncode}: {proc.stderr[-400:].strip()}")
+            raise TransientPersonaError(f"[{label}] claude 退出 {proc.returncode}: {proc.stderr[-400:].strip()}")
         try:
             outer = json.loads(proc.stdout)
         except json.JSONDecodeError as e:
@@ -479,6 +482,49 @@ def run_persona(name: str, prompt: str, stage: str, label: str,
         log(f"[{label}] persona result 非 JSON（attempt {attempt}/2，容错抽取仍失败）→ 重试并加强 JSON-only 契约")
         cur_prompt = prompt + _JSON_RETRY_SUFFIX
     raise RuntimeError(f"[{label}] persona result 两轮均非合法 JSON: {last_err}")
+
+
+# ─── pa-hardening P0-1/P0-2/P1-1：persona 调用统一前置包裹 ──────────────────
+class TransientPersonaError(RuntimeError):
+    """P1-1（pa-hardening）：persona 调用**瞬态**失败——wall-clock 超时 / claude 非零退出（进程被杀，
+    token 基本未产出 → 重试不重复烧钱）。RuntimeError 子类 → 既有 ``except RuntimeError`` 捕获面与
+    消息格式不变（baseline 零行为变化）。非瞬态（is_error 业务失败 / JSON 契约失败）仍走基类 RuntimeError：
+    前者已花完钱重试=重复计费，后者已有 for attempt (1,2) 两轮机制，均不叠加退避。"""
+
+
+def _current_stamp() -> str:
+    """CK/SB 状态文件用的当前 run stamp（_run_pipeline 起点置位 _RUN_STAMP；未置位兜底 today_stamp()）。"""
+    return _RUN_STAMP or today_stamp()
+
+
+def run_persona_with_backoff(name: str, prompt: str, stage: str, label: str,
+                             allowed_tools: list[str] | None = None) -> tuple[dict, dict]:
+    """run_persona 的统一前置包裹（签名镜像，调用点只换函数名；flag 全 off = 等价直调，零行为变化）。
+
+    职责切分（重试与熔断分离）：
+      * 调用前 ``SB.check``——已熔断 → 立即抛 ``CircuitBreakerTripped`` 快速失败（防 stage_fetch 的
+        per-source 隔离 / dispatch 的 per-future 兜底把熔断吞掉后继续逐源烧钱）；
+      * 成功 → ``SB.record_success``（清连续失败计数）+ ``CK.add_cost``（P2-1 成本聚合；SB 侧另有
+        熔丝2 记账，双账同源喂入——两模块 flag 独立故不互读，见各自 docstring）；
+      * 失败 → ``SB.record_failure``（熔丝命中时其内部抛 ``CircuitBreakerTripped`` 替换原异常上抛——
+        熔断止损优先于顶层看到原始错误；err_kind 按 TransientPersonaError 分类）。
+    P1-1 在此基础上加瞬态退避重试（_persona_call_with_backoff），本体逻辑不变。
+    """
+    SB.check(STATE_DIR, _current_stamp(), stage)
+    try:
+        if allowed_tools is None:   # 保直通语义：不带 allowed_tools 的调用点（radar/prd/critic/verify）与原 4 参调用形状一致
+            payload, meta = run_persona(name, prompt, stage, label)
+        else:
+            payload, meta = run_persona(name, prompt, stage, label, allowed_tools)
+    except TransientPersonaError:
+        SB.record_failure(STATE_DIR, _current_stamp(), stage, label, "transient", now_fn=_now_iso)
+        raise
+    except RuntimeError:
+        SB.record_failure(STATE_DIR, _current_stamp(), stage, label, "permanent", now_fn=_now_iso)
+        raise
+    SB.record_success(STATE_DIR, _current_stamp(), stage, now_fn=_now_iso)
+    CK.add_cost(STATE_DIR, _current_stamp(), stage, meta.get("cost"), now_fn=_now_iso)
+    return payload, meta
 
 
 # ─── 三段 prompt 构造 ────────────────────────────────────────────────
@@ -828,8 +874,8 @@ def stage_fetch(args, sources, stamp) -> dict:
         try:
             root = VAULT_ROOT / src["root"]
             root.mkdir(parents=True, exist_ok=True)
-            payload, meta = run_persona(cfg["agent"], cfg["prompt"](src), "fetch",
-                                        f"fetch-{src['name']}", allowed_tools=cfg["tools"])
+            payload, meta = run_persona_with_backoff(cfg["agent"], cfg["prompt"](src), "fetch",
+                                                     f"fetch-{src['name']}", allowed_tools=cfg["tools"])
             items = _payload_to_items(payload, cfg["mode"], src)
             if not items:
                 log(f"[fetch] ⚠ {src['name']} agent 未返回任何 item（跳过落盘）")
@@ -849,6 +895,8 @@ def stage_fetch(args, sources, stamp) -> dict:
                 produced.append(entry)
                 log(f"[fetch] ✅ {src['name']} → {out.relative_to(VAULT_ROOT)}｜「{title}」"
                     + (f" sources={raw['sources_count']}" if "sources_count" in raw else ""))
+        except SB.CircuitBreakerTripped:
+            raise   # pa-hardening P0-1：熔断终态须穿透 per-source 隔离层（吞掉=熔了还继续烧下一个源）
         except Exception as e:
             log(f"[fetch] ✗ {src['name']} 失败（跳过，不拖垮其他源）：{e}")
             continue
@@ -911,7 +959,7 @@ def stage_radar(args, sources, profiles, stamp) -> dict:
         if not flat:
             log(f"[radar] ⏭ {proj}: 订阅文件均已产 PRD，跳过 radar 调用（省 LLM）")
             continue
-        payload, meta = run_persona(
+        payload, meta = run_persona_with_backoff(
             "pa-radar", radar_prompt(proj, flat, profiles[proj], dedup.get(proj, [])),
             "radar", f"radar-{proj}")
         for c in payload.get("candidates", []):
@@ -970,7 +1018,7 @@ def stage_prd(args, candidates_payload, profiles, stamp) -> dict:
         return empty
 
     log(f"[prd] 翻译 {len(candidates)} 条候选 → PRD")
-    payload, meta = run_persona("pa-prd", prd_prompt(candidates, profiles, stamp), "prd", "prd")
+    payload, meta = run_persona_with_backoff("pa-prd", prd_prompt(candidates, profiles, stamp), "prd", "prd")
     log(f"[prd] ✅ PRD={len(payload.get('prds',[]))} skipped={len(payload.get('skipped',[]))}｜cost=${meta['cost']:.4f} turns={meta['turns']}")
     for prd in payload.get("prds", []):
         log(f"        - {prd.get('path')}")
@@ -1014,7 +1062,7 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
             log(f"[critic] revise：{path} → 喂回 pa-prd round 2")
             rev = entry
             try:
-                rev_payload, _ = run_persona(
+                rev_payload, _ = run_persona_with_backoff(
                     "pa-prd", prd_prompt([], profiles, stamp, revise=rev), "prd", f"prd-revise:{proj}")
                 rev_prd = (rev_payload.get("prds") or [{}])[0]
                 rev_path = rev_prd.get("path", path)
@@ -1022,6 +1070,8 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
                 entry2["round"] = 2
                 entry2["revised"] = True
                 entries.append(entry2)
+            except SB.CircuitBreakerTripped:
+                raise   # pa-hardening P0-1：熔断终态须穿透 revise 回环隔离层（按 drop 吞掉=熔断失效）
             except Exception as e:
                 log(f"[critic] revise 失败，按 drop：{e}")
                 entries.append({"prd_path": path, "project": proj, "verdict": "drop",
@@ -1033,7 +1083,7 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
 
 def _critic_one(path: str, source_path: str, prof: dict) -> dict:
     label = f"critic:{Path(path).stem}"
-    payload, meta = run_persona("pa-prd-critic", critic_prompt(path, source_path, prof), "critic", label)
+    payload, meta = run_persona_with_backoff("pa-prd-critic", critic_prompt(path, source_path, prof), "critic", label)
     log(f"[critic] {payload.get('verdict','?').upper():6} {path}｜cost=${meta['cost']:.4f} "
         f"issues={len(payload.get('issues',[]))}")
     payload.setdefault("round", 1)
@@ -1489,7 +1539,7 @@ def _pa_verify_round(rec: dict, prof: dict, prd_abs: str, cur_base: str,
     rec["verify_bundles"] = [list(b.files) for b in bundles]   # task 3.3：bundles 入 record（可序列化）
     prompt = verify_prompt(prd_abs, rec.get("branch"), cur_base, diff_path, rec.get("verify"),
                            round_n, prof, anchors=anchors, bundles=bundles)
-    payload, meta = run_persona("pa-verify", prompt, "verify", f"verify:{slug}:r{round_n}")
+    payload, meta = run_persona_with_backoff("pa-verify", prompt, "verify", f"verify:{slug}:r{round_n}")
     log(f"[verify] r{round_n} {str(payload.get('verdict', '?')).upper():6} {slug}｜"
         f"cost=${meta['cost']:.4f} turns={meta['turns']}")
     payload.setdefault("round", round_n)
@@ -2843,6 +2893,16 @@ def _raise_critical_alert_safe(state_dir, owner_repo: str, prd_id: str, *, reaso
         log(f"  ⚠️ raise_alert 失败（{reason}）: {e}（rec 已标 halted + slot 已 halt，须人工查 alerts）")
 
 
+def _breaker_alert_safe(stamp: str, reason: str) -> None:
+    """pa-hardening P0-1：段级熔断 halted 时落 durable CRITICAL 告警（复用 critical_alert 通道；exit 3 前
+    调，cron.log 之外的独立持久观测面）。fail-open：写失败不 raise（熔断终态已落 breaker 状态文件 +
+    checkpoint halted，告警丢失须人工查）。"""
+    try:
+        CA.raise_alert(STATE_DIR, "pipeline/run-daily", f"stage-breaker-{stamp}", reason=reason, stamp_fn=_now_iso)
+    except Exception as e:
+        log(f"  ⚠️ breaker raise_alert 失败（{reason}）: {e}（breaker+checkpoint 已落盘，须人工查 alerts）")
+
+
 def _shadow_merge_decision(serial_shadow: bool, classify_payload: dict | None) -> str | None:
     """single-flight-auto-merge task 7.1a：serial_shadow on → 据 classify-only dev-agent 结果返 shadow merge 决策。
 
@@ -3202,6 +3262,19 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
                     f"失败/超时/跳过：{len([d for d in disp if d.get('status') in ('skip', 'planned', 'fail')])}｜"
                     f"阻断（未投递）：{len(blocked_external) + len(blocked_gate)}"
                     f"（远程态不明 {len(blocked_external)} / 测试门未过 {len(blocked_gate)}）", ""]
+    # pa-hardening P2-1/P0-1：run 成本聚合 + 熔断状态行（文件存在才渲染——flag off 的 baseline run 零新增行）。
+    # checkpoint 按 run 起始 stamp（args.stamp）命名；breaker 按实际 stamp（inject 自增后）命名——与各自写点一致。
+    _ck = CK.load_checkpoint(STATE_DIR, getattr(args, "stamp", stamp))   # run 起始 stamp（args.stamp；测试 harness 缺省回落段参数）
+    if _ck:
+        _stage_costs = [f"{s} ${v:.2f}" for s, v in sorted((_ck.get("cost_usd") or {}).items())
+                        if isinstance(v, (int, float))]
+        L.append(f"- run 成本：${CK.total_cost(_ck):.2f}" + (f"（{'｜'.join(_stage_costs)}）" if _stage_costs else "")
+                 + f"｜checkpoint：{_ck.get('status')}"
+                 + f"（{'→'.join(CK.verified_stages_done(_ck, STATE_DIR)) or '—'}）")
+    _bk = SB.load_breaker(STATE_DIR, stamp)
+    if _bk and _bk.get("tripped"):
+        L.append(f"- ⛔ 当日熔断：{_bk.get('tripped_reason')}"
+                 f"｜近 {SB.DEFAULT_TRIP_WINDOW_DAYS} 日熔断天数：{SB.consecutive_trip_days(STATE_DIR, now_fn=_now_iso)}")
 
     # ✅ 待 review 绿 PR
     L += ["## ✅ 待你 review 合并的 PR（验证绿）"]
@@ -3497,6 +3570,7 @@ def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if not acquire_run_lock(args.break_lock):
         sys.exit(2)
+    CK.maybe_auto_resume(STATE_DIR, args, log_fn=log)   # pa-hardening P0-2：当日 interrupted checkpoint → 自动推导 --from-stage（PA_AUTO_RESUME 门控，默认 off；守卫见 run_checkpoint）
     try:
         _run_pipeline(args)
     finally:
@@ -3504,7 +3578,9 @@ def main():
 
 
 def _run_pipeline(args) -> None:
-    """流水线主体（run 锁由 main 持有）。RuntimeError→exit(1)（state 已落盘可 --from-stage 续跑）。"""
+    """流水线主体（run 锁由 main 持有）。RuntimeError→exit(1)（state 已落盘可 --from-stage 续跑）；
+    CircuitBreakerTripped→checkpoint halted + 告警 + exit(3)（pa-hardening P0-1：熔断终态区别于普通失败，
+    监控/cron 可区分；3≠1≠2(lock)≠0）。"""
     (STATE_DIR / "prd").mkdir(parents=True, exist_ok=True)
     log(f"═══ 项目推进流水线 {args.stamp} ═══  stage {args.from_stage}→{args.to_stage}"
         f"{'  [DRY-RUN]' if args.dry_run else ''}{'  [LIMIT='+str(args.limit)+']' if args.limit else ''}"
@@ -3522,16 +3598,28 @@ def _run_pipeline(args) -> None:
 
     candidates_payload, manifest, gate, dispatch = {"candidates": []}, {"prds": []}, [], []
     stamp = args.stamp   # inject 段可能自增（避碰），下游 critic/dispatch/report 用此 stamp 对齐文件名
+    global _RUN_STAMP     # pa-hardening：run_persona_with_backoff / stage_report 经 _current_stamp() 对齐本值
+    _RUN_STAMP = stamp
     try:
         if lo <= 0 <= hi:
+            SB.check(STATE_DIR, stamp, "fetch")
             stage_fetch(args, sources, args.stamp)
+            CK.mark_done(STATE_DIR, args.stamp, "fetch", now_fn=_now_iso)
         if lo <= 1 <= hi:
+            SB.check(STATE_DIR, stamp, "radar")
             candidates_payload = stage_radar(args, sources, profiles, args.stamp)
+            CK.mark_done(STATE_DIR, args.stamp, "radar", now_fn=_now_iso)
         if lo <= 2 <= hi:
+            SB.check(STATE_DIR, stamp, "prd")
             manifest = stage_prd(args, candidates_payload, profiles, args.stamp)
+            CK.mark_done(STATE_DIR, args.stamp, "prd", now_fn=_now_iso)
         if lo <= 3 <= hi and getattr(args, "inject_prd", None):
+            SB.check(STATE_DIR, stamp, "inject")
             manifest, stamp = stage_inject(args, profiles, stamp)   # 手动注入 PRD（替 radar→prd）
+            _RUN_STAMP = stamp                                     # 自增后 stamp：SB 状态文件与后续段命名对齐
+            CK.mark_done(STATE_DIR, args.stamp, "inject", now_fn=_now_iso, actual_stamp=stamp)
         if lo <= 4 <= hi:
+            SB.check(STATE_DIR, stamp, "critic")
             if getattr(args, "skip_critic", False):
                 gate = [{"prd_path": e.get("path", ""), "project": e.get("project", ""),
                          "verdict": "pass", "summary": "--skip-critic 直 pass（canary/演练）",
@@ -3541,17 +3629,30 @@ def _run_pipeline(args) -> None:
                 log(f"[critic] ⏭ skip（--skip-critic）：{len(gate)} 条 PRD 直 pass（canary/演练，绕质量闸）")
             else:
                 gate = stage_critic(args, manifest, profiles, stamp)
+            CK.mark_done(STATE_DIR, args.stamp, "critic", now_fn=_now_iso)
         if lo <= 5 <= hi:
+            SB.check(STATE_DIR, stamp, "dispatch")
             if not gate:   # --from-stage dispatch：critic 未跑，从盘读 prd_gate
                 gf = STATE_DIR / f"prd_gate_{stamp}.json"
                 gate = json.loads(gf.read_text(encoding="utf-8")) if gf.is_file() else []
             dispatch = stage_dispatch(args, gate, profiles, stamp)
+            CK.mark_done(STATE_DIR, args.stamp, "dispatch", now_fn=_now_iso)
         if lo <= 6 <= hi:
+            SB.check(STATE_DIR, stamp, "report")
             stage_report(args, profiles, stamp)
+            CK.mark_done(STATE_DIR, args.stamp, "report", now_fn=_now_iso)
+    except SB.CircuitBreakerTripped as e:
+        CK.mark_terminal(STATE_DIR, args.stamp, status="halted", reason=str(e), now_fn=_now_iso)
+        _breaker_alert_safe(stamp, str(e))
+        log(f"⛔ 熔断（halted）：{e}")
+        log("（当日不再自动重试；人工处置后可次日新 stamp 重跑，或确认根因后 --from-stage 续）")
+        sys.exit(3)
     except RuntimeError as e:
+        CK.mark_terminal(STATE_DIR, args.stamp, status="interrupted", reason=str(e), now_fn=_now_iso)
         log(f"✗ {e}")
         log("（state 产物已落盘，修参后可 --from-stage 续跑）")
         sys.exit(1)
+    CK.mark_terminal(STATE_DIR, args.stamp, status="completed", now_fn=_now_iso)
 
     # 汇总
     passed = [e for e in gate if e.get("verdict") == "pass"]
