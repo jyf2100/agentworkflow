@@ -424,6 +424,15 @@ def run_persona(name: str, prompt: str, stage: str, label: str,
     if _model:
         base_cmd += [f"--model={_model}"]
         log(f"[{label}] model route → {_model}（{'env' if _env_model else 'config'}）")
+    # ponytail-ab：A/B 试点开关——PA_PONYTAIL 真值（1/true/yes/on，大小写不敏感）时挂 --plugin-dir
+    # （SessionStart 注入 ponytail mode，效果以 ~/.claude/.ponytail-active 旗标为准）。
+    # 审计锁定版本 v4.10.0（commit 1d95ff7d，见 20260917-C）；unset 即回 baseline（off=零行为变化，秒回退）。
+    # cron 不挂此 flag（run_cron.sh 未设，仅手动跑批 A/B 用）；目录可经 PA_PONYTAIL_DIR 覆盖。
+    if os.environ.get("PA_PONYTAIL", "").lower() in ("1", "true", "yes", "on"):
+        _plugin_dir = os.environ.get("PA_PONYTAIL_DIR",
+                                     "/mnt/disk01/workspaces/worksummary/pa-ponytail/ponytail")
+        base_cmd += ["--plugin-dir", _plugin_dir]
+        log(f"[{label}] ponytail ON → --plugin-dir {_plugin_dir}")
     if allowed_tools:
         base_cmd += ["--allowedTools", ",".join(allowed_tools)]
     cur_prompt = prompt

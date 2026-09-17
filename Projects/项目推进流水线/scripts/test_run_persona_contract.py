@@ -117,3 +117,28 @@ def test_run_persona_model_env_overrides_file_twin(monkeypatch, tmp_path):
     run_daily.run_persona("pa-radar", "P", "radar", "t-radar4")
     assert any(x == "--model=opus" for x in captured["cmds"][0])
     assert not any(x == "--model=haiku" for x in captured["cmds"][0])
+
+
+# ─── ponytail-ab：PA_PONYTAIL 开关守护（20260917-D）────────────────────────────
+# off → cmd 不含 --plugin-dir（baseline 零变更）；on → 含且后跟正确 plugin 目录。
+@pytest.mark.parametrize("truthy", ["1", "true", "yes", "on", "TRUE", "On"])
+def test_run_persona_ponytail_on_injects_plugin_dir(monkeypatch, truthy):
+    """设 PA_PONYTAIL 真值（大小写不敏感）→ cmd 含 '--plugin-dir' + 默认目录。"""
+    monkeypatch.setenv("PA_PONYTAIL", truthy)
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(run_daily.subprocess, "run", _cmd_capturing_run(captured))
+    run_daily.run_persona("pa-radar", "P", "radar", "t-pony-on")
+    cmd = captured["cmds"][0]
+    assert "--plugin-dir" in cmd
+    assert cmd[cmd.index("--plugin-dir") + 1] == "/mnt/disk01/workspaces/worksummary/pa-ponytail/ponytail"
+
+
+def test_run_persona_ponytail_off_omits_flag(monkeypatch):
+    """不设 PA_PONYTAIL（或非真值）→ cmd 不含 --plugin-dir（off=零行为变化）。"""
+    for k in [k for k in os.environ if k.startswith("PA_PONYTAIL")]:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("PA_PONYTAIL", "0")
+    captured: dict = {"cmds": []}
+    monkeypatch.setattr(run_daily.subprocess, "run", _cmd_capturing_run(captured))
+    run_daily.run_persona("pa-radar", "P", "radar", "t-pony-off")
+    assert "--plugin-dir" not in captured["cmds"][0]
