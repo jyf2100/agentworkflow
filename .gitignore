@@ -39,3 +39,6 @@ Thumbs.db
 # === vault 工作记录产物（日报/项目推进报告属本地流水记录，不入仓）===
 日报/
 项目推进/
+
+# === critic 双通道第二臂凭证（派发单 20261009_0910）：LITELLM_API_KEY 实值只经此文件注入，绝不入仓 ===
+Projects/项目推进流水线/config/.env.codex
