@@ -1146,6 +1146,16 @@ def _critic_one(path: str, source_path: str, prof: dict) -> dict:
         f"issues={len(payload.get('issues',[]))}")
     payload.setdefault("round", 1)
     payload.setdefault("revised", False)
+    # dual-critic（派发单 20261009_0910，评估 §2.0-2.5）：PA_CRITIC_ARM2=codex 时串行第二臂——claude 主审
+    # 照旧 → codex 复审（claude=drop 短路不烧钱）→ synthesize S1 偏序取严合成。flag off（cron 天然不设）
+    # 时本分支零执行、模块零加载，byte-identical baseline（先例 PA_PONYTAIL :427-435）。
+    # 回滚一级=unset PA_CRITIC_ARM2（秒退）；二级/三级见评估 §4.3。
+    if os.environ.get("PA_CRITIC_ARM2", "").strip().lower() == "codex":
+        from codex_critic import codex_review, synthesize   # 惰性 import：off 不加载
+        e2 = None if payload.get("verdict") == "drop" else codex_review(path, source_path, prof, log=log)
+        payload = synthesize(payload, e2, prd_path=path, project=prof.get("name", ""))
+        log(f"[critic] dual {payload['dual_channel']}: claude={payload['channels']['claude']} "
+            f"codex={payload['channels']['codex']} → {payload['verdict']}")
     return payload
 
 

@@ -28,6 +28,20 @@ export PATH="$HOME/.local/bin:$PATH"
 # （2026-07-29 修：0729 cron dev r1 崩于 dev-agent.py:46 import；persona 走 claude CLI 子进程不受影响）
 export PATH="$HOME/miniconda3/bin:$PATH"
 
+# codex CLI（critic 双通道第二臂，派发单 20261009_0910）：npm -g 装在 nvm node bin——source nvm.sh
+# 后 default(24)=v24.14.1 已激活在 PATH；glob 兜底防 default alias 漂移（镜像 run_daily
+# resolve_claude_bin 的版本无关 glob 哲学）。PA_CRITIC_ARM2 未设（cron 天然不设）时 codex 臂
+# 零调用，本块不影响任何行为；回滚一级 = unset PA_CRITIC_ARM2（秒退，评估 §4.3）。
+for _nb in "$HOME"/.nvm/versions/node/*/bin; do
+  if [ -x "$_nb/codex" ]; then export PATH="$_nb:$PATH"; break; fi
+done
+
+# codex 臂凭证：LITELLM_API_KEY 从 config/.env.codex 注入（gitignore 排除，实值由大脑注入，
+# 占位符形态入档零 key）。缺文件/占位符 → codex 认证失败走降级（degraded，回退 claude 单通道
+# 基线，不阻断日跑——评估 §2.4 fail-open）。
+CODEX_ENV="$VAULT/Projects/项目推进流水线/config/.env.codex"
+if [ -f "$CODEX_ENV" ]; then set -a; . "$CODEX_ENV"; set +a; fi
+
 CLAUDE_BIN="$(command -v claude || true)"
 [ -n "$CLAUDE_BIN" ] && export PA_CLAUDE_BIN="$CLAUDE_BIN"
 
