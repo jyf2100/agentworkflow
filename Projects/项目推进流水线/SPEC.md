@@ -10,10 +10,12 @@ tags:
   - full-auto
 ai-first: true
 uid: project-advance-pipeline
-status: spec-draft
+status: superseded
 ---
 
 > **For future Claude：** 这是一条「全自动研发流水线」的设计 Spec。拓扑分两面：**控制面** = vault 大脑（承载公众号/deep-research 内容、生成 PRD、汇聚报告），**目标面** = roc 自有的 workspace 代码仓（如 cc-web-control）。每天一次，控制面从内容里抽**技术信号**→ 翻译成**项目专属 PRD** → **过质量闸** → **只把 PRD + 信息源投递给白名单目标仓** → **各目标仓自带的开发 agent 自治跑完整 dev loop（需求分析→设计→开发→review→回归→开 PR）** → dispatch 独立验证 → 回控制面汇总成待人 review 的报告。全程无人，人只看报告决定合哪些 PR。
+>
+> **⚠ 历史化注记（2026-10，F2）**：本文件是**早期设计稿，已被取代**——现行行为以 `openspec/specs/`（capability 规约，随变更演进）为准，术语以 `CONTEXT.md` 为准，架构决定以 `docs/adr/` 为准。本稿中与现状不符处（如「各目标仓自带的开发 agent」已被 ADR-0006 上收为控制面标准执行器、「仓自带 dev-agent 脚本」已废弃）一律以上述真理源为准。留档不删（vault 历史，不进 template 投影）。
 >
 > 四条铁律：① vault 是 PRD+报告中心，**永不作 dev 目标**；② **控制面不污染目标仓**（ADR-0001）；③ **项目自治**——pipeline 只投递 PRD+信息源，不画 boundaries、不规定开发流程（ADR-0002）；④ **PRD 投递前必过质量闸**（`pa-prd-critic`，只判有据+可执行，不管价值）。
 >

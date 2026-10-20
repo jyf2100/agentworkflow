@@ -1084,6 +1084,22 @@ def stage_prd(args, candidates_payload, profiles, stamp) -> dict:
     return payload
 
 
+def _manifest_disk_fallback(manifest: dict, stamp: str) -> tuple[dict, bool]:
+    """F7（7.3 试点，verification-7 §8）：critic 段 manifest 盘读兜底。
+
+    ``--from-stage critic`` 单独跑时 prd/inject 段未执行，manifest 是空初值 → 旧行为
+    「无 PRD 跳过」且**写空 gate []**，连锁清掉 dispatch 段兜底要读的 prd_gate（分段放行断裂）。
+    本函数与 dispatch 段 prd_gate 盘读兜底（3758-3762 一带）对称：manifest 空且盘上有
+    ``prd_manifest_{stamp}.json``（inject/prd 先跑过）→ 读回。局限亦对称：inject 自增（m/m2）
+    场景只认原始 stamp 文件，不追后缀（读不到宁可维持空、走「无 PRD 跳过」，不投错轮）。"""
+    if manifest.get("prds"):
+        return manifest, False
+    mf = STATE_DIR / f"prd_manifest_{stamp}.json"
+    if mf.is_file():
+        return json.loads(mf.read_text(encoding="utf-8")), True
+    return manifest, False
+
+
 def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
     gate_file = STATE_DIR / f"prd_gate_{stamp}.json"
     if gate_file.is_file() and not args.force:
@@ -3745,6 +3761,9 @@ def _run_pipeline(args) -> None:
             CK.mark_done(STATE_DIR, args.stamp, "inject", now_fn=_now_iso, actual_stamp=stamp)
         if lo <= 4 <= hi:
             SB.check(STATE_DIR, stamp, "critic")
+            manifest, _mf_hit = _manifest_disk_fallback(manifest, stamp)   # F7：--from-stage critic 续跑盘读
+            if _mf_hit:
+                log(f"[critic] ⤴ 从盘读 prd_manifest_{stamp}.json（--from-stage critic 续跑）")
             if getattr(args, "skip_critic", False):
                 gate = [{"prd_path": e.get("path", ""), "project": e.get("project", ""),
                          "verdict": "pass", "summary": "--skip-critic 直 pass（canary/演练）",

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pa 注入面板</title>
+<style>
+  :root {
+    --bg: #101418; --surface: #1a2028; --line: #2a323d;
+    --text: #dbe2ea; --dim: #8b97a5; --accent: #4fa3e3; --ok: #5fbf7a; --warn: #e0b34f; --bad: #e07070;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 28px; }
+  section { background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+            padding: 20px 22px; margin-bottom: 20px; }
+  h2 { font-size: 14px; margin: 0 0 14px; color: var(--dim);
+       text-transform: uppercase; letter-spacing: .08em; }
+  #drop { border: 1px dashed var(--line); border-radius: 8px; padding: 26px;
+          text-align: center; color: var(--dim); cursor: pointer; transition: border-color .15s; }
+  #drop.hover { border-color: var(--accent); color: var(--text); }
+  #drop input { display: none; }
+  button { background: var(--accent); color: #0c1116; border: 0; border-radius: 6px;
+           padding: 9px 22px; font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 14px; }
+  button:disabled { opacity: .45; cursor: default; }
+  .msg { margin-top: 12px; font-size: 13px; white-space: pre-wrap; }
+  .msg.ok { color: var(--ok); } .msg.warn { color: var(--warn); } .msg.bad { color: var(--bad); }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 12px;
+          font-family: var(--mono); border: 1px solid var(--line); }
+  .pill.run { color: var(--warn); border-color: var(--warn); }
+  .pill.idle { color: var(--dim); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  td.mono { font-family: var(--mono); font-size: 12px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .s-pr_open { color: var(--ok); } .s-fail { color: var(--bad); }
+  .s-skip, .s-pending { color: var(--dim); } .s-test_failed, .s-revise { color: var(--warn); }
+  .empty { color: var(--dim); font-size: 13px; }
+  footer { color: var(--dim); font-size: 12px; text-align: center; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>pa 注入面板</h1>
+  <p class="sub">上传手写 PRD markdown → 触发 <code>--from-stage inject</code>；状态与 PR 只读渲染（面板零 verdict）。</p>
+
+  <section>
+    <h2>上传 PRD</h2>
+    <div id="drop">
+      拖一份 .md 到这里，或点击选择文件<br>
+      <span style="font-size:12px">（YAML frontmatter 需含 project 字段——见 CLAUDE.md 注入说明）</span>
+      <input id="file" type="file" accept=".md,.markdown">
+    </div>
+    <button id="go" disabled>注入</button>
+    <div id="upmsg" class="msg"></div>
+  </section>
+
+  <section>
+    <h2>状态</h2>
+    <p><span id="runpill" class="pill idle">…</span> <span id="rundetail" class="empty"></span></p>
+    <p class="empty" id="dispfile"></p>
+    <div id="counts" class="empty"></div>
+  </section>
+
+  <section>
+    <h2>PR 列表（最近一次 dispatch）</h2>
+    <div id="prlist"></div>
+  </section>
+
+  <footer>默认监听 127.0.0.1（localhost 单人）· 注入与 CLI 共享同一实现 · 面板崩溃不影响进行中的 run</footer>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let picked = null;
+
+const drop = $("drop");
+drop.addEventListener("click", () => $("file").click());
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("hover"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("hover"));
+drop.addEventListener("drop", e => {
+  e.preventDefault(); drop.classList.remove("hover");
+  pick(e.dataTransfer.files[0]);
+});
+$("file").addEventListener("change", e => pick(e.target.files[0]));
+
+function pick(f) {
+  picked = f;
+  const ok = f && /\.(md|markdown)$/i.test(f.name);
+  $("go").disabled = !ok;
+  drop.textContent = f ? (ok ? f.name + "（" + f.size + " B）" : "只接受 .md/.markdown：" + f.name) : "拖一份 .md 到这里，或点击选择文件";
+  drop.appendChild($("file"));   // 保持 input 不被 textContent 清掉
+}
+
+$("go").addEventListener("click", async () => {
+  const msg = $("upmsg");
+  msg.className = "msg"; msg.textContent = "上传中…"; $("go").disabled = true;
+  try {
+    const fd = new FormData(); fd.append("file", picked);
+    const r = await fetch("/api/inject", { method: "POST", body: fd });
+    const j = await r.json();
+    if (r.status === 409) {
+      msg.className = "msg warn";
+      msg.textContent = "⏳ 进行中：" + (j.note || "已有 run 在跑") + "（pid=" + (j.pid || "?") + "）——不排队，稍后再试。";
+    } else if (!r.ok) {
+      msg.className = "msg bad"; msg.textContent = "✗ " + (j.detail || r.status);
+    } else {
+      msg.className = "msg ok";
+      msg.textContent = "✓ 已受理（stamp=" + j.stamp + "，pid=" + j.pid + "）——run 日志：" + j.log;
+    }
+  } catch (err) {
+    msg.className = "msg bad"; msg.textContent = "✗ 请求失败：" + err;
+  }
+  $("go").disabled = !picked;
+});
+
+async function refresh() {
+  try {
+    const j = await (await fetch("/api/status")).json();
+    const pill = $("runpill");
+    if (j.running) {
+      pill.className = "pill run"; pill.textContent = "run 进行中";
+      $("rundetail").textContent = "pid=" + (j.lock.pid || "?") + " · 已 " + Math.round((j.lock.age_seconds||0)/60) + " 分钟";
+    } else {
+      pill.className = "pill idle"; pill.textContent = "空闲";
+      $("rundetail").textContent = "";
+    }
+    $("dispfile").textContent = j.dispatch_file
+      ? (j.is_today ? "当日终态：" : "今日无 run，显示最近一次：") + j.dispatch_file
+      : "尚无 dispatch 记录（注入一份 PRD 后这里出现当日终态）";
+    $("counts").textContent = j.counts && Object.keys(j.counts).length
+      ? Object.entries(j.counts).map(([k, v]) => k + " × " + v).join(" · ") : "";
+    const rows = j.records || [];
+    $("prlist").innerHTML = rows.length ? "<table><tr><th>项目</th><th>slug</th><th>状态</th><th>verify</th><th>PR / 说明</th></tr>" +
+      rows.map(r => "<tr><td class='mono'>" + (r.project || "?") + "</td><td class='mono'>" + (r.slug || "") +
+        "</td><td class='mono s-" + (r.status || "") + "'>" + (r.status || "?") + "</td><td class='mono'>" + (r.verify_verdict || "") +
+        "</td><td>" + (r.pr_url ? "<a href='" + r.pr_url + "' target='_blank'>PR</a>" : (r.skip_reason || "")) + "</td></tr>").join("") +
+      "</table>" : "<p class='empty'>（无记录）</p>";
+  } catch { /* 面板不在服务时静默——下次轮询再试 */ }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

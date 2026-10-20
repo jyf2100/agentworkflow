@@ -39,6 +39,16 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+    "httpx>=0.27",   # FastAPI TestClient 的传输层（test_webapp.py；面板本体在 webapp extras）
+]
+# webapp 注入面板（openspec/changes/productize-pa-template，prd-injection-console）：FastAPI 独立
+# 依赖面——编排器核心（run_daily 及 scripts/ 扁平模块）零新依赖；不装此 extras 时 webapp 不可用
+# 但流水线行为完全不受影响。面板进程只做「上传落盘 + subprocess 起 run_daily --from-stage inject +
+# 只读状态视图」，不在面板进程内重实现编排。
+webapp = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
 ]
 
 # 本仓脚本以「路径同目录 import」方式互引（sys.path.insert，见各 test_*），并非可安装包；

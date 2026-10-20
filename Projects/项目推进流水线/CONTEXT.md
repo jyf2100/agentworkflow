@@ -9,7 +9,7 @@ roc 自有的代码仓库（github.com/jyf2100/ 或 okwinds/ 下），位于 /Us
 _Avoid_: 仓/代码库（太泛）、vault 子目录（那些不是项目）、上游 fork 作为目标。
 
 **大脑 (Brain)**:
-Obsidian vault 本身——本地仓，无 remote。承载雷达内容源、PRD 生成、报告汇聚。pa-dev 永不改动它。
+控制面仓——承载雷达内容源、PRD 生成、报告汇聚的 Obsidian vault。范畴为**多实例**（2026-10 产品化设计 D3）：每个流水线部署有自己的控制面仓实例；本 vault（agentworkflow）是开发真源的**第一个实例**，不是唯一合法形态。dev 永不改动它。
 _Avoid_: hub、中心、vault（当指枢纽角色时统一用「大脑」）。
 
 **上游仓 (Upstream repo)**:
@@ -102,11 +102,27 @@ _Avoid_: 用 node 内循环表达跨语义角色的回环（掩埋拓扑、损 g
 
 **drop**:
 [[PRD 质量闸]] / verify 闭环中，**对抗 persona 独占**的语义排除判决（PRD 不进 dispatch / dev 产出判死）。编排器（graph node/edge）**从不产生 drop**——遇 persona 输出残缺只产 [[triaged]]（升人工，不替判死）。守「机械层不替语义层判结论」。
+**现状标注（2026-10）**：「编排器从不产 drop」是 langgraph 重构目标态，task 4.2（3 处编排器 drop 改 triaged）**未完成**——现行 `run_daily.py` stage_critic 三边界仍产 drop（缺 path / 漏吐 verdict / revise 异常；熔断终态 raise 穿透除外），`graph_pa_aggregate.py` 聚合层全镜像同语义。file:line 证据见 change `productize-pa-template` 验证笔记。
 _Avoid_: 编排器硬判 drop（边界滑落，见 `orchestrator-boundary-audit-2026-08-11.md` 层 2）。
 
 **triaged**:
 编排器（机械层）的终端状态——遇 persona 输出残缺（prd 缺 path / critic 漏吐 verdict / revise 异常）或循环用尽（verify 用满 / dev off_track 连续 2 次）时，编排器**不替判死**，defer 给人 review。与 [[drop]]（persona 语义判决）严格区分：triaged = 升人工待审，drop = 已判排除。
+**现状标注（2026-10）**：残缺输入路径的 triaged 化依赖 langgraph task 4.2（未完成，现仍落 drop）；循环用尽路径已生效（verify 用满 → 对账降级 `interrupted_pr` 不 drop，半成品留 review）。
 _Avoid_: 把 triaged 当 drop（编排器替判死）。
 
 **node（消歧）**:
 重构后「node」指 LangGraph StateGraph 图节点（4 类配置实例：PersonaNode/DevLoopNode/MechanicalNode/GatewayNode）。**与 pa 现有「node」= Node.js/npm 项目无关**（后者见 `orchestrator-boundary-audit-2026-08-11.md`，指被控仓的技术栈）。二者仅同词，无语义关联。
+
+## 产品化拓扑（2026-10 产品化引入）
+
+**投影 (Projection)**:
+vault 开发真源 → pa-pipeline-template 仓的版本化只读拷贝（release_template.sh：manifest 内容契约 + transform 机械转换 + 去个人化/规约层双门禁）。投影单向、可随时重建、绝无反向同步；template 的一切内容以 vault 为唯一真源。
+_Avoid_: fork（含双向同步语义，投影只读）、模板仓当独立仓讨论（脱离 vault 真源谈它的内容会漂移）。
+
+**template 实例 (Template Instance)**:
+同事 clone 投影仓 + `bootstrap.sh` 实例化后的控制面仓部署——[[大脑]] 多实例范畴的实例形态。仓根 `.project-auto/` 持实例数据（profiles、sources.yaml、state），cron/SMTP 缺省关；升级 = `git pull` + 重跑 bootstrap（本地改动检测护分叉）。本 vault（agentworkflow）是开发真源 + 第一个实例。
+_Avoid_: 把实例与 vault 真源混称（实例不反向改 `scripts/`）；「部署」单用（太泛——一个实例是一台机上仓+实例数据+目标仓 worktree 的整体）。
+
+**回流 (Backport)**:
+实例侧 bug/改进的唯一合法反向通道：提 issue 给 template 维护者 → vault 修复 → 下次 release 投影随行。实例本地改受检路径（`scripts/`、`.claude/agents/`、`openspec/`）即与上游分叉——bootstrap 漂移警告（不阻断），修复责任在实例。
+_Avoid_: fork-and-fix（分叉后升级自担、违背单真源）、把回流当代码依赖（它是人的流程，投影内零反向机制）。

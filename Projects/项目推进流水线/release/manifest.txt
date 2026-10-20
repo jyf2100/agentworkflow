@@ -1,0 +1,18 @@
+# manifest.txt — template 内容契约的「当前已交付子集」（task 2.2）
+#
+# 每行一个 pathspec，经 `git ls-files -- <pathspec>` 展开为精确文件清单
+# （自动排除 gitignore：Knowledge/、.project-auto/ 天然不入）。
+# 完整契约见 specs/template-release/spec.md「模板内容契约」；随 §3-§6 交付逐项增行：
+#   §3 → bootstrap/bootstrap.sh          §5 → webapp/
+#   §4 → admit_repo.py（在 scripts/ 内自动随行）   §6 → config/、CLAUDE.md（使用版）、RUNBOOK（template 版）
+# 未交付项由 RELEASE_NOTE「上游 in-progress 状态」注明（release note 上游状态义务）。
+Projects/项目推进流水线/scripts/
+Projects/项目推进流水线/bootstrap/
+Projects/项目推进流水线/webapp/
+Projects/项目推进流水线/pyproject.toml
+Projects/项目推进流水线/CONTEXT.md
+Projects/项目推进流水线/RUNBOOK.md
+Projects/项目推进流水线/release/docs/CLAUDE.template.md
+.claude/agents/
+openspec/specs/
+docs/adr/

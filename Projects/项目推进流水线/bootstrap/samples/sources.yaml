@@ -1,0 +1,11 @@
+# sources.yaml — 采集源配置（实例数据，位于 .project-auto/ 不入仓）
+# 空模板：signal 链（fetch/radar/prd）需要时在此加源；手动 PRD 注入（--from-stage inject 起）不需要本文件。
+# 结构以 scripts/run_daily.py load_sources/FETCH_CONFIG 为准；name 全局唯一、root 全局排他（硬错不静默）。
+sources: []
+# 每项结构示例（kind 决定 fetch 行为；缺省 directory = 只扫已有文件、不主动抓取）：
+# - name: my-github-watch        # 采集源身份（必须全局唯一）
+#   root: Knowledge/github-watch/  # 内容根（必须全局排他——一个 root 只属一个源）
+#   kind: github-repo            # directory | github-repo | wechat-url | agent-deepresearch
+#   repos: [owner/repo]          # github-repo：监控的仓（gh CLI 拉 window 内 commits/pulls）
+#   urls: [https://mp.weixin.qq.com/s/xxxx]   # wechat-url：抓取的公众号文章
+#   topic: 某主题的深研问题        # agent-deepresearch：研究主题（合成一份带引用报告）

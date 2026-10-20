@@ -382,3 +382,17 @@ git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<bra
 ```
 判据：dev log 出现 `already exists` 反复失败 / PR diff 突然缩水（新分支只含本轮 commit）→ 查
 `git rev-parse <branch>` vs `origin/<branch>` 是否同 SHA。
+
+## 11. 部署拓扑与路径真相（2026-10 产品化前置 F3）
+
+**双 checkout 拓扑**——vault 有两个 checkout，职责不同：
+
+| | 运行时真身机（roc mac） | 本服务器（Linux 开发/评审 checkout） |
+|---|---|---|
+| 路径 | `/Users/roc/…`（vault + 目标仓 workspace 双检出） | `/mnt/disk01/workspaces/worksummary/agentworkflow` |
+| cron | ✅ 03:17 `run_cron.sh`（`install_cron.sh` 装） | ❌ 无 |
+| `.project-auto/`（profiles、sources.yaml、state） | ✅ 存在（gitignore，绝不入仓，故**只在此机**） | ❌ 不存在（冷 checkout） |
+| 目标仓 worktree | ✅ `<repo>/.worktrees/`（dispatch 建） | ❌ 无目标仓 |
+| 职责 | 流水线每日运行 | 编辑 pa 源码、评审、git 操作 |
+
+**路径真相**：CONTEXT.md / SPEC.md / 旧报告中的 `/Users/roc/*` 路径指运行时真身机，在本服务器上无效（对应物是 `/mnt/disk01/…`）；两 checkout 经 `github.com/jyf2100/agentworkflow` remote 同步。**在冷 checkout 上跑 `run_daily.py` 会因 `.project-auto` 缺失而无法全链运行**（VAULT_ROOT 推导正常但 profiles/sources 不在）——这是预期行为，不是 bug。恢复/迁移运行时 = 从真身机搬 `.project-auto/`（含 profiles、sources.yaml、去重清单；state 可选）到目标机 vault 根。

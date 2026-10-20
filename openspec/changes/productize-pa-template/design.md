@@ -71,5 +71,11 @@ E1 通道指导进 template 产品文档（「需新测试证据才走流水线�
 
 ## Open Questions
 
-- template 仓托管位置与可见性（团队 git 具体 org/repo、private？）——发布时由用户决定，不阻塞开发
-- 试点同事与目标仓人选——运营决策，试点前定
+- ~~template 仓托管位置与可见性~~ **已决（2026-10-20）**：新建私有仓 `jyf2100/pa-pipeline-template`，v0.1.1 已发布（发布记录与两处真 bug 修复见 verification-7 §7）。
+- 试点同事与目标仓人选——**已决（2026-10-20）**：试点仓 = `jyf2100/cc-session-mgr`（目标面，试点中转公开+分支保护）；执行人 = 维护者自跑通（7.3 于 2026-10-20 达成：PR#1 独立验证绿、目标仓零 scripts 本地改动、抓出 F7-F11 五缺陷，见 verification-7 §8）；「没接触过 pa 的真实同事」信号留二期试点。
+- 镜像化封装（S1 服务器集中式第一步）——**方向已定（2026-10-20），试点后立项为独立 change**：
+  - 层级 = 工具镜像 thin：镜像只装工具链（python3.11 / git / gh / claude code CLI），template 仍 git clone + `git pull` 升级（现有回路不变）；
+  - 凭据绝不进镜像层：`~/.claude` 与 gh 凭据运行时 volume/env 注入（对齐「每个用户一个凭证」原则）；
+  - 数据持久化到宿主 volume：仓根 `.project-auto/`（journal/state/PRD）+ 目标仓 workspace；
+  - 构建托管 = GitHub Packages（ghcr.io）+ Actions 自动 build/push；
+  - 容器内需可达 roc LiteLLM 代理（`ANTHROPIC_BASE_URL`）。不在本 change 内膨胀。

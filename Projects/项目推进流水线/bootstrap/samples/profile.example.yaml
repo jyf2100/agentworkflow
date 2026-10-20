@@ -1,0 +1,29 @@
+# profile.example.yaml — 目标仓档案样例（bootstrap 装到 config/；改好后复制到仓根
+# .project-auto/profiles/<project>.yaml 才会被流水线读到——profiles glob 只认那一个目录）
+#
+# profile 是「一个被控目标仓」的控制面描述：radar 用 match_surface 判信号相关性，
+# dispatch 用 repo 定位目标仓、用 type 做代码仓准入门。字段 = run_daily.load_profiles 消费的全集。
+#
+# ⚠ admission: true 才会被流水线接管；改 false 即暂停该仓的一切自动投递。
+
+name: demo-repo            # 项目名（PRD frontmatter 的 project 值须等于它）
+admission: true            # 准入开关（false = radar/dispatch 均跳过）
+repo: /abs/path/to/demo-repo   # 目标仓本地 clone 路径（绝对路径；dispatch 在其中建 .worktrees/ 跑 dev loop，
+                               # owner/repo 从该仓 git remote origin 自动提取——不要直接填 owner/repo 字符串）
+type: code                 # 准入门合法值仅 code（run_daily 准入 1 硬判 type=="code"，其余值 dispatch 必跳
+                           # 「profile 不满足」）。测试驱动是探测式（见 package.json → npm，否则重放
+                           # dev 上报 test_cmd），与 type 无关——不要填 node/python
+default_branch: main       # 默认分支（branch protection / PR 基线）
+match_surface:             # radar 信号匹配面（dict！one_liner + keywords；radar/critic 均按此形态消费，
+                           # 填关键词 list 会让 critic 段直接 AttributeError 崩）
+  one_liner: 一个 TypeScript 前端示例项目（一句话：项目是什么，radar 拿它判信号相关性）
+  keywords: [typescript, vite, 登录]   # 项目无关技术词（命中即候选）
+conda_env: null            # Python 仓专用：conda env 名（非 Python 仓保持 null）
+max_prs_in_flight: 2       # 该仓同时在飞的 PR 上限（对账计数超过则本轮跳过）
+dev_agent_ready: true      # 目标仓可跑 dev loop（标准测试入口 scripts.test 已配置）
+
+# ── 维护注记（E3 学习回流约定）────────────────────────────────────────────
+# 本样例 = generic profile 的教学载体。实例运营中发现的可复用经验（profile 字段语义坑、
+# 准入前置、PRD 写法教训等）属「高价值 lesson」：人工回流上游（提 issue 给 template 维护者
+# → vault 修复 → release 随行），本文件只吸收「所有目标仓通用」的部分，项目特定的进你自己的
+# profile。机制化学习回路的触发条件 = 实例数 ≥3 且人工回流成瓶颈（此前维持人工，E3 决策）。
