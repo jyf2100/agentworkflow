@@ -37,7 +37,23 @@ label：`io.pa.template-tag=v0.1.3-rc1` / `io.pa.upstream-commit=d49fd7d` / `io.
 - `--model sonnet` 被 CLI 正规化为 `claude-sonnet-5` 仍拒；`--model glm-5.2` 直传 → **`is_error: False, text: OK`**（全绿）。
 - **结论**：F9「凭据=三值」仍成立（模型映射非凭据，无秘密性）；容器运行时注入面 = 三值 + 模型路由（`glm-*` 显式传或 `ANTHROPIC_DEFAULT_*_MODEL` env）。镜像保持中立不预置（roc 特定形态）——此为 hub/compose 切片的注入面设计输入，非镜像缺陷。
 
-## 3. 遗留
+## 3. 发布与 tag 复验（5.3 / 5.4，2026-10-20 闭环）
 
-- 5.3 发布 v0.1.3（Dockerfile 首次随投影发布）待用户指示；5.4 从 v0.1.3 tag 复验 build 随后闭环。
-- v0.1.2 tag 无 Dockerfile，不可作 build context（tasks 5.1 已注明，未重蹈）。
+**5.3 发布**（用户明确指示「发布」）：vault commit `e650069` → `release_template.sh --publish … v0.1.3` 全门禁绿（副本内 quality **2020 passed + 3 skipped**——release 工具链测试按设计 module-skip）→ push（快照式发布模型 force push main，v0.1.0-0.1.2 tag 锚定各自历史不丢；先例 verification-7.md:67）。
+
+**5.4 tag 复验**（一条命令完整链）：
+
+```bash
+bash release/build_executor_image.sh --tag v0.1.3 --remote https://github.com/jyf2100/pa-pipeline-template.git
+```
+
+- **BUILD_RC=0**，`pa-executor:v0.1.3` 正式镜像产出（非 rc1）
+- **F1b git 差集校验首次真发布形态生效**：clone 即干净 git checkout → 走 git 分支（未出现「等价导出」告警），`ls-files --others` 差集 = 0
+- **label 五项核对全对**：`io.pa.template-tag=v0.1.3` / `io.pa.upstream-commit=e650069`（自动从 tag 内 RELEASE_NOTE 抓取真 sha，非 unknown 非手动）/ `claude-code-version=2.1.220` / `gh-version=2.102.0` / `org.opencontainers.image.version=v0.1.3`
+- 七项容器自检全绿（id/python/claude/gh/pytest/compileall/secrets）
+
+**闭环实证**：tag 即 build context——任何同事 clone v0.1.3 即可 build 出同内容镜像，不依赖 vault 侧任何东西；「vault 真源 → template tag → pa-executor 镜像」版本链全程机械可验。
+
+## 4. 遗留
+
+- 无（14/14 全勾）。v0.1.2 tag 无 Dockerfile 不可作 build context 的限制自 v0.1.3 起消除。

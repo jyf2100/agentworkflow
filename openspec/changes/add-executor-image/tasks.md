@@ -24,5 +24,5 @@
 
 - [x] 5.1 本服务器 E2E（发布前验证）：从**已纳管 Dockerfile 的投影工作副本** build 全绿（v0.1.2 tag 无 Dockerfile，不可作 build context——勿重蹈 tasks 原序错误）；记 verification 文档——`pa-executor:v0.1.3-rc1` 七项自检全绿 BUILD_RC=0；干跑抓出 6 个真问题全部回流修复（syntax 行/mirror 403/gh 落位/chown/secrets 排除/curl 重试），见 verification-4.2-5.1.md
 - [x] 5.2 `release/docs/CLAUDE.template.md` 补「可选容器化」一节（docker build 用法；直跑仍是默认）——含 env 三值注入说明与 `/workspace` 目标面挂载语义
-- [ ] 5.3 发布 v0.1.3（Dockerfile 首次随投影发布），release note 注明 executor-image 中间态与 pa-sandbox→pa-executor 更名
-- [ ] 5.4 从 v0.1.3 tag 复验 build（tag 即 build context 的闭环实证）
+- [x] 5.3 发布 v0.1.3（Dockerfile 首次随投影发布），release note 注明 executor-image 中间态与 pa-sandbox→pa-executor 更名——已推（快照模型 force push main，v0.1.0-0.1.2 tag 锚定不丢；副本内 quality 2020 passed + 3 skipped，upstream e650069）
+- [x] 5.4 从 v0.1.3 tag 复验 build（tag 即 build context 的闭环实证）——`--remote` clone 完整链 BUILD_RC=0：F1b git 差集校验首次真形态生效（clone 即 git repo，差集 0，未走等价导出告警分支）；label 五项全对（template-tag v0.1.3 / upstream e650069 自动从 tag 内 RELEASE_NOTE 抓取 / claude 2.1.220 / gh 2.102.0）；七项自检全绿
