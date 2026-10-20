@@ -126,3 +126,11 @@ _Avoid_: 把实例与 vault 真源混称（实例不反向改 `scripts/`）；�
 **回流 (Backport)**:
 实例侧 bug/改进的唯一合法反向通道：提 issue 给 template 维护者 → vault 修复 → 下次 release 投影随行。实例本地改受检路径（`scripts/`、`.claude/agents/`、`openspec/`）即与上游分叉——bootstrap 漂移警告（不阻断），修复责任在实例。
 _Avoid_: fork-and-fix（分叉后升级自担、违背单真源）、把回流当代码依赖（它是人的流程，投影内零反向机制）。
+
+**执行镜像 (pa-executor)**:
+[[投影]] 的物化运行形态——template tag 经 docker build 产出的执行容器镜像。内容唯一源 = template tag（tag 即 [[build context]]；build 脚手产 `pa-executor:<template-tag>` 并打 upstream commit / 组件版本 label）。pa-sandbox 的正式化替代（D9）：名字维度与 tag 策略正交，`:latest` 仅本机兜底、生产显式引用 tag 版本。凭据零入镜像（per-user 三值 + 模型路由运行时 env 注入）。
+_Avoid_: 脱离 template tag 谈镜像内容（会漂移）、与 pa-sandbox 并称（旧名已废）、镜像层与运行时隔离语义混谈（后者归 isolated-observable-execution capability）。
+
+**build context**:
+docker build 的构建输入目录 = template tag 的 checkout（或等价导出）——投影的物化形态（D3 规范术语）。内容清单 = tag 的 git 树；混入「未跟踪未忽略」文件即内容偏离（build 脚手 git 差集校验拦截，等价导出场景 review 把守）。
+_Avoid_: 与「目标仓 worktree」混淆（那是 dev-agent 运行时 clone 目标项目的目录，容器内 /workspace——[[大脑]] 的目标面投影，非构建输入）。

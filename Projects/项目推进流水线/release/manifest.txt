@@ -13,6 +13,8 @@ Projects/项目推进流水线/pyproject.toml
 Projects/项目推进流水线/CONTEXT.md
 Projects/项目推进流水线/RUNBOOK.md
 Projects/项目推进流水线/release/docs/CLAUDE.template.md
+Projects/项目推进流水线/release/Dockerfile
+Projects/项目推进流水线/release/.dockerignore
 .claude/agents/
 openspec/specs/
 docs/adr/

@@ -1,0 +1,12 @@
+# .dockerignore — build context（template tag checkout）防御排除
+# template 本身不含 Knowledge/ 与 .project-auto/（投影天然排除），此处双保险
+# 防手动 build 场景（template 用户在混入本地数据的目录里 build）。
+.git
+.gitignore
+.project-auto/
+Knowledge/
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/node_modules
+*.pyc

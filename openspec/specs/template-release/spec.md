@@ -24,7 +24,7 @@ release SHALL 在 template 副本内执行 `quality.sh`（compileall + pytest + 
 - **THEN** 发布流程继续到打 tag 步骤
 
 #### Scenario: 命中个人痕迹
-- **WHEN** grep 门禁在 template 副本中命中个人路径（如 `/Users/roc`）或个人 SMTP 配置等模式
+- **WHEN** grep 门禁在 template 副本中命中个人路径（如 `/Users/<user>` 形态的用户家目录）或个人 SMTP 配置等模式
 - **THEN** 发布失败并列出命中文件与行
 
 ### Requirement: 文档分层与转换机械化

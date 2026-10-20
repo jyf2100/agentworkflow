@@ -74,6 +74,28 @@ python3 Projects/项目推进流水线/webapp/app.py
 - 注入一条龙会跑到 dispatch+report；产出的 PR 出现在**你的目标仓**，验证闸（pa-verify）
   判绿后由流水线兜底开 PR，你正常 review 合入。
 
+## 可选容器化（默认仍是本机直跑）
+
+**本机直跑是默认形态**——上面的安装与日常使用不依赖 docker。容器化是可选项，适合想把
+流水线整体隔离在固定环境里跑的场景（执行面服务的部署形态也基于同一镜像）。
+
+仓根自带 `Dockerfile` + `.dockerignore`（随 template 发布）：
+
+```bash
+docker build -t pa-executor:$(git describe --tags 2>/dev/null || echo local) .
+docker run --rm -it \
+  -v "$PWD/.project-auto:/workspace/.project-auto" \
+  -e ANTHROPIC_BASE_URL=... -e ANTHROPIC_AUTH_TOKEN=... -e GH_TOKEN=... \
+  pa-executor:local --help
+```
+
+- 镜像含 python3.11 + pa 依赖 + claude CLI + gh CLI（版本在 Dockerfile ARG 钉扎）；
+  入口即 `run_daily.py`（`docker run <image> --help` 可查参数）。
+- **凭据经 env 注入容器**（三值：`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` /
+  `GH_TOKEN`），镜像本身零凭据；与本机直跑「模型层是你自己的 claude CLI」语义一致，
+  只是登录态从本机 CLI 换成 env。
+- 容器内目标仓 worktree 挂载在 `/workspace`——目标面仍是你的目标仓，不随镜像分发。
+
 ## FAQ
 
 **Q：注入后想中断？** run 进行中时 `.run.lock` 被占（拒绝并发是刻意的）；中断用

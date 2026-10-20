@@ -60,6 +60,12 @@ while IFS= read -r line; do
 done < "$MANIFEST"
 [[ ${#FILES[@]} -gt 0 ]] || fail "manifest 展开为空"
 echo "  共 ${#FILES[@]} 文件"
+# F12 差集校验（add-executor-image task 2.2；本体论审核 F2 裁决 warning→阻断）：
+# manifest 覆盖范围内未跟踪文件 = 将静默漏出投影（v0.1.2 教训）。纳管目录下
+# 「未 stage 未 ignore」几乎必是遗漏（故意不发该 gitignore）→ 阻断发布；
+# 告警器自身失败同样阻断（fail-closed：工具坏了本就不该发布）
+python3 "$HERE/check_release_gates.py" --untracked-diff "$MANIFEST" --vault "$VAULT_ROOT" \
+  || fail "F12 差集非空或告警器失败——先 git add 新文件或移出 manifest 范围"
 
 # ── [2] 转换（抽取+去个人化一体）──────────────────────────────────────────
 echo "▶ [2/6] 机械转换 → $OUT"
@@ -79,6 +85,23 @@ fi
 # vault 开发视角 CLAUDE.md 不进 manifest，template 使用视角由独立真源承担）
 if [[ -f "$OUT/Projects/项目推进流水线/release/docs/CLAUDE.template.md" ]]; then
   cp "$OUT/Projects/项目推进流水线/release/docs/CLAUDE.template.md" "$OUT/CLAUDE.md"
+fi
+# add-executor-image task 1.2 落位：执行镜像 Dockerfile 复到 template 根（真源
+# <pa>/release/Dockerfile；build context 惯例 Dockerfile 在根——spec: executor-image
+# 「template tag 即 build context」）
+if [[ -f "$OUT/Projects/项目推进流水线/release/Dockerfile" ]]; then
+  cp "$OUT/Projects/项目推进流水线/release/Dockerfile" "$OUT/Dockerfile"
+  cp "$OUT/Projects/项目推进流水线/release/.dockerignore" "$OUT/.dockerignore"
+fi
+# task 2.3 接线：Dockerfile 四项静态检查（存在/tag/非root/无凭据）——在 manifest 则强制过
+# （与 CLAUDE.template.md 通道指导检查同构：manifest 条件 + 缺失即 fail）
+DOCKERFILE_SRC="Projects/项目推进流水线/release/Dockerfile"
+if printf '%s\n' "${FILES[@]}" | grep -qxF "$DOCKERFILE_SRC"; then
+  [[ -f "$OUT/Dockerfile" ]] || fail "根 Dockerfile 复刻失败（$DOCKERFILE_SRC 在 manifest）"
+  python3 "$HERE/check_release_gates.py" --dockerfile "$OUT/Dockerfile" \
+    || fail "Dockerfile 四项静态检查未过（spec: template-release 发布门禁 + executor-image）"
+else
+  echo "  ⚠ Dockerfile 未纳管 manifest——executor-image in-progress，见 RELEASE_NOTE"
 fi
 for f in "${FILES[@]}"; do
   for fb in "${FORBIDDEN_PATHS[@]}"; do

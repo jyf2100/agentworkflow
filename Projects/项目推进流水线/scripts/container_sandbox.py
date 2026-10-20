@@ -178,7 +178,9 @@ class DockerCliRunner:
     里通过自定义 network / egress 规则实现（部署侧），本层在命令标志表达意图 + NetworkPolicy 强制。
     """
 
-    def __init__(self, runtime: str = "docker", image: str = "pa-sandbox:latest",
+    # 默认 image 的 :latest 仅本机兜底；生产配置显式传 tag 版本（D9 版本锚定——
+    # build 脚手产 pa-executor:<template-tag>，见 release/build_executor_image.sh）。
+    def __init__(self, runtime: str = "docker", image: str = "pa-executor:latest",
                  run_as_user: str = "1000:1000", timeout: float = 120):
         self.runtime = runtime
         self.image = image
@@ -279,7 +281,8 @@ class ContainerSandbox:
 
     tier = AssuranceTier.CONTAINER
 
-    def __init__(self, runner: ContainerRunner, *, image: str = "pa-sandbox:latest",
+    # image 默认 :latest 仅兜底——生产显式传 tag 版本（版本锚定语义同 ContainerRunner 处注释，D9）
+    def __init__(self, runner: ContainerRunner, *, image: str = "pa-executor:latest",
                  run_as_user: str = "1000:1000", egress: EgressEnforcement | None = None):
         self.runner = runner
         self.image = image

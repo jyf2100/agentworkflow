@@ -1,6 +1,6 @@
 # pa 服务器集中式部署形态设计（阶段 2）
 
-> 日期：2026-10-20 ｜ 状态：已批准（S1 + per-user 凭据修订 + 本体论裁决 F1-F7 并入；spec 见 issue #3）
+> 日期：2026-10-20 ｜ 状态：已批准（S1 + per-user 凭据修订 + 本体论裁决 F1-F7 并入；spec 见 issue #3。落地裁决 F8-F9 已补：hub=vault 顶层 `hub/`、部署=本服务器 compose、凭据 env 注入验证通过）
 > 前置：`2026-10-20-productize-pa-design.md`（方案 B template repo，阶段 1）+ `openspec/changes/productize-pa-template/`
 > 关系：**演进路线**——阶段 1 照跑不冻结（template/bootstrap/admit/webapp 试点照做），本设计是阶段 2 团队服务器形态。
 > 决策画像：四动机全要（上手成本/团队可见性/凭据集中管控/Mattermost 协作流）；dev loop 在服务器容器内；Mattermost OAuth 登录 + bot 通知；中等规模（5-15 人、十来个仓、峰值并发 run 5-10）。
@@ -123,6 +123,18 @@ PRD 两个入口汇入同一队列：① 同事浏览器 OAuth → 面板上传�
 - **F4 run:容器 = 1:N**：journal run id 是持续身份；容器是即弃执行载体。实现约束：续跑必须复用同一 run id（起新 run = 毁断点续跑语义）
 - **F5 互斥主从**：hub 队列是权威层；容器内 `.run.lock` 退化为防御层。两层都不许「优化」掉——去掉队列=绕过串行，去掉锁=绕过队列直起容器无防线
 - **F6 ADR-0001 不被推翻**：目标面分离是**权威/身份分离**（目标面真理源 = 其 git 远端，容器内 worktree 是目标面在执行环境中的投影），从来不是物理位置隔离——与 vault 本机双 checkout 拓扑同构，服务器形态只是把双 checkout 搬进容器
+
+### F8 裁决（2026-10-20 探索会话）：hub 位置 + 部署形态
+- **hub 代码位置 = vault 顶层 `hub/` 目录**（候选 B）：hub 是独立部署物，与 pa 的 import 依赖刻意保持极薄（ContainerRunner 协议语义 + journal 只读渲染；流水线在容器内跑，hub 不直接跑 run_daily）——独立目录与独立部署物互相印证。
+- **连锁债**：vault「除 pa 外无可执行代码」的约定破例 → CLAUDE.md 仓库描述随实施同步修订（登记，不丢）。
+- **部署 = 本服务器 docker-compose**（docker 28.3.2 + compose v2.38.2 + 当前用户在 docker 组，前提已验证）：compose 含两个服务——pa-hub（build context = vault `hub/`）+ 执行容器池（image = template tag + Dockerfile）；数据卷 `/data/pa/projects/<proj>/state`。
+- **hub 镜像分发细节（本地 build vs 推 ghcr.io）**留 change 细化（thin 镜像 + ghcr.io 方向已有基调）。
+
+### F9 验证消解（2026-10-20）：per-user 凭据注入假设成立
+- **认证形态 = 纯 env**（三层证据）：① 本机实证 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` 走 LiteLLM 代理、无 OAuth credentials 文件，生产 roc cron 同模式；② 调用链无文件级认证依赖（persona_call 起 `claude -p` 子进程全靠 env 继承；`_load_claude_settings_env` 的存在意义即 SDK 子进程 env 认证）；③ F1 裁决下 hub 只跑执行链，涉及 persona（critic/progress/verify）仅用 Read/Bash、无 MCP 依赖。
+- **保险箱每条 per-user 记录 = 3 值**：`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `GH_TOKEN`（开 PR + 拉目标仓一份双用）；容器经 docker 原生 `--env-file`/secrets 注入，**零 credentials 文件挂载**。
+- **残留项（非凭据问题）**：容器内 claude CLI 首跑状态（onboarding/config 预置）归切片 0 镜像脚手验收。
+- **注入面实测补记（切片 0 E2E，2026-10-20 闭环）**：容器运行时注入面 = 三值 + **模型路由**——roc 代理拒裸 Anthropic id（CLI 默认被拒；`--model sonnet` 被正规化为 claude-sonnet-5 仍拒；`--model glm-5.2` 直传全绿）。模型映射非凭据（无秘密性），F9「3 值」结论仍成立；镜像中立不预置（roc 特定形态）→ hub 保险箱每条 per-user 记录建议为「3 值 + 可选模型路由」，容器经 `--env-file` 同通道注入（`ANTHROPIC_DEFAULT_*_MODEL` env 或显式 `--model`）。证据：openspec/changes/add-executor-image/verification-4.2-5.1.md §2。
 
 ## 10. 风险登记
 1. **LLM 端点容量**：5-10 并发 dev loop 对各用户 LLM 端点的压力——试点观察
