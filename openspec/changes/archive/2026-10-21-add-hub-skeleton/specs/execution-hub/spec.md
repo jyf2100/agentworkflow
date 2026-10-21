@@ -46,7 +46,7 @@ hub SHALL 在起容器前向 state 卷 `runs/<proj>/` 写入 `<stamp>_<slug>.met
 - **THEN** 该 run 标记为 failed_to_start 并保留 meta 作审计证据，不静默清理
 
 ### Requirement: 容器生命周期（1:N 即弃 + 续跑 + 崩溃对账）
-run 与容器 SHALL 为 1:N：容器即弃载体，崩溃续跑 = 同一 run 的新容器（journal 在卷上延续）。hub SHALL 检测容器非零退出并记录 exit_code；同一队列项的重派受可配上限约束，超限转 failed。hub 崩溃 MUST NOT 杀执行容器（独立进程树）；hub 重启后 SHALL 经 docker inspect 对账恢复 running 项跟踪（容器仍在跑 = 继续跟踪；容器已消失 = 按卷上 journal/孤儿 meta 归档终态）。
+run 与容器 SHALL 为 1:N：容器即弃载体，崩溃续跑 = 同一 run 的新容器（journal 在卷上延续）。hub SHALL 检测容器非零退出并记录 exit_code；同一队列项的重派受可配上限约束，超限转 failed。hub 崩溃 MUST NOT 杀执行容器（独立进程树）；hub 重启后 SHALL 经 docker inspect 对账恢复 running 项跟踪（容器仍在跑 = 继续跟踪；容器已消失 = 按执行证据归档终态：存在任一执行证据——docker 终态或卷上 journal——即 failed，两者皆无即 failed_to_start。failed_to_start 判据统一为「无任何执行证据」，不以 container_ref 有无区分，本体论审核 B1）。
 
 #### Scenario: 容器非零退出
 - **WHEN** 执行容器以非零码退出
