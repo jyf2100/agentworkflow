@@ -134,3 +134,7 @@ _Avoid_: 脱离 template tag 谈镜像内容（会漂移）、与 pa-sandbox 并
 **build context**:
 docker build 的构建输入目录 = template tag 的 checkout（或等价导出）——投影的物化形态（D3 规范术语）。内容清单 = tag 的 git 树；混入「未跟踪未忽略」文件即内容偏离（build 脚手 git 差集校验拦截，等价导出场景 review 把守）。
 _Avoid_: 与「目标仓 worktree」混淆（那是 dev-agent 运行时 clone 目标项目的目录，容器内 /workspace——[[大脑]] 的目标面投影，非构建输入）。
+
+**执行面 (hub)**:
+服务器集中式部署形态的第三范畴（阶段 2）——[[大脑]]控制面（编排+状态+persona）与目标面（被控项目仓）之外的**执行调度层**。hub/ 骨架（add-hub-skeleton 切片 1）：SQLite 队列（per-project 串行+峰值上限+重派状态机）+ F10 卷上署名 meta（写面钉死仅 meta）+ ContainerRunner 接缝（Fake/Docker 同判，镜像缺失 fail 不回退）+ 最小 API 三端点。只做机械活（排度/署名/记账）；语义活仍归 pa persona。切片 1 单用户 env 直注，身份系统是切片 2 凭据保险箱的替换面。
+_Avoid_: 与控制面混称（hub 不审 PRD 不产报告——它是调度器不是大脑）；当作 pa 的一部分（hub 不 import pa，两部署物零耦合，语义漂移由 spec 把关）；「执行面」与「目标面」互换（目标面是被控项目仓；执行面是起容器的调度层）。

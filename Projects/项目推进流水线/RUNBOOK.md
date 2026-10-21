@@ -396,3 +396,19 @@ git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<bra
 | 职责 | 流水线每日运行 | 编辑 pa 源码、评审、git 操作 |
 
 **路径真相**：CONTEXT.md / SPEC.md / 旧报告中的 `/Users/roc/*` 路径指运行时真身机，在本服务器上无效（对应物是 `/mnt/disk01/…`）；两 checkout 经 `github.com/jyf2100/agentworkflow` remote 同步。**在冷 checkout 上跑 `run_daily.py` 会因 `.project-auto` 缺失而无法全链运行**（VAULT_ROOT 推导正常但 profiles/sources 不在）——这是预期行为，不是 bug。恢复/迁移运行时 = 从真身机搬 `.project-auto/`（含 profiles、sources.yaml、去重清单；state 可选）到目标机 vault 根。
+
+## 12. 执行 hub 骨架（add-hub-skeleton 切片 1，2026-10）
+
+**部署形态**：vault 根 `hub/` 是服务器集中式部署的执行调度层（阶段 2 切片 1 骨架）——与控制面（vault 大脑）、目标面（被控项目仓）三分。hub 只做机械活：队列排度（SQLite，per-project 串行 + 峰值上限 + 重派状态机）、F10 卷上署名 meta、容器生命周期记账、最小 API/CLI。语义活（审 PRD/判价值）仍归 pa persona。**hub 不 import pa**（两部署物零耦合）。
+
+**env 清单**（单用户直注 bootstrap，切片 2 换凭据保险箱）：必需六项 `HUB_USER_ID` / `HUB_USER_ANTHROPIC_BASE_URL` / `HUB_USER_ANTHROPIC_AUTH_TOKEN` / `HUB_USER_GH_TOKEN` / `HUB_IMAGE_TAG_DEFAULT` / `HUB_DATA_ROOT`（缺失列出全部缺项拒绝启动）；可选 `HUB_USER_MODEL`（模型路由）、`HUB_MAX_CONTAINERS`（默认 3）、`HUB_MAX_RETRIES`（默认 2）。凭据只经 0600 env-file 注入容器（即弃即删），绝不进错误消息/日志/DB/镜像层。
+
+**数据卷布局**：`<HUB_DATA_ROOT>/<project>/state/` 是该项目 state 卷（挂给容器内 pa 的 `/workspace/vault/.project-auto/state`）；run 目录 = `state/runs/<proj>/<stamp>_<slug>/`；hub 在卷上的**写面钉死为仅 meta 署名文件**（`<stamp>_<slug>.meta.json`，文件名正则硬校验）——journal 与 state 其他内容归容器内 pa 写。
+
+**运维口径**：
+- 质量命令：`bash hub/quality.sh`（compile+pytest+ruff 三段，与 pa quality.sh **并列**——pa scripts/ 零改动）。
+- 入队/查状态：`python -m hub.cli enqueue --project X --prd /path/to.md`（或 `hub/` 下 `python cli.py …`）；API 三端点 `POST /queue`、`GET /queue`、`GET /runs/{id}`。
+- 镜像缺失（F13）：队列项转 failed 并报 tag 与 build 提示——**先手动 build 该 tag 再重新入队，绝不回退 latest**。
+- hub 崩溃恢复：重启即 `reconcile_startup` 对账——容器在跑续跟踪（hub 崩溃不杀容器，docker -d 进程树分离）；已消失按卷上 journal 证据归档（有 journal → run failed 走重派；无 journal → failed_to_start）；卷上孤儿 meta（有 meta 无 journal 且 DB 无记录）补索引 failed_to_start，meta 保留不清理。
+- 重派语义（A3）：容器失败回 pending 保留 attempt 计数（FIFO 保序天然优先），`HUB_MAX_RETRIES` 达上限才转 failed；run 的 failed（容器事实）与队列项的 failed（放弃决定）是两个生命周期。
+- daemon 故障退避（本体论审核 B2）：起容器基础设施异常（如 docker daemon down）→ run 记账 failed_to_start、队列项留 pending；连续失败进冷却（`dispatch_backoff` 默认 3——每 3 tick 重试一次，不逐 tick 记账膨胀 runs 表），daemon 恢复后自动续派；meta 首写保真（written_at 不因重试刷新，各次尝试的时间线在 runs 索引各行 started_at）。镜像缺失（F13）是确定性失败不重试——终态 failed，修环境重新入队。

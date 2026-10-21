@@ -1,0 +1,7 @@
+# hub 独立部署物自己的 lint 口径——对齐 pa（E9 致命 + F 实缺陷，line-length=120，py311）；
+# 刻意不开 E7/E4 纯风格（test_* 的紧凑写法是有意的，与 pa 同源约定）
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = ["E9", "F"]
