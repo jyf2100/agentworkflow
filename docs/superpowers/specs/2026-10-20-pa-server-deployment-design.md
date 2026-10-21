@@ -136,6 +136,38 @@ PRD 两个入口汇入同一队列：① 同事浏览器 OAuth → 面板上传�
 - **残留项（非凭据问题）**：容器内 claude CLI 首跑状态（onboarding/config 预置）归切片 0 镜像脚手验收。
 - **注入面实测补记（切片 0 E2E，2026-10-20 闭环）**：容器运行时注入面 = 三值 + **模型路由**——roc 代理拒裸 Anthropic id（CLI 默认被拒；`--model sonnet` 被正规化为 claude-sonnet-5 仍拒；`--model glm-5.2` 直传全绿）。模型映射非凭据（无秘密性），F9「3 值」结论仍成立；镜像中立不预置（roc 特定形态）→ hub 保险箱每条 per-user 记录建议为「3 值 + 可选模型路由」，容器经 `--env-file` 同通道注入（`ANTHROPIC_DEFAULT_*_MODEL` env 或显式 `--model`）。证据：openspec/changes/add-executor-image/verification-4.2-5.1.md §2。
 
+### F10 裁决（2026-10-21 探索会话）：run 发起人维度 = 卷上署名 meta（T1）
+- **journal 保持 user-agnostic**——journal 的本体是流水线事实流（恢复/reconcile 判据源），「谁发起」是因果上层；恢复时 user 无语义作用，进 journal 即死字段。pa 零侵入、本机形态零概念污染。
+- **hub 起容器前往 `state/runs/<proj>/` 写 `<stamp>_<slug>.meta.json`**（发起人 / 队列项 id / 镜像 tag）。审计自包含在卷上，hub DB 只做索引、可从 meta 重建。
+- **hub 对 state 卷的写面钉死为「仅 meta 署名文件」**——不写 journal、不删 state（防 hub 膨胀滑坡的不变式；滑坡正是从「顺手写一个小文件」开始）。
+- **孤儿 meta（journal 缺失）= failed-to-start 的准确审计标记**，优于事后水位扫描。
+- **连带契约：run 目录命名 `<stamp>_<slug>` 升格为 journal 契约的一部分**（hub 靠它与 DB 对齐），pa 侧改格式须过 change 评审。
+- 弃案记录：a) journal 加 user 字段（自包含最彻底但污染事实流、工具链全跟、本机形态背空字段）；b) 纯 hub DB 映射（零侵入但 DB 丢审计断链、failed-to-start 不可辨）。
+
+### F11 裁决（2026-10-21 探索会话）：投递 API = state ownership 交接协议（T2）
+- **前提修正（staging 事实）**：`stage_inject` 不是 prd 段的下游而是**平行入口**——「把手写 PRD md 转成标准 manifest，替 radar→prd 自动路径」（run_daily.py docstring），显式 `--inject-prd` 手动触发。故**分家线在 critic 前，不在 inject 前**：自动 PRD（vault prd 段产出的标准 manifest）经投递 API 直达 `--from-stage critic`；手写 PRD（同事面板/Mattermost 提交）不经 vault，由 hub 落盘后在容器内走 `--from-stage inject --inject-prd`（YAML frontmatter / project 已知性 / manifest 标准化等机械活复用 inject 段，hub 不重写）。两入口在服务器汇流，critic 统一把关——即 T3 的解法雏形。
+- **裁决：执行链分家机制 = `--to-stage` 物理分家（方案 a）**。mac cron 显式 `run_daily --to-stage prd`（新参数，对称既有 `--from-stage` 断点续跑机制——**分家 = 既有机制升格为部署边界，最小新概念**）；投递器为独立脚本 `deliver_prd.py`（扫未 delivered 的 PRD → 逐个 POST → 成功写标记）。不变式「一个 project 的执行链运行权威必须唯一」由机制物理保证（命令行层面就没有后半段）而非纪律保证。
+- **幂等交接协议（exactly-once 投递）**：崩溃窗口 ①POST前 ②POST后未收响应(UNKNOWN) ③收200未写标记 ④hub收到未落队 ⑤落队未响应——全部靠「vault 重扫重投 + hub 幂等去重」收敛。三态远程查询不变式的推广：投递响应 UNKNOWN 绝不当成功处理（无回执不标 delivered），幂等键让重试安全。幂等键建议 `(project, 文件名, sha256)`（stamp 前缀天然唯一，sha 检测同名异容），细节切片 3 定。
+- **PRD 生命周期（vault 视角）**：`produced → delivered`，止步。critic pass/drop/revise 结果在服务器 state，vault 不知道也不需要知道。
+- **衍生张力登记（T2a，未裁）**：report 段产物（报告文件）服务器形态下落服务器卷，vault「大脑」的报告沉淀职责被劈开一半——roc 侧可见性靠 Mattermost 通知 + 面板查询。待后续裁决，不阻塞切片 1-3。
+- **去重边界劈开实害盘点：实害 = 无**。radar 去重清单完整留 vault 信号链；执行链逐段检验（critic 无 dedup 需求 / dispatch exactly-once 是 journal-based reconcile 不依赖 radar dedup / report 无）。手写 PRD 不过 radar dedup 是既有形态非新债。
+- 弃案记录：b) 投递钩子嵌 run_daily（prd 段后自动投递并跳过已投 PRD 后续段）——delivered 标记写失败时存在双跑风险窗口，且投递职责耦合进编排器；c) project 白名单分流——最灵活但 `.project-auto` 是 gitignore 本地态、两机配置无同步机制，配置真源分裂成新问题。
+
+### F12 裁决（2026-10-21 探索会话）：critic「有据」单标准推广 + 手写入口必填（T3）
+- **裁决**：「有据」定义推广为**可追溯依据**——信号出处（自动 PRD 的 source_path）**或** PRD 自带依据链接/背景（手写 PRD），critic **不看出身**、只判依据是否可追溯；hub 面板提交手写 PRD 时 evidence 字段**机械必填**（入口把空依据挡在闸外，省一轮 critic）。单标准 + 双层把守。
+- 关键本体判断：**不是两套标准按出身分流**（反对——分裂把关标准是滑坡），是同一个「有据」概念的两种满足方式。伏笔：run_daily.py inject 段已有「PRD 无 source_path——critic 可能因『无据』revise/drop」警告（本机形态手写是罕见路径；服务器形态是同事主通道，不推广标准则通道形同虚设）。
+- 弃案记录：仅 prompt 适配（入口不强制——依赖自觉，空 evidence 进 critic 浪费一轮闸）；手写免据（间接降低闸口水位）。
+- 落地：critic persona prompt 一处适配 + 面板入口校验，切片 3/4。
+
+### F13 裁决（2026-10-21 探索会话）：镜像版本链条三条（T4，均为既有裁决连锁）
+- **队列项入队时钉镜像 tag**：F10 meta 已含 image tag 字段——run 与镜像版本的关系是 run 的属性，入队即锁定（审计可复现 + 一个队列项从入队到执行版本意图不变）。
+- **镜像缺失 fail 不回退**：hub 起容器时本地无该 tag → 报错暴露，**绝不静默回退 `:latest`**（`container_sandbox.py` F4 注释已钉此语义；镜像缺失是运维事件，静默漂移是事故）。
+- **build 触发 = 手动（YAGNI）**：发布 template tag 后 ssh 服务器跑 build 脚手（一条命令，已验证 BUILD_RC=0）。发布频率周级，webhook 自动化是过度工程。陈旧检测（remote 最新 tag vs 本地镜像比对 → Mattermost 通知）推切片 4。
+
+### F14 裁决（2026-10-21 探索会话）：Mattermost 双角色显式分离（T5）
+- **两个独立集成点/凭据实体**：OAuth app（身份——同事登录面板，识别发起人喂 F10 meta）与 notify bot（通道——run 完成/失败通知）。凭据、生命周期、失败模式各自独立；落地时序：切片 2 OAuth、切片 4 bot。
+- **显式不变式：自动化主干（投递→队列→容器→报告落卷）零依赖 Mattermost**——OAuth 挂 = 登不了面板但 vault cron 投递不经 Mattermost、执行链照跑；bot 挂 = 通知丢、正确性零影响。两个集成点都是外围（身份入口便利 + 通知），可分别失效而不伤主干。
+
 ## 10. 风险登记
 1. **LLM 端点容量**：5-10 并发 dev loop 对各用户 LLM 端点的压力——试点观察
 2. **服务器单点**：接受（规模决定）；缓解 = 备份（见 6）
