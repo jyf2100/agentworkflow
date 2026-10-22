@@ -1,0 +1,32 @@
+# hub compose 部署（add-hub-slice-2a 5.2，spec: hub-deployment）。
+# 唯一常驻 service = pa-hub；执行容器是 hub 经 socket 起的**兄弟容器**，不进
+# compose service 定义（D1：每 run 动态挂载/env-file/stamp，静态 service 表达不了；
+# 执行镜像版本钉定 = F13 入队钉 tag + 部署机显式 tag 预 build + hub image_exists fail 暴露）。
+#
+# 部署三步（顺序不可倒，详见 RUNBOOK「hub compose 部署」）：
+#   ① vault-import（此时 data_root 尚属宿主用户可写）
+#   ② chown -R 1001:1001 /data/pa（连 vault 递归；此后宿主用户写不进）
+#   ③ docker compose up -d --build
+services:
+  pa-hub:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    user: "1001:1001"          # D5：与执行镜像 pa(uid=1001) 对齐（MUST NOT 777 放宽）
+    group_add:
+      - "${HUB_DOCKER_GID:-999}"  # 宿主 docker 组 gid：socket root:docker 0660，uid=1001 须补组才可连
+                                 # （5.3 真机坐实 connect permission denied；本机实测 999，换机核 stat /var/run/docker.sock）
+    volumes:
+      # socket 兄弟容器（挂载 = 容器内等效 root，F2 阶段性边界，2b 复审）
+      - /var/run/docker.sock:/var/run/docker.sock
+      # data 卷（state/profiles/sources.yaml/vault/hub.sqlite3）。同路径 bind 是前提：
+      # hub 容器内生成的 -v 源路径会被宿主 daemon 按字面解析，内外必须同路径。
+      - /data/pa:/data/pa
+    env_file:
+      - hub.env                # 0600、gitignore：HUB_USER_ID + 三值 + HUB_IMAGE_TAG_DEFAULT
+                               # + HUB_VAULT_MASTER_KEY（vault.key 内容；不配 = env-only 兜底形态）
+    environment:
+      HUB_DATA_ROOT: /data/pa
+      HUB_TICK_INTERVAL: "5"
+    restart: unless-stopped    # 崩溃自愈：拉起后 reconcile_startup 幂等对账再进排度
+    stop_grace_period: 30s     # docker stop 默认 10s 会 SIGKILL 斩断优雅退出（本体论审核 B3）

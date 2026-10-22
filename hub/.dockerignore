@@ -1,0 +1,6 @@
+# hub thin 镜像 build context 排除（add-hub-slice-2a 5.4 凭据面复核）
+# vault.key / hub.env 绝不进镜像层——即使被误放进 deploy/ 也被此处挡下
+__pycache__/
+*.pyc
+deploy/hub.env
+deploy/vault.key
