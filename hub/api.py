@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import hmac
 import secrets
+import sqlite3
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import auth
 import daemon
+import prd_store
 import queue_engine
 from lifecycle import PROJECT_RE
 from fastapi import FastAPI, HTTPException, Request
@@ -38,6 +40,19 @@ class EnqueueBody(BaseModel):
     prd_path: str
     image_tag: str | None = None
     enqueued_by: str | None = None  # 缺省由端点兜底 cfg.user_id（B4）——无第三身份字面量
+
+
+class DeliverBody(BaseModel):
+    """slice-3 D1：PRD 正文内嵌投递（vault→hub 机机通道）。sha256 是声明值，
+    hub 落盘前校验 sha256(content)==声明值（防传输损坏 + 防幂等键撒谎）。"""
+    project: str
+    filename: str
+    sha256: str
+    content: str
+
+
+_DELIVER_MAX_BYTES = 1024 * 1024  # body 正文上限 1MB（超限 400 确定性拒绝）
+_DELIVER_ENQUEUED_BY = "vault-deliver"  # 机机通道来源字面量（队列面可辨识，非人身份）
 
 
 class CredentialsBody(BaseModel):
@@ -216,6 +231,57 @@ def create_app(
         # 响应只含确认与字段名，绝不回显明文值（spec「会话用户凭据录入」）
         return {"ok": True, "user": ident["mm_user_id"], "fields": sorted(env)}
 
+    # ── 投递端点（slice-3 D1/D2/D6/D7，spec: prd-delivery「hub 幂等交接端点」）──
+
+    def _deliver_receipt(item: dict, *, duplicate: bool) -> dict:
+        return {
+            "id": item["id"], "project": item["project"], "prd_path": item["prd_path"],
+            "status": item["status"], "deliver_key": item["deliver_key"], "duplicate": duplicate,
+        }
+
+    def _store_or_repair(project: str, filename: str, content: str, sha: str, *, overwrite: bool) -> Path:
+        try:
+            return prd_store.store_prd(
+                lc.cfg.data_root, project, filename, content, declared_sha=sha, overwrite=overwrite,
+            )
+        except prd_store.PrdStoreError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
+
+    @app.post("/deliver")
+    def deliver(body: DeliverBody, request: Request) -> JSONResponse:
+        """vault→hub PRD 交接（state ownership 交接协议）。file-first：先落盘（含 sha
+        校验）再入队；db/文件双层幂等（重复投递回既有项 + 校验落盘完整并补写）；
+        并发撞键 IntegrityError db 层兜底后回重复响应。响应 2xx 即 delivered 回执。"""
+        tok = lc.cfg.deliver_token  # D7：不配 = 内网无守卫；配置则 Bearer 必查
+        if tok is not None:
+            scheme, _, value = request.headers.get("authorization", "").partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(value, tok):
+                raise HTTPException(status_code=401, detail="投递 token 缺失或错误")
+        if len(body.content.encode("utf-8")) > _DELIVER_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="content 超 1MB 上限——拒绝")
+
+        key = f"{body.project}:{body.filename}:{body.sha256}"
+        existing = database.get_item_by_deliver_key(key)
+        if existing is not None:
+            # 幂等回执 + 落盘完整校验（缺失/异容补写回原位——防 db-first 崩溃窗口不可恢复态）
+            target = prd_store.prd_dir(lc.cfg.data_root, body.project) / body.filename
+            if not target.exists() or prd_store.sha256_text(target.read_text(encoding="utf-8")) != body.sha256:
+                _store_or_repair(body.project, body.filename, body.content, body.sha256, overwrite=True)
+            return JSONResponse(_deliver_receipt(existing, duplicate=True), status_code=200)
+
+        target = _store_or_repair(body.project, body.filename, body.content, body.sha256, overwrite=False)
+        try:
+            item_id = engine.enqueue(
+                body.project, str(target), _DELIVER_ENQUEUED_BY, deliver_key=key,
+            )
+        except sqlite3.IntegrityError:
+            # 并发撞键（两请求同键竞态，先者已入队）——db 层兜底后回重复响应
+            winner = database.get_item_by_deliver_key(key)
+            if winner is None:
+                raise HTTPException(status_code=500, detail="撞键后查无既有项——状态不一致") from None
+            return JSONResponse(_deliver_receipt(winner, duplicate=True), status_code=200)
+        return JSONResponse(_deliver_receipt(engine.get_item(item_id), duplicate=False), status_code=201)
+
     # ── 既有三端点（POST /queue 会话优先，2b D5）────────────────────
 
     @app.post("/queue", status_code=201)
@@ -237,6 +303,22 @@ def create_app(
             return queue_view(database, status)
         except ApiInputError as e:
             raise HTTPException(status_code=400, detail=str(e)) from None
+
+    @app.delete("/queue/{item_id}")
+    def delete_queue_item(item_id: int) -> dict:
+        """清队列原语（slice-3 2.5，回退序列 RUNBOOK §15 ③）：仅 pending 可清。
+        清除 = 转终态 failed + last_error 记回退原因（行保留审计，非物理删除）；
+        running 拒绝并提示先 drain（「清 pending」不覆盖 running——双跑撞目标仓
+        branch 命名空间）；done/failed 终态不清（回退序列只清 pending）。"""
+        try:
+            item = engine.get_item(item_id)
+        except db.DBError:
+            raise HTTPException(status_code=404, detail=f"queue_item 不存在：{item_id}") from None
+        if item["status"] != "pending":
+            hint = "——先 drain（等 running 终态或停容器；「清 pending」不覆盖 running）" if item["status"] == "running" else ""
+            raise HTTPException(status_code=409, detail=f"仅 pending 可清（当前 {item['status']}）{hint}")
+        engine.fail_item(item_id, "回退序列人工清除（RUNBOOK §15 ③——服务器投递回退）")
+        return engine.get_item(item_id)
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: int) -> dict:

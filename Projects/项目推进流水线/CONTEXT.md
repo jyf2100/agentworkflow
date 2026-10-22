@@ -138,3 +138,23 @@ _Avoid_: 与「目标仓 worktree」混淆（那是 dev-agent 运行时 clone �
 **执行面 (hub)**:
 服务器集中式部署形态的第三范畴（阶段 2）——[[大脑]]控制面（编排+状态+persona）与目标面（被控项目仓）之外的**执行调度层**。hub/ 骨架（add-hub-skeleton 切片 1）：SQLite 队列（per-project 串行+峰值上限+重派状态机）+ F10 卷上署名 meta（写面钉死仅 meta）+ ContainerRunner 接缝（Fake/Docker 同判，镜像缺失 fail 不回退）+ 最小 API 三端点。只做机械活（排度/署名/记账）；语义活仍归 pa persona。切片 1 单用户 env 直注，身份系统是切片 2 凭据保险箱的替换面。
 _Avoid_: 与控制面混称（hub 不审 PRD 不产报告——它是调度器不是大脑）；当作 pa 的一部分（hub 不 import pa，两部署物零耦合，语义漂移由 spec 把关）；「执行面」与「目标面」互换（目标面是被控项目仓；执行面是起容器的调度层）。
+
+**投递 (Deliver)**:
+PRD state ownership 的跨机交接动作（add-hub-slice-3，F11）——mac cron `--to-stage prd` 产出 PRD 后由 `deliver_prd.py` POST 至 [[执行面 (hub)]]`/deliver`，hub 落盘入队、容器内经既有 inject 桥消费。**delivered 标记**是 vault 视角 PRD 生命周期终点（`produced → delivered` 止步——critic pass/drop/revise 结果在服务器 state，vault 不知道也不需要知道）。执行链权威由 `--to-stage` 取值物理保证（mac 侧根本没有 critic 后半段可跑），非纪律保证。
+_Avoid_: 与 dispatch 混称（dispatch 是控制面本机派发 dev loop 到目标仓；deliver 是跨机交接 PRD 所有权——物理分家后 vault 不再 dispatch）；「投递失败重试」当 run_daily 职责（投递器独立脚本独立退出码，崩溃窗口靠重扫重投+幂等收敛，非进程内重试）。
+
+**deliver_key**:
+投递幂等键 `(project, 文件名, sha256)`——hub 队列项 UNIQUE 列，同一 PRD 重投恰好一个队列项（exactly-once 入队）。与文件层同名同容复用构成 **db/文件双层幂等**：任一层先到，另一层补齐。
+_Avoid_: 当 run 标识（它标识「一份投递内容」，不标识执行——落盘撞名异容时文件带 `-<sha8>` 后缀而 key 不变）；当去重万能键（它只管投递交接；GitHub 远端查重 already_dispatched 是 dispatch 段另一层）。
+
+**投递台账 (deliver_ledger)**:
+vault 侧 append-only 标记台账 `<state_dir>/deliver_ledger.jsonl`——delivered 标记的**唯一写面**（PRD 产出后不可变，标记绝不写进 PRD 文件）。行三态：delivered（2xx 回执后）/ unknown（UNKNOWN 计数行，非终态）/ failed（死信）。半行损坏跳过 = 该 PRD 视为未投递重投（hub 幂等兜底）。
+_Avoid_: 当通用日志（它是扫描幂等的真相源，行形态受三态约束）；扫描时把 unknown 行当已投（UNKNOWN 绝不当成功）。
+
+**死信 (dead letter) 与 error_class**:
+不再自动重投的终态投递记录（ledger failed 行），`error_class` 字段分流运维动作：`config_4xx`（401/403/404/405——token 失配/URL 错/hub 未升级，高声告警 exit 2，修部署）、`data_4xx`（sha 不符/超限/文件名非法，修数据）、`unknown_exhausted`（连续 K=5 次 UNKNOWN，查网络/hub 5xx）。人工修后 `--retry` 显式重投。
+_Avoid_: 把 UNKNOWN 当死信（UNKNOWN 是可恢复态：不写标记下轮重投，只有超限才转死信）；见 exit 2 就去改 PRD（config 类死信批量出现几乎必是部署/凭据错，不是数据错）。
+
+**file-first**:
+hub 落盘顺序钉死：先落盘 PRD（含 sha 校验）再持久化队列项——若 db-first，中间崩溃产生「队列项存在但 PRD 永不补写」不可恢复态。重复投递命中键时校验落盘完整（缺失/异容补写回原位），是双层幂等的文件侧执行点。
+_Avoid_: 当性能优化（是崩溃窗口收敛语义：六窗口全靠重扫重投+双层幂等收敛，零协调机制）。

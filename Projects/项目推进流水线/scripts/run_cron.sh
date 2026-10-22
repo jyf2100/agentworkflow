@@ -74,6 +74,24 @@ export PA_BREAKER_COST_CAP=1.0   # ≈观测值 $0.30 的 3 倍，观察期校�
 #   coordinator.preflight 强制 orchestrator⇒shadow 依赖，orchestrator on 但 shadow off → blocked）。
 # unset / =0 → 仍走 run_daily.py（baseline 不变）。秒回退：unset PA_GRAPH_ORCHESTRATOR 下个 cron
 # 立即回 legacy run_daily（flag off = run_daily 完整保留，graph_pa.py 不被 run_daily import）。
+#
+# ── add-hub-slice-3 物理分家启用样例（注释态——启用是 roc 侧部署动作，本机不替启）──
+# 前置（顺序钉死，见 RUNBOOK §15 部署顺序）：①hub 端点已上服务器 ②pa-executor 镜像
+# 已重建并升 HUB_IMAGE_TAG_DEFAULT（critic prompt 打进镜像，不重建则容器内静默旧 prompt）。
+# 启用 = 同一变更改两处（防双跑窗口）：①下方两臂 --to-stage report → prd（exec 改普通
+# 调用——exec 后脚本终止，投递器须在编排器正常退出后串行跑，D5：先编排后投递）
+# ②追加 deliver_prd.py 调用。样例：
+#   export PA_HUB_URL="http://<hub-host>:8000"
+#   export PA_DELIVER_TOKEN="<与 hub.env HUB_DELIVER_TOKEN 同值>"
+#   if [ "${PA_GRAPH_ORCHESTRATOR:-}" = "1" ]; then
+#       python3 "$VAULT/Projects/项目推进流水线/scripts/graph_pa.py" --to-stage prd
+#   else
+#       python3 "$VAULT/Projects/项目推进流水线/scripts/run_daily.py" --to-stage prd
+#   fi
+#   python3 "$VAULT/Projects/项目推进流水线/scripts/deliver_prd.py"
+# 投递器独立退出码：0=无死信；1=死信（data_4xx/unknown_exhausted）；2=config_4xx（部署/
+# 凭据错高声告警）；3=hub 地址缺失。回退完整五步（停投递→drain→清 pending→回退 cron→
+# 补跑或放弃）见 RUNBOOK §15——「服务器与本机执行互不干扰」不可依赖，须按序回退。
 if [ "${PA_GRAPH_ORCHESTRATOR:-}" = "1" ]; then
     exec python3 "$VAULT/Projects/项目推进流水线/scripts/graph_pa.py" --to-stage report
 else

@@ -12,7 +12,7 @@
 - **THEN** 行为与既有形态逐字节一致（跑到 dispatch 止，report 不跑——默认值本就是 dispatch，非完整 7 段）
 
 ### Requirement: 投递器与 delivered 标记（vault 侧）
-独立投递器 `deliver_prd.py` SHALL 扫描已产出但未投递的 PRD（`produced` 状态），逐个 POST 至 hub 投递端点，仅在收到确定性成功回执（2xx + 队列项标识）后写 delivered 标记。PRD 生命周期在 vault 视角 SHALL 为 `produced → delivered` 止步——critic pass/drop/revise 结果在服务器 state，vault 不知道也不需要知道。投递器 SHALL 幂等可重跑：已 delivered 的 PRD 不再投递。死信行 SHALL 带 `error_class`（`data_4xx` 坏数据 / `config_4xx` 部署或凭据配错），`config_4xx`（401/404/405——token 失配、URL 错、hub 未升级）SHALL 高声告警（stderr + 非零退出），区别于单份坏数据。
+独立投递器 `deliver_prd.py` SHALL 扫描已产出但未投递的 PRD（`produced` 状态），逐个 POST 至 hub 投递端点，仅在收到确定性成功回执（2xx + 队列项标识）后写 delivered 标记。PRD 生命周期在 vault 视角 SHALL 为 `produced → delivered` 止步——critic pass/drop/revise 结果在服务器 state，vault 不知道也不需要知道。投递器 SHALL 幂等可重跑：已 delivered 的 PRD 不再投递。死信行 SHALL 带 `error_class`（`data_4xx` 坏数据 / `config_4xx` 部署或凭据配错），`config_4xx`（401/403/404/405——token 失配/无权限、URL 错、hub 未升级）SHALL 高声告警（stderr + 非零退出），区别于单份坏数据。
 
 #### Scenario: 成功投递写标记
 - **WHEN** 投递器 POST 某未 delivered 的 PRD 且收到 2xx 回执
@@ -23,7 +23,7 @@
 - **THEN** 该 PRD 被扫描跳过，不产生重复 POST
 
 ### Requirement: hub 幂等交接端点
-hub SHALL 提供 `POST /deliver` 投递端点：接收 project、PRD 文件名、sha256 与 PRD 正文，以 `(project, 文件名, sha256)` 为幂等键去重——重复投递 SHALL 返回既有队列项标识而不重复入队（响应可区分首次/重复）。首次投递 SHALL 将 PRD 落盘到 `<卷根>/<project>/prd/<文件名>`（写面约束见 execution-hub F10 ②），落盘成功并经 sha256 校验后创建队列项（队列项 PRD 路径 = 落盘位）——**落盘 MUST 先于队列项持久化**（file-first 顺序钉死：若先入队后落盘，中间崩溃将产生「队列项存在但 PRD 永不补写」的不可恢复态）。重复投递命中幂等键时 SHALL 先校验落盘文件存在且 sha256 一致（缺失或异容则补写/改写落盘）再返回重复响应——文件层与 db 层双层幂等。同文件名已存在且 sha 相同（同名同容）SHALL 幂等复用既有文件、不重写。容器内执行链 SHALL 经既有 inject 桥起跑：队列项 PRD 路径即投递落盘位，派发挂载 `/input/` + `--from-stage inject --inject-prd`（lifecycle 既有机制零改动），inject 段（纯机械、零 LLM）读挂载 PRD、规范化落 `state/prd/<project>/` 标准位并产 `prd_manifest_<stamp>.json`，critic 段经既有 manifest 拾取消费。
+hub SHALL 提供 `POST /deliver` 投递端点：接收 project、PRD 文件名、sha256 与 PRD 正文，以 `(project, 文件名, sha256)` 为幂等键去重——重复投递 SHALL 返回既有队列项标识而不重复入队（响应可区分首次/重复）。首次投递 SHALL 将 PRD 落盘到 `<卷根>/<project>/prd/<文件名>`（写面约束见 execution-hub F10 ②），落盘成功并经 sha256 校验后创建队列项（队列项 PRD 路径 = 落盘位）——**落盘 MUST 先于队列项持久化**（file-first 顺序钉死：若先入队后落盘，中间崩溃将产生「队列项存在但 PRD 永不补写」的不可恢复态）。重复投递命中幂等键时 SHALL 先校验落盘文件存在且 sha256 一致（缺失或异容则补写/改写落盘）再返回重复响应——文件层与 db 层双层幂等。同文件名已存在且 sha 相同（同名同容）SHALL 幂等复用既有文件、不重写。容器内执行链 SHALL 经既有 inject 桥起跑：队列项 PRD 路径即投递落盘位，派发挂载 `/input/` + `--from-stage inject --inject-prd`（lifecycle 既有机制零改动），inject 段（纯机械、零 LLM）读挂载 PRD、规范化落 `state/prd/<project>/` 标准位并产 `prd_manifest_<stamp>.json`，critic 段经既有 manifest 拾取消费。投递入队的队列项 SHALL 以 `enqueued_by="vault-deliver"`（机机通道来源字面量，非人身份）标识来源、`initiator` 留空——派发回落 enqueued_by，故其 meta 署名 initiator 为 `vault-deliver`（机机通道标识，审计面可辨识 vault 投递发起的 run，属 initiator 范畴「人或机机通道标识」的有意扩展）。
 
 #### Scenario: 首次投递落盘入队
 - **WHEN** vault 投递一份新 PRD（project/文件名/sha256/正文）至 `POST /deliver`
@@ -42,7 +42,7 @@ hub SHALL 提供 `POST /deliver` 投递端点：接收 project、PRD 文件名�
 - **THEN** 视为不同 PRD：落盘名追加 `-<sha8>` 后缀（见 execution-hub F10 ② 撞名规则），各建独立队列项
 
 ### Requirement: 投递三态与崩溃窗口收敛
-投递响应 SHALL 遵循三态不变式（fail-safe-dispatch 三态的推广）：**确定性成功**（2xx + 回执）才写 delivered 标记；**UNKNOWN**（超时、连接断、未收响应、5xx 类不可判态）绝不当成功处理——不写标记，下轮重扫重投；**确定性 4xx 拒绝**（sha 不匹配、body 超限、格式坏、401/404/405）SHALL 写死信行不再自动重投（详见投递器 requirement 的 error_class）。UNKNOWN 重投 SHALL 带尝试计数：同一 PRD 连续 UNKNOWN 超 K 次（K=5）SHALL 转 failed 死信行并告警——防确定性 5xx（如 handler bug）无界重投且零持久痕迹（无静默失败）。全部崩溃窗口（①POST 前 ②POST 后未收响应 ③收 200 未写标记 ④hub 收到未落盘 ⑤落队未响应 ⑥落盘成功未入队）SHALL 不需要任何额外协调机制，仅靠「vault 重扫重投 + hub 幂等去重（db 层 deliver_key + 文件层同名同容复用）」收敛至 exactly-once 入队。
+投递响应 SHALL 遵循三态不变式（fail-safe-dispatch 三态的推广）：**确定性成功**（2xx + 回执）才写 delivered 标记；**UNKNOWN**（超时、连接断、未收响应、5xx 类不可判态）绝不当成功处理——不写标记，下轮重扫重投；**确定性 4xx 拒绝**（sha 不匹配、body 超限、格式坏、401/404/405）SHALL 写死信行不再自动重投（详见投递器 requirement 的 error_class）。UNKNOWN 重投 SHALL 带尝试计数：同一 PRD 连续 UNKNOWN 达 K 次（K=5）SHALL 转 failed 死信行并告警——防确定性 5xx（如 handler bug）无界重投且零持久痕迹（无静默失败）。全部崩溃窗口（①POST 前 ②POST 后未收响应 ③收 200 未写标记 ④hub 收到未落盘 ⑤落队未响应 ⑥落盘成功未入队）SHALL 不需要任何额外协调机制，仅靠「vault 重扫重投 + hub 幂等去重（db 层 deliver_key + 文件层同名同容复用）」收敛至 exactly-once 入队。
 
 #### Scenario: UNKNOWN 不标 delivered 下轮重投
 - **WHEN** POST 超时、连接中断或收到 5xx（响应 UNKNOWN）

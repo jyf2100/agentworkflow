@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS queue_items (
     attempt     INTEGER NOT NULL DEFAULT 0,
     enqueued_by TEXT NOT NULL,
     initiator   TEXT,
+    deliver_key TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     last_error  TEXT
@@ -43,7 +44,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_queue_items_status ON queue_items(status);
 CREATE INDEX IF NOT EXISTS idx_runs_item ON runs(queue_item_id);
-"""
+"""  # deliver_key UNIQUE 索引不在此——旧表存在时 executescript 先于 _migrate 跑，索引引用新列会炸；统一在 _migrate 建
 
 
 class DBError(Exception):
@@ -93,6 +94,14 @@ class HubDB:
         if "initiator" not in cols:
             self._conn.execute("ALTER TABLE queue_items ADD COLUMN initiator TEXT")
             self._conn.commit()
+        if "deliver_key" not in cols:  # slice-3 D2：幂等键列（投递交接去重）
+            self._conn.execute("ALTER TABLE queue_items ADD COLUMN deliver_key TEXT")
+            self._conn.commit()
+        # UNIQUE 索引统一在此建（新库/旧库同路径）：旧库补列后全 NULL 建立无冲突
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_items_deliver_key ON queue_items(deliver_key)"
+        )
+        self._conn.commit()
 
     @_locked
     def close(self) -> None:
@@ -103,16 +112,26 @@ class HubDB:
     @_locked
     def enqueue(
         self, project: str, prd_path: str, image_tag: str, enqueued_by: str,
-        initiator: str | None = None,
+        initiator: str | None = None, deliver_key: str | None = None,
     ) -> int:
+        """deliver_key（slice-3 D2）="{project}:{filename}:{sha256}" 投递幂等键；
+        None = 非投递入队（既有 CLI/API 路径，无幂等语义——UNIQUE 对 NULL 不约束）。"""
         ts = _now()
         cur = self._conn.execute(
-            "INSERT INTO queue_items (project, prd_path, image_tag, status, attempt, enqueued_by, initiator, created_at, updated_at)"
-            " VALUES (?,?,?,?,0,?,?,?,?)",
-            (project, prd_path, image_tag, "pending", enqueued_by, initiator, ts, ts),
+            "INSERT INTO queue_items (project, prd_path, image_tag, status, attempt, enqueued_by, initiator, deliver_key, created_at, updated_at)"
+            " VALUES (?,?,?,?,0,?,?,?,?,?)",
+            (project, prd_path, image_tag, "pending", enqueued_by, initiator, deliver_key, ts, ts),
         )
         self._conn.commit()
         return int(cur.lastrowid)
+
+    @_locked
+    def get_item_by_deliver_key(self, deliver_key: str) -> dict | None:
+        """撞键回查（并发投递 IntegrityError 后取既有项返重复响应——handler 2.4 用）。"""
+        row = self._conn.execute(
+            "SELECT * FROM queue_items WHERE deliver_key=?", (deliver_key,)
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     @_locked
     def get_item(self, item_id: int) -> dict:

@@ -32,7 +32,7 @@ vault 与 hub 异机，路径引用无效。body = `{project, filename, sha256, 
 ### D4: 投递三态 = 确定性成功才标记；UNKNOWN 重投（带计数上限）；4xx 死信
 - **2xx + 回执** → 写 ledger delivered；
 - **UNKNOWN**（超时/连接断/未收响应/5xx 类不可判）→ 不标记，下轮重扫重投（spec 钉死）；同一 PRD 连续 UNKNOWN 超 K=5 次 → 转 failed 死信行（error_class=unknown_exhausted）+ 告警——防确定性 5xx（handler bug 等）无界重投且零持久痕迹（无静默失败）；
-- **确定性 4xx 拒绝**（sha 不匹配/body 超限/格式坏/401/404/405）→ 不标记且记 `failed` 死信行（带 `error_class`：`data_4xx` 坏数据 / `config_4xx` 部署或凭据配错——后者高声告警，token 失配或 hub 未升级时批量死信须一眼可辨），不再自动重投，人工修后 `--retry` 显式重投。
+- **确定性 4xx 拒绝**（sha 不匹配/body 超限/格式坏/401/403/404/405）→ 不标记且记 `failed` 死信行（带 `error_class`：`data_4xx` 坏数据 / `config_4xx` 部署或凭据配错——后者高声告警，token 失配或 hub 未升级时批量死信须一眼可辨），不再自动重投，人工修后 `--retry` 显式重投。
 弃案：全部重投（4xx/确定性 5xx 死循环噪声）；全部死信（UNKNOWN 是可恢复的，违背三态不变式）。
 
 ### D5: `--to-stage` = 既有参数复用，部署取值变更（report → prd）

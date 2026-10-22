@@ -1,4 +1,5 @@
 """db.py 单测——队列/_run 两表持久层（add-hub-skeleton 任务 2.1，spec: execution-hub「队列排度」+ D2/A3 重派语义）。"""
+import sqlite3
 from pathlib import Path
 
 import db
@@ -104,3 +105,99 @@ def test_sqlite_multithread_writes_no_deadlock_no_loss(tmp_path):
     t1.start(); t2.start(); t1.join(timeout=30); t2.join(timeout=30)
     assert not errors
     assert len(d.list_items(None)) == 40  # 无丢写
+
+
+# ── add-hub-slice-3 任务 2.1：deliver_key 幂等列（D2）──────────────────
+# 幂等键 "{project}:{filename}:{sha256}" 生命周期 = 队列项生命周期，同表 UNIQUE 索引；
+# 2a/2b 既有库经 _migrate ALTER 补列不丢队列；并发撞键 db 层兜底（IntegrityError），
+# handler（2.4）捕获后查既有项返重复响应——文件层幂等互补（spec: prd-delivery）。
+
+# 2b 既有库 schema：有 initiator 无 deliver_key
+_LEGACY_SCHEMA_2B = """
+CREATE TABLE queue_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL,
+    prd_path    TEXT NOT NULL,
+    image_tag   TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    attempt     INTEGER NOT NULL DEFAULT 0,
+    enqueued_by TEXT NOT NULL,
+    initiator   TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    last_error  TEXT
+);
+"""
+_LEGACY_SCHEMA_2A = _LEGACY_SCHEMA_2B.replace("    initiator   TEXT,\n", "")  # 2a 库：连 initiator 都没有
+
+_KEY = "proj-a:20261022_some-slug.md:%s" % ("ab" * 32)
+
+
+def _legacy_db_with_row(db_file: Path, schema: str) -> None:
+    conn = sqlite3.connect(db_file)
+    conn.executescript(schema)
+    conn.execute(
+        "INSERT INTO queue_items (project, prd_path, image_tag, status, attempt, enqueued_by, created_at, updated_at)"
+        " VALUES ('proj-a','/p/x.md','pa-executor:v1','pending',0,'roc','2026-10-01T00:00:00+00:00','2026-10-01T00:00:00+00:00')"
+    )
+    conn.commit(); conn.close()
+
+
+def _cols(db_file: Path) -> set[str]:
+    conn = sqlite3.connect(db_file)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(queue_items)")}
+    conn.close()
+    return cols
+
+
+def test_deliver_key_column_and_unique_index_on_fresh_db(tmp_path):
+    db_file = tmp_path / "hub.sqlite3"
+    db.HubDB(db_file)
+    cols = _cols(db_file)
+    assert "deliver_key" in cols
+    conn = sqlite3.connect(db_file)
+    idx = {r[1] for r in conn.execute("PRAGMA index_list(queue_items)") if r[2]}  # r[2]=unique
+    conn.close()
+    assert any("deliver_key" in name for name in idx), "deliver_key 须有 UNIQUE 索引（并发撞键 db 层兜底）"
+
+
+def test_migrate_2b_legacy_db_adds_deliver_key_keeps_rows(tmp_path):
+    db_file = tmp_path / "hub.sqlite3"
+    _legacy_db_with_row(db_file, _LEGACY_SCHEMA_2B)
+    d = db.HubDB(db_file)  # 打开即迁移
+    assert "deliver_key" in _cols(db_file)
+    items = d.list_items()
+    assert len(items) == 1 and items[0]["project"] == "proj-a" and items[0]["deliver_key"] is None
+
+
+def test_migrate_2a_legacy_db_chains_both_alters_keeps_rows(tmp_path):
+    db_file = tmp_path / "hub.sqlite3"
+    _legacy_db_with_row(db_file, _LEGACY_SCHEMA_2A)
+    d = db.HubDB(db_file)
+    cols = _cols(db_file)
+    assert "initiator" in cols and "deliver_key" in cols  # 两步链式迁移都到终点
+    assert len(d.list_items()) == 1
+
+
+def test_duplicate_deliver_key_rejected_at_db_layer(tmp_path):
+    d = _open(tmp_path)
+    d.enqueue("proj-a", "/p/x.md", "t", "roc", deliver_key=_KEY)
+    try:
+        d.enqueue("proj-a", "/p/x.md", "t", "roc", deliver_key=_KEY); raised = False
+    except sqlite3.IntegrityError:
+        raised = True
+    assert raised  # 撞键 db 层兜底；handler 捕获后查既有项返重复响应（2.4）
+
+
+def test_get_item_by_deliver_key_roundtrip(tmp_path):
+    d = _open(tmp_path)
+    qid = d.enqueue("proj-a", "/p/x.md", "t", "roc", deliver_key=_KEY)
+    item = d.get_item_by_deliver_key(_KEY)
+    assert item is not None and item["id"] == qid and item["prd_path"] == "/p/x.md"
+    assert d.get_item_by_deliver_key("no:such:key") is None
+
+
+def test_enqueue_without_deliver_key_allows_multiple_nulls(tmp_path):
+    d = _open(tmp_path)
+    d.enqueue("a", "/p1", "t", "u"); d.enqueue("b", "/p2", "t", "u")  # 既有 CLI/API 入队路径零破坏
+    assert len(d.list_items()) == 2  # UNIQUE 索引对 NULL 不约束——非投递入队无幂等键语义

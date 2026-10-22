@@ -23,16 +23,18 @@ class QueueEngine:
     def enqueue(
         self, project: str, prd_path: str, enqueued_by: str,
         image_tag: str | None = None, initiator: str | None = None,
+        deliver_key: str | None = None,
     ) -> int:
         """入队固化 tag（F13）：未显式传 → 取配置默认；写入队列项，派发与 meta 均用记录值。
 
         initiator（2b D4）：会话发起的人读展示名（F10 meta 用）；None = 派发回落
-        enqueued_by（2a 单用户行为）。
+        enqueued_by（2a 单用户行为）。deliver_key（slice-3 D2）：投递幂等键
+        "{project}:{filename}:{sha256}"，None = 非投递入队。
         """
         tag = image_tag if image_tag is not None else self._image_tag_default
         if not tag:
             raise ValueError("image tag 缺失且无配置默认——拒绝入队（MUST NOT 在派发时解析「最新」）")
-        return self._db.enqueue(project, prd_path, tag, enqueued_by, initiator=initiator)
+        return self._db.enqueue(project, prd_path, tag, enqueued_by, initiator=initiator, deliver_key=deliver_key)
 
     def get_item(self, item_id: int) -> dict:
         """队列项公共读面——api/cli 回读经引擎，不穿透 _db（本体论审核 B5）。"""

@@ -33,6 +33,10 @@ MM_CLIENT_SECRET_ENV = "HUB_MM_CLIENT_SECRET"
 SESSION_SECRET_ENV = "HUB_SESSION_SECRET"
 SESSION_TTL_ENV = "HUB_SESSION_TTL_S"
 
+# 可选投递通道 token（add-hub-slice-3 D7）：不配 = 内网无守卫；配置则 POST /deliver
+# 要求 Authorization: Bearer（hmac.compare_digest 线性比较防时序）。
+DELIVER_TOKEN_ENV = "HUB_DELIVER_TOKEN"
+
 
 class ConfigError(Exception):
     """配置缺失/非法——消息只含键名，绝不含凭据值。"""
@@ -55,6 +59,7 @@ class HubConfig:
     mm_client_secret: str | None = None
     session_secret: bytes | None = None      # 与保险箱 master key 分离（spec「签名会话生命周期」）
     session_ttl_s: int = 7 * 86400           # D2：默认 7 天
+    deliver_token: str | None = None         # slice-3 D7：投递通道共享 token（None = 内网无守卫）
 
     def user_env(self) -> dict[str, str]:
         """容器 env-file 内容：三值 + 可选模型路由（与切片 2 保险箱同通道）。"""
@@ -106,4 +111,5 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         mm_client_secret=e.get(MM_CLIENT_SECRET_ENV) or None,
         session_secret=(e.get(SESSION_SECRET_ENV) or "").encode("ascii") or None,
         session_ttl_s=int(e.get(SESSION_TTL_ENV) or auth_mod.DEFAULT_SESSION_TTL_S),
+        deliver_token=e.get(DELIVER_TOKEN_ENV) or None,
     )

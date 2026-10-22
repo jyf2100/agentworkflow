@@ -477,3 +477,32 @@ PY
 - journal 连 `stage_persona_failed` 都为 0 → 核 env 注入链是否生效（cron 非 login shell）；确为 5 周零失败 → 熔丝1 无数据，按默认 N=3 真熔即可（保守值）。
 
 - 回退：注释 `run_cron.sh` 三行，下个 cron 即回 baseline（flag off = 全 no-op 零行为变化）。
+
+## 15. 投递协议运维（add-hub-slice-3，PRD state ownership 交接）
+
+**机制**（F11）：mac cron `--to-stage prd` 只跑前半段（fetch→radar→prd 产出即停），`scripts/deliver_prd.py` 随后串行投递至服务器 hub `POST /deliver`（幂等键 `(project, 文件名, sha256)`，file-first 落盘 `<卷根>/<project>/prd/`）；容器内经既有 inject 桥消费（`--from-stage inject --inject-prd`），critic 起不进 mac——执行链权威物理唯一。vault 视角 PRD 生命周期 `produced → delivered` 止步（critic 结果在服务器 state，vault 不知道也不需要知道）。
+
+**部署顺序（钉死——顺序错会产生双执行窗口）**：
+1. hub 侧先上：拉 main 重启 hub 容器（端点纯新增，不配 token = 内网无守卫，现有调用零影响）；
+2. pa-executor 镜像重建（critic prompt 改动硬依赖）：切 pa repo template tag checkout 作 build context，`docker build` 出新 tag → 服务器 `hub.env` 升 `HUB_IMAGE_TAG_DEFAULT` → 重启 hub。不重建则容器内 critic 仍是旧 prompt（静默不生效）；
+3. mac 侧**同一 cron 变更**一次切换：`run_cron.sh` 里 `--to-stage report` → `--to-stage prd` + 追加 `deliver_prd.py` 调用（物理分家与投递同时生效）。
+
+**token**：`hub.env` 配 `HUB_DELIVER_TOKEN=<random>`（注释态默认无守卫，内网可接受；公网暴露前是硬门槛），mac 侧投递器 env `PA_DELIVER_TOKEN` 传同值、`PA_HUB_URL=http://<hub-host>:<port>`。
+
+**ledger / 死信排查**（`<state_dir>/deliver_ledger.jsonl` append-only，半行损坏自动跳过视为未投递）：
+```bash
+# 死信分布（error_class 一眼分流）
+grep '"failed"' .project-auto/state/deliver_ledger.jsonl | python3 -c "import sys,json,collections; print(collections.Counter(json.loads(l)['error_class'] for l in sys.stdin))"
+```
+- `config_4xx`（401/403/404/405）：部署/凭据错（token 失配、URL 错、hub 未升级）——投递器已高声告警非零退出（exit 2），修 hub 侧后 `--retry` 重投；
+- `data_4xx`（400/413）：单份坏数据（sha 不符/超 1MB/文件名非法）——exit 1，修 PRD 产出后 `--retry`；
+- `unknown_exhausted`：连续 5 次 UNKNOWN（网络/hub 5xx）转死信——排查 hub 后 `--retry`。
+- 退出码：0=无死信；1=有死信；2=config_4xx；3=hub 地址缺失。
+
+**完整回退序列（五步，顺序不可乱——「服务器与本机执行互不干扰」不可依赖，in-flight 双跑仍撞目标仓 branch 命名空间）**：
+1. **停投递**：`run_cron.sh` 注释掉 `deliver_prd.py` 调用行（先停增量）；
+2. **drain running**：等服务器 running 队列项到终态，或停容器（`GET /queue` 看 running；「清 pending」不覆盖 running）；
+3. **清服务器 pending**：逐项 `DELETE /queue/<id>`（2.5 原语——仅 pending 可清，清除 = 转 failed 留审计记录）；
+4. **回退 cron**：`--to-stage prd` → `--to-stage report`（mac 重新全链本机跑）；
+5. **处理当日已投 PRD**：ledger 已 delivered 但服务器未执行的 PRD，于 mac 逐份 `run_daily.py --from-stage inject --inject-prd <落盘副本>` 补跑，**或明确放弃并记录**——不补跑则这些 PRD 两侧都不执行 = 静默丢失。
+   （投递 PRD 的 mac 本机副本即 `state/prd/<project>/` 原产出文件，投递不移动不删改它。）
