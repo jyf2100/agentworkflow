@@ -440,3 +440,40 @@ git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<bra
 - **master key 经 compose env 注入、无轮换工具**：维持（YAGNI——单 key 单机，泄漏概率低且可整箱重录）；后手：真需轮换时做 re-encrypt 工具（新 key 重加密全 vault 记录 + 原子切换），届时同步补 vault-store spec。
 
 - 回退：`docker compose down` 后切片 1 手工形态完整可用（env 兜底保证代码向后兼容；`vault-import` 不必撤销，data 卷属主 chown 回滚无害）。auth 面回退 = hub.env 去掉 MM 四项重启（auth 群 503，队列/派发回到 2a 单用户行为）。
+
+## 14. 段级熔断 PA_BREAKER（pa-hardening P0-1，OBSERVE 灰度）
+
+**机制**（`scripts/stage_breaker.py`，与 §8 的 `circuit_breaker.py` 键空间/journal/调用点均不重叠——那边熔「合入后回退」循环，这边熔「段级 persona 连续失败 + 日成本」）：双熔丝——熔丝1 `PA_BREAKER_N`（默认 3，同段连续失败）+ 熔丝2 `PA_BREAKER_COST_CAP`（美元，当日累计）。状态文件 `<state_dir>/breaker_<stamp>.json`（次日自然重置）；跨日观测面 `<state_dir>/breaker.journal.jsonl`（事件 `stage_breaker_tripped` / `stage_persona_failed`）。真熔 = journal 落事件 + 抛 `CircuitBreakerTripped` → run_daily 写 checkpoint `halted` + exit 3。fail-open：状态损坏不熔（护栏需正向证据）。
+
+**当前状态**：`run_cron.sh` 挂 `PA_BREAKER=1 + PA_BREAKER_OBSERVE=1 + PA_BREAKER_COST_CAP=1.0`（2026-09-15 批准，观察期 1-2 周校准 cap；cap = 观测值 $0.30 的 3 倍）。OBSERVE = fuse 命中只 log + 落 journal 不真熔。**2026-10-22 盘点：超期未收口，数据在 roc 真身机 `.project-auto/`（gitignore 不入仓），须 roc 侧提取后裁决。**
+
+**收口数据提取（roc 真身机 vault 根）**：
+```bash
+# ① 熔丝命中（observe 降级）事件数与样本——真熔后 halt 频率预估
+#    注：journal 惰性创建（零失败即无文件，grep 兜底输出 0）；非 observe 模式下 _trip 的 journal
+#    事件先于状态文件写、fail-open 时状态写失败不熔——计数轻微高估，方向可接受
+grep -c '"stage_breaker_tripped"' .project-auto/state/breaker.journal.jsonl 2>/dev/null || echo 0
+grep '"stage_breaker_tripped"' .project-auto/state/breaker.journal.jsonl 2>/dev/null | tail -3
+# ② 成本分布（熔丝2 cap 校准数据源）——per-stamp 与按天聚合双口径
+#    注：同日手动/恢复重跑 stamp bump（m2/...）各自成 breaker 文件，「当日累计」被碎片化，cap 校准以按天聚合为准
+python3 - <<'PY'
+import json,glob,collections,math
+xs=[json.load(open(p)).get('cost_usd',0) for p in glob.glob('.project-auto/state/breaker_*.json')]
+if not xs: raise SystemExit('无 breaker 状态文件（疑似 env 注入链失效，见判定规则第三条）')
+p95=lambda v:sorted(v)[max(0,math.ceil(.95*len(v))-1)]  # 夹逼取保守高位，小样本不低估
+by_day=collections.defaultdict(float)
+for p in glob.glob('.project-auto/state/breaker_*.json'):
+    by_day[p.split('breaker_')[1][:8]]+=json.load(open(p)).get('cost_usd',0)
+days=sorted(by_day.values())
+print('per-stamp n=%d p50=%.2f p95=%.2f max=%.2f'%(len(xs),sorted(xs)[len(xs)//2],p95(xs),max(xs)))
+print('按天聚合 n=%d p95=%.2f max=%.2f（cap 校准以此为准）'%(len(days),p95(days),max(days)))
+if len(days)<20: print('⚠ 天样本不足 20，p95 仅供方向参考')
+PY
+```
+
+**判定规则 → 收口三选项**（去/留改 flag 均改 `run_cron.sh` 三行）：
+- observe 事件 0 次 且 ② p95 ≪ $1.0 → **选项 A（去 OBSERVE 真熔）**：删 `PA_BREAKER_OBSERVE` 行，`PA_BREAKER_COST_CAP` 收紧至 p95×2 左右。
+- observe 事件频繁 → 真熔会日级 halt：先调 cap/N 再观察一轮（**选项 B**），或判定成本风险可接受走 **选项 C（关 BREAKER 回 baseline）**。
+- journal 连 `stage_persona_failed` 都为 0 → 核 env 注入链是否生效（cron 非 login shell）；确为 5 周零失败 → 熔丝1 无数据，按默认 N=3 真熔即可（保守值）。
+
+- 回退：注释 `run_cron.sh` 三行，下个 cron 即回 baseline（flag off = 全 no-op 零行为变化）。
