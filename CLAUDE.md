@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 这不是一个普通应用仓库，而是 **控制面大脑**（Obsidian vault），同时托管一个自动化的 R&D 编排器。严格的角色划分：
 
-- **vault 根**：大脑（笔记、报告、日报、所有流水线**状态**）。除 `Projects/项目推进流水线/` 外几乎没有可执行代码。
-- **`Projects/项目推进流水线/`**（下称 **pa**）：唯一代码区 —— 全自动研发流水线编排器 + 控制面标准执行器。所有命令、测试、脚本都在这里。
+- **vault 根**：大脑（笔记、报告、日报、所有流水线**状态**）。除下两条代码区外几乎没有可执行代码。
+- **`Projects/项目推进流水线/`**（下称 **pa**）：主力代码区 —— 全自动研发流水线编排器 + 控制面标准执行器。所有命令、测试、脚本都在这里。
+- **`hub/`**：第二代码区 —— 服务器集中式部署的执行 hub（队列 + run 记录 + 容器生命周期，`openspec/specs/execution-hub/`）；驱动 pa-executor 镜像容器化跑 pa（切片 1 骨架已落地，2026-10）。质量门 `bash hub/quality.sh`。
 - **`openspec/`**：规约即设计 —— 用 capability spec + 多轮评审（`docs/reviews/`）驱动变更，而非即兴改代码。改 pa 行为前先看相关 spec。
 - **`docs/reviews/`**：评审记录（add → tasks → r2 → r3 → r3-response 演进），是理解决策「为什么」的入口。
 
@@ -72,7 +73,7 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 - **机械活**（确定性、零 LLM、纯 Python）：今日新文件发现、date-marker、文件读写、去重清单、journal 事件、副作用的 exactly-once reconcile。
 - **语义活**（交给 headless persona）：抽信号 / 翻译 PRD / 对抗审 PRD / 审 dev 产出。
 
-### 7 个 headless persona（`.claude/agents/pa-*.md`）
+### 8 个 headless persona（`.claude/agents/pa-*.md`）
 每个 persona 由编排器经 `claude --agent <persona> -p --output-format json --max-turns N` 链式调用；stdout 是信封 JSON，**两层解析**：`json.loads(stdout)["result"]` 再 `json.loads` 一次得 payload。
 
 | persona | 角色 |
@@ -81,6 +82,7 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 | pa-radar | 信号雷达（抽技术信号 + 比对打分去重） |
 | pa-prd | 信号 × profile → PRD |
 | pa-prd-critic | PRD 对抗质量闸（默认怀疑，只判「有据+可执行」） |
+| pa-progress | dev 内循环方向抽查（每 K=10 turn 判 on_track/off_track；off_track→redirect_hint 纠偏 1 次，连续 2 次止损；由 dev-agent.py 链式调用） |
 | pa-verify | dev 产出验证闸（审 diff + 全量测试，判绿/红，2 次重做机会） |
 
 ### 控制面标准执行器（ADR-0006）
@@ -105,6 +107,10 @@ persona 调用**默认省略 model 参数** → 走 roc LiteLLM 代理默认（`
 - **配置点（canary 覆盖）**：env `PA_*_MODEL` 优先于文件（临时覆盖，仍可经 `~/.claude/settings.json` env block 配，`_load_claude_settings_env` 注入）。优先级 **env > 文件 > roc**。
 
 ## 开发约定
+
+### 部署拓扑（路径真相，2026-10 F3）
+
+vault 是**双 checkout**：运行时真身在 roc mac（`/Users/roc/…`，cron 03:17 + `.project-auto/`（profiles/sources.yaml/state，gitignore 绝不入仓）+ 目标仓 workspace）；本服务器（`/mnt/disk01/…`）是冷的开发/评审 checkout（无 cron、无 `.project-auto`、无目标仓）。文档里的 `/Users/roc/*` 路径指真身机。两 checkout 经 GitHub remote 同步。详见 `Projects/项目推进流水线/RUNBOOK.md` §11。
 
 - **线性 git 历史**（无 merge commits）；rebase 是标准做法，不要用 merge。
 - **ruff 只开 `E9` + `F`**（`line-length=120`, py311）。不要顺手开 E7/E4 风格规则 —— `test_*.py` 的紧凑 `a; b` 写法是有意的，开了会产生大量噪声。

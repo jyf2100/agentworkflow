@@ -412,3 +412,21 @@ git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<bra
 - hub 崩溃恢复：重启即 `reconcile_startup` 对账——容器在跑续跟踪（hub 崩溃不杀容器，docker -d 进程树分离）；已消失按卷上 journal 证据归档（有 journal → run failed 走重派；无 journal → failed_to_start）；卷上孤儿 meta（有 meta 无 journal 且 DB 无记录）补索引 failed_to_start，meta 保留不清理。
 - 重派语义（A3）：容器失败回 pending 保留 attempt 计数（FIFO 保序天然优先），`HUB_MAX_RETRIES` 达上限才转 failed；run 的 failed（容器事实）与队列项的 failed（放弃决定）是两个生命周期。
 - daemon 故障退避（本体论审核 B2）：起容器基础设施异常（如 docker daemon down）→ run 记账 failed_to_start、队列项留 pending；连续失败进冷却（`dispatch_backoff` 默认 3——每 3 tick 重试一次，不逐 tick 记账膨胀 runs 表），daemon 恢复后自动续派；meta 首写保真（written_at 不因重试刷新，各次尝试的时间线在 runs 索引各行 started_at）。镜像缺失（F13）是确定性失败不重试——终态 failed，修环境重新入队。
+
+## 13. hub compose 部署（add-hub-slice-2a 切片 2a，2026-10）
+
+**形态**：pa-hub 以 docker compose 常驻（`hub/deploy/docker-compose.yml`，唯一 service；执行容器是 hub 经 `/var/run/docker.sock` 起的**兄弟容器**，不在 compose 里——D1）。hub 镜像 = thin 独立 Dockerfile（`hub/deploy/Dockerfile`，python:3.11-slim + fastapi/uvicorn/cryptography/pypinyin + docker CLI，与执行镜像零共享层）。排度常驻 = FastAPI 同进程 daemon 线程（`serve.py` 入口，`HUB_TICK_INTERVAL` 默认 5s）。
+
+**部署三步（顺序不可倒——①时 data_root 尚属宿主用户可写，②之后宿主写不进）**：
+1. **vault-import**：宿主 checkout `hub/` 下 `python3 cli.py vault-import --from-env`（env 具备六项必需 + `HUB_VAULT_MASTER_KEY`；master key 生成 `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" > hub/deploy/vault.key && chmod 600 hub/deploy/vault.key`）。确认输出只含字段名不含值；重复执行幂等覆盖。凭据源文件 `hub/deploy/hub.env`（0600）同放 deploy/ 下——**vault.key 与 hub.env 均已 gitignore + dockerignore 钉死，绝不入仓/入镜像层**。
+2. **chown**：`sudo chown -R 1001:1001 /data/pa`（连 vault 一起递归；hub 容器以 `1001:1001` 跑 = 与执行镜像 `pa(uid=1001)` 对齐，**拒 777**）。per-project 启动必读面（`<proj>/profiles/<proj>.yaml` + `<proj>/sources.yaml`）缺则派发 fail fast（补齐重新入队）。
+3. **compose up**：`docker compose -f hub/deploy/docker-compose.yml up -d --build`。执行镜像先手动 build 显式 tag（F13，队列项入队时固化 tag；镜像缺失首派发 fail 暴露，绝不回退 latest）。
+
+**凭据口径（D3）**：派发时 vault 优先（`<data_root>/vault/credentials.json` 单 Fernet token，0600/0700）→ 无该 user 记录降级 hub 进程 env 直注（warn 日志）→ 双缺明确报错（列缺失项）。master key 配了但坏 = 启动即崩，不静默吞成 env-only。
+
+**运维口径**：
+- 优雅退出：`docker compose stop`（SIGTERM → uvicorn lifespan shutdown → daemon 线程完成当前迭代再退；`stop_grace_period: 30s` 兜底）——在跑执行容器不动，重启后 `reconcile_startup` 幂等对账接管。
+- 崩溃自愈：进程内崩溃（exit/OOM/容器内 `kill -9 1`）由 `restart: unless-stopped` 拉起，先 `reconcile_startup` 幂等对账再进排度（2026-10-21 实证：runs 行数不变、无重复派发）。注意 **`docker kill`/`docker stop` 是显式操作，restart 策略不覆盖**——显式停后须手动 `docker start`。
+- socket 权限：hub 以 uid=1001 跑而宿主 `/var/run/docker.sock` 是 `root:docker 0660`——compose `group_add: "${HUB_DOCKER_GID:-999}"` 补宿主 docker 组 gid（本机实测 999；换机核 `stat -c %g /var/run/docker.sock`，可在 hub.env 覆盖）。症状缺失时派发报 connect permission denied。
+- data 卷是**同路径 bind**（`/data/pa:/data/pa`）：hub 容器内生成的 `-v` 源路径被宿主 daemon 按字面解析，内外必须同路径——改挂载点须同改 `HUB_DATA_ROOT`。
+- 回退：`docker compose down` 后切片 1 手工形态完整可用（env 兜底保证代码向后兼容；`vault-import` 不必撤销，data 卷属主 chown 回滚无害）。
