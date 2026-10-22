@@ -7,18 +7,24 @@ from __future__ import annotations
 
 import signal
 import threading
+import types
 
 import daemon
 
 
 class FakeLC:
-    """fake lifecycle：记 tick/reconcile/startup 次数；raise_at 模拟单迭代异常。"""
+    """fake lifecycle：记 tick/reconcile/startup 次数；raise_at 模拟单迭代异常。
+
+    cfg.stale_check_ticks 默认天文数——既有测试零触发陈旧检测（4a 挂点测试单独设小值）。
+    """
 
     def __init__(self):
         self.ticks = 0
         self.reconciles = 0
         self.startups = 0
         self.raise_at: set[int] = set()
+        self.cfg = types.SimpleNamespace(stale_check_ticks=10**9)
+        self.notifier = None
 
     def reconcile_startup(self):
         self.startups += 1
@@ -103,3 +109,28 @@ def test_install_signal_handlers_sets_stop_event():
     finally:
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
+
+
+# ── add-hub-slice-4a 3.2：镜像陈旧检测低频挂点（每 N tick 一次）────────
+
+def test_stale_check_runs_every_n_ticks(monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(daemon.stale_check, "check_stale",
+                        lambda cfg, seen, notifier=None, client=None: calls.append({"seen": seen}))
+    lc, se = FakeLC(), threading.Event()
+    lc.cfg = types.SimpleNamespace(stale_check_ticks=2)  # 每 2 tick 一次
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
+    assert rc == 0 and lc.ticks == 5
+    assert len(calls) == 2  # tick 2 / tick 4 触发；tick 1/3/5 不触发
+    assert calls[0]["seen"] is calls[1]["seen"]  # 去抖集合进程内同一引用（跨周期记忆）
+
+
+def test_stale_check_exception_does_not_kill_loop(monkeypatch):
+    def boom(cfg, seen, notifier=None, client=None):
+        raise RuntimeError("gh 挂了")
+
+    monkeypatch.setattr(daemon.stale_check, "check_stale", boom)
+    lc, se = FakeLC(), threading.Event()
+    lc.cfg = types.SimpleNamespace(stale_check_ticks=1)  # 每 tick 都查 → 必炸
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 3))
+    assert rc == 0 and lc.ticks == 3  # 检测异常只记日志，循环续跑（观察面不崩执行面）

@@ -158,3 +158,15 @@ _Avoid_: 把 UNKNOWN 当死信（UNKNOWN 是可恢复态：不写标记下轮重
 **file-first**:
 hub 落盘顺序钉死：先落盘 PRD（含 sha 校验）再持久化队列项——若 db-first，中间崩溃产生「队列项存在但 PRD 永不补写」不可恢复态。重复投递命中键时校验落盘完整（缺失/异容补写回原位），是双层幂等的文件侧执行点。
 _Avoid_: 当性能优化（是崩溃窗口收敛语义：六窗口全靠重扫重投+双层幂等收敛，零协调机制）。
+
+**通知 (Notify)**:
+hub 观察面的 run 终态事件出口（add-hub-slice-4a，F14）——事件面钉死为 hub DB **自有 run 终态行**（succeeded/failed/failed_to_start），机械读行转发，零 pa 格式依赖；语义事件（critic pass/drop、PR 开出、verify verdict）与无 run 的队列放弃**不在事件面**（归后续切片事件出口）。「至多一次」由挂点结构保证（`_finish_run` 收敛点，无标记列无轮询）；fail-open（通知异常绝不阻断落库与状态机）；零持久写面（丢失兜底是读面查询）。
+_Avoid_: 与 SMTP 简讯混称（那是 vault 侧 report 段动作；hub 通知只认 run 终态行）；「通知失败阻断执行」的直觉（观察面永不阻断执行面——fail-open 是钉死语义）。
+
+**bot 通道 (notify bot)**:
+与 OAuth 2.0 应用（登录身份）分离的**第二个 MM 凭据实体**（F14）——bot token 只司推递，不做登录；未配（或 MM base_url 缺）= 通道关闭零行为。收件人值形态三代分流：enqueued_by 为 26-hex mm_user_id（2b 会话入队）直发 / username（2a env 兜底）经 `users/username/{name}` 解析后发（内存缓存，解析失败可见丢）/ `vault-deliver`（机机字面量）回落 cfg.user_id 走 username 路径。频道广播仅失败类（噪音控制）。
+_Avoid_: bot token 与 OAuth client_secret 混用（两实体两用途，spec 钉死分离）；把 username 解析失败当 bug（是「可见的丢」——stderr 留痕，修法是 MM 侧加 bot 联系人/核对 username）。
+
+**陈旧检测 (stale check)**:
+remote release tag vs `HUB_IMAGE_TAG_DEFAULT` 的周期比对（daemon 每 N tick，F13 推迟项）——remote 查询三态分流对齐 fail-safe 三态不变式：FOUND 参与比对（不一致 → bot 私信 + stderr，去抖一次/组合）；**config_4xx**（repo 配错 404）高声告警绝不静默；UNKNOWN（网络/5xx）不告警下轮再查。告警是唯一动作——**绝不自动拉取或重建镜像**（升级是人工决定）。
+_Avoid_: 给检测加自动 `docker pull` 的「优化」（告警-only 是 spec 钉死语义）；把 404 归 UNKNOWN 静默（配置错使检测整体失效且无人知——slice-3 `_CONFIG_4XX` 同型教训）。

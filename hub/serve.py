@@ -13,6 +13,7 @@ import uvicorn
 import config
 import db
 import lifecycle as lifecycle_mod
+import notify as notify_mod
 import queue_engine
 import runner as runner_mod
 import vault_store
@@ -24,6 +25,8 @@ def build_app(cfg: config.HubConfig | None = None):
 
     未配 master key（VaultKeyMissing）= env-only 合法形态静默落位；配了但坏
     （VaultError 其他）= 明确崩启动，绝不静默吞成 env-only。
+    通知通道（4a D8）：bot token + MM base_url 齐 → 构造 Notifier 注入 Lifecycle
+    （daemon 陈旧检测同引用复用）；缺任一 = None 注入（通道关闭零行为）。
     """
     cfg = cfg or config.load_config()
     database = db.HubDB(cfg.data_root / "hub.sqlite3")
@@ -33,7 +36,8 @@ def build_app(cfg: config.HubConfig | None = None):
     except vault_store.VaultKeyMissing:
         key = None
     vault = vault_store.CredentialVault(cfg.data_root, key) if key is not None else None
-    lc = lifecycle_mod.Lifecycle(database, engine, runner_mod.DockerRunner(), cfg, vault=vault)
+    notifier = notify_mod.build_notifier(cfg)
+    lc = lifecycle_mod.Lifecycle(database, engine, runner_mod.DockerRunner(), cfg, vault=vault, notifier=notifier)
     interval = float(os.environ.get("HUB_TICK_INTERVAL") or 5)
     app = create_app(database, engine, lc, tick_interval=interval)
     return app, lc, cfg

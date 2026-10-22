@@ -6,6 +6,7 @@ from pathlib import Path
 import config
 import db as hub_db
 import lifecycle
+import notify
 import queue_engine as qe
 from runner import FakeRunner
 
@@ -34,14 +35,15 @@ def _boot_inputs(data_root: Path, project: str) -> None:
     (data_root / project / "sources.yaml").write_text("sources: []\n", encoding="utf-8")
 
 
-def _mk(tmp_path: Path, images=None, max_retries: int = 2, boot_inputs: bool = True, vault=None):
+def _mk(tmp_path: Path, images=None, max_retries: int = 2, boot_inputs: bool = True, vault=None, mm=None):
     d = hub_db.HubDB(tmp_path / "h.sqlite3")
     eng = qe.QueueEngine(d, max_containers=2, max_retries=max_retries, image_tag_default="pa-executor:v0.1.3")
     fake = FakeRunner(images=images if images is not None else {"pa-executor:v0.1.3"})
     cfg = config.load_config(_env(tmp_path / "data"))
     if boot_inputs:
         _boot_inputs(tmp_path / "data", "proj-a")
-    lc = lifecycle.Lifecycle(d, eng, fake, cfg, clock=_CLOCK, vault=vault)
+    notifier = notify.Notifier(cfg, mm=mm) if mm is not None else None  # 4a D3：注入式通知（None=关闭）
+    lc = lifecycle.Lifecycle(d, eng, fake, cfg, clock=_CLOCK, vault=vault, notifier=notifier)
     return lc, d, fake, tmp_path / "data"
 
 
@@ -373,4 +375,54 @@ def test_dispatch_meta_initiator_falls_back_to_enqueued_by(tmp_path):
     lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "cli-user")
     assert lc.tick_dispatch() is True
     assert _meta_payload(data)["initiator"] == "cli-user"
+
+
+# ── add-hub-slice-4a 2.6：run 终态通知（D3 挂点 _finish_run；FakeRunner 全离线）──
+
+_MM_ID_A = "a1b2c3d4e5f6a1b2c3d4e5f6a1"  # 26-hex（值形态判据）
+
+
+def test_reconcile_exit_zero_notifies_succeeded(tmp_path):
+    # exited 0 → succeeded 私信发起人（username "roc" 解析路径，消息含 run 标识与终态）
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID_A})
+    lc, d, fake, _ = _mk(tmp_path, mm=mm)
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    lc.tick_dispatch()
+    fake.finish(d.runs_for_item(qid)[0]["container_ref"], exit_code=0)
+    lc.reconcile_running()
+    assert len(mm.dms) == 1
+    recipient, text = mm.dms[0]
+    assert recipient == _MM_ID_A  # username 经解析后直发
+    assert "proj-a" in text and "succeeded" in text and "exit 0" in text
+    assert d.get_item(qid)["status"] == "done"  # 通知不扰动状态机
+    lc.reconcile_running()  # 二次对账：终态行已离开 running 扫描集——至多一次（不重发）
+    assert len(mm.dms) == 1
+
+
+def test_reconcile_exit_nonzero_notifies_failed_with_channel(tmp_path):
+    # exited 非零 → failed 私信 + 频道广播（失败类才广播）——与私信并行互不依赖
+    import dataclasses
+
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID_A})
+    lc, d, fake, _ = _mk(tmp_path, mm=mm)
+    lc.cfg = dataclasses.replace(lc.cfg, project_channels={"proj-a": "chan-1"})
+    lc.notifier = notify.Notifier(lc.cfg, mm=mm)  # 换新 cfg 后重建（频道映射进通知面）
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    lc.tick_dispatch()
+    fake.finish(d.runs_for_item(qid)[0]["container_ref"], exit_code=1)
+    lc.reconcile_running()
+    assert len(mm.dms) == 1 and "failed" in mm.dms[0][1] and "exit 1" in mm.dms[0][1]
+    assert mm.channels == [("chan-1", mm.dms[0][1])]  # 同文广播到项目频道
+
+
+def test_image_missing_notifies_failed_to_start(tmp_path):
+    # ImageMissingError → failed_to_start 通知（消息含缺失 tag，人可定位）+ item 终态 failed
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID_A})
+    lc, d, fake, _ = _mk(tmp_path, images=set(), mm=mm)
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    assert lc.tick_dispatch() is False
+    assert len(mm.dms) == 1
+    text = mm.dms[0][1]
+    assert "failed_to_start" in text and "pa-executor:v0.1.3" in text
+    assert d.get_item(qid)["status"] == "failed"  # F13 终态不受通知影响
 

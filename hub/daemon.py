@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 
+import stale_check
+
 ALERT_AFTER = 3  # 连续异常告警阈值：≥3 次连续失败升 ALERT 级日志（不中断循环）
 
 
@@ -30,12 +32,17 @@ def run_forever(
 
     sleep 可注入（fake clock 测试）。启动对账失败不阻循环（下轮 reconcile_running
     再对）；迭代内不检查 stop_event——当前迭代必然完整收尾（spec「优雅退出不动容器」）。
+
+    4a D6：每 cfg.stale_check_ticks 个 tick 低频跑一次镜像陈旧检测（默认 720 ≈
+    每小时一次）；检测异常记日志续跑（绝不崩排度循环），去抖集合进程内持有。
     """
     try:
         lc.reconcile_startup()
     except Exception as e:  # noqa: BLE001——对账失败也不该杀死常驻进程
         print(f"[daemon][warn] 启动对账异常（继续进循环，后续迭代再对）: {e}", file=sys.stderr)
     consecutive = 0
+    tick = 0
+    stale_seen: set = set()
     while not stop_event.is_set():
         try:
             lc.tick_dispatch()
@@ -45,6 +52,12 @@ def run_forever(
             consecutive += 1
             level = "[daemon][ALERT]" if consecutive >= ALERT_AFTER else "[daemon][warn]"
             print(f"{level} 迭代异常（连续 x{consecutive}）: {e}", file=sys.stderr)
+        tick += 1
+        try:  # M1 防御纵深：modulo 与检测整体兜底——观察面任何异常（含配置异常值）绝不崩排度循环
+            if tick % lc.cfg.stale_check_ticks == 0:
+                stale_check.check_stale(lc.cfg, stale_seen, notifier=lc.notifier)
+        except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
+            print(f"[stale][warn] 陈旧检测异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
         if not stop_event.is_set():
             sleep(interval)
     print(f"[daemon] 优雅退出：当前迭代已收尾，连续异常 {consecutive}（在跑容器不动，重启经对账接管）")

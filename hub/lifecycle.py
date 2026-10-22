@@ -15,6 +15,7 @@ from pathlib import Path
 
 import config
 import db
+import notify
 import queue_engine
 import runner as runner_mod
 import vault_store
@@ -52,6 +53,7 @@ class Lifecycle:
         clock: datetime | None = None,
         dispatch_backoff: int = 3,
         vault: vault_store.CredentialVault | None = None,
+        notifier: notify.Notifier | None = None,
     ):
         self._db = database
         self.engine = engine
@@ -61,6 +63,7 @@ class Lifecycle:
         self._dispatch_backoff = dispatch_backoff  # 0 = 禁用退避；daemon 故障后隔 N tick 再试（B2）
         self._dispatch_cooldown = 0
         self._vault = vault  # None = 未配 master key（切片 1 env-only 合法形态，非降级）
+        self.notifier = notifier  # 4a D3 公开（daemon 陈旧检测复用，cfg 公开先例）：None = 通道关闭零通知
 
     def _credentials(self, user: str | None = None) -> tuple[dict[str, str] | None, str]:
         """凭据来源（2a D3 / 2b D4）：vault 优先 → env 兜底（warn 可见）→ 双缺明确报错。
@@ -90,6 +93,34 @@ class Lifecycle:
         if missing:
             return None, f"vault 与 env 均无必需凭据：缺 {', '.join(missing)}"
         return env, "env"
+
+    # ── run 终态收敛点（4a D3，spec: hub-notifications「run 终态通知」）────
+
+    def _safe_item(self, item_id: int) -> dict | None:
+        """孤儿归档行（queue_item_id=0 / 行已不在）查 item 失败 → None（通知回落 cfg.user_id）。"""
+        try:
+            return self._db.get_item(item_id)
+        except db.DBError:
+            return None
+
+    def _finish_run(
+        self, rid: int, status: str, *, project: str, run_dir_name: str,
+        item: dict | None, exit_code: int | None = None, last_error: str | None = None,
+    ) -> None:
+        """落库 + 通知（4a D3）：五处 set_run_finished 的唯一收敛点——「至多一次」由挂点
+        结构保证（无标记列无轮询）；通知 try/except 全捕获 fail-open，绝不阻断落库
+        与后续状态机（notifier 内部对私信/频道也已各自兜底——此处兜的是构造/组装层）。"""
+        self._db.set_run_finished(rid, status, exit_code)
+        if self.notifier is None:
+            return
+        try:
+            self.notifier.notify_run(
+                run_id=rid, project=project, run_dir_name=run_dir_name, status=status,
+                exit_code=exit_code, enqueued_by=(item or {}).get("enqueued_by"),
+                initiator=(item or {}).get("initiator"), last_error=last_error,
+            )
+        except Exception as e:  # noqa: BLE001——观察面绝不阻断执行面（fail-open）
+            print(f"[notify][warn] run#{rid} {status} 通知失败（fail-open 不阻断）: {type(e).__name__}", file=sys.stderr)
 
     # ── 派发（7.1）───────────────────────────────────────────────
 
@@ -157,11 +188,13 @@ class Lifecycle:
             try:
                 ref = self._runner.start(spec)
             except ImageMissingError as e:
-                self._db.set_run_finished(rid, "failed_to_start")
+                self._finish_run(rid, "failed_to_start", project=project, run_dir_name=run_dir.name,
+                                 item=item, last_error=str(e))
                 self.engine.fail_item(item["id"], str(e))  # F13：终态，修环境后重新入队
                 return False
             except Exception as e:  # daemon 故障等基础设施异常——run 记账，item 保持 pending 重试
-                self._db.set_run_finished(rid, "failed_to_start")
+                self._finish_run(rid, "failed_to_start", project=project, run_dir_name=run_dir.name,
+                                 item=item, last_error=f"起容器异常：{e}")
                 self.engine.note_error(item["id"], f"起容器异常：{e}")
                 self._dispatch_cooldown = self._dispatch_backoff  # 连续失败退避（B2）：冷却期不再逐 tick 记账
                 return False
@@ -182,12 +215,18 @@ class Lifecycle:
             if st.state == "exited":
                 rc = st.exit_code if st.exit_code is not None else 1  # None 不该出现，兜底按失败
                 status = "succeeded" if rc == 0 else "failed"
-                self._db.set_run_finished(run["id"], status, rc)
+                self._finish_run(run["id"], status, exit_code=rc, project=run["project"],
+                                 run_dir_name=Path(run["run_dir"]).name,
+                                 item=self._safe_item(run["queue_item_id"]))
                 self.engine.on_exit(run["queue_item_id"], rc)
             else:  # gone——终态不明，以卷上 journal 证据归档，绝不静默当成功
                 has_journal = _journal_exists(run["run_dir"])
                 status = "failed" if has_journal else "failed_to_start"
-                self._db.set_run_finished(run["id"], status, None)
+                self._finish_run(run["id"], status, project=run["project"],
+                                 run_dir_name=Path(run["run_dir"]).name,
+                                 item=self._safe_item(run["queue_item_id"]),
+                                 last_error="容器记录消失，按卷上 journal 证据归档" if has_journal
+                                 else "容器记录消失且无 journal——归档 failed_to_start")
                 self.engine.on_exit(run["queue_item_id"], 1)
 
     def reconcile_startup(self) -> None:
@@ -218,4 +257,6 @@ class Lifecycle:
         except (OSError, json.JSONDecodeError):
             return  # 坏 meta 不猜——留卷上待人工（fail 暴露但不静默编造终态）
         rid = self._db.create_run(int(payload.get("queue_item_id") or 0), project, str(run_dir))
-        self._db.set_run_finished(rid, "failed_to_start")
+        self._finish_run(rid, "failed_to_start", project=project, run_dir_name=run_dir.name,
+                         item=self._safe_item(int(payload.get("queue_item_id") or 0)),
+                         last_error="孤儿 meta（hub 崩溃窗口），重启对账归档")

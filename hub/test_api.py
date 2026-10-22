@@ -6,6 +6,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
+import auth
 import config
 import db as hub_db
 import queue_engine as qe
@@ -310,4 +311,37 @@ def test_delete_queue_rejects_running_and_terminal_and_missing(tmp_path):
     done_qid = eng.enqueue("proj-b", str(prd), "roc")
     d.set_item_status(done_qid, "done")
     assert client.delete(f"/queue/{done_qid}").status_code == 409  # 终态不清（回退序列只清 pending）
+    assert client.delete("/queue/999").status_code == 404
+
+
+# ── 读面守卫（add-hub-slice-4a 1.2，spec: execution-hub delta「读面会话守卫」）──
+
+_MM_ENV = {  # auth 已配置态（mm_configured=True）——守卫生效前提
+    "HUB_MM_BASE_URL": "https://mm.example.com",
+    "HUB_MM_CLIENT_ID": "cid", "HUB_MM_CLIENT_SECRET": "sec",
+    "HUB_SESSION_SECRET": "S" * 43,
+}
+
+
+def test_read_endpoints_guarded_when_auth_configured(tmp_path):
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    # 无会话：三端点 401（GET 两读面 + DELETE 回退原语）
+    assert client.get("/queue").status_code == 401
+    assert client.get("/runs/1").status_code == 401
+    assert client.delete("/queue/1").status_code == 401
+    # 有效会话（sign_token 直造，不走 OAuth 流）：守卫放行走到路由层
+    tok = auth.sign_token(
+        {"mm_user_id": "abc123def456abc123def456ab", "username": "zhang3"},
+        lc.cfg.session_secret, ttl_s=60,
+    )
+    client.cookies.set(auth.SESSION_COOKIE, tok)
+    assert client.get("/queue").status_code == 200
+    assert client.get("/runs/999").status_code == 404  # 守卫放行后正常 404（非 401）
+    assert client.delete("/queue/999").status_code == 404
+
+
+def test_read_endpoints_unguarded_when_auth_unconfigured(tmp_path):
+    client, *_ = _mk(tmp_path)  # 无 MM env = 2a 回退态：守卫零变化
+    assert client.get("/queue").status_code == 200
+    assert client.get("/runs/999").status_code == 404
     assert client.delete("/queue/999").status_code == 404

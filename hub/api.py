@@ -154,6 +154,12 @@ def create_app(
                 detail="auth 未配置（需 HUB_MM_BASE_URL / HUB_MM_CLIENT_ID / HUB_MM_CLIENT_SECRET / HUB_SESSION_SECRET）",
             )
 
+    def _require_session(request: Request) -> None:
+        """读面守卫（add-hub-slice-4a D1，F2 收紧）：auth 已配置态强制有效会话；
+        未配置回退态跳过检查（2a 单用户形态零变化——守卫强度跟随 auth 配置面）。"""
+        if auth.mm_configured(lc.cfg) and _session_identity(request) is None:
+            raise HTTPException(status_code=401, detail="读面须有效会话（auth 已配置态）——先 /auth/authorize 登录")
+
     @app.get("/auth/authorize")
     def auth_authorize(request: Request):
         _require_configured()
@@ -298,18 +304,20 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e)) from None
 
     @app.get("/queue")
-    def list_queue(status: str | None = None) -> list[dict]:
+    def list_queue(request: Request, status: str | None = None) -> list[dict]:
+        _require_session(request)
         try:
             return queue_view(database, status)
         except ApiInputError as e:
             raise HTTPException(status_code=400, detail=str(e)) from None
 
     @app.delete("/queue/{item_id}")
-    def delete_queue_item(item_id: int) -> dict:
+    def delete_queue_item(item_id: int, request: Request) -> dict:
         """清队列原语（slice-3 2.5，回退序列 RUNBOOK §15 ③）：仅 pending 可清。
         清除 = 转终态 failed + last_error 记回退原因（行保留审计，非物理删除）；
         running 拒绝并提示先 drain（「清 pending」不覆盖 running——双跑撞目标仓
         branch 命名空间）；done/failed 终态不清（回退序列只清 pending）。"""
+        _require_session(request)
         try:
             item = engine.get_item(item_id)
         except db.DBError:
@@ -321,7 +329,8 @@ def create_app(
         return engine.get_item(item_id)
 
     @app.get("/runs/{run_id}")
-    def get_run(run_id: int) -> dict:
+    def get_run(run_id: int, request: Request) -> dict:
+        _require_session(request)
         detail = run_detail(database, run_id)
         if detail is None:
             raise HTTPException(status_code=404, detail=f"run 不存在：{run_id}")

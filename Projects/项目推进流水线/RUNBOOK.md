@@ -506,3 +506,26 @@ grep '"failed"' .project-auto/state/deliver_ledger.jsonl | python3 -c "import sy
 4. **回退 cron**：`--to-stage prd` → `--to-stage report`（mac 重新全链本机跑）；
 5. **处理当日已投 PRD**：ledger 已 delivered 但服务器未执行的 PRD，于 mac 逐份 `run_daily.py --from-stage inject --inject-prd <落盘副本>` 补跑，**或明确放弃并记录**——不补跑则这些 PRD 两侧都不执行 = 静默丢失。
    （投递 PRD 的 mac 本机副本即 `state/prd/<project>/` 原产出文件，投递不移动不删改它。）
+
+## 16. 通知与陈旧检测（add-hub-slice-4a 切片 4a，2026-10）
+
+hub 观察面三件套：读面会话守卫 + MM 通知 bot + 镜像陈旧检测（spec: `openspec/specs/`（归档后）hub-notifications / execution-hub delta）。全离线可测，真机联调项见下。
+
+**bot 创建（前置）**：MM 管理员在 系统控制台 → 集成 → Bot 帐号 新建 bot（独立于 OAuth 2.0 应用的第二个凭据实体——登录归 OAuth app，推通知归 bot token）。记下 bot token；每个要收通知的用户需把 bot 加为 DM 联系人（否则 DM 推递失败——fail-open 只留 stderr warn，不重试）。
+
+**env 填值（hub.env）**：
+- `HUB_MM_BOT_TOKEN`：bot token（与 `HUB_MM_BASE_URL` 齐才生效）；
+- `HUB_MM_PROJECT_CHANNELS=proj:chan-id,...`：可选失败广播频道（仅 failed/failed_to_start；chan-id 是频道 id 非名字）；
+- `HUB_IMAGE_TEMPLATE_REPO=owner/repo`：陈旧检测比对源（不配 = 关闭）；`HUB_STALE_CHECK_TICKS` 默认 720（≈5s tick 每小时一查）。
+
+**两级回退**：只 unset `HUB_MM_BOT_TOKEN` = 通知静默（读面守卫不变——bot 通道与 auth 独立）；连 MM 四项（BASE_URL/CLIENT_ID/CLIENT_SECRET/SESSION_SECRET）也 unset = 整体回 2a 回退态（读面守卫同退、auth 群 503）。读面守卫强度跟随 auth 配置面，无独立开关。
+
+**MM 真机联调项**（离线测试覆盖不了的面）：
+1. bot DM 两步 API（`/channels/direct` 建 channel → `/posts` 发帖）对本 MM 版本的行为；
+2. `users/username/{name}` 解析真实 username（cfg.user_id 形态如 "roc"）；
+3. OAuth 会话用户（enqueued_by=26-hex mm_user_id）直发路径；
+4. 频道 id 有效性（坏 id → post 失败 fail-open warn，无广播）。
+
+**陈旧检测语义**：差异（remote ≠ `HUB_IMAGE_TAG_DEFAULT`）→ bot 私信 + stderr 告警一次/组合（去抖，重启重告）；repo 404 → stderr 高声（配置错，不修则检测整体失效）；网络错/5xx → 静默下轮再查。**hub 绝不自动拉取或重建镜像**——升级是人工决定（重建流程见 §15 部署顺序第 2 步）。
+
+**读面守卫（顺带，F2 收紧）**：auth 已配置态下 `GET /queue`、`GET /runs/{id}`、`DELETE /queue/{item_id}` 须有效会话（401 否则）；未配置回退态三端点无守卫（2a 零变化）。CLI（`cli.py`）走函数直调不经 HTTP——守卫不影响 CLI 双皮。

@@ -77,3 +77,40 @@ def test_user_env_three_values_plus_model():
     assert env["ANTHROPIC_MODEL"] == "glm-5.2"
     # 未设模型路由时不含该键（镜像中立——roc 特定形态运行时注入）
     assert "ANTHROPIC_MODEL" not in config.load_config(_full_env()).user_env()
+
+
+# ── 通知面 env（add-hub-slice-4a 4.1，spec: hub-notifications）──
+
+def test_notification_env_defaults_closed():
+    cfg = config.load_config(_full_env())  # 全不配 = 各能力关闭零行为
+    assert cfg.mm_bot_token is None
+    assert cfg.project_channels == {}
+    assert cfg.image_template_repo is None
+    assert cfg.stale_check_ticks == config.DEFAULT_STALE_CHECK_TICKS
+
+
+def test_notification_env_parsed():
+    cfg = config.load_config(_full_env(
+        HUB_MM_BOT_TOKEN="bot-tok",
+        HUB_MM_PROJECT_CHANNELS="proj-a:chan1, proj-b:chan2",
+        HUB_IMAGE_TEMPLATE_REPO="newland/pa-executor",
+        HUB_STALE_CHECK_TICKS="10",
+    ))
+    assert cfg.mm_bot_token == "bot-tok"
+    assert cfg.project_channels == {"proj-a": "chan1", "proj-b": "chan2"}
+    assert cfg.image_template_repo == "newland/pa-executor"
+    assert cfg.stale_check_ticks == 10
+
+
+def test_stale_check_ticks_invalid_rejected():
+    # M1（审核）：0 炸 daemon modulo、负数令检测静默关闭——fail fast 启动拦
+    for bad in ("0", "-1", "abc"):
+        with pytest.raises(config.ConfigError):
+            config.load_config(_full_env(HUB_STALE_CHECK_TICKS=bad))
+
+
+def test_project_channels_bad_segments_skipped(capsys):
+    # 坏段（无冒号/空值）跳过不崩启动，warn 可见（观察面配错不崩、不静默）
+    got = config.parse_project_channels("ok:chan1, badseg, :empty, proj:")
+    assert got == {"ok": "chan1"}
+    assert "坏段" in capsys.readouterr().err

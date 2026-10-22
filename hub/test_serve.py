@@ -48,3 +48,23 @@ def test_build_app_bad_key_raises_not_silent(tmp_path, monkeypatch):
     monkeypatch.setenv("HUB_VAULT_MASTER_KEY", "not-a-fernet-key")  # 配了但坏
     with pytest.raises(vault_store.VaultError, match="master key 非法"):
         serve.build_app()  # 明确崩启动——绝不静默吞成 env-only
+
+
+# ── add-hub-slice-4a 4.2：通知通道装配（D8 两级回退之一级）────────
+
+def test_build_app_notifier_none_without_bot_token(tmp_path, monkeypatch):
+    for k, v in _env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("HUB_VAULT_MASTER_KEY", raising=False)
+    monkeypatch.delenv("HUB_MM_BOT_TOKEN", raising=False)
+    app, lc, cfg = serve.build_app()
+    assert lc.notifier is None  # 未配 bot token = 通道关闭（run 终态照常落库零通知）
+
+
+def test_build_app_notifier_mounted_with_bot_token_and_base_url(tmp_path, monkeypatch):
+    for k, v in _env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("HUB_MM_BASE_URL", "https://mm.example.com")
+    monkeypatch.setenv("HUB_MM_BOT_TOKEN", "bot-tok")
+    app, lc, cfg = serve.build_app()
+    assert lc.notifier is not None  # bot token + base_url 齐 = Notifier 注入（daemon 陈旧检测同引用）
