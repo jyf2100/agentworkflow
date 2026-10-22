@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+import auth as auth_mod
+
 # 必需 env（缺失即拒绝启动——不静默降级）；凭据三值 + 镜像默认 tag + 数据卷根 + 单用户标识
 REQUIRED_KEYS = (
     "HUB_USER_ID",
@@ -22,6 +24,14 @@ REQUIRED_KEYS = (
 )
 DEFAULT_MAX_CONTAINERS = 3
 DEFAULT_MAX_RETRIES = 2
+
+# 可选 auth env（add-hub-slice-2b）：不配 = auth 群 503「未配置」，其余端点零影响
+#（2a 形态即回退态）。四项齐（auth.mm_configured）auth 群才可用。
+MM_BASE_URL_ENV = "HUB_MM_BASE_URL"
+MM_CLIENT_ID_ENV = "HUB_MM_CLIENT_ID"
+MM_CLIENT_SECRET_ENV = "HUB_MM_CLIENT_SECRET"
+SESSION_SECRET_ENV = "HUB_SESSION_SECRET"
+SESSION_TTL_ENV = "HUB_SESSION_TTL_S"
 
 
 class ConfigError(Exception):
@@ -39,6 +49,12 @@ class HubConfig:
     data_root: Path                 # 数据卷根（服务器 /data/pa 同构约定）
     max_containers: int             # 跨项目并行峰值上限（design doc §2：峰值 5-10 可配）
     max_retries: int                # 单队列项重派上限（0=一次失败即放弃，A3）
+    # auth 可选面（2b D7/D8）：None = 未配置（auth 群 503，2a 形态照跑）
+    mm_base_url: str | None = None
+    mm_client_id: str | None = None
+    mm_client_secret: str | None = None
+    session_secret: bytes | None = None      # 与保险箱 master key 分离（spec「签名会话生命周期」）
+    session_ttl_s: int = 7 * 86400           # D2：默认 7 天
 
     def user_env(self) -> dict[str, str]:
         """容器 env-file 内容：三值 + 可选模型路由（与切片 2 保险箱同通道）。"""
@@ -85,4 +101,9 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         data_root=Path(e["HUB_DATA_ROOT"]),
         max_containers=max_containers,
         max_retries=max_retries,
+        mm_base_url=e.get(MM_BASE_URL_ENV) or None,
+        mm_client_id=e.get(MM_CLIENT_ID_ENV) or None,
+        mm_client_secret=e.get(MM_CLIENT_SECRET_ENV) or None,
+        session_secret=(e.get(SESSION_SECRET_ENV) or "").encode("ascii") or None,
+        session_ttl_s=int(e.get(SESSION_TTL_ENV) or auth_mod.DEFAULT_SESSION_TTL_S),
     )

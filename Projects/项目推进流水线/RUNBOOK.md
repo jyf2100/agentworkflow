@@ -430,4 +430,13 @@ git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<bra
 - socket 权限：hub 以 uid=1001 跑而宿主 `/var/run/docker.sock` 是 `root:docker 0660`——compose `group_add: "${HUB_DOCKER_GID:-999}"` 补宿主 docker 组 gid（本机实测 999；换机核 `stat -c %g /var/run/docker.sock`，可在 hub.env 覆盖）。症状缺失时派发报 connect permission denied。
 - data 卷是**同路径 bind**（`/data/pa:/data/pa`）：hub 容器内生成的 `-v` 源路径被宿主 daemon 按字面解析，内外必须同路径——改挂载点须同改 `HUB_DATA_ROOT`。属主不对齐（漏 chown）的症状：每个 tick 日志刷 `[daemon][ALERT]` PermissionError、队列项永留 pending 无终态——核 `ls -ln /data/pa` 属主是否 1001，补跑三步②。
 
-- 回退：`docker compose down` 后切片 1 手工形态完整可用（env 兜底保证代码向后兼容；`vault-import` 不必撤销，data 卷属主 chown 回滚无害）。
+**MM OAuth 身份（2b，可选面）**：MM 做 IdP（不新建用户系统），hub 发自包含 HMAC 签名会话 cookie（重启/MM 宕机会话不丢；`HUB_SESSION_SECRET` 与 vault master key 分离）。启用前置：MM 管理员在 **系统控制台 → 集成 → OAuth 2.0 应用** 注册 confidential client，**redirect_uri 填 `http://<hub-host>:<port>/auth/callback`**（与部署可达地址严格一致）；`hub.env` 补四项（见 `hub/deploy/hub.env.example`）：`HUB_MM_BASE_URL` / `HUB_MM_CLIENT_ID` / `HUB_MM_CLIENT_SECRET` / `HUB_SESSION_SECRET`（`openssl rand -base64 32`；可选 `HUB_SESSION_TTL_S` 默认 7d）。**四项全不配 = 2a 单用户回退态**（auth 群 503、`POST /queue` 走 `HUB_USER_ID` 兜底，零行为变化）。
+
+- 登录流：`GET /auth/authorize` →（MM 授权页）→ `GET /auth/callback` 发会话 → `GET /auth/me` 确认。登录后本人 `PUT /auth/credentials` 录凭据入保险箱（key = mm_user_id；响应只含字段名不回显值）。会话入队时 `enqueued_by=mm_user_id`（vault 解密 key）、`initiator=username`（meta 人读署名）；该用户未录凭据 = 派发降级 hub env + warn。
+- auth 排障：**503** = MM 四项未配全（或 `PUT /auth/credentials` 时 `HUB_VAULT_MASTER_KEY` 未配）；**400 state** = 授权往返超 10 min 或非同浏览器发起（state 签名短期 cookie 校验）；**401** = 无有效会话（未登录/已 `GET /auth/logout`/cookie 过期，重登即可）；**502** = MM token 端点/`users/me` 拒绝或宕机（查 MM 侧 client_secret 与可用性）。
+
+**F2 复审结论（2b D6，2026-10-22 两笔均维持现状）**：
+- **socket 挂载等效 root**：维持（内网单机形态成本最优）；**公网/多租户暴露前必须加 socket proxy（如 docker-socket-proxy 白名单化 API 面）**，此项为暴露硬门槛，不是可选优化。
+- **master key 经 compose env 注入、无轮换工具**：维持（YAGNI——单 key 单机，泄漏概率低且可整箱重录）；后手：真需轮换时做 re-encrypt 工具（新 key 重加密全 vault 记录 + 原子切换），届时同步补 vault-store spec。
+
+- 回退：`docker compose down` 后切片 1 手工形态完整可用（env 兜底保证代码向后兼容；`vault-import` 不必撤销，data 卷属主 chown 回滚无害）。auth 面回退 = hub.env 去掉 MM 四项重启（auth 群 503，队列/派发回到 2a 单用户行为）。

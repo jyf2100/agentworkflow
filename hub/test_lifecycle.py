@@ -327,3 +327,50 @@ def test_dispatch_env_file_content_from_vault(tmp_path, monkeypatch):
     monkeypatch.setattr(lifecycle, "env_file", lambda env: (captured.update(env), orig(env))[1])
     assert lc.tick_dispatch() is True
     assert captured == _VAULT_ENV  # env-file 写入内容实证来自保险箱
+
+
+# ── 3.3 派发链贯通（2b D4/D5：会话用户入队 → vault 按 mm_user_id 解密 + meta initiator=username）──
+
+_MM_ID = "mmid-xyz"
+
+
+def _capture_env(monkeypatch) -> dict:
+    captured: dict = {}
+    orig = lifecycle.env_file
+    monkeypatch.setattr(lifecycle, "env_file", lambda env: (captured.update(env), orig(env))[1])
+    return captured
+
+
+def _meta_payload(data: Path, project: str = "proj-a") -> dict:
+    meta = data / project / "state" / "runs" / project / "20261021_my-feature" / "20261021_my-feature.meta.json"
+    return json.loads(meta.read_text(encoding="utf-8"))
+
+
+def test_dispatch_session_user_vault_and_meta_initiator(tmp_path, monkeypatch):
+    # 会话用户入队（enqueued_by=mm_user_id、initiator=username）→ 凭据按 mm_user_id
+    # 查保险箱（该用户登录后自录的记录），meta initiator=username（人读名）
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {_MM_ID: _VAULT_ENV}))
+    lc.engine.enqueue("proj-a", str(_prd(tmp_path)), _MM_ID, initiator="zhang3")
+    captured = _capture_env(monkeypatch)
+    assert lc.tick_dispatch() is True
+    assert captured == _VAULT_ENV  # 解密的是 mm_user_id 的记录，不是 cfg.user_id
+    assert _meta_payload(data)["initiator"] == "zhang3"
+
+
+def test_dispatch_session_user_no_vault_record_falls_back_env(tmp_path, monkeypatch, capsys):
+    # 该用户未录凭据（vault 无记录）→ 降级 hub 进程 env + warn 点名 user（可追溯）
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {}))  # 空保险箱
+    lc.engine.enqueue("proj-a", str(_prd(tmp_path)), _MM_ID, initiator="zhang3")
+    captured = _capture_env(monkeypatch)
+    assert lc.tick_dispatch() is True
+    assert captured == lc.cfg.user_env()  # env 兜底（2a 同通道）
+    assert _MM_ID in capsys.readouterr().err  # warn 点名降级用户
+
+
+def test_dispatch_meta_initiator_falls_back_to_enqueued_by(tmp_path):
+    # 无 initiator（2a 形态入队/CLI）→ meta initiator=enqueued_by（D4 回落，非 cfg.user_id）
+    lc, d, fake, data = _mk(tmp_path)
+    lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "cli-user")
+    assert lc.tick_dispatch() is True
+    assert _meta_payload(data)["initiator"] == "cli-user"
+

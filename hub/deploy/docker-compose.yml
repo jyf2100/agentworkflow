@@ -25,6 +25,7 @@ services:
     env_file:
       - hub.env                # 0600、gitignore：HUB_USER_ID + 三值 + HUB_IMAGE_TAG_DEFAULT
                                # + HUB_VAULT_MASTER_KEY（vault.key 内容；不配 = env-only 兜底形态）
+                               # + MM OAuth 四项（2b，不配 = auth 群 503 单用户回退态；见 hub.env.example）
     environment:
       HUB_DATA_ROOT: /data/pa
       HUB_TICK_INTERVAL: "5"

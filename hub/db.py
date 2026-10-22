@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS queue_items (
     status      TEXT NOT NULL CHECK (status IN ('pending','running','done','failed')),
     attempt     INTEGER NOT NULL DEFAULT 0,
     enqueued_by TEXT NOT NULL,
+    initiator   TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     last_error  TEXT
@@ -84,6 +85,14 @@ class HubDB:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """既有库补列（2b initiator：2a 库升级不丢队列——CREATE IF NOT EXISTS 不加列）。"""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(queue_items)")}
+        if "initiator" not in cols:
+            self._conn.execute("ALTER TABLE queue_items ADD COLUMN initiator TEXT")
+            self._conn.commit()
 
     @_locked
     def close(self) -> None:
@@ -92,12 +101,15 @@ class HubDB:
     # ── queue_items ────────────────────────────────────────────────
 
     @_locked
-    def enqueue(self, project: str, prd_path: str, image_tag: str, enqueued_by: str) -> int:
+    def enqueue(
+        self, project: str, prd_path: str, image_tag: str, enqueued_by: str,
+        initiator: str | None = None,
+    ) -> int:
         ts = _now()
         cur = self._conn.execute(
-            "INSERT INTO queue_items (project, prd_path, image_tag, status, attempt, enqueued_by, created_at, updated_at)"
-            " VALUES (?,?,?,?,0,?,?,?)",
-            (project, prd_path, image_tag, "pending", enqueued_by, ts, ts),
+            "INSERT INTO queue_items (project, prd_path, image_tag, status, attempt, enqueued_by, initiator, created_at, updated_at)"
+            " VALUES (?,?,?,?,0,?,?,?,?)",
+            (project, prd_path, image_tag, "pending", enqueued_by, initiator, ts, ts),
         )
         self._conn.commit()
         return int(cur.lastrowid)

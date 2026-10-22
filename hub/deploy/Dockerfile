@@ -11,8 +11,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# 运行依赖（对齐 hub/quality.sh 清单 + uvicorn/cryptography；httpx 仅测试依赖不入镜像）
-RUN pip install --no-cache-dir fastapi uvicorn cryptography pypinyin
+# 运行依赖（对齐 hub/quality.sh 清单 + uvicorn/cryptography；httpx 2b 起为运行依赖——
+# MM OAuth2 出站调用，2a 时期曾标「仅测试」已翻案，见 add-hub-slice-2b D3/D8）
+RUN pip install --no-cache-dir fastapi uvicorn cryptography pypinyin httpx
 
 COPY . /opt/hub
 WORKDIR /opt/hub

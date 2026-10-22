@@ -62,23 +62,26 @@ class Lifecycle:
         self._dispatch_cooldown = 0
         self._vault = vault  # None = 未配 master key（切片 1 env-only 合法形态，非降级）
 
-    def _credentials(self) -> tuple[dict[str, str] | None, str]:
-        """凭据来源（2a D3）：vault 优先 → env 兜底（warn 可见）→ 双缺明确报错。
+    def _credentials(self, user: str | None = None) -> tuple[dict[str, str] | None, str]:
+        """凭据来源（2a D3 / 2b D4）：vault 优先 → env 兜底（warn 可见）→ 双缺明确报错。
 
-        vault 配了但无该 user 记录 = 降级 env，warn stderr 可追溯；vault 未配置 =
-        切片 1 env-only 合法形态，不 warn。返回 (env 字典, 来源)；双缺/保险箱坏 →
-        (None, 缺失说明)——调用方 fail fast，绝不空值注入。
+        user（2b）= 队列项 enqueued_by（会话用户 = mm_user_id）；缺省 cfg.user_id
+        （2a 单用户行为零变化）。vault 配了但无该 user 记录 = 降级 env，warn stderr
+        可追溯；vault 未配置 = 切片 1 env-only 合法形态，不 warn。返回
+        (env 字典, 来源)；双缺/保险箱坏 → (None, 缺失说明)——调用方 fail fast，
+        绝不空值注入。
         """
+        user = user or self.cfg.user_id
         if self._vault is not None:
             try:
-                rec = self._vault.get_user_env(self.cfg.user_id)
+                rec = self._vault.get_user_env(user)
             except vault_store.VaultError as e:
                 return None, f"保险箱读取失败：{e}"
             if rec is not None:
                 missing = [k for k in vault_store.VAULT_REQUIRED_KEYS if not rec.get(k)]
                 return (rec, "vault") if not missing else (None, f"保险箱记录缺必需字段：{', '.join(missing)}")
             print(
-                f"[warn] 保险箱无 user={self.cfg.user_id} 记录——降级 hub 进程 env 直注"
+                f"[warn] 保险箱无 user={user} 记录——降级 hub 进程 env 直注"
                 f"（spec: execution-hub「单用户凭据来源」）",
                 file=sys.stderr,
             )
@@ -121,7 +124,7 @@ class Lifecycle:
                 f"（存在={sources_file.is_file()}）——补齐后重新入队",
             )
             return False
-        user_env, cred_msg = self._credentials()
+        user_env, cred_msg = self._credentials(item["enqueued_by"])  # 2b D4：按队列项发起人取凭据
         if user_env is None:  # 双缺/保险箱坏——fail fast 不空值注入（spec scenario「缺凭据明确报错」）
             self.engine.fail_item(item["id"], f"凭据缺失（不静默空值注入）：{cred_msg}")
             return False
@@ -134,7 +137,8 @@ class Lifecycle:
         try:
             sign_meta(
                 run_dir, stamp, slug,
-                initiator=self.cfg.user_id, queue_item_id=item["id"],
+                initiator=item.get("initiator") or item["enqueued_by"],  # 2b D4：会话人读名，无则回落队列项发起人
+                queue_item_id=item["id"],
                 image_tag=item["image_tag"], now=now,
             )
         except MetaSignError as e:
