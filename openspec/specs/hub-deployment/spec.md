@@ -7,11 +7,15 @@ hub 的 docker compose 部署形态与运维口径。
 ## Requirements
 
 ### Requirement: compose 单常驻服务
-hub SHALL 以 docker compose 部署：唯一常驻 service 为 pa-hub（build context = vault `hub/`，thin 镜像：Python + API/daemon 依赖 + docker CLI）。pa-hub MUST 挂载 `/var/run/docker.sock`（起兄弟执行容器）与 data 卷根；执行容器 MUST NOT 出现在 compose service 定义中（每 run 动态挂载/env-file/stamp 由 hub 经 docker run 生成，静态 service 表达不了；执行镜像存在性由 F13 手动 build + hub image_exists fail 暴露保证）。
+hub SHALL 以 docker compose 部署：唯一常驻 service 为 pa-hub（build context = vault `hub/`，thin 镜像：Python + API/daemon 依赖 + docker CLI）。pa-hub MUST 挂载 `/var/run/docker.sock`（起兄弟执行容器）与 data 卷根；socket 属主 SHALL 对齐：宿主 socket 通常 `root:docker 0660`，容器用户 uid=1001 MUST 经 compose `group_add` 注入宿主 docker 组 gid（可配，如 `HUB_DOCKER_GID`）获得连接权，未对齐时连接报 permission denied 而非静默降级（换机部署核宿主 gid）。执行容器 MUST NOT 出现在 compose service 定义中（每 run 动态挂载/env-file/stamp 由 hub 经 docker run 生成，静态 service 表达不了；执行镜像存在性由 F13 手动 build + hub image_exists fail 暴露保证）。
 
 #### Scenario: 一条命令起服务
 - **WHEN** 部署机执行 `docker compose up -d --build`
 - **THEN** pa-hub 单常驻服务就绪（API + 排度循环同进程），执行镜像缺失时首个派发 fail 暴露而非静默
+
+#### Scenario: socket 属主对齐补组
+- **WHEN** 宿主 `/var/run/docker.sock` 为 `root:docker 0660` 而 pa-hub 以 uid=1001 运行
+- **THEN** compose `group_add` 注入宿主 docker 组 gid 后 hub 可连 daemon 起兄弟容器；缺补组时连接报 permission denied（部署配置问题暴露，非镜像/网络故障）
 
 #### Scenario: 兄弟容器而非嵌套
 - **WHEN** hub 派发执行容器

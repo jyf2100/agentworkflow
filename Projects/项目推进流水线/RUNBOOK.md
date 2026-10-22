@@ -425,8 +425,9 @@ git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<bra
 **凭据口径（D3）**：派发时 vault 优先（`<data_root>/vault/credentials.json` 单 Fernet token，0600/0700）→ 无该 user 记录降级 hub 进程 env 直注（warn 日志）→ 双缺明确报错（列缺失项）。master key 配了但坏 = 启动即崩，不静默吞成 env-only。
 
 **运维口径**：
-- 优雅退出：`docker compose stop`（SIGTERM → uvicorn lifespan shutdown → daemon 线程完成当前迭代再退；`stop_grace_period: 30s` 兜底）——在跑执行容器不动，重启后 `reconcile_startup` 幂等对账接管。
+- 优雅退出：`docker compose stop`（SIGTERM → uvicorn lifespan shutdown → daemon 线程有界等待当前迭代收尾（join 上限 10s），超界随进程退出、悬挂 run 由重启对账归档兜底；`stop_grace_period: 30s` 外层兜底）——在跑执行容器不动，重启后 `reconcile_startup` 幂等对账接管。
 - 崩溃自愈：进程内崩溃（exit/OOM/容器内 `kill -9 1`）由 `restart: unless-stopped` 拉起，先 `reconcile_startup` 幂等对账再进排度（2026-10-21 实证：runs 行数不变、无重复派发）。注意 **`docker kill`/`docker stop` 是显式操作，restart 策略不覆盖**——显式停后须手动 `docker start`。
 - socket 权限：hub 以 uid=1001 跑而宿主 `/var/run/docker.sock` 是 `root:docker 0660`——compose `group_add: "${HUB_DOCKER_GID:-999}"` 补宿主 docker 组 gid（本机实测 999；换机核 `stat -c %g /var/run/docker.sock`，可在 hub.env 覆盖）。症状缺失时派发报 connect permission denied。
-- data 卷是**同路径 bind**（`/data/pa:/data/pa`）：hub 容器内生成的 `-v` 源路径被宿主 daemon 按字面解析，内外必须同路径——改挂载点须同改 `HUB_DATA_ROOT`。
+- data 卷是**同路径 bind**（`/data/pa:/data/pa`）：hub 容器内生成的 `-v` 源路径被宿主 daemon 按字面解析，内外必须同路径——改挂载点须同改 `HUB_DATA_ROOT`。属主不对齐（漏 chown）的症状：每个 tick 日志刷 `[daemon][ALERT]` PermissionError、队列项永留 pending 无终态——核 `ls -ln /data/pa` 属主是否 1001，补跑三步②。
+
 - 回退：`docker compose down` 后切片 1 手工形态完整可用（env 兜底保证代码向后兼容；`vault-import` 不必撤销，data 卷属主 chown 回滚无害）。

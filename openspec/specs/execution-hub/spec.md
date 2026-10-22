@@ -22,7 +22,7 @@
 - **THEN** 该项等待已有容器终态释放名额后才派发
 
 ### Requirement: 入队钉镜像 tag（F13）
-队列项 SHALL 在入队时记录确定的镜像 tag（显式传入或取配置默认并固化进队列项），MUST NOT 在派发时解析「最新」。起容器时本地无该 tag 镜像 SHALL fail 暴露（队列项转 failed 并给出手动 build 提示），MUST NOT 静默回退 `:latest` 或任何其他 tag。
+队列项 SHALL 在入队时记录确定的镜像 tag（显式传入或取配置默认并固化进队列项），MUST NOT 在派发时解析「最新」。起容器时本地无该 tag 镜像 SHALL fail 暴露（队列项转 failed 并给出手动 build 提示），MUST NOT 静默回退 `:latest` 或任何其他 tag。镜像存在性检查 SHALL 三态分流（对齐 fail-safe-dispatch 三态不变式）：确无该 tag（NOT_FOUND）→ fail 终态；docker daemon 不可达（UNKNOWN：cannot connect / permission denied / 守护进程未跑）→ 基础设施异常走记日志重试路径，MUST NOT 误判为镜像缺失进 fail 终态。
 
 #### Scenario: 入队固化 tag
 - **WHEN** 入队请求未显式指定 image tag
@@ -31,6 +31,10 @@
 #### Scenario: 镜像缺失 fail
 - **WHEN** 派发时 `docker image inspect` 发现队列项钉定的 tag 本地不存在（FakeRunner 对 fake 镜像清单同判）
 - **THEN** 队列项转 failed 并报告缺失 tag 与 build 提示，不产出容器、不回退其他 tag
+
+#### Scenario: daemon 不可达不是镜像缺失
+- **WHEN** 派发时镜像检查因 docker daemon 不可达而失败（cannot connect / permission denied）
+- **THEN** 该项按基础设施异常记日志并走重试路径，不转 failed 终态、不给 build 提示（UNKNOWN ≠ NOT_FOUND）
 
 ### Requirement: F10 卷上署名 meta 与写面钉死
 hub SHALL 在起容器前向 state 卷 `runs/<proj>/` 写入 `<stamp>_<slug>.meta.json`（字段：initiator / queue_item_id / image_tag / written_at）。hub 对 state 卷的写面 MUST 钉死为仅此 meta 署名文件：写入口只接受数据卷根 + project + stamp + slug 四元组拼路径，文件名必须匹配 `^\d{8}(m\d*)?_[a-z0-9-]+\.meta\.json$`（stamp 形态 = 8 位日期 + 可选 mN 避碰后缀，对齐 run_daily `_bump_stamp_suffix` 事实）；hub MUST NOT 写 journal、删改 state 其他内容。run 名 SHALL 由 hub 派发时预分配：基于 PRD 文件名的 `<stamp>_<slug>` 扫卷撞名则自增后缀直到 fresh，经 run_daily 既有 `--stamp` 参数传入容器——依赖契约「inject 段仅在撞名时 bump」（见 durable-loop-state delta），由此 meta 文件名、`--stamp`、实际 run 目录三者对齐。hub DB 的 runs 表是索引而非真相，可从卷上 meta 重建。
@@ -111,7 +115,7 @@ hub SHALL 只做机械活（排队、起容器、meta 署名、状态渲染）�
 - **THEN** 不存在任何 PRD 质量评判、信号打分或 diff 审查的端点或模块
 
 ### Requirement: 排度常驻服务
-hub SHALL 提供常驻排度循环：启动时先跑一次重启对账（reconcile_startup，幂等），随后按可配间隔（HUB_TICK_INTERVAL，默认 5s）循环执行派发 tick 与在跑对账（reconcile_running）。进程收到 SIGTERM/SIGINT SHALL 优雅退出：完成当前迭代后停止循环，MUST NOT 杀在跑容器（docker -d 进程树分离，容器由崩溃对账状态机接管）。循环体异常 MUST 捕获记日志并续跑（无静默失败），连续异常计数告警。
+hub SHALL 提供常驻排度循环：启动时先跑一次重启对账（reconcile_startup，幂等），随后按可配间隔（HUB_TICK_INTERVAL，默认 5s）循环执行派发 tick 与在跑对账（reconcile_running）。进程收到 SIGTERM/SIGINT SHALL 优雅退出：有界等待当前迭代收尾（daemon 线程 join 上限，与容器编排 stop_grace_period 配合）；迭代超出有界等待时随进程退出、不保证迭代完整——悬挂 run 行由重启对账归档兜底（durable 口径：退出与崩溃同靠对账收敛，不靠「迭代不可中断」强保证）。MUST NOT 杀在跑容器（docker -d 进程树分离，容器由崩溃对账状态机接管）。循环体异常 MUST 捕获记日志并续跑（无静默失败），连续异常计数告警。
 
 #### Scenario: 常驻循环驱动派发
 - **WHEN** 常驻服务运行且有可派队列项
@@ -119,7 +123,7 @@ hub SHALL 提供常驻排度循环：启动时先跑一次重启对账（reconci
 
 #### Scenario: 优雅退出不动容器
 - **WHEN** 服务收到 SIGTERM 且当前迭代进行中
-- **THEN** 完成当前迭代后退出进程；在跑容器不受影响，重启后经 reconcile_startup 续跟踪或归档
+- **THEN** 有界等待内迭代完成则干净退出；迭代超界时随进程退出（悬挂 run 由重启对账归档，不阻塞退出）。在跑容器始终不受影响，重启后经 reconcile_startup 续跟踪或归档
 
 #### Scenario: 循环异常不静默
 - **WHEN** 单次迭代抛出异常（如 docker CLI 瞬时失败）

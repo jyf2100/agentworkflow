@@ -46,3 +46,20 @@
 ## 六、最终质量门
 
 `bash hub/quality.sh` 全绿：compileall + **94 passed**（66 → 94：vault 9 + cli 3 + lifecycle 4 + daemon 5 + db 并发 1 + api lifespan 2 + serve 3 + runner 三态 1）+ ruff（E9+F）零告警。
+
+## 七、收口后本体论审核（2026-10-22，sync 落成后）
+
+**审核对象**：sync 落成的三份主 specs × hub 实现 × 部署物 × RUNBOOK §13。方法：实体范畴边界、声明不变式与实现事实咬合、sync 产物与 delta 原文忠实度（diff 机械确认）、部署三步序/socket 权限/凭据通道口径一致性。
+
+**正面确认**：
+- sync 忠实度：三份（execution-hub 改名替换+追加 / hub-credential-vault / hub-deployment）requirement 正文与 scenario 逐字一致，validate 19 passed。
+- 凭据通道不变式三方咬合（不落 DB/日志/meta、0600 env-file 即弃、无明文枚举面）；部署三步序三方一致（spec scenario ↔ RUNBOOK ↔ compose 头注释）；崩溃自愈 scenario ↔ kill 实证；范畴边界（兄弟容器不进 compose、保险箱全局层 vs per-project data、控制面/目标面镜像正交）延续成立。
+
+**分级发现与裁决（用户 2026-10-22 裁决：B 全修 + C 随手带上）**：
+- **B1** hub-deployment spec 缺 socket 属主对齐事实（uid=1001 连 root:docker 0660 须 group_add 宿主 gid；5.3 真机坐实，compose/RUNBOOK 已有、spec 未回写）→ 已修：「compose 单常驻服务」requirement 补 socket 属主 SHALL + 新 scenario「socket 属主对齐补组」。
+- **B2** execution-hub「排度常驻服务」SHALL「完成当前迭代后停止循环」强于实现保证（lifespan join(10) 有界 + grace 30s；迭代卡 docker run 可至 120s）→ 已修：正文改「有界等待当前迭代收尾……超界随进程退出、悬挂 run 由重启对账归档兜底（durable 口径：退出与崩溃同靠对账收敛）」，scenario「优雅退出不动容器」同步两分支；RUNBOOK §13 优雅退出行同口径对齐（join 上限 10s 显式化）。
+- **C3** F13「镜像缺失 fail」未声明 daemon 不可达分流 → 已修：正文补三态分流 SHALL（UNKNOWN 走重试、MUST NOT 误判 NOT_FOUND）+ 新 scenario「daemon 不可达不是镜像缺失」（对齐 fail-safe-dispatch 三态不变式）。
+- **C4** RUNBOOK §13 补 data 卷属主不对齐症状（每 tick `[daemon][ALERT]` PermissionError、队列项永留 pending；核属主补跑三步②）。
+- **C5**（提醒不落地）hub 新术语（保险箱/master key/排度常驻/兄弟容器）并入已挂账 F3 债（CONTEXT.md 术语第三次修订）。
+
+**复跑**：`openspec validate --specs` 19 passed（与修正前持平）。
