@@ -71,3 +71,36 @@ def test_list_items_by_status(tmp_path):
     d.set_item_status(b, "running")
     assert [i["id"] for i in d.list_items(status="pending")] == [a]
     assert len(d.list_items()) == 2
+
+
+def test_sqlite_multithread_writes_no_deadlock_no_loss(tmp_path):
+    """add-hub-slice-2a 3.3：API enqueue 线程 × daemon tick 线程并发共连接——
+    WAL + busy_timeout + 短事务下无死锁无丢写（spec: execution-hub「排度常驻服务」）。"""
+    import threading
+
+    import queue_engine as qe
+
+    d = db.HubDB(tmp_path / "h.sqlite3")
+    eng = qe.QueueEngine(d, max_containers=2, max_retries=1, image_tag_default="t:v1")
+    errors: list[Exception] = []
+
+    def writer():  # API 线程：连续 enqueue 40
+        for i in range(40):
+            try:
+                eng.enqueue("proj-a", f"/prd/{i}.md", "roc")
+            except Exception as e:  # noqa: BLE001——并发错误面全收（断言 not errors）
+                errors.append(e)
+
+    def reader_marker():  # daemon 线程：读 + 状态写交错（set 同值 = 纯写压力，不污染 writer 语义）
+        for _ in range(40):
+            try:
+                rows = d.list_items(None)
+                if rows:
+                    d.set_item_status(rows[0]["id"], "pending")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+    t1, t2 = threading.Thread(target=writer), threading.Thread(target=reader_marker)
+    t1.start(); t2.start(); t1.join(timeout=30); t2.join(timeout=30)
+    assert not errors
+    assert len(d.list_items(None)) == 40  # 无丢写

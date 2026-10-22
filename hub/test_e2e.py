@@ -29,14 +29,21 @@ def _mk(tmp_path: Path, images=None):
         "HUB_DATA_ROOT": str(tmp_path / "data"),
     })
     lc = lc_mod.Lifecycle(d, eng, fake, cfg, clock=_CLOCK)
+    # per-project 启动必读面（镜像咬合）：容器内 pa 无条件读 sources.yaml + profiles
+    for proj in ("proj-a", "proj-b"):
+        profs = tmp_path / "data" / proj / "profiles"
+        profs.mkdir(parents=True, exist_ok=True)
+        (profs / f"{proj}.yaml").write_text(f"name: {proj}\nadmission: true\n", encoding="utf-8")
+        (tmp_path / "data" / proj / "sources.yaml").write_text("sources: []\n", encoding="utf-8")
     return lc, d, fake, cfg, tmp_path / "data"
 
 
 def _simulate_container_writes(run_dir: Path, stamp: str, slug: str) -> None:
-    """扮演容器内 pa：往挂载的 state 卷写 manifest + journal（机械活，非语义）。"""
+    """扮演容器内 pa：往挂载的 state 卷写 manifest + journal（机械活，非语义）。
+    journal 是 runs/<proj>/ 下平铺文件（run_daily 事实布局），与 run 目录同名同层。"""
     state_root = run_dir.parent.parent.parent
     (state_root / f"prd_manifest_{stamp}.json").write_text(json.dumps({"slug": slug}), encoding="utf-8")
-    (run_dir / f"{stamp}_{slug}.journal.jsonl").write_text('{"event": "run_started"}\n', encoding="utf-8")
+    (run_dir.parent / f"{run_dir.name}.journal.jsonl").write_text('{"event": "run_started"}\n', encoding="utf-8")
 
 
 def test_full_journey_enqueue_to_done_with_crash_restart(tmp_path):
@@ -54,7 +61,7 @@ def test_full_journey_enqueue_to_done_with_crash_restart(tmp_path):
     assert d.get_item(qid)["status"] == "done"
     assert d.runs_for_item(qid)[0]["status"] == "succeeded"
     assert (run_dir / "20261021_feat-x.meta.json").exists()       # F10 署名在卷
-    assert (run_dir / "20261021_feat-x.journal.jsonl").exists()   # 容器写的 journal 在卷
+    assert (run_dir.parent / "20261021_feat-x.journal.jsonl").exists()  # 容器写的平铺 journal 在卷
     assert (data / "proj-a" / "state" / "prd_manifest_20261021.json").exists()
 
     # ── 旅程 2：崩溃-重启-对账 + 失败重派后成功 ──
@@ -88,7 +95,7 @@ def test_full_journey_enqueue_to_done_with_crash_restart(tmp_path):
     assert {i["status"] for i in d.list_items()} == {"done"}
     assert all(p.exists() for p in [
         run_dir2 / "20261021_feat-y.meta.json",
-        run_dir2 / "20261021_feat-y.journal.jsonl",
+        run_dir2.parent / "20261021_feat-y.journal.jsonl",
         data / "proj-b" / "state" / "prd_manifest_20261021.json",
     ])
 

@@ -30,6 +30,11 @@ def _mk(tmp_path: Path):
         "HUB_DATA_ROOT": str(tmp_path / "data"),
     })
     lc = lc_mod.Lifecycle(d, eng, FakeRunner(images={"pa-executor:v0.1.3"}), cfg, clock=_CLOCK)
+    # 启动必读面（镜像咬合）：容器内 pa 无条件读 sources.yaml + profiles
+    profs = tmp_path / "data" / "proj-a" / "profiles"
+    profs.mkdir(parents=True, exist_ok=True)
+    (profs / "proj-a.yaml").write_text("name: proj-a\nadmission: true\n", encoding="utf-8")
+    (tmp_path / "data" / "proj-a" / "sources.yaml").write_text("sources: []\n", encoding="utf-8")
     return TestClient(api.create_app(d, eng, lc)), d, eng, lc
 
 
@@ -87,3 +92,54 @@ def test_get_run_detail_shape_and_404(tmp_path):
     assert detail["id"] == rid and detail["status"] == "running"
     assert detail["queue_item"]["id"] == qid  # 附队列项概要
     assert "run_dir" in detail and "container_ref" in detail
+
+
+# ── add-hub-slice-2a 4.1：lifespan 挂 daemon 线程（SIGTERM 路由链）──────
+
+class _TickLC:
+    """fake lifecycle：只供 daemon 循环驱动（不触端点，无需 cfg）。"""
+
+    def __init__(self):
+        self.ticks = 0
+        self.startups = 0
+
+    def reconcile_startup(self):
+        self.startups += 1
+
+    def tick_dispatch(self):
+        self.ticks += 1
+        return False
+
+    def reconcile_running(self):
+        pass
+
+
+def test_lifespan_starts_and_stops_daemon(tmp_path):
+    import time
+
+    import api
+
+    d = hub_db.HubDB(tmp_path / "h.sqlite3")
+    eng = qe.QueueEngine(d, max_containers=1, max_retries=1, image_tag_default="t:v1")
+    fake = _TickLC()
+    app = api.create_app(d, eng, fake, tick_interval=0.01)
+    with TestClient(app):
+        deadline = time.time() + 2
+        while fake.ticks == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        assert fake.ticks >= 1 and fake.startups == 1  # startup 挂线程，启动先对账
+        assert app.state.daemon_thread.is_alive()
+    assert not app.state.daemon_thread.is_alive()  # shutdown 置 stop_event + join 后已退
+    frozen = fake.ticks
+    time.sleep(0.05)
+    assert fake.ticks == frozen  # 优雅退出后循环不再跑（完成当前迭代即止）
+
+
+def test_create_app_without_interval_passive(tmp_path):
+    import api
+
+    d = hub_db.HubDB(tmp_path / "h.sqlite3")
+    eng = qe.QueueEngine(d, max_containers=1, max_retries=1, image_tag_default="t:v1")
+    app = api.create_app(d, eng, _TickLC())  # 默认不挂线程（切片 1 被动形态不变）
+    with TestClient(app):
+        assert app.state.daemon_thread is None

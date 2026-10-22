@@ -42,3 +42,7 @@ Thumbs.db
 
 # === critic 双通道第二臂凭证（派发单 20261009_0910）：LITELLM_API_KEY 实值只经此文件注入，绝不入仓 ===
 Projects/项目推进流水线/config/.env.codex
+
+# hub 凭据面（add-hub-slice-2a）：绝不入仓——master key 与 env 文件
+hub/deploy/vault.key
+hub/deploy/hub.env

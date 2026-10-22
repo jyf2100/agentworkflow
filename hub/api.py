@@ -1,15 +1,23 @@
-"""hub 最小 API 面——FastAPI 三端点（add-hub-skeleton 任务 8.1，spec: execution-hub「最小 API 面」）。
+"""hub 最小 API 面——FastAPI 三端点 + 可选排度常驻线程（add-hub-slice-2a 4.1）。
 
 仅机械面：入队（校验+固化 tag）/队列视图/run 详情。无语义判定面（审 PRD、判
 价值归 pa persona——hub 不做）。共享内部函数（validate_and_enqueue /
 queue_view / run_detail）同时是 cli.py 的数据源（8.2：同一函数，两种皮）。
+
+SIGTERM 路由链（design D4）：容器形态 PID 1 是 uvicorn——lifespan shutdown 置
+stop_event + join 线程，保证「完成当前迭代后退出」（daemon=True 线程随进程退
+会被硬杀，故 shutdown 必须 join，不能只靠进程退出）。
 """
 from __future__ import annotations
 
+import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import daemon
 import queue_engine
 from lifecycle import PROJECT_RE
 from fastapi import FastAPI, HTTPException
-from pathlib import Path
 from pydantic import BaseModel
 
 import db
@@ -61,8 +69,29 @@ def run_detail(database: db.HubDB, run_id: int) -> dict | None:
     return {**run, "queue_item": item}
 
 
-def create_app(database: db.HubDB, engine: queue_engine.QueueEngine, lc) -> FastAPI:
-    app = FastAPI(title="pa-hub", version="0.1.0")
+def create_app(database: db.HubDB, engine: queue_engine.QueueEngine, lc, *, tick_interval: float | None = None) -> FastAPI:
+    """tick_interval=None = 被动 API（切片 1 形态零变化）；非 None = startup 挂排度常驻线程。"""
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        stop = threading.Event()
+        thread = None
+        if tick_interval is not None:
+            thread = threading.Thread(
+                target=daemon.run_forever, args=(lc, tick_interval, stop),
+                name="hub-daemon", daemon=True,
+            )
+            thread.start()
+        app.state.daemon_thread = thread
+        app.state.stop_event = stop
+        try:
+            yield
+        finally:
+            stop.set()  # uvicorn lifespan shutdown（SIGTERM 终点）→ 优雅退出信号
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=10)  # 等当前迭代收尾；超时由 compose stop_grace_period 兜底
+
+    app = FastAPI(title="pa-hub", version="0.2.0", lifespan=lifespan)
 
     @app.post("/queue", status_code=201)
     def enqueue(body: EnqueueBody) -> dict:

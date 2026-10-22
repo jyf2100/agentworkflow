@@ -1,8 +1,10 @@
 """hub 排度核心——per-project 串行 + 峰值上限 + 重派状态机（add-hub-skeleton 任务 3.1-3.3）。
 
 spec: execution-hub「队列排度」。引擎无状态（D2）：全部排度事实在 HubDB，
-hub 重启 = 新引擎实例同 DB，语义天然延续（3.3）。单线程 tick 调用
-（排度器单写者），pick → start → mark_running 顺序无并发窗口。
+hub 重启 = 新引擎实例同 DB，语义天然延续（3.3）。tick 序列单循环串行
+（add-hub-slice-2a 起 daemon 单线程迭代），pick → start → mark_running 顺序无
+并发窗口；API enqueue 线程与 tick 线程的并发写由 HubDB 的 WAL + busy_timeout +
+短事务兜底（db.py，3.3）。
 """
 from __future__ import annotations
 

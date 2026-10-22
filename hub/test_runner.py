@@ -10,13 +10,12 @@ import runner
 def _spec(tag: str, **over) -> runner.RunSpec:
     kw = dict(
         image_tag=tag,
-        command=[
-            "python3", "/workspace/vault/Projects/项目推进流水线/scripts/run_daily.py",
-            "--from-stage", "inject", "--inject-prd", "/input/prd.md", "--stamp", "20261021",
-        ],
+        command=["--from-stage", "inject", "--inject-prd", "/input/prd.md", "--stamp", "20261021"],
         state_root=Path("/data/pa/proj-a/state"),
         project="proj-a",
         prd_input=Path("/data/pa/proj-a/prd/prd.md"),
+        profiles_root=Path("/data/pa/proj-a/profiles"),
+        sources_file=Path("/data/pa/proj-a/sources.yaml"),
     )
     kw.update(over)
     return runner.RunSpec(**kw)
@@ -91,13 +90,16 @@ def test_docker_cmd_pins_mounts_envfile_limits_and_tag():
     argv = dr._docker_cmd(spec)
     join = " ".join(argv)
     assert argv[:3] == ["docker", "run", "-d"]
-    assert f"{spec.state_root}:/workspace/vault/.project-auto/state" in join  # state 卷 → 镜像内 pa 期望路径
-    assert f"{spec.prd_input}:/input/{spec.prd_input.name}:ro" in join       # PRD 只读输入卷（A2）
+    assert f"{spec.state_root}:/opt/pa/.project-auto/state" in join              # state 写卷 → 镜像内 pa 期望路径
+    assert f"{spec.profiles_root}:/opt/pa/.project-auto/profiles:ro" in join     # inject 校验必读（load_profiles）
+    assert f"{spec.sources_file}:/opt/pa/.project-auto/sources.yaml:ro" in join  # _run_pipeline 顶部无条件必读
+    assert f"{spec.prd_input}:/input/{spec.prd_input.name}:ro" in join           # PRD 只读输入卷（A2）
     assert "--env-file /tmp/e.env" in join                                    # 与切片 2 同通道（D6）
     assert "--cpus 2" in join and "--memory 4g" in join
     assert "pa-executor:v0.1.3" in argv
     cmd_at = argv.index("pa-executor:v0.1.3") + 1
-    assert argv[cmd_at:] == spec.command  # 容器命令原样接在 tag 后
+    assert argv[cmd_at:] == spec.command  # 纯参数原样接在 tag 后（附加到镜像 ENTRYPOINT=run_daily）
+    assert not any(a.startswith("python3") for a in spec.command)  # 入口收敛镜像——hub 不重复指解释器
     # 非 root 是镜像默认（isolated-observable-execution 契约）——hub 不加 --user，仅传参与施加（A5）
 
 
@@ -148,6 +150,30 @@ def test_docker_start_missing_image_raises_before_run(monkeypatch):
     assert raised and not started  # 不产出容器：docker run 根本不发起
 
 
+def test_docker_image_exists_daemon_unreachable_raises_not_missing(monkeypatch):
+    """daemon 不可达（socket 权限/daemon down）≠ 镜像缺失——三态精神（UNKNOWN 不当
+    NOT_FOUND，spec: fail-safe-dispatch）。5.3 真机坐实：permission denied 曾被误报
+    『镜像缺失』进 fail 终态，带偏排障方向。"""
+    dr = runner.DockerRunner()
+    features = [
+        "permission denied while trying to connect to the Docker daemon socket",
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+    ]
+    for err in features:
+        def fake_run(cmd, *, _err=err, **kw):
+            class P: returncode = 1; stdout = ""; stderr = _err
+            return P()
+        monkeypatch.setattr(runner.subprocess, "run", fake_run)
+        try:
+            dr.image_exists("pa-executor:v0.1.3")
+            raised = None
+        except RuntimeError as e:
+            raised = e
+        assert raised is not None, f"daemon 不可达须抛 RuntimeError：{err!r}"
+        assert "不可达" in str(raised)
+        assert not isinstance(raised, runner.ImageMissingError)  # 绝不进镜像缺失终态
+
+
 # ── 6.3 env-file 注入（0600 + 即弃）────────────────────────────────
 
 
@@ -162,6 +188,8 @@ def test_env_file_0600_content_and_transient():
 
 # ── real-docker 标记测试（本机有 daemon 且镜像在才跑；冷 checkout 恒 skip）──
 
+_REAL_TAG = "pa-executor:v0.1.3"  # 正式镜像 tag（随 release 演进时同步更新）
+
 
 def _real_docker_ready() -> bool:
     import shutil
@@ -170,28 +198,61 @@ def _real_docker_ready() -> bool:
         return False
     try:
         return subprocess.run(
-            ["docker", "image", "inspect", "pa-executor:ci"], capture_output=True, timeout=30
+            ["docker", "image", "inspect", _REAL_TAG], capture_output=True, timeout=30
         ).returncode == 0
     except Exception:
         return False
 
 
-def test_real_docker_mechanical_selfcheck():
+def test_real_docker_mount_contract(tmp_path):
+    """真容器挂载契约收口（切片 1 核心设计值的首证）：inject-to-inject 端到端——
+    镜像 ENTRYPOINT 收敛 run_daily（vault 投影 /opt/pa），纯参数经 hub 挂载面
+    （state 写卷 + profiles/sources.yaml 只读卷 + PRD /input）驱动 pa 真跑 inject 段，
+    manifest 与 PRD 落宿主挂载卷可见。零 LLM、零外呼——纯机械段端到端。"""
     if not _real_docker_ready():
         import pytest
-        pytest.skip("本机无 docker daemon 或无 pa-executor:ci 镜像——真容器自检随切片 3 部署机跑")
+        pytest.skip(f"本机无 docker daemon 或无 {_REAL_TAG} 镜像——真容器契约验证随部署机跑")
+    import os
+    import subprocess
+    import time
+    # host 侧 fixtures：per-project 启动必读面（load_sources 无条件读 / inject 校验 profiles）
+    host_state = tmp_path / "state"
+    host_state.mkdir()
+    # 镜像运行用户 pa(uid=1001) 须可写 state 卷——探针放宽 0777；
+    # 生产属主对齐（data_root chown 1001 / compose user）是切片 2 compose 部署事项
+    os.chmod(host_state, 0o777)
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    os.chmod(profiles, 0o755)
+    (profiles / "selfcheck.yaml").write_text("name: selfcheck\nadmission: true\n", encoding="utf-8")
+    sources = tmp_path / "sources.yaml"
+    sources.write_text("sources: []\n", encoding="utf-8")
+    prd = tmp_path / "probe.md"
+    prd.write_text(
+        "---\nproject: selfcheck\nslug: contract-probe\n---\n\n# 挂载契约探针\n\n纯机械干跑。\n",
+        encoding="utf-8",
+    )
     dr = runner.DockerRunner()
     spec = runner.RunSpec(
-        image_tag="pa-executor:ci",
-        command=["python3", "-c", "print('mechanical-ok')"],  # 机械自检段：零 LLM、零外呼
-        state_root=Path("/tmp/hub-real-docker-state"),
+        image_tag=_REAL_TAG,
+        command=["--from-stage", "inject", "--to-stage", "inject",
+                 "--inject-prd", "/input/probe.md", "--stamp", "20261021"],
+        state_root=host_state,
         project="selfcheck",
+        prd_input=prd,
+        profiles_root=profiles,
+        sources_file=sources,
     )
     ref = dr.start(spec)
-    import time
     for _ in range(120):  # 轮询至终态（≤120s 机械自检）
         st = dr.status(ref)
         if st.state != "running":
             break
         time.sleep(1)
-    assert dr.status(ref).state == "exited" and dr.status(ref).exit_code == 0
+    st = dr.status(ref)
+    logs = subprocess.run(["docker", "logs", ref], capture_output=True, text=True, timeout=30)
+    assert st.state == "exited" and st.exit_code == 0, logs.stdout + logs.stderr
+    out = logs.stdout + logs.stderr
+    assert "[inject] ✓" in out                                        # pa inject 段真跑成功
+    assert (host_state / "prd_manifest_20261021.json").is_file()      # manifest 落宿主挂载卷
+    assert (host_state / "prd" / "selfcheck" / "20261021_contract-probe.md").is_file()

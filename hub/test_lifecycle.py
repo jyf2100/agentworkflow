@@ -25,12 +25,23 @@ def _env(data_root: Path, **over) -> dict:
     return {k: v for k, v in env.items() if v is not None}
 
 
-def _mk(tmp_path: Path, images=None, max_retries: int = 2):
+def _boot_inputs(data_root: Path, project: str) -> None:
+    """per-project 启动必读面（镜像咬合）：profiles 目录 + sources.yaml——
+    容器内 pa 无条件读取（_run_pipeline 顶部 load_sources / inject 校验 profiles）。"""
+    profs = data_root / project / "profiles"
+    profs.mkdir(parents=True, exist_ok=True)
+    (profs / f"{project}.yaml").write_text(f"name: {project}\nadmission: true\n", encoding="utf-8")
+    (data_root / project / "sources.yaml").write_text("sources: []\n", encoding="utf-8")
+
+
+def _mk(tmp_path: Path, images=None, max_retries: int = 2, boot_inputs: bool = True, vault=None):
     d = hub_db.HubDB(tmp_path / "h.sqlite3")
     eng = qe.QueueEngine(d, max_containers=2, max_retries=max_retries, image_tag_default="pa-executor:v0.1.3")
     fake = FakeRunner(images=images if images is not None else {"pa-executor:v0.1.3"})
     cfg = config.load_config(_env(tmp_path / "data"))
-    lc = lifecycle.Lifecycle(d, eng, fake, cfg, clock=_CLOCK)
+    if boot_inputs:
+        _boot_inputs(tmp_path / "data", "proj-a")
+    lc = lifecycle.Lifecycle(d, eng, fake, cfg, clock=_CLOCK, vault=vault)
     return lc, d, fake, tmp_path / "data"
 
 
@@ -60,6 +71,8 @@ def test_dispatch_signs_meta_creates_run_starts_container(tmp_path):
     assert "/input/my-feature.md" in spec.command and "--from-stage" in spec.command
     assert spec.env_file is not None and spec.env_file.suffix == ".env"  # 与切片 2 同通道（D6）
     assert spec.state_root == data / "proj-a" / "state"
+    assert spec.profiles_root == data / "proj-a" / "profiles"      # inject 校验必读卷（镜像咬合）
+    assert spec.sources_file == data / "proj-a" / "sources.yaml"   # 启动必读单文件卷
 
 
 def test_dispatch_missing_image_fails_item_records_no_container(tmp_path):
@@ -72,6 +85,17 @@ def test_dispatch_missing_image_fails_item_records_no_container(tmp_path):
     assert not fake.containers  # 不产出容器
     run = d.runs_for_item(qid)[0]
     assert run["status"] == "failed_to_start" and run["container_ref"] is None  # A7 粒度
+
+
+def test_missing_boot_inputs_fails_fast_before_run_created(tmp_path):
+    # 镜像咬合 fail fast：缺 profiles/sources.yaml → 容器内 pa 启动必崩（load_sources 无条件读 +
+    # inject 校验 profiles）——派发前拦下（终态，与 F13 同级：修环境后重新入队）
+    lc, d, fake, _ = _mk(tmp_path, boot_inputs=False)
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    assert lc.tick_dispatch() is False
+    item = d.get_item(qid)
+    assert item["status"] == "failed" and "启动必读面缺失" in item["last_error"]
+    assert not fake.containers and d.runs_for_item(qid) == []  # 不产 run 行不产容器
 
 
 def test_reconcile_exit_zero_marks_done_and_run_succeeded(tmp_path):
@@ -132,6 +156,15 @@ def test_orphan_meta_marked_failed_to_start_and_kept(tmp_path):
     # 幂等：再跑一次不重复索引
     lc.reconcile_startup()
     assert len([r for r in d.list_all_runs() if r["run_dir"].endswith("20260101_old-thing")]) == 1
+    # 平铺 journal 在（容器跑过）→ 非孤儿不归档（pa 布局事实；执行证据查平铺文件非目录内）
+    ran_dir = data / "proj-a" / "state" / "runs" / "proj-a" / "20260102_ran-once"
+    ran_dir.mkdir(parents=True)
+    (ran_dir / "20260102_ran-once.meta.json").write_text(
+        json.dumps({"initiator": "roc", "queue_item_id": 998, "image_tag": "t:v0", "written_at": "x"}),
+        encoding="utf-8")
+    (ran_dir.parent / "20260102_ran-once.journal.jsonl").write_text("{}\n", encoding="utf-8")
+    lc.reconcile_startup()
+    assert not [r for r in d.list_all_runs() if r["run_dir"].endswith("20260102_ran-once")]
 
 
 def test_crash_restart_live_container_retracked_until_exit(tmp_path):
@@ -160,7 +193,8 @@ def test_crash_restart_gone_container_archived_by_volume_evidence(tmp_path):
     ref = d.runs_for_item(qid)[0]["container_ref"]
     fake.stop(ref)  # 容器消失（如 daemon 清理）
     run_dir = Path(d.runs_for_item(qid)[0]["run_dir"])
-    (run_dir / "20261021_my-feature.journal.jsonl").write_text("{}\n", encoding="utf-8")  # 卷上证据：跑过
+    # pa 事实布局：journal 是 runs/<proj>/ 下平铺文件（与 run 目录同名同层），非目录内
+    (run_dir.parent / "20261021_my-feature.journal.jsonl").write_text("{}\n", encoding="utf-8")  # 卷上证据：跑过
     eng2 = qe.QueueEngine(d, max_containers=2, max_retries=2, image_tag_default="pa-executor:v0.1.3")
     lc2 = lifecycle.Lifecycle(d, eng2, fake, config.load_config(_env(tmp_path / "data")), clock=_CLOCK)
     lc2.reconcile_startup()
@@ -188,6 +222,7 @@ def test_daemon_failure_records_once_per_retry_with_backoff(tmp_path):
     fake = FakeRunner(images={"pa-executor:v0.1.3"}, crash_on_start=RuntimeError("docker daemon down"))
     cfg = config.load_config(_env(tmp_path / "data"))
     lc = lifecycle.Lifecycle(d, eng, fake, cfg, clock=_CLOCK, dispatch_backoff=2)
+    _boot_inputs(tmp_path / "data", "proj-a")
     qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
 
     assert lc.tick_dispatch() is False  # 第 1 次尝试：记账 1 行，不放弃
@@ -211,6 +246,7 @@ def test_retry_dispatch_preserves_first_meta_written_at(tmp_path):
     eng = qe.QueueEngine(d, max_containers=2, max_retries=2, image_tag_default="pa-executor:v0.1.3")
     fake = FakeRunner(images={"pa-executor:v0.1.3"}, crash_on_start=RuntimeError("down"))
     cfg = config.load_config(_env(tmp_path / "data"))
+    _boot_inputs(tmp_path / "data", "proj-a")
     t1 = datetime(2026, 10, 21, 3, 0, 0, tzinfo=timezone.utc)
     lc1 = lifecycle.Lifecycle(d, eng, fake, cfg, clock=t1)
     lc1.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
@@ -233,3 +269,61 @@ def test_project_path_injection_rejected_no_write(tmp_path):
     assert d.get_item(qid)["status"] == "failed"  # 防御性 fail（入队面 API 层另有校验）
     assert not (tmp_path / "data" / "..").joinpath("evil").exists()  # 无越界写
     assert not fake.containers
+
+
+# ── add-hub-slice-2a：凭据来源 vault 优先 + env 兜底（D3，spec「单用户凭据来源」）──
+
+_VAULT_ENV = {
+    "ANTHROPIC_BASE_URL": "https://vault-litellm.example",
+    "ANTHROPIC_AUTH_TOKEN": "tok-from-vault",
+    "GH_TOKEN": "ghp-from-vault",
+}
+
+
+def _vault(tmp_path: Path, records: dict | None = None):
+    from cryptography.fernet import Fernet
+
+    import vault_store as vs
+
+    v = vs.CredentialVault(tmp_path / "data", Fernet.generate_key())
+    for user, env in (records or {}).items():
+        v.set_user(user, env)
+    return v
+
+
+def test_credentials_vault_wins_over_env(tmp_path):
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _VAULT_ENV}))
+    env, source = lc._credentials()
+    assert source == "vault" and env == _VAULT_ENV  # 命中保险箱，不经 hub 进程 env
+
+
+def test_credentials_fallback_env_with_warn(tmp_path, capsys):
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path))  # 保险箱无 roc 记录
+    env, source = lc._credentials()
+    assert source == "env" and env["GH_TOKEN"] == "ghp_xyz"  # cfg.user_env() 兜底（切片 1 形态）
+    assert "降级" in capsys.readouterr().err  # warn 可见可追溯
+
+
+def test_credentials_both_missing_fails_dispatch(tmp_path):
+    import dataclasses
+
+    empty = _vault(tmp_path)  # 保险箱无记录
+    lc, d, fake, data = _mk(tmp_path, vault=empty)
+    # dataclass 绕过 load_config 硬校验构造空三值（守卫未来 env 键可选化形态）
+    lc.cfg = dataclasses.replace(lc.cfg, anthropic_base_url="", anthropic_auth_token="", gh_token="")
+    env, msg = lc._credentials()
+    assert env is None and "ANTHROPIC_BASE_URL" in msg and "GH_TOKEN" in msg  # 列出缺失项
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    assert lc.tick_dispatch() is False
+    assert d.get_item(qid)["status"] == "failed"  # 明确报错，不静默空值注入
+    assert not fake.containers
+
+
+def test_dispatch_env_file_content_from_vault(tmp_path, monkeypatch):
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _VAULT_ENV}))
+    lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    captured: dict = {}
+    orig = lifecycle.env_file
+    monkeypatch.setattr(lifecycle, "env_file", lambda env: (captured.update(env), orig(env))[1])
+    assert lc.tick_dispatch() is True
+    assert captured == _VAULT_ENV  # env-file 写入内容实证来自保险箱

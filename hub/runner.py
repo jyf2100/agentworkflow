@@ -6,11 +6,18 @@ tag。隔离语义（非 root/资源限额/网络策略）的契约归
 isolated-observable-execution capability——hub 仅传参与施加（A5 范畴声明）：
 非 root 是镜像默认，hub 不加 --user；限额经 --cpus/--memory 施加。
 
-挂载契约（hub ↔ executor 镜像，镜像 build 时对齐）：
-- state 卷：host `<data_root>/<project>/state` → 容器 `/workspace/vault/.project-auto/state`
-  （run_daily.py 以 VAULT_ROOT=parents[3] 推导 state 路径，镜像内 vault 同构布局）
+挂载契约（hub ↔ executor 镜像，对齐镜像事实：vault 投影 = `/opt/pa`，ENTRYPOINT 已收敛
+`python3 /opt/pa/Projects/项目推进流水线/scripts/run_daily.py`；`/workspace` 是目标面
+worktree 挂载落点（design D6），hub 绝不挂不碰——两个范畴不混）：
+- state 卷（写面）：host `<data_root>/<project>/state` → 容器 `/opt/pa/.project-auto/state`
+  （run_daily.py 以 VAULT_ROOT=parents[3] 推导 `.project-auto/state`；镜像层无此目录，运行时挂载）
+- profiles 卷（只读）：host `<data_root>/<project>/profiles` → 容器
+  `/opt/pa/.project-auto/profiles`（inject 段校验 project ∈ load_profiles() 必读）
+- sources.yaml（只读单文件）：host `<data_root>/<project>/sources.yaml` → 容器
+  `/opt/pa/.project-auto/sources.yaml`（_run_pipeline 顶部无条件 load_sources() 必读）
 - PRD 只读输入卷：host PRD 文件 → 容器 `/input/<prd>.md:ro`（A2：PRD 经只读卷进容器）
-- 容器命令：`run_daily.py --from-stage inject --inject-prd /input/<prd>.md --stamp <预分配>`
+- 容器命令：传给镜像 ENTRYPOINT 的**纯参数**（docker run tag 后 args 附加到 ENTRYPOINT）——
+  `--from-stage inject --inject-prd /input/<prd>.md --stamp <预分配>`
 """
 from __future__ import annotations
 
@@ -24,8 +31,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-CONTAINER_VAULT = "/workspace/vault"
-CONTAINER_STATE = f"{CONTAINER_VAULT}/.project-auto/state"
+CONTAINER_VAULT = "/opt/pa"                       # 镜像内 vault 投影（Dockerfile COPY 落点）
+CONTAINER_PA_HOME = f"{CONTAINER_VAULT}/.project-auto"
+CONTAINER_STATE = f"{CONTAINER_PA_HOME}/state"    # 写面（run_daily VAULT_ROOT=parents[3] 推导）
+CONTAINER_PROFILES = f"{CONTAINER_PA_HOME}/profiles"   # inject 校验必读（load_profiles）
+CONTAINER_SOURCES = f"{CONTAINER_PA_HOME}/sources.yaml"  # _run_pipeline 顶部无条件必读
 CONTAINER_INPUT = "/input"
 
 
@@ -38,10 +48,12 @@ class RunSpec:
     """单次容器载荷：tag 钉死 + 命令 + 挂载 + 注入通道 + 资源限额参数。"""
 
     image_tag: str
-    command: list[str]
+    command: list[str]                 # 传给镜像 ENTRYPOINT（run_daily.py）的纯参数（tag 后 args）
     state_root: Path                   # host 侧 state 卷根（挂给容器内 pa 期望路径）
     project: str                       # 派发对象 project（runs/<proj>/ 布局）
     prd_input: Path | None = None      # PRD host 文件（只读输入卷挂 /input/）
+    profiles_root: Path | None = None  # host 侧 profiles 目录（只读卷挂 .project-auto/profiles）
+    sources_file: Path | None = None   # host 侧 sources.yaml（只读单文件挂 .project-auto/）
     env_file: Path | None = None       # 凭据 env-file（0600，容器退出后删）
     cpus: str = "2"
     memory: str = "4g"
@@ -114,15 +126,30 @@ class DockerRunner:
     def __init__(self, docker_bin: str = "docker"):
         self._bin = docker_bin
 
+    # daemon 不可达特征（三态精神：UNKNOWN ≠ NOT_FOUND——连不上≠镜像不在，
+    # 5.3 真机坐实 permission denied 曾被误报「镜像缺失」进 fail 终态带偏排障）
+    _DAEMON_UNREACHABLE = ("cannot connect", "permission denied", "is the docker daemon running")
+
     def image_exists(self, tag: str) -> bool:
-        proc = subprocess.run([self._bin, "image", "inspect", tag], capture_output=True, timeout=60)
-        return proc.returncode == 0
+        proc = subprocess.run(
+            [self._bin, "image", "inspect", tag], capture_output=True, text=True, timeout=60
+        )
+        if proc.returncode == 0:
+            return True
+        err = (proc.stderr or "").lower()
+        if any(k in err for k in self._DAEMON_UNREACHABLE):
+            raise RuntimeError(f"docker daemon 不可达（≠镜像缺失，不进 fail 终态）：{proc.stderr.strip()}")
+        return False
 
     def _docker_cmd(self, spec: RunSpec) -> list[str]:
         argv = [self._bin, "run", "-d", "--cpus", spec.cpus, "--memory", spec.memory]
         if spec.env_file is not None:
             argv += ["--env-file", str(spec.env_file)]
         argv += ["-v", f"{spec.state_root}:{CONTAINER_STATE}"]
+        if spec.profiles_root is not None:
+            argv += ["-v", f"{spec.profiles_root}:{CONTAINER_PROFILES}:ro"]
+        if spec.sources_file is not None:
+            argv += ["-v", f"{spec.sources_file}:{CONTAINER_SOURCES}:ro"]
         if spec.prd_input is not None:
             argv += ["-v", f"{spec.prd_input}:{CONTAINER_INPUT}/{spec.prd_input.name}:ro"]
         argv.append(spec.image_tag)

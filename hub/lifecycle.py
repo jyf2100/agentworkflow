@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,13 +17,21 @@ import config
 import db
 import queue_engine
 import runner as runner_mod
+import vault_store
 from meta_sign import MetaSignError, allocate_fresh_stamp, sign_meta
 from pypinyin import lazy_pinyin
-from runner import CONTAINER_VAULT, ImageMissingError, RunSpec, env_file
+from runner import ImageMissingError, RunSpec, env_file
 
 # project 目录名判据——api 入队校验与 lifecycle 派发防御共用同一常量（防路径越界同源）
 PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
-_RUN_DAILY = f"{CONTAINER_VAULT}/Projects/项目推进流水线/scripts/run_daily.py"
+
+
+def _journal_exists(run_dir: str) -> bool:
+    """执行证据判据（B1）：pa 的 journal 是 `runs/<proj>/<stamp>_<slug>.journal.jsonl`
+    **平铺文件**（run_daily.py 事实），与 hub 的 run 目录 `<stamp>_<slug>/` 同名同层——
+    查平铺文件而非 run 目录内 glob（目录内永远空，查了判据就失真）。"""
+    d = Path(run_dir)
+    return (d.parent / f"{d.name}.journal.jsonl").is_file()
 
 
 def _slugify(name: str) -> str:
@@ -42,6 +51,7 @@ class Lifecycle:
         cfg: config.HubConfig,
         clock: datetime | None = None,
         dispatch_backoff: int = 3,
+        vault: vault_store.CredentialVault | None = None,
     ):
         self._db = database
         self.engine = engine
@@ -50,6 +60,33 @@ class Lifecycle:
         self._clock = clock
         self._dispatch_backoff = dispatch_backoff  # 0 = 禁用退避；daemon 故障后隔 N tick 再试（B2）
         self._dispatch_cooldown = 0
+        self._vault = vault  # None = 未配 master key（切片 1 env-only 合法形态，非降级）
+
+    def _credentials(self) -> tuple[dict[str, str] | None, str]:
+        """凭据来源（2a D3）：vault 优先 → env 兜底（warn 可见）→ 双缺明确报错。
+
+        vault 配了但无该 user 记录 = 降级 env，warn stderr 可追溯；vault 未配置 =
+        切片 1 env-only 合法形态，不 warn。返回 (env 字典, 来源)；双缺/保险箱坏 →
+        (None, 缺失说明)——调用方 fail fast，绝不空值注入。
+        """
+        if self._vault is not None:
+            try:
+                rec = self._vault.get_user_env(self.cfg.user_id)
+            except vault_store.VaultError as e:
+                return None, f"保险箱读取失败：{e}"
+            if rec is not None:
+                missing = [k for k in vault_store.VAULT_REQUIRED_KEYS if not rec.get(k)]
+                return (rec, "vault") if not missing else (None, f"保险箱记录缺必需字段：{', '.join(missing)}")
+            print(
+                f"[warn] 保险箱无 user={self.cfg.user_id} 记录——降级 hub 进程 env 直注"
+                f"（spec: execution-hub「单用户凭据来源」）",
+                file=sys.stderr,
+            )
+        env = self.cfg.user_env()
+        missing = [k for k in vault_store.VAULT_REQUIRED_KEYS if not env.get(k)]
+        if missing:
+            return None, f"vault 与 env 均无必需凭据：缺 {', '.join(missing)}"
+        return env, "env"
 
     # ── 派发（7.1）───────────────────────────────────────────────
 
@@ -72,6 +109,22 @@ class Lifecycle:
             return False
 
         state_root = self.cfg.data_root / project / "state"
+        profiles_root = self.cfg.data_root / project / "profiles"
+        sources_file = self.cfg.data_root / project / "sources.yaml"
+        if not profiles_root.is_dir() or not sources_file.is_file():
+            # fail fast（镜像咬合）：pa 启动无条件读 sources.yaml + inject 校验 profiles——
+            # 缺则容器必崩非零退，白白消耗重派名额；不猜，补齐后重新入队
+            self.engine.fail_item(
+                item["id"],
+                f"启动必读面缺失（镜像内 pa 无条件读取）：profiles={profiles_root}"
+                f"（存在={profiles_root.is_dir()}）、sources.yaml={sources_file}"
+                f"（存在={sources_file.is_file()}）——补齐后重新入队",
+            )
+            return False
+        user_env, cred_msg = self._credentials()
+        if user_env is None:  # 双缺/保险箱坏——fail fast 不空值注入（spec scenario「缺凭据明确报错」）
+            self.engine.fail_item(item["id"], f"凭据缺失（不静默空值注入）：{cred_msg}")
+            return False
         state_root.mkdir(parents=True, exist_ok=True)
         now = self._clock or datetime.now(timezone.utc)
         stamp = allocate_fresh_stamp(state_root, now.strftime("%Y%m%d"))
@@ -89,15 +142,13 @@ class Lifecycle:
             return False
 
         rid = self._db.create_run(item["id"], project, str(run_dir))
-        cmd = [
-            "python3", _RUN_DAILY,
-            "--from-stage", "inject", "--inject-prd", f"/input/{prd.name}",
-            "--stamp", stamp,
-        ]
-        with env_file(self.cfg.user_env()) as ef:
+        # 纯参数（镜像 ENTRYPOINT 已收敛 run_daily.py——docker run tag 后 args 附加到 ENTRYPOINT）
+        cmd = ["--from-stage", "inject", "--inject-prd", f"/input/{prd.name}", "--stamp", stamp]
+        with env_file(user_env) as ef:
             spec = RunSpec(
                 image_tag=item["image_tag"], command=cmd, state_root=state_root,
-                project=project, prd_input=prd, env_file=ef,
+                project=project, prd_input=prd, profiles_root=profiles_root,
+                sources_file=sources_file, env_file=ef,
             )
             try:
                 ref = self._runner.start(spec)
@@ -130,7 +181,7 @@ class Lifecycle:
                 self._db.set_run_finished(run["id"], status, rc)
                 self.engine.on_exit(run["queue_item_id"], rc)
             else:  # gone——终态不明，以卷上 journal 证据归档，绝不静默当成功
-                has_journal = bool(list(Path(run["run_dir"]).glob("*.journal.jsonl")))
+                has_journal = _journal_exists(run["run_dir"])
                 status = "failed" if has_journal else "failed_to_start"
                 self._db.set_run_finished(run["id"], status, None)
                 self.engine.on_exit(run["queue_item_id"], 1)
@@ -156,8 +207,8 @@ class Lifecycle:
         if not run_dir.is_dir() or str(run_dir) in known:
             return
         metas = list(run_dir.glob("*.meta.json"))
-        if not metas or list(run_dir.glob("*.journal.jsonl")):
-            return  # 无 meta 非本系统目录；有 journal 则容器跑过，非孤儿
+        if not metas or _journal_exists(str(run_dir)):
+            return  # 无 meta 非本系统目录；有平铺 journal 则容器跑过，非孤儿
         try:
             payload = json.loads(metas[0].read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
