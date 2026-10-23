@@ -105,7 +105,7 @@ hub SHALL 以凭据保险箱（hub-credential-vault capability）为容器注入
 - **THEN** DockerRunner 对真镜像起容器跑机械自检段并正确报告终态
 
 ### Requirement: 最小 API 面
-hub SHALL 提供 FastAPI 既有三端点：`POST /queue`（入队：PRD 路径 + project + 可选 image_tag）、`GET /queue`（队列状态）、`GET /runs/{id}`（run 详情），auth 端点群：`GET /auth/authorize`、`GET /auth/callback`（OAuth2 登录）、`GET /auth/me`（会话身份，强制会话）、`GET /auth/logout`（清会话）、`PUT /auth/credentials`（会话凭据录入，强制会话），投递端点：`POST /deliver`（state ownership 交接：PRD 内容投递 + 幂等键去重 + 落盘入队，协议见 spec: prd-delivery），以及回退原语：`DELETE /queue/{item_id}`（回退序列人工清除：仅 pending 可清，清除 = 转终态 failed + last_error 记原因，行保留审计不物理删除）。守卫边界：`POST /queue` 会话可选（有则真实发起人身份、无则单用户兜底）；`POST /deliver` 为 vault→hub 机间通道（守卫口径见 prd-delivery 设计）；读面与回退原语收紧（F2，add-hub-slice-4a）——`GET /queue`、`GET /runs/{id}`、`DELETE /queue/{item_id}` 在 auth 已配置态（MM 四项齐）SHALL 强制有效会话（无会话 401），auth 未配置回退态 SHALL 保持无守卫现状（2a 形态零变化）；公网/多租户暴露前的 token + socket proxy 硬门槛仍属部署期门，不在本端点面。MUST NOT 引入面板 UI（归切片 4b）或任何语义判定端点。
+hub SHALL 提供 FastAPI 既有 REST 端点：`POST /queue`（入队：PRD 路径 + project + 可选 image_tag）、`GET /queue`（队列状态）、`GET /runs/{id}`（run 详情），auth 端点群：`GET /auth/authorize`、`GET /auth/callback`（OAuth2 登录）、`GET /auth/me`（会话身份，强制会话）、`GET /auth/logout`（清会话）、`PUT /auth/credentials`（会话凭据录入，强制会话），投递端点：`POST /deliver`（state ownership 交接：PRD 内容投递 + 幂等键去重 + 落盘入队，协议见 spec: prd-delivery），回退原语：`DELETE /queue/{item_id}`（回退序列人工清除：仅 pending 可清，清除 = 转终态 failed + last_error 记原因，行保留审计不物理删除），以及**面板端点群（add-hub-slice-4b）**：`GET /panel/*`（面板只读页：队列 / run 列表 / run 详情，强制会话）、`POST /panel/prd`（面板提交：PRD 内容 + project + evidence 必填，强制会话，见 spec: hub-panel）。守卫边界：`POST /queue` 会话可选（有则真实发起人身份、无则单用户兜底）；`POST /deliver` 为 vault→hub 机间通道（守卫口径见 prd-delivery 设计）；`GET /queue`、`GET /runs/{id}`、`DELETE /queue/{item_id}` 与面板端点群在 auth 已配置态 SHALL 强制有效会话（无会话 401/302），auth 未配置回退态：REST 读面保持无守卫现状、**面板端点群 503 不可用**（面板以会话为前提，无会话形态无意义）；公网/多租户暴露前的 token + socket proxy 硬门槛仍属部署期门。hub MUST NOT 提供任何语义判定端点（面板渲染为机械展示，见 spec: hub-panel）。
 
 #### Scenario: CLI 驱动闭环
 - **WHEN** 维护者经 hub CLI（或 curl 三端点）入队一份本地 PRD 并轮询状态
@@ -125,7 +125,11 @@ hub SHALL 提供 FastAPI 既有三端点：`POST /queue`（入队：PRD 路径 +
 
 #### Scenario: 读面回退态零变化（auth 未配置）
 - **WHEN** 未配置 MM（2a 回退态），无会话访问 `GET /queue`、`GET /runs/{id}`、`DELETE /queue/{item_id}`
-- **THEN** 端点行为与收紧前完全一致（无守卫检查，内网单用户形态照跑）
+- **THEN** 端点行为与收紧前完全一致（无守卫检查，内网单用户形态照跑）；面板端点群 503（面板以会话为前提）
+
+#### Scenario: 面板端点群会话守卫
+- **WHEN** auth 已配置态无有效会话访问 `GET /panel/*` 或 `POST /panel/prd`
+- **THEN** 302 到登录（GET）/ 401（POST）；携带有效会话则正常渲染与提交
 
 ### Requirement: 发起人身份来源（会话优先、单用户兜底）
 入队 `enqueued_by` SHALL 会话优先：有效会话 → 以 mm_user_id 为稳定 key（MM username 可改、id 不变），username 供人读面（F10 meta initiator、状态渲染）；无会话（CLI / 内部调用）→ 兜底配置单用户（2a 形态不破）。派发时凭据解密 SHALL 按 enqueued_by 的 key 取保险箱记录（无记录降级 hub env，既有逻辑零变化）。
