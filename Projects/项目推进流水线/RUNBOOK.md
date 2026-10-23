@@ -526,6 +526,24 @@ hub 观察面三件套：读面会话守卫 + MM 通知 bot + 镜像陈旧检测
 3. OAuth 会话用户（enqueued_by=26-hex mm_user_id）直发路径；
 4. 频道 id 有效性（坏 id → post 失败 fail-open warn，无广播）。
 
+**一键自检（上四项的命令化）**：hub.env 配好后 `python3 hub/cli.py check-notify`（在 hub 进程 env 下跑，容器内 `python3 cli.py check-notify` 同）——①bot token 有效性 ②username 解析 ③DM 测试私信 三步 ✓/✗，任一 ✗ 非零退出即停；`--to <26-hex>` 验直发路径（联调项 3）、`--channel <chan-id>` 附加频道连通（联调项 4）。token 绝不回显。
+
 **陈旧检测语义**：差异（remote ≠ `HUB_IMAGE_TAG_DEFAULT`）→ bot 私信 + stderr 告警一次/组合（去抖，重启重告）；repo 404 → stderr 高声（配置错，不修则检测整体失效）；网络错/5xx → 静默下轮再查。**hub 绝不自动拉取或重建镜像**——升级是人工决定（重建流程见 §15 部署顺序第 2 步）。
 
 **读面守卫（顺带，F2 收紧）**：auth 已配置态下 `GET /queue`、`GET /runs/{id}`、`DELETE /queue/{item_id}` 须有效会话（401 否则）；未配置回退态三端点无守卫（2a 零变化）。CLI（`cli.py`）走函数直调不经 HTTP——守卫不影响 CLI 双皮。
+
+## 17. 面板与语义事件（add-hub-slice-4b 切片 4b，2026-10）
+
+手写 PRD 入口（面板 UI）+ 语义事件通知（critic / PR / verify）+ 无 run 放弃告警（spec: `openspec/changes/add-hub-slice-4b/`，归档后入 hub-panel / pa-event-outlet delta）。**前置依赖 4a**：面板登录走 OAuth 会话（MM 四项 + SESSION_SECRET），事件/放弃通知走 bot token——两条通道都不配时 4b 全静默零行为（503 / 零转发）。
+
+**面板使用入口**：`/panel`（提交页）、`/panel/queue`（队列）、`/panel/runs`（run 列表）、`/panel/runs/{id}`（run 详情：journal 尾部 30 行 + 报告原文）。提交闭环：登录 → 选 project（清单 = data_root 下有 `profiles/` 目录 + `sources.yaml` 的项目，与派发 fail fast 同判据）→ 粘贴 PRD markdown → **evidence 必填**（链接或出处说明，strip 后空则 422 拒绝——无据 PRD 在闸前被拒）→ 提交即落盘 `data_root/<project>/prd/<stamp>_hand-<8hex>.md` + 入队（enqueued_by = 会话 mm_user_id，initiator = 显示名）。内网外不可达（与 hub 同暴露面）；auth 未配置整群 503。
+
+**events.jsonl 契约一页**（pa → hub 唯一语义事件接缝；hub 绝不解析 pa journal 内部格式）：
+- 路径：`<state>/runs/<project>/<stamp>_<PRD stem>.events.jsonl`（与 journal 平铺伴生同拼法；**stem 原样含下划线**——hub 侧从 queue_item.prd_path 拼寻址，不用 run 目录名，因 hub `_slugify` 把下划线转横线会使目录名与文件名错位）；
+- 行：`{"v":1,"event":"critic_verdict"|"pr_opened"|"verify_verdict","seq":<run 内单调 int>,"stamp":...,"project":...,...事实字段}`；critic 带 verdict+summary，pr_opened 带 pr_url+repo，verify 带 verdict+round+summary；
+- 写纪律：O_APPEND + fsync 对齐 journal.py；写失败 fail-open（stderr warn 不阻断流水线）；
+- hub 读面：reconcile_running 对 running run 每轮读 → `(run_id, seq)` 进程内存去重 → 新行经 4a bot 通道转发（critic drop / verify 红进频道 + 私信，其余仅私信）；`v≠1` **整文件跳过**（不转发半懂的形态）、未知 event 行跳过、坏 JSON 行跳过；run 终态后不读；孤儿 run（item 查无）跳过。
+
+**PA_REPORT_DIR（report 双写）**：hub 派发时给容器注入 `PA_REPORT_DIR=<容器内 state>/reports`（docker `-e` 直传，与凭据 env-file 分离）——pa report 段在该目录**追加**双写一份 `项目推进报告_<stamp>.md`（原落点不变，缺省零变化），落容器内 state 卷即 host `<data_root>/<project>/state/reports/` 可见，面板 run 详情页按 run stamp 对齐读。不注入（如本地 vault 直接跑 run_daily）= 行为与 4b 前完全一致。
+
+**无 run 放弃告警**：create_run 前的五类放弃（project 名非法 / PRD 缺失 / 启动必读面缺失 / 凭据缺失 / meta 署名失败）收敛经 `_abandon` → bot 私信管理员（含队列项 id + project + 原因摘要）；通道关闭 = stderr 降级留痕（fail_item 不受影响）。与 run 终态通知（4a notify_run）互补：无 run 的放弃也有可见性。

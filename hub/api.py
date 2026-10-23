@@ -15,16 +15,20 @@ import hmac
 import secrets
 import sqlite3
 import threading
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import auth
 import daemon
+import panel
 import prd_store
 import queue_engine
 from lifecycle import PROJECT_RE
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 import db
@@ -236,6 +240,135 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"保险箱写入失败：{e}") from None
         # 响应只含确认与字段名，绝不回显明文值（spec「会话用户凭据录入」）
         return {"ok": True, "user": ident["mm_user_id"], "fields": sorted(env)}
+
+    # ── 面板端点群（add-hub-slice-4b，spec: hub-panel）─────────────────
+    # 守卫口径：auth 未配置 = 整群 503（面板以会话为前提，对齐 auth 群）；
+    # GET 未登录 302 到 authorize（浏览器友好）；POST 未登录 401（机器可判）。
+
+    def _panel_projects() -> list[str]:
+        """project 清单 = data_root 下有启动必读面的子目录（与派发 fail fast 同判据，
+        lifecycle.py 启动必读面检查）——hub 不维护独立 project 注册表。"""
+        root = lc.cfg.data_root
+        if not root.is_dir():
+            return []
+        return sorted(
+            sub.name for sub in root.iterdir()
+            if sub.is_dir() and PROJECT_RE.fullmatch(sub.name)
+            and (sub / "profiles").is_dir() and (sub / "sources.yaml").is_file()
+        )
+
+    def _panel_get(request: Request) -> HTMLResponse | RedirectResponse | None:
+        """GET 面守卫：未配置 503（HTML）/ 未登录 302；已登录返回 None 由端点续渲染。"""
+        if not auth.mm_configured(lc.cfg):
+            return HTMLResponse(panel.render_503(), status_code=503)
+        if _session_identity(request) is None:
+            return RedirectResponse("/auth/authorize", status_code=302)
+        return None
+
+    @app.get("/panel")
+    def panel_home(request: Request):
+        guard = _panel_get(request)
+        if guard is not None:
+            return guard
+        ident = _session_identity(request)
+        return HTMLResponse(panel.render_submit(_panel_projects(), current_user=ident["username"]))
+
+    @app.post("/panel/prd")
+    async def panel_prd(request: Request):
+        """提交闭环（spec scenario「会话提交闭环」）：会话身份 → evidence 机械必填
+        （空 422 回显）→ 落盘（复用 store_prd，文件名 stamp 前缀 + uuid hex8 唯一）
+        → 入队（enqueued_by = mm_user_id 直发路径）。evidence 值不落盘不入队。"""
+        if not auth.mm_configured(lc.cfg):
+            return HTMLResponse(panel.render_503(), status_code=503)
+        ident = _session_identity(request)
+        if ident is None:
+            raise HTTPException(status_code=401, detail="面板提交须有效会话——先 /auth/authorize 登录")
+        form = await request.form()  # urlencoded 由 Starlette 原生解析（零新依赖）
+        project = str(form.get("project") or "")
+        prd_content = str(form.get("prd_content") or "")
+        evidence = str(form.get("evidence") or "")
+        user = ident["username"]
+
+        def _reject(msg: str) -> HTMLResponse:
+            return HTMLResponse(
+                panel.render_submit(_panel_projects(), error=msg, current_user=user),
+                status_code=422,
+            )
+
+        if not evidence.strip():
+            return _reject("evidence 必填（链接或出处说明）——空依据在闸前被拒")
+        if not prd_content.strip():
+            return _reject("PRD 内容不能为空")
+        if not PROJECT_RE.fullmatch(project):
+            return _reject(f"project 名非法（须匹配 {PROJECT_RE.pattern}）：{project!r}")
+        if project not in _panel_projects():
+            return _reject(f"project {project!r} 不在可提交清单（data_root 必读面扫描未命中）")
+        if len(prd_content.encode("utf-8")) > _DELIVER_MAX_BYTES:
+            return _reject("PRD 内容超 1MB 上限——拒绝")
+
+        filename = f"{datetime.now():%Y%m%d}_hand-{uuid4().hex[:8]}.md"
+        try:
+            target = prd_store.store_prd(
+                lc.cfg.data_root, project, filename, prd_content,
+                declared_sha=prd_store.sha256_text(prd_content), overwrite=False,
+            )
+        except prd_store.PrdStoreError as e:
+            return _reject(f"落盘失败：{e}")
+        item_id = engine.enqueue(project, str(target), ident["mm_user_id"], initiator=user)
+        return HTMLResponse(
+            panel.render_submit(
+                _panel_projects(),
+                success=f"已入队：队列项 #{item_id}（{project}）——状态见「队列」页",
+                current_user=user,
+            ),
+            status_code=201,
+        )
+
+    @app.get("/panel/queue")
+    def panel_queue(request: Request):
+        guard = _panel_get(request)
+        if guard is not None:
+            return guard
+        return HTMLResponse(panel.render_queue(database.list_items()))
+
+    @app.get("/panel/runs")
+    def panel_runs(request: Request):
+        guard = _panel_get(request)
+        if guard is not None:
+            return guard
+        return HTMLResponse(panel.render_runs(database.list_all_runs()))
+
+    @app.get("/panel/runs/{run_id}")
+    def panel_run_detail(request: Request, run_id: int):
+        guard = _panel_get(request)
+        if guard is not None:
+            return guard
+        detail = run_detail(database, run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"run 不存在：{run_id}")
+        qi = detail.pop("queue_item") or {}
+        flat = {**detail, "last_error": qi.get("last_error")}  # last_error 在 queue_item 上不在 runs 表
+        return HTMLResponse(panel.render_run_detail(flat, _run_journal_tail(detail["run_dir"]), _run_report_md(detail)))
+
+    def _run_journal_tail(run_dir: str, n: int = 30) -> list[str]:
+        """journal 平铺伴生（lifecycle._journal_exists 同拼法）尾部 n 行原样读。"""
+        jf = Path(run_dir).parent / f"{Path(run_dir).name}.journal.jsonl"
+        if not jf.is_file():
+            return []
+        with jf.open(encoding="utf-8", errors="replace") as f:
+            return [line.rstrip("\n") for line in deque(f, maxlen=n)]
+
+    def _run_report_md(run: dict) -> str | None:
+        """报告落卷读取（T2a）：host 侧 = data_root/<project>/state/reports/，文件名
+        对齐 run stamp（run_dir 名前缀）。缺失 = None → 面板显「无报告」（非错误）。"""
+        reports = lc.cfg.data_root / run["project"] / "state" / "reports"
+        if not reports.is_dir():
+            return None
+        stamp = Path(run["run_dir"]).name.split("_", 1)[0]
+        hits = sorted(reports.glob(f"项目推进报告_{stamp}.md")) or sorted(reports.glob(f"项目推进报告_{stamp}*.md"))
+        if not hits:
+            return None
+        return hits[-1].read_text(encoding="utf-8", errors="replace")
 
     # ── 投递端点（slice-3 D1/D2/D6/D7，spec: prd-delivery「hub 幂等交接端点」）──
 

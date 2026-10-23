@@ -55,6 +55,7 @@ class RunSpec:
     profiles_root: Path | None = None  # host 侧 profiles 目录（只读卷挂 .project-auto/profiles）
     sources_file: Path | None = None   # host 侧 sources.yaml（只读单文件挂 .project-auto/）
     env_file: Path | None = None       # 凭据 env-file（0600，容器退出后删）
+    container_env: tuple[str, ...] = ()  # 非凭据 env 直传（K=V；docker -e，与凭据 env-file 分离）
     cpus: str = "2"
     memory: str = "4g"
 
@@ -145,6 +146,8 @@ class DockerRunner:
         argv = [self._bin, "run", "-d", "--cpus", spec.cpus, "--memory", spec.memory]
         if spec.env_file is not None:
             argv += ["--env-file", str(spec.env_file)]
+        for kv in spec.container_env:  # 非凭据 env 直传（4b：PA_REPORT_DIR 等，与 env-file 分离）
+            argv += ["-e", kv]
         argv += ["-v", f"{spec.state_root}:{CONTAINER_STATE}"]
         if spec.profiles_root is not None:
             argv += ["-v", f"{spec.profiles_root}:{CONTAINER_PROFILES}:ro"]

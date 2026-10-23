@@ -40,10 +40,11 @@ def build_notifier(cfg, mm=None) -> "Notifier | None":
 class MMClient(Protocol):
     """MM 推递鸭子面（D7/L5）——生产 HttpMMClient 与测试 FakeMMClient 的共享契约。
 
-    Notifier 只依赖这三方法（me_id 等连接管理细节留在 HttpMMClient 私有面，
-    不进契约——防两面漂移无静态防护）。
+    lookup/post_dm/post_channel 是 Notifier 依赖面；me_id 供通道自检
+    （cli check-notify 验 token 有效性）消费——同属生产/测试共享契约，防两面漂移。
     """
 
+    def me_id(self) -> str: ...
     def lookup_user_id(self, username: str) -> str | None: ...
     def post_dm(self, mm_user_id: str, text: str) -> None: ...
     def post_channel(self, channel_id: str, text: str) -> None: ...
@@ -107,14 +108,20 @@ class FakeMMClient:
 
     def __init__(self, user_ids: dict[str, str] | None = None,
                  fail_lookup: set[str] | None = None, crash_on_send: Exception | None = None,
-                 crash_on_channel: Exception | None = None):
+                 crash_on_channel: Exception | None = None, crash_on_me: Exception | None = None):
         self.user_ids = dict(user_ids or {})
         self.fail_lookup = set(fail_lookup or ())
         self.crash_on_send = crash_on_send
         self.crash_on_channel = crash_on_channel
+        self.crash_on_me = crash_on_me
         self.dms: list[tuple[str, str]] = []
         self.channels: list[tuple[str, str]] = []
         self.lookups: list[str] = []
+
+    def me_id(self) -> str:
+        if self.crash_on_me is not None:
+            raise self.crash_on_me
+        return "f" * 26  # 假 bot id（26-hex 形态同真值）
 
     def lookup_user_id(self, username: str) -> str | None:
         self.lookups.append(username)
@@ -166,6 +173,23 @@ class Notifier:
             self._send_dm(None, text)  # None → 回落 cfg.user_id
         except Exception as e:  # noqa: BLE001
             print(f"[notify][warn] 管理面告警推递异常（fail-open）: {type(e).__name__}", file=sys.stderr)
+
+    def notify_event(self, *, text: str, enqueued_by: str | None = None,
+                     project: str | None = None, broadcast: bool = False) -> None:
+        """语义事件转发（4b，spec: hub-notifications「语义事件转发」）：私信 run 发起人
+        （三代分流同 notify_run）；broadcast=True 且 project 配了频道才广播。fail-open：
+        私信与频道并行互不依赖，绝不抛（调用方 reconcile 同步路径）。"""
+        try:
+            self._send_dm(enqueued_by, text)
+        except Exception as e:  # noqa: BLE001——观察面绝不阻断执行面
+            print(f"[notify][warn] 事件私信推递异常（fail-open）: {type(e).__name__}", file=sys.stderr)
+        if broadcast and project:
+            chan = self._cfg.project_channels.get(project)
+            if chan:
+                try:
+                    self._mm.post_channel(chan, text)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[notify][warn] 事件频道广播异常（fail-open）: {type(e).__name__}", file=sys.stderr)
 
     def _message(self, *, run_id: int, project: str, run_dir_name: str, status: str,
                  exit_code: int | None, initiator: str | None, last_error: str | None) -> str:

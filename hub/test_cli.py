@@ -2,6 +2,7 @@
 from pathlib import Path
 
 import cli
+import notify
 
 
 def _env(tmp_path: Path) -> dict:
@@ -85,3 +86,70 @@ def test_cli_entrypoint_runs_as_script(tmp_path):
     )
     assert r.returncode == 0
     assert "共 0 项" in r.stdout  # 空队列也必须有这行——静默即入口块又没了
+
+
+# ── 通道自检（check-notify，RUNBOOK §16 联调一键化；Fake 注入全离线）──
+
+_MM_ID = "a1b2c3d4e5f6a1b2c3d4e5f6a1"  # 26-hex
+
+
+def _notify_env(tmp_path: Path) -> dict:
+    return {**_env(tmp_path), "HUB_MM_BOT_TOKEN": "bot-tok", "HUB_MM_BASE_URL": "https://mm"}
+
+
+def test_check_notify_closed_channel_exit_1(tmp_path, capsys, monkeypatch):
+    # 未配 bot token = 通道关闭：报缺项（只字段名）、exit 1、零出站调用
+    for k, v in _env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("HUB_MM_BOT_TOKEN", raising=False)
+    rc = cli.main(["check-notify"], mm=notify.FakeMMClient())
+    assert rc == 1
+    assert "HUB_MM_BOT_TOKEN" in capsys.readouterr().err
+
+
+def test_check_notify_full_pass_with_channel(tmp_path, capsys, monkeypatch):
+    # 三步全通 + 频道附加：username 解析路径 + DM + 频道各一次，exit 0
+    for k, v in _notify_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
+    rc = cli.main(["check-notify", "--channel", "chan-9"], mm=mm)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1/3" in out and "2/3" in out and "3/3" in out and "自检通过" in out
+    assert mm.dms == [(_MM_ID, mm.dms[0][1])] and "check-notify" in mm.dms[0][1]
+    assert mm.channels == [("chan-9", mm.channels[0][1])]
+
+
+def test_check_notify_direct_mm_id_skips_lookup(tmp_path, capsys, monkeypatch):
+    # --to 26-hex = 直发路径：不 lookup（lookups 空），DM 收件人即该 id
+    for k, v in _notify_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
+    rc = cli.main(["check-notify", "--to", _MM_ID], mm=mm)
+    assert rc == 0
+    assert mm.lookups == []
+    assert mm.dms[0][0] == _MM_ID
+    assert "直发" in capsys.readouterr().out
+
+
+def test_check_notify_bad_token_stops_at_step1(tmp_path, capsys, monkeypatch):
+    # token 无效（me_id 抛）= 1/3 ✗ 即停：不走解析不发 DM（后续步骤依赖前步）
+    for k, v in _notify_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID}, crash_on_me=RuntimeError("401"))
+    rc = cli.main(["check-notify"], mm=mm)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "1/3" in err and "token 不回显" in err
+    assert mm.dms == [] and mm.lookups == []
+
+
+def test_check_notify_lookup_fail_stops_at_step2(tmp_path, capsys, monkeypatch):
+    # username 解析失败 = 2/3 ✗ 即停（查无此用户）：不发 DM
+    for k, v in _notify_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    mm = notify.FakeMMClient(user_ids={}, fail_lookup={"roc"})
+    rc = cli.main(["check-notify"], mm=mm)
+    assert rc == 1
+    assert "2/3" in capsys.readouterr().err
+    assert mm.dms == []

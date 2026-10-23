@@ -1,0 +1,212 @@
+"""panel 面板单测（add-hub-slice-4b 任务 1.5，spec: hub-panel）。
+
+覆盖：提交闭环（落盘+入队+发起人身份）、evidence 机械必填 422、GET 未登录 302 /
+POST 未登录 401、auth 未配置 503、只读页事实渲染、XSS 转义、project 清单必读面
+扫描、run 详情 journal 尾部 + 报告渲染（T2a）。全离线（FakeRunner + 无 MM 出站）。
+"""
+from datetime import datetime, timezone
+from pathlib import Path
+
+import auth
+import config
+import db as hub_db
+import panel
+import queue_engine as qe
+from fastapi.testclient import TestClient
+from runner import FakeRunner
+
+import api
+import lifecycle as lc_mod
+
+_CLOCK = datetime(2026, 10, 21, 3, 0, 0, tzinfo=timezone.utc)
+_AUTH_ENV = {  # 四项齐 = auth 已配置态（面板以会话为前提）
+    "HUB_MM_BASE_URL": "https://mm.example.com",
+    "HUB_MM_CLIENT_ID": "cid",
+    "HUB_MM_CLIENT_SECRET": "csec",
+    "HUB_SESSION_SECRET": "s" * 32,
+}
+
+
+def _mk(tmp_path: Path, extra_env: dict | None = None):
+    env = {
+        "HUB_USER_ID": "roc",
+        "HUB_USER_ANTHROPIC_BASE_URL": "https://x",
+        "HUB_USER_ANTHROPIC_AUTH_TOKEN": "tok",
+        "HUB_USER_GH_TOKEN": "ghp",
+        "HUB_IMAGE_TAG_DEFAULT": "pa-executor:v0.1.3",
+        "HUB_DATA_ROOT": str(tmp_path / "data"),
+    }
+    env.update(extra_env or {})
+    d = hub_db.HubDB(tmp_path / "h.sqlite3")
+    eng = qe.QueueEngine(d, max_containers=2, max_retries=2, image_tag_default="pa-executor:v0.1.3")
+    cfg = config.load_config(env)
+    lc = lc_mod.Lifecycle(d, eng, FakeRunner(images={"pa-executor:v0.1.3"}), cfg, clock=_CLOCK)
+    _mk_project(tmp_path / "data", "proj-a")  # 启动必读面齐备的 project
+    return TestClient(api.create_app(d, eng, lc)), d, eng, lc
+
+
+def _mk_project(root: Path, name: str, *, complete: bool = True):
+    """造 project 必读面：complete=True = profiles 目录 + sources.yaml（派发同判据）。"""
+    (root / name / "profiles").mkdir(parents=True, exist_ok=True)
+    if complete:
+        (root / name / "sources.yaml").write_text("sources: []\n", encoding="utf-8")
+
+
+def _login(client: TestClient, lc, mm_user_id="abc123defghijklmnopqrstuv", username="alice"):
+    tok = auth.sign_token({"mm_user_id": mm_user_id, "username": username}, lc.cfg.session_secret, ttl_s=60)
+    client.cookies.set(auth.SESSION_COOKIE, tok)
+    return mm_user_id
+
+
+# ── 提交闭环（spec scenario「会话提交闭环」）──────────────────────────
+
+
+def test_panel_submit_full_loop(tmp_path):
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    uid = _login(client, lc)
+    resp = client.post("/panel/prd", data={
+        "project": "proj-a", "prd_content": "# 手写 PRD\n## 验收\n- [ ] x",
+        "evidence": "https://example.com/issue/1",
+    })
+    assert resp.status_code == 201 and "已入队" in resp.text and "队列项 #1" in resp.text
+    item = d.list_items()[0]
+    assert item["enqueued_by"] == uid  # 会话身份（直发路径），非 cfg 兜底
+    assert item["initiator"] == "alice" and item["status"] == "pending"
+    prd_files = list((tmp_path / "data" / "proj-a" / "prd").glob("*_hand-*.md"))
+    assert len(prd_files) == 1 and "手写 PRD" in prd_files[0].read_text(encoding="utf-8")
+
+
+def test_panel_submit_empty_evidence_rejected_422(tmp_path):
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    for ev in ("", "   "):  # 空与纯空白（strip 判据）
+        resp = client.post("/panel/prd", data={
+            "project": "proj-a", "prd_content": "# x", "evidence": ev,
+        })
+        assert resp.status_code == 422 and "evidence 必填" in resp.text
+    assert d.list_items() == []  # 拒绝即不入队、不落盘
+    assert not (tmp_path / "data" / "proj-a" / "prd").exists()
+
+
+def test_panel_submit_rejects_unknown_project(tmp_path):
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    _mk_project(tmp_path / "data", "proj-b", complete=False)  # 缺 sources.yaml = 非候选
+    for proj in ("proj-b", "no-such", "<script>x</script>"):
+        resp = client.post("/panel/prd", data={
+            "project": proj, "prd_content": "# x", "evidence": "https://e",
+        })
+        assert resp.status_code == 422
+    assert d.list_items() == []
+
+
+# ── 守卫（spec scenario「未登录不可提交」）────────────────────────────
+
+
+def test_panel_get_redirects_to_authorize_when_not_logged_in(tmp_path):
+    client, *_ = _mk(tmp_path, _AUTH_ENV)
+    for path in ("/panel", "/panel/queue", "/panel/runs", "/panel/runs/1"):
+        resp = client.get(path, follow_redirects=False)
+        assert resp.status_code == 302 and resp.headers["location"] == "/auth/authorize"
+
+
+def test_panel_post_401_when_not_logged_in(tmp_path):
+    client, d, *_ = _mk(tmp_path, _AUTH_ENV)
+    resp = client.post("/panel/prd", data={"project": "proj-a", "prd_content": "# x", "evidence": "https://e"})
+    assert resp.status_code == 401
+    assert d.list_items() == []
+
+
+def test_panel_503_when_auth_unconfigured(tmp_path):
+    """auth 未配置态面板整群 503（面板以会话为前提；REST 面不受影响的对照见 test_api）。"""
+    client, d, *_ = _mk(tmp_path)  # 无 _AUTH_ENV = 2a 回退态
+    assert client.get("/panel").status_code == 503
+    assert client.get("/panel/queue").status_code == 503
+    resp = client.post("/panel/prd", data={"project": "proj-a", "prd_content": "# x", "evidence": "https://e"})
+    assert resp.status_code == 503 and d.list_items() == []
+
+
+# ── project 清单扫描（spec scenario「project 清单来自必读面扫描」）────
+
+
+def test_panel_project_list_scans_prerequisites(tmp_path):
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    _mk_project(tmp_path / "data", "proj-c")           # 齐备 → 候选
+    _mk_project(tmp_path / "data", "proj-d", complete=False)  # 缺 sources.yaml → 非候选
+    (tmp_path / "data" / "loose-files").mkdir(parents=True)   # 无必读面杂目录 → 非候选
+    html = client.get("/panel").text
+    assert 'value="proj-a"' in html and 'value="proj-c"' in html
+    assert 'value="proj-d"' not in html and "loose-files" not in html
+
+
+# ── 只读面（spec「面板只读面——零语义渲染」）─────────────────────────
+
+
+def test_panel_read_pages_render_facts(tmp_path):
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    prd = tmp_path / "p.md"; prd.write_text("# x", encoding="utf-8")
+    qid = eng.enqueue("proj-a", str(prd), "roc")
+    lc.tick_dispatch()
+    rid = d.runs_for_item(qid)[0]["id"]
+
+    q_html = client.get("/panel/queue").text
+    assert "proj-a" in q_html and "running" in q_html
+    runs_html = client.get("/panel/runs").text
+    assert f"/panel/runs/{rid}" in runs_html and "proj-a" in runs_html
+    assert client.get("/panel/runs/999").status_code == 404
+
+
+def test_panel_run_detail_journal_tail_and_report(tmp_path):
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    prd = tmp_path / "p.md"; prd.write_text("# x", encoding="utf-8")
+    qid = eng.enqueue("proj-a", str(prd), "roc")
+    lc.tick_dispatch()
+    run = d.runs_for_item(qid)[0]
+    rid, run_dir = run["id"], Path(run["run_dir"])
+
+    # journal 平铺伴生（lifecycle 同拼法）+ 报告落卷（T2a：state/reports/ 按 stamp 对齐）
+    jf = run_dir.parent / f"{run_dir.name}.journal.jsonl"
+    jf.write_text('{"event":"stage_done","stage":"fetch"}\n{"event":"run_finished"}\n', encoding="utf-8")
+    stamp = run_dir.name.split("_", 1)[0]
+    reports = tmp_path / "data" / "proj-a" / "state" / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    (reports / f"项目推进报告_{stamp}.md").write_text("# 今日推进总结\n内容……", encoding="utf-8")
+
+    html = client.get(f"/panel/runs/{rid}").text
+    assert "stage_done" in html and "run_finished" in html  # journal 尾部原样
+    assert "今日推进总结" in html  # 报告原文渲染
+
+
+def test_panel_run_detail_no_report_is_not_error(tmp_path):
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    prd = tmp_path / "p.md"; prd.write_text("# x", encoding="utf-8")
+    qid = eng.enqueue("proj-a", str(prd), "roc")
+    lc.tick_dispatch()
+    rid = d.runs_for_item(qid)[0]["id"]
+    html = client.get(f"/panel/runs/{rid}").text
+    assert "无报告" in html and "无 journal" in html  # 缺失显式降级（非错误态）
+
+
+# ── XSS（render 层 _esc 唯一转义入口）───────────────────────────────
+
+
+def test_panel_escapes_dynamic_values():
+    html = panel.render_submit(["<b>p</b>"], error="<script>alert(1)</script>", current_user="<i>u</i>")
+    for raw in ("<script>", "<b>p</b>", "<i>u</i>"):
+        assert raw not in html
+    assert "&lt;script&gt;" in html and "&lt;b&gt;p&lt;/b&gt;" in html
+
+
+def test_panel_submit_error_echo_escaped(tmp_path):
+    """端到端：非法 project 名（含标签）422 回显须转义——可注入面只有 error 回显。"""
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    resp = client.post("/panel/prd", data={
+        "project": "<script>alert(1)</script>", "prd_content": "# x", "evidence": "https://e",
+    })
+    assert resp.status_code == 422
+    assert "<script>" not in resp.text and "&lt;script&gt;" in resp.text

@@ -15,16 +15,42 @@ from pathlib import Path
 
 import config
 import db
+import events
 import notify
 import queue_engine
 import runner as runner_mod
 import vault_store
 from meta_sign import MetaSignError, allocate_fresh_stamp, sign_meta
 from pypinyin import lazy_pinyin
-from runner import ImageMissingError, RunSpec, env_file
+from runner import CONTAINER_STATE, ImageMissingError, RunSpec, env_file
 
 # project 目录名判据——api 入队校验与 lifecycle 派发防御共用同一常量（防路径越界同源）
 PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
+
+def _event_broadcast(row: dict) -> bool:
+    """频道广播判据（4b spec：critic drop / verify 红进频道 + 私信，其余仅私信）——
+    hub 只做机械枚举比对，零语义解读。"""
+    ev = row.get("event")
+    if ev == "critic_verdict":
+        return row.get("verdict") == "drop"
+    if ev == "verify_verdict":
+        return row.get("verdict") != "pass"  # 红 = 非 pass（revise 等均频道可见）
+    return False  # pr_opened / critic pass 仅私信
+
+
+def _event_text(run: dict, row: dict) -> str:
+    """事件通知文本 = 事实字段机械拼接（hub 零语义加工），头部带 run 标识可回查。"""
+    head = f"[pa-hub] {row.get('project') or run['project']} run #{run['id']}（{Path(run['run_dir']).name}）"
+    ev = row.get("event")
+    if ev == "critic_verdict":
+        return f"{head} critic 判定 → {row.get('verdict')}\n{row.get('summary') or ''}".rstrip()
+    if ev == "pr_opened":
+        repo = row.get("repo")
+        return f"{head} PR 开出{f'（{repo}）' if repo else ''}：{row.get('pr_url')}"
+    rnd = row.get("round")
+    return (f"{head} verify 判定 → {row.get('verdict')}"
+            f"{'（round ' + str(rnd) + '）' if rnd is not None else ''}\n{row.get('summary') or ''}").rstrip()
 
 
 def _journal_exists(run_dir: str) -> bool:
@@ -64,6 +90,9 @@ class Lifecycle:
         self._dispatch_cooldown = 0
         self._vault = vault  # None = 未配 master key（切片 1 env-only 合法形态，非降级）
         self.notifier = notifier  # 4a D3 公开（daemon 陈旧检测复用，cfg 公开先例）：None = 通道关闭零通知
+        # 4b 语义事件去重：已转发 (run_id, seq)——进程内存，run 终态即清（_finish_run），
+        # 无持久写面；hub 重启重发一轮已发事件是接受的语义（文本幂等，最多一条重复私信）
+        self._event_seen: set[tuple[int, int]] = set()
 
     def _credentials(self, user: str | None = None) -> tuple[dict[str, str] | None, str]:
         """凭据来源（2a D3 / 2b D4）：vault 优先 → env 兜底（warn 可见）→ 双缺明确报错。
@@ -111,6 +140,7 @@ class Lifecycle:
         结构保证（无标记列无轮询）；通知 try/except 全捕获 fail-open，绝不阻断落库
         与后续状态机（notifier 内部对私信/频道也已各自兜底——此处兜的是构造/组装层）。"""
         self._db.set_run_finished(rid, status, exit_code)
+        self._event_seen = {k for k in self._event_seen if k[0] != rid}  # 终态即清（内存有界）
         if self.notifier is None:
             return
         try:
@@ -124,6 +154,19 @@ class Lifecycle:
 
     # ── 派发（7.1）───────────────────────────────────────────────
 
+    def _abandon(self, item: dict, project: str, reason: str) -> None:
+        """无 run 的队列放弃收敛点（4b 任务 4.1，spec: hub-notifications「无 run 放弃告警」）：
+        create_run 前五处 fail_item 的唯一包装——落放弃 + notify_admin（含 project + 原因摘要）。
+        通道关闭（notifier None）stderr 降级留痕；通知异常 fail-open 绝不阻断 fail_item。"""
+        self.engine.fail_item(item["id"], reason)
+        if self.notifier is None:
+            print(f"[notify][warn] 队列放弃（通道关闭，仅 stderr）：item#{item['id']} {project}：{reason}", file=sys.stderr)
+            return
+        try:
+            self.notifier.notify_admin(f"[pa-hub] 队列项 #{item['id']}（{project}）放弃，无 run 产生：\n{reason}")
+        except Exception as e:  # noqa: BLE001——观察面绝不阻断执行面
+            print(f"[notify][warn] 放弃告警推递异常（fail-open）: {type(e).__name__}", file=sys.stderr)
+
     def tick_dispatch(self) -> bool:
         """单次派发：pick → 预分配 → 署名 → 起容器。False = 无可派或派发失败。"""
         if self._dispatch_cooldown > 0:  # 退避中（B2）：跳过本 tick，不重复记账
@@ -135,11 +178,11 @@ class Lifecycle:
 
         project = item["project"]
         if not PROJECT_RE.fullmatch(project):
-            self.engine.fail_item(item["id"], f"project 名非法：{project!r}（拒绝派发，防路径越界）")
+            self._abandon(item, project, f"project 名非法：{project!r}（拒绝派发，防路径越界）")
             return False
         prd = Path(item["prd_path"])
         if not prd.is_file():
-            self.engine.fail_item(item["id"], f"PRD 文件不存在：{prd}（重新入队正确路径）")
+            self._abandon(item, project, f"PRD 文件不存在：{prd}（重新入队正确路径）")
             return False
 
         state_root = self.cfg.data_root / project / "state"
@@ -148,8 +191,8 @@ class Lifecycle:
         if not profiles_root.is_dir() or not sources_file.is_file():
             # fail fast（镜像咬合）：pa 启动无条件读 sources.yaml + inject 校验 profiles——
             # 缺则容器必崩非零退，白白消耗重派名额；不猜，补齐后重新入队
-            self.engine.fail_item(
-                item["id"],
+            self._abandon(
+                item, project,
                 f"启动必读面缺失（镜像内 pa 无条件读取）：profiles={profiles_root}"
                 f"（存在={profiles_root.is_dir()}）、sources.yaml={sources_file}"
                 f"（存在={sources_file.is_file()}）——补齐后重新入队",
@@ -157,7 +200,7 @@ class Lifecycle:
             return False
         user_env, cred_msg = self._credentials(item["enqueued_by"])  # 2b D4：按队列项发起人取凭据
         if user_env is None:  # 双缺/保险箱坏——fail fast 不空值注入（spec scenario「缺凭据明确报错」）
-            self.engine.fail_item(item["id"], f"凭据缺失（不静默空值注入）：{cred_msg}")
+            self._abandon(item, project, f"凭据缺失（不静默空值注入）：{cred_msg}")
             return False
         state_root.mkdir(parents=True, exist_ok=True)
         now = self._clock or datetime.now(timezone.utc)
@@ -173,7 +216,7 @@ class Lifecycle:
                 image_tag=item["image_tag"], now=now,
             )
         except MetaSignError as e:
-            self.engine.fail_item(item["id"], f"meta 署名失败：{e}")
+            self._abandon(item, project, f"meta 署名失败：{e}")
             return False
 
         rid = self._db.create_run(item["id"], project, str(run_dir))
@@ -184,6 +227,9 @@ class Lifecycle:
                 image_tag=item["image_tag"], command=cmd, state_root=state_root,
                 project=project, prd_input=prd, profiles_root=profiles_root,
                 sources_file=sources_file, env_file=ef,
+                # 4b 任务 3.3：report 双写出口（docker -e 直传——非凭据，与 env-file 分离）；
+                # 落容器内 state 卷（host 可见），run 详情页按 stamp 对齐读
+                container_env=(f"PA_REPORT_DIR={CONTAINER_STATE}/reports",),
             )
             try:
                 ref = self._runner.start(spec)
@@ -206,11 +252,43 @@ class Lifecycle:
 
     # ── 对账（7.3 + 7.2）─────────────────────────────────────────
 
+    def _forward_events(self, run: dict) -> None:
+        """语义事件转发（4b 任务 3.2，spec: pa-event-outlet hub 读面）：running run 每轮
+        reconcile 读伴生 events.jsonl，(run_id, seq) 进程内存去重后新行经 notifier 转发。
+
+        寻址不依赖 hub run 目录 slug（_slugify 后与 pa stem 可能不同）——从
+        queue_item.prd_path 拿 PRD stem 机械拼 `{stamp}_{stem}.events.jsonl`
+        （stamp = run 目录名前缀 = 派发预分配，与 pa 侧写点逐字节同源）。孤儿 run
+        （item 查无）无 prd_path 可拼 → 跳过。run 终态后不再进本方法（读取面在
+        running 扫描集内）。fail-open：任一异常 stderr 告警不抛（reconcile 同步路径）。
+        """
+        if self.notifier is None:
+            return
+        try:
+            item = self._safe_item(run["queue_item_id"])
+            if item is None:
+                return  # 孤儿归档行无 prd_path 可拼——跳过（终态通知已覆盖该 run）
+            stem = Path(item["prd_path"]).stem
+            run_dir = Path(run["run_dir"])
+            ev_file = run_dir.parent / f"{run_dir.name.split('_', 1)[0]}_{stem}.events.jsonl"
+            for row in events.read_events(ev_file):
+                key = (run["id"], row.get("seq"))
+                if key in self._event_seen:
+                    continue
+                self._event_seen.add(key)
+                self.notifier.notify_event(
+                    text=_event_text(run, row), enqueued_by=item.get("enqueued_by"),
+                    project=run["project"], broadcast=_event_broadcast(row),
+                )
+        except Exception as e:  # 观察面 fail-open——绝不炸 reconcile 主路径
+            print(f"[events][warn] run#{run['id']} 事件转发失败（fail-open）: {type(e).__name__}", file=sys.stderr)
+
     def reconcile_running(self) -> None:
         """轮询 running run 行：exited → 记终态走状态机；gone → 按卷证据归档。"""
         for run in self._db.runs_in_status("running"):
             st = self._runner.status(run["container_ref"])
             if st.state == "running":
+                self._forward_events(run)  # 4b：running 中读伴生事件文件转发新行（观察面）
                 continue
             if st.state == "exited":
                 rc = st.exit_code if st.exit_code is not None else 1  # None 不该出现，兜底按失败

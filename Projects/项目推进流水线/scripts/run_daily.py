@@ -79,6 +79,7 @@ import learning_memory_retrieval as LMRet
 import learning_memory_effectiveness as LMEff
 import learning_memory_schema as LM     # UsageOutcomeKind 受控词表（unknown 跳过判定的真源）
 import learning_memory_store as LMS     # append_usage_outcome（Section 6 闭环持久化）
+import event_outlet as EO               # add-hub-slice-4b：语义事件出口（critic/PR/verify → events.jsonl，hub 唯一语义事件接缝；纯 stdlib，cron 安全）
 
 try:
     import yaml
@@ -1152,6 +1153,14 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
                                 "summary": f"revise 失败：{e}", "round": 2, "revised": True})
 
     gate_file.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    # add-hub-slice-4b：critic verdict 落定即转发事件出口（读既有 entry 变量机械转发零新语义；
+    # 复用门分支不发——同 stamp gate 已存在 = 事件已发过，幂等）。slug = PRD stem（与
+    # dispatch slug 同源，事件文件名与 journal 伴生同拼法）。revise 回环两条 entry 都发
+    # （round1 revise / round2 终判各自是真实 verdict 事实）。
+    for _e in entries:
+        EO.append_event(STATE_DIR, _e.get("project"), stamp,
+                        Path(_e.get("prd_path") or "").stem or "unknown", "critic_verdict",
+                        verdict=_e.get("verdict"), summary=str(_e.get("summary") or ""))
     return entries
 
 
@@ -2604,6 +2613,12 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
                 vinfo = None
         rec["verify_verdict"] = vinfo.get("verdict") if vinfo else None
         rec["verify_round"] = round_n
+        # add-hub-slice-4b：verify verdict 落定即转发事件出口（摘要句取 feedback_section
+        # 头 160 字机械截断防巨行；pass 无 feedback → 空串）。
+        if vinfo:
+            EO.append_event(STATE_DIR, proj, stamp, slug, "verify_verdict",
+                            verdict=vinfo.get("verdict"), round=round_n,
+                            summary=str(vinfo.get("feedback_section") or "")[:160])
         # task 3.2：verify 闭环判决旁路 emit。verifying=状态迁移（AGENT_FINISHED→VERIFYING）；
         # verifier=payload 观测（判决）；pass→publish_ready（VERIFYING→PUBLISH_READY）/ revise（VERIFYING→REVISE）。
         _sj.emit("verifying", _iter, _prd, payload={"round": round_n})
@@ -3296,6 +3311,16 @@ def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str, *, worker
     records.extend(skip_records)
     # records 按 project+slug 排序保 diff 稳定（并行下完成序不确定）
     records.sort(key=lambda r: (r.get("project") or "", r.get("slug") or ""))
+    # add-hub-slice-4b：pr_opened 收敛转发——per-record 收尾统一判 pr_url（三处开出路径
+    # 实查 FOUND / 补开 / 撞并发复用在收尾时 rec["pr_url"] 均已落定；无 PR 的 blocked/
+    # orphan/fail 自然不发）。复用门（disp_file 已存在）不发：同 stamp 已发过，幂等。
+    # 目标仓从 pr_url 机械析出（rec 无 repo 字段；github.com/<owner/repo>/pull/N）。
+    for _r in records:
+        if _r.get("pr_url"):
+            _m = re.search(r"github\.com/([^/]+/[^/]+)/pull/", str(_r["pr_url"]))
+            EO.append_event(STATE_DIR, _r.get("project"), stamp,
+                            Path(_r.get("prd_path") or "").stem or "unknown", "pr_opened",
+                            pr_url=_r["pr_url"], repo=(_m.group(1) if _m else ""))
     disp_file.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
     return records
 
@@ -3556,6 +3581,18 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
 
     report_path = REPORT_DIR / f"项目推进报告_{stamp}.md"
     report_path.write_text("\n".join(L) + "\n", encoding="utf-8")
+    # add-hub-slice-4b：report 双写（T2a 裁决落地，spec: pa-event-outlet「report 双写」）——
+    # PA_REPORT_DIR 非空时同内容再落一份（原 vault 落点不变；hub 容器形态注入
+    # <state>/reports 出口路径，面板读卷渲染）。缺省未设 = 行为零变化。fail-open。
+    _extra_dir = os.environ.get("PA_REPORT_DIR", "").strip()
+    if _extra_dir:
+        try:
+            _extra = Path(_extra_dir)
+            _extra.mkdir(parents=True, exist_ok=True)
+            (_extra / report_path.name).write_text("\n".join(L) + "\n", encoding="utf-8")
+            log(f"[report] 双写 → {_extra / report_path.name}（PA_REPORT_DIR）")
+        except OSError as e:
+            log(f"[report] ⚠ PA_REPORT_DIR 双写失败（fail-open 不阻断）: {e}")
     n_blocked = len(blocked_external) + len(blocked_gate)
     log(f"[report] 已生成 {report_path}（review {len(review)} / failing {len(failing)} / "
         f"drop {len(dropped)} / 阻断 {n_blocked}）")

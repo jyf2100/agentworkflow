@@ -170,3 +170,11 @@ _Avoid_: bot token 与 OAuth client_secret 混用（两实体两用途，spec �
 **陈旧检测 (stale check)**:
 remote release tag vs `HUB_IMAGE_TAG_DEFAULT` 的周期比对（daemon 每 N tick，F13 推迟项）——remote 查询三态分流对齐 fail-safe 三态不变式：FOUND 参与比对（不一致 → bot 私信 + stderr，去抖一次/组合）；**config_4xx**（repo 配错 404）高声告警绝不静默；UNKNOWN（网络/5xx）不告警下轮再查。告警是唯一动作——**绝不自动拉取或重建镜像**（升级是人工决定）。
 _Avoid_: 给检测加自动 `docker pull` 的「优化」（告警-only 是 spec 钉死语义）；把 404 归 UNKNOWN 静默（配置错使检测整体失效且无人知——slice-3 `_CONFIG_4XX` 同型教训）。
+
+**面板 (Panel)**:
+hub 的手写 PRD 提交入口 + 只读观察页（add-hub-slice-4b，`/panel` 群）——登录走 OAuth 会话（与 REST 读面同守卫），提交 = 落盘 `prd/<stamp>_hand-<8hex>.md` + 入队（enqueued_by = 会话 mm_user_id、initiator = 显示名）；**evidence 必填**（空则 422——无据 PRD 在闸前被拒，与流水线 critic 哲学同源）。project 清单来自 data_root 必读面扫描（profiles/ + sources.yaml，与派发 fail fast 同判据——面板可见即派发可跑）。零新依赖（f-string 拼 HTML + `_esc` 唯一转义入口）；auth 未配置整群 503。run 详情页 = journal 尾部 + 报告原文（按 stamp 对齐）纯展示零语义。
+_Avoid_: 把面板当管理面（无取消/重试/改态操作——hub 操纵面钉死在 CLI）；期待文件上传（粘贴 only，multipart 会破零新依赖面）。
+
+**事件出口 (event outlet)**:
+pa → hub 的**唯一语义事件接缝**（add-hub-slice-4b）——pa 侧 `event_outlet.py` 在 critic/PR/verify 落点机械追加 `runs/<project>/<stamp>_<PRD stem>.events.jsonl`（O_APPEND+fsync 对齐 journal 写纪律，fail-open 绝不炸流水线）；hub 侧 reconcile_running 读新行经 bot 通道转发（critic drop/verify 红进频道 + 私信，其余仅私信），`(run_id, seq)` 进程内存去重、终态即清。**hub 绝不解析 pa journal 内部格式**（4a D2 边界不动）；`v≠1` 整文件跳过（不转发半懂的形态）。寻址从 queue_item.prd_path 拼stem（不用 run 目录名——hub `_slugify` 下划线→横线与 pa stem 原样天然错位）。
+_Avoid_: 期待事件通知「至多一次」（进程内存去重 + hub 重启重发一轮是接受的语义——文本幂等）；把 events.jsonl 当 pa 内部状态（是单向观察面输出，容器即弃后文件留卷）。
