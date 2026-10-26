@@ -3,7 +3,8 @@
 三平台 × 四操作 × 三态矩阵；monkeypatch ``_RestApi._http`` 注入状态码/响应体（无真网络）、
 ``_GithubApi._run`` 注入 gh 退出码/stdout。断言：
 - 列表端点 404→UNKNOWN（看不见项目）、单对象 404→NOT_FOUND、空列表→FOUND
-- 401/403→ForgeConfigError（permanent）；merge 405/409→permanent；406/429/5xx/坏 JSON→UNKNOWN
+- 401/403→ForgeConfigError（permanent）；merge 409→permanent；405→UNKNOWN（组5.1 实证：MR
+  mergeability 窗口/已 merged 重放混装）；406/429/5xx/坏 JSON→UNKNOWN
 - state 归一（opened/locked/progress→open 保守算在途）
 - GitLab merge：项目 merge_method≠merge → permanent；merge 后单 parent → permanent；双 parent → FOUND(sha)
 - 错误消息不含 token 片段（sanitize 面覆盖）
@@ -44,6 +45,17 @@ def gitlab(monkeypatch):
     monkeypatch.setenv("GITLAB_TOKEN", GITLAB_TOK)
     return _GitlabApi(host="gitlab.example.com", full_path="group/sub/proj",
                       token=GITLAB_TOK)   # token 显式注入（不测 env 读取本身）
+
+
+def test_gitlab_host_scheme_normalization():
+    """组5.1（内网 http 自建实例）：host 显式 scheme → api_root 跟随；无 scheme 缺省 https；
+    self.host 恒归一裸 host（身份面/分流面不受声明形态影响）。"""
+    api = _GitlabApi(host="http://172.32.153.183:8180", full_path="g/x", token="t")
+    assert api.api_root == "http://172.32.153.183:8180/api/v4" and api.host == "172.32.153.183:8180"
+    api2 = _GitlabApi(host="https://gitlab.corp.local/", full_path="g/x", token="t")
+    assert api2.api_root == "https://gitlab.corp.local/api/v4" and api2.host == "gitlab.corp.local"
+    api3 = _GitlabApi(host="gitlab.example.com", full_path="g/x", token="t")
+    assert api3.api_root == "https://gitlab.example.com/api/v4"   # 无 scheme = 现产零变化
 
 
 @pytest.fixture
@@ -208,13 +220,24 @@ def test_gitlab_merge_404_not_found(gitlab, monkeypatch):
     assert gitlab.pr_merge(99, "t", "b").state is ExtState.NOT_FOUND
 
 
-@pytest.mark.parametrize("status", [405, 409])
-def test_gitlab_merge_405_409_permanent(gitlab, monkeypatch, status):
+@pytest.mark.parametrize("status", [409])
+def test_gitlab_merge_409_permanent(gitlab, monkeypatch, status):
     install_http(monkeypatch, gitlab, {
         ("GET", "/projects/group"): (200, '{"merge_method":"merge"}'),
         ("PUT", "/projects/"): (status, "{}")})
     with pytest.raises(ForgeConfigError):
         gitlab.pr_merge(1, "t", "b")
+
+
+def test_gitlab_merge_405_unknown(gitlab, monkeypatch):
+    """组5.1 183 实例实证：MR 创建后 mergeability 异步计算窗口内 PUT /merge 405（同一 MR
+    数十秒后可合）；对已 merged MR 重放 merge 也 405——同码混装瞬态/幂等/永久，fail-safe
+    归 UNKNOWN 供 reconcile 重查 MR state 收敛（merged→已完成 / opened→窗口后重试）。"""
+    install_http(monkeypatch, gitlab, {
+        ("GET", "/projects/group"): (200, '{"merge_method":"merge"}'),
+        ("PUT", "/projects/"): (405, "{}")})
+    r = gitlab.pr_merge(1, "t", "b")
+    assert r.state is ExtState.UNKNOWN and "405" in (r.reason or "")
 
 
 # ── pr_create 409：幂等 recheck 复用（审核修复 M6，对齐 gh 面 A5）─────
@@ -271,6 +294,24 @@ def test_gitlab_merge_two_parents_found_sha(gitlab, monkeypatch):
         ("GET", "/projects/group%2Fsub%2Fproj/repository/commits/"): (200, '{"parent_ids":["p1","p2"]}')})
     r = gitlab.pr_merge(1, "title", "body")
     assert r.state is ExtState.FOUND and r.value == "abc"
+
+
+def test_gitlab_merge_empty_title_omits_message_field(gitlab, monkeypatch):
+    """组5.1 183 实例实证：merge_commit_message 空串字段被 GitLab 以 422 拒（误报
+    "Branch cannot be merged"，实为空串校验）；缺省字段/无 body PUT 均 200 可合——
+    空 title/body 时整个字段不发，有 title 才发。"""
+    calls = install_http(monkeypatch, gitlab, {
+        ("GET", "/projects/group"): (200, '{"merge_method":"merge"}'),
+        ("PUT", "/projects/"): (200, "{}"),
+        ("GET", "/projects/group%2Fsub%2Fproj/merge_requests/1"): (200, '{"merge_commit_sha":"abc"}'),
+        ("GET", "/projects/group%2Fsub%2Fproj/repository/commits/"): (200, '{"parent_ids":["p1","p2"]}')})
+    r = gitlab.pr_merge(1)   # 空 title/body → PUT 无 body
+    put = [c for c in calls if c["method"] == "PUT"][0]
+    assert r.state is ExtState.FOUND and put["body"] is None
+    calls.clear()
+    gitlab.pr_merge(1, "t", "b")   # 有 title → 发完整字段
+    put2 = [c for c in calls if c["method"] == "PUT"][0]
+    assert put2["body"] == {"merge_commit_message": "t\n\nb"}
 
 
 def test_gitcode_merge_two_parents(gitcode, monkeypatch):

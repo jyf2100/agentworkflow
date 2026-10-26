@@ -178,10 +178,11 @@ class _RestApi:
     def _call(self, method: str, path: str, *, query=None, body=None,
               list_endpoint: bool, on_409: str = "raise") -> ExtResult:
         """统一请求 → 三态。``list_endpoint=True``：404→UNKNOWN（看不见项目）；
-        False（单对象）：404→NOT_FOUND。401/403 → ForgeConfigError；405 恒 permanent；
-        409 分面（审核修复 M6）：``on_409="raise"``（缺省，merge 面——不可 merge 冲突重试必败）/
-        ``"unknown"``（pr_create 面——同 head PR 已存在，返回 UNKNOWN 供调用点幂等 recheck，对齐
-        gh 面 A5）。429/5xx/网络/坏 JSON → UNKNOWN。"""
+        False（单对象）：404→NOT_FOUND。401/403 → ForgeConfigError；405 → UNKNOWN
+        （组5.1 修正，见 _call 体内注释）；409 分面（审核修复 M6）：``on_409="raise"``
+        （缺省，merge 面——不可 merge 冲突重试必败）/ ``"unknown"``（pr_create 面——
+        同 head PR 已存在，返回 UNKNOWN 供调用点幂等 recheck，对齐 gh 面 A5）。
+        429/5xx/网络/坏 JSON → UNKNOWN。"""
         try:
             status, text = self._http(method, path, query=query, body=body)
         except ForgeConfigError:
@@ -196,12 +197,17 @@ class _RestApi:
                 return unknown(f"{self.forge} 404 看不见项目（无权限/路径错；≠ 无 PR，fail-safe）")
             return not_found(f"{self.forge} 对象不存在（404）")
         if status in (405, 409):
-            # merge 前置条件不满足（405 方法不允许 / 409 冲突——如已 merge/不可 merge）：
-            # permanent（重试必败），pr_merge 面消费；列表查询面不会收到（GET 无此形态）。
-            # 例外（审核修复 M6）：pr_create 面 409 = 同 head PR 已存在——幂等 recheck 信号非失败
-            if status == 409 and on_409 == "unknown":
-                return unknown(f"{self.forge} PR 已存在（409 同 head 撞名，幂等 recheck 面）")
-            raise ForgeConfigError(f"{self.forge} HTTP {status}（merge 前置条件不满足或冲突）")
+            # 409（merge 面）= 真冲突，重试必败 → permanent；pr_create 面（审核修复 M6）→
+            # unknown 供幂等 recheck。405 → UNKNOWN（组5.1 183 实例实证修正）：GitLab MR
+            # 创建后 mergeability 异步计算窗口内 PUT /merge 405（实测同一 MR 数十秒后可合），
+            # 对已 merged MR 重放 merge 同样 405（幂等重放面）——同码混装瞬态/幂等/永久不可
+            # 区分，permanent 会把可自愈路径误判成配置错。fail-safe 归 UNKNOWN，交 reconcile
+            # 重查 MR state 收敛（merged→已完成 / opened→窗口后重试）。
+            if status == 409:
+                if on_409 == "unknown":
+                    return unknown(f"{self.forge} PR 已存在（409 同 head 撞名，幂等 recheck 面）")
+                raise ForgeConfigError(f"{self.forge} HTTP 409（merge 冲突——重试必败）")
+            return unknown(f"{self.forge} HTTP 405（MR 状态不可合——瞬态窗口/已 merged 重放混装，recheck 收敛面）")
         if status == 429 or status >= 500:
             return unknown(f"{self.forge} HTTP {status}（限速/服务端，可重试面）")
         if status >= 400:
@@ -236,8 +242,17 @@ class _GitlabApi(_RestApi):
         super().__init__(FORGE_GITLAB, FORGE_TOKEN_ENV[FORGE_GITLAB], token)
         if not host:
             raise ForgeConfigError("gitlab 缺 gitlab_host（自建实例不猜，profile 显式声明）")
-        self.host = host.rstrip("/")
-        self.api_root = f"https://{self.host}/api/v4"
+        # scheme 归一（组5.1 真实验收发现：内网自建实例常为 http 无 TLS——https 硬编码会让
+        # http 实例全部网络异常进 UNKNOWN）：host 显式带 ``http(s)://`` 前缀时 api_root 跟随；
+        # 无 scheme 缺省 https（现产零变化）。self.host 恒归一为裸 host——GIT_ASKPASS 按 git
+        # 提示串域分流、dispatch 身份键 host 取自 remote 提取，均与声明形态无关不受影响。
+        h = host.strip().rstrip("/")
+        if h.startswith(("http://", "https://")):
+            scheme, _, bare = h.partition("://")
+        else:
+            scheme, bare = "https", h
+        self.host = bare
+        self.api_root = f"{scheme}://{self.host}/api/v4"
         self.project = urllib.parse.quote(full_path, safe="")   # v4 官方形态：URL-encode 全路径
         self.api_repo = self.project
 
@@ -293,9 +308,12 @@ class _GitlabApi(_RestApi):
             raise ForgeConfigError(
                 f"gitlab 项目 merge method = {method}（需 merge commit；squash/rebase 形态破坏双 parent "
                 f"revert 对账，拒投——改项目设置或换仓）")
-        # ② merge（单对象端点：404=PR 不存在 → NOT_FOUND；405/409 permanent 在 _call）
+        # ② merge（单对象端点：404=PR 不存在 → NOT_FOUND；405/409 分态在 _call）。
+        # merge_commit_message 为空则整个字段不发（组5.1 183 实例实证：空串字段被 GitLab 以
+        # 422 拒——误导性 "Branch cannot be merged"，缺省字段/无 body 均 200 可合）
+        msg = f"{title}\n\n{body}".strip() if body else title.strip()
         res = self._call("PUT", f"/projects/{self.project}/merge_requests/{number}/merge",
-                         body={"merge_commit_message": f"{title}\n\n{body}" if body else title},
+                         body={"merge_commit_message": msg} if msg else None,
                          list_endpoint=False)
         if res.state is not ExtState.FOUND:
             return res
