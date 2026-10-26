@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Mapping
 
 import auth as auth_mod
+import vault_store
 
 # 必需 env（缺失即拒绝启动——不静默降级）；凭据三值 + 镜像默认 tag + 数据卷根 + 单用户标识
 REQUIRED_KEYS = (
@@ -33,6 +34,7 @@ MM_CLIENT_ID_ENV = "HUB_MM_CLIENT_ID"
 MM_CLIENT_SECRET_ENV = "HUB_MM_CLIENT_SECRET"
 SESSION_SECRET_ENV = "HUB_SESSION_SECRET"
 SESSION_TTL_ENV = "HUB_SESSION_TTL_S"
+PANEL_ADMINS_ENV = "HUB_PANEL_ADMINS"  # 面板改行为操作白名单（MM username 逗号分隔；空=任何有效会话，add-hub-panel-console D4）
 
 # 可选投递通道 token（add-hub-slice-3 D7）：不配 = 内网无守卫；配置则 POST /deliver
 # 要求 Authorization: Bearer（hmac.compare_digest 线性比较防时序）。
@@ -91,6 +93,7 @@ class HubConfig:
     session_secret: bytes | None = None      # 与保险箱 master key 分离（spec「签名会话生命周期」）
     session_ttl_s: int = 7 * 86400           # D2：默认 7 天
     deliver_token: str | None = None         # slice-3 D7：投递通道共享 token（None = 内网无守卫）
+    panel_admins: frozenset[str] = frozenset()  # 空 = 面板改行为操作对任何有效会话放行（单用户回退态）
     # 通知面（4a，spec: hub-notifications）：None/空 = 对应能力关闭零行为
     mm_bot_token: str | None = None          # 独立 bot 凭据实体（F14，与 OAuth app 分离）
     project_channels: dict[str, str] = field(default_factory=dict)  # 空 = 仅私信（无频道广播）
@@ -106,6 +109,11 @@ class HubConfig:
         }
         if self.user_model:
             env["ANTHROPIC_MODEL"] = self.user_model
+        # add-forge-adapter 3.2：平台 token 透传（env 兜底路径与 vault 整 payload 注入对齐；
+        # hub.env 可直接配三平台，有才带——GH_TOKEN 上面的固定三值是切片 2 既有契约不动）
+        for k in vault_store.FORGE_TOKEN_KEYS.values():
+            if k != "GH_TOKEN" and os.environ.get(k):
+                env[k] = os.environ[k]
         return env
 
 
@@ -157,6 +165,7 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         session_secret=(e.get(SESSION_SECRET_ENV) or "").encode("ascii") or None,
         session_ttl_s=int(e.get(SESSION_TTL_ENV) or auth_mod.DEFAULT_SESSION_TTL_S),
         deliver_token=e.get(DELIVER_TOKEN_ENV) or None,
+        panel_admins=frozenset(u.strip() for u in (e.get(PANEL_ADMINS_ENV) or "").split(",") if u.strip()),
         mm_bot_token=e.get(MM_BOT_TOKEN_ENV) or None,
         project_channels=parse_project_channels(e.get(MM_PROJECT_CHANNELS_ENV)),
         image_template_repo=e.get(IMAGE_TEMPLATE_REPO_ENV) or None,

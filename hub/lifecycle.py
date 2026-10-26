@@ -27,6 +27,32 @@ from runner import CONTAINER_STATE, ImageMissingError, RunSpec, env_file
 # project 目录名判据——api 入队校验与 lifecycle 派发防御共用同一常量（防路径越界同源）
 PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
+# profile 的 forge: 声明行（零 YAML 库逐行扫——hub 最小依赖面不动，projects.py 同口径）
+_FORGE_LINE_RE = re.compile(r'^\s*forge:\s*"?([A-Za-z0-9_-]+)"?\s*$', re.M)
+
+
+def _profile_forges(profiles_root: Path) -> set[str] | None:
+    """项目 profiles/*.yaml 的 forge 声明集合（add-forge-adapter 3.2）。
+
+    None/空集 = 无任何声明（github 缺省口径）。非法值原样收集（不在此处 raise）——
+    必需键计算处（vault_store.forge_required_keys）fail-fast，abandon 消息带原值。
+    目录缺失/读失败 = None（派发前置检查已保证启动必读面存在，此处仅兜底）。
+    """
+    if not profiles_root.is_dir():
+        return None
+    forges: set[str] = set()
+    try:
+        files = sorted(profiles_root.glob("*.yaml"))
+    except OSError:
+        return None
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        forges.update(_FORGE_LINE_RE.findall(text))
+    return forges or None
+
 
 def _event_broadcast(row: dict) -> bool:
     """频道广播判据（4b spec：critic drop / verify 红进频道 + 私信，其余仅私信）——
@@ -94,33 +120,51 @@ class Lifecycle:
         # 无持久写面；hub 重启重发一轮已发事件是接受的语义（文本幂等，最多一条重复私信）
         self._event_seen: set[tuple[int, int]] = set()
 
-    def _credentials(self, user: str | None = None) -> tuple[dict[str, str] | None, str]:
+    def _credentials(self, user: str | None = None,
+                     project: str | None = None) -> tuple[dict[str, str] | None, str]:
         """凭据来源（2a D3 / 2b D4）：vault 优先 → env 兜底（warn 可见）→ 双缺明确报错。
 
         user（2b）= 队列项 enqueued_by（会话用户 = mm_user_id）；缺省 cfg.user_id
-        （2a 单用户行为零变化）。vault 配了但无该 user 记录 = 降级 env，warn stderr
-        可追溯；vault 未配置 = 切片 1 env-only 合法形态，不 warn。返回
-        (env 字典, 来源)；双缺/保险箱坏 → (None, 缺失说明)——调用方 fail fast，
-        绝不空值注入。
+        （2a 单用户行为零变化）。project（add-forge-adapter 3.2）= 待派发项目——必需键
+        按该项目 profiles 的 forge 声明动态计算（project_required_keys）：gitlab 项目必需
+        GITLAB_TOKEN、GH_TOKEN 不再无条件必需（gitlab/gitcode-only 用户不被迫造假）；
+        缺省 None = github 口径（旧三值必需，单用户行为零变化）。
+        vault 配了但无该 user 记录 = 降级 env，warn stderr 可追溯；vault 未配置 = 切片 1
+        env-only 合法形态，不 warn。返回 (env 字典, 来源)；双缺/保险箱坏/forge 声明非法 →
+        (None, 缺失说明)——调用方 fail fast，绝不空值注入。
         """
         user = user or self.cfg.user_id
+        try:
+            required = vault_store.project_required_keys(
+                _profile_forges(self.cfg.data_root / project / "profiles") if project else None
+            )
+        except ValueError as e:
+            return None, f"项目 forge 声明非法（不猜）：{e}"
         if self._vault is not None:
             try:
                 rec = self._vault.get_user_env(user)
             except vault_store.VaultError as e:
                 return None, f"保险箱读取失败：{e}"
             if rec is not None:
-                missing = [k for k in vault_store.VAULT_REQUIRED_KEYS if not rec.get(k)]
-                return (rec, "vault") if not missing else (None, f"保险箱记录缺必需字段：{', '.join(missing)}")
+                missing = [k for k in required if not rec.get(k)]
+                if missing:
+                    return None, f"保险箱记录缺必需字段（项目 {project} 按 forge 声明）：{', '.join(missing)}"
+                bad = vault_store.placeholder_issues(rec)
+                if bad:
+                    return None, f"保险箱记录凭据形态非法：{'；'.join(bad)}"
+                return rec, "vault"
             print(
                 f"[warn] 保险箱无 user={user} 记录——降级 hub 进程 env 直注"
                 f"（spec: execution-hub「单用户凭据来源」）",
                 file=sys.stderr,
             )
         env = self.cfg.user_env()
-        missing = [k for k in vault_store.VAULT_REQUIRED_KEYS if not env.get(k)]
+        missing = [k for k in required if not env.get(k)]
         if missing:
-            return None, f"vault 与 env 均无必需凭据：缺 {', '.join(missing)}"
+            return None, f"vault 与 env 均无必需凭据（项目 {project} 按 forge 声明）：缺 {', '.join(missing)}"
+        bad = vault_store.placeholder_issues(env)
+        if bad:
+            return None, f"env 凭据形态非法（疑似模板占位未换真值）：{'；'.join(bad)}"
         return env, "env"
 
     # ── run 终态收敛点（4a D3，spec: hub-notifications「run 终态通知」）────
@@ -198,7 +242,10 @@ class Lifecycle:
                 f"（存在={sources_file.is_file()}）——补齐后重新入队",
             )
             return False
-        user_env, cred_msg = self._credentials(item["enqueued_by"])  # 2b D4：按队列项发起人取凭据
+        # 占位符形态检测在 _credentials 内（vault_store.placeholder_issues）——派发前
+        # fail-fast abandon，不烧容器才发现（2026-10-23 首跑 #3：占位 env 烧 3 分钟才暴露）。
+        # 2b D4：按队列项发起人取凭据；project = 按该项目 forge 声明算必需键（3.2）
+        user_env, cred_msg = self._credentials(item["enqueued_by"], project=project)
         if user_env is None:  # 双缺/保险箱坏——fail fast 不空值注入（spec scenario「缺凭据明确报错」）
             self._abandon(item, project, f"凭据缺失（不静默空值注入）：{cred_msg}")
             return False

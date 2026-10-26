@@ -17,8 +17,9 @@ def _env(data_root: Path, **over) -> dict:
     env = {
         "HUB_USER_ID": "roc",
         "HUB_USER_ANTHROPIC_BASE_URL": "https://litellm.example",
-        "HUB_USER_ANTHROPIC_AUTH_TOKEN": "tok-abc",
-        "HUB_USER_GH_TOKEN": "ghp_xyz",
+        # 长 token：占位符判据（vault_store.placeholder_issues，MIN_TOKEN_LEN=8——内网短 key 放行，见其注释）
+        "HUB_USER_ANTHROPIC_AUTH_TOKEN": "tok-abcdef0123456789abcdef",
+        "HUB_USER_GH_TOKEN": "ghp_abcdefghij0123456789",
         "HUB_IMAGE_TAG_DEFAULT": "pa-executor:v0.1.3",
         "HUB_DATA_ROOT": str(data_root),
     }
@@ -277,8 +278,8 @@ def test_project_path_injection_rejected_no_write(tmp_path):
 
 _VAULT_ENV = {
     "ANTHROPIC_BASE_URL": "https://vault-litellm.example",
-    "ANTHROPIC_AUTH_TOKEN": "tok-from-vault",
-    "GH_TOKEN": "ghp-from-vault",
+    "ANTHROPIC_AUTH_TOKEN": "tok-from-vault-0123456789abcdef",
+    "GH_TOKEN": "ghp-from-vault-0123456789",
 }
 
 
@@ -302,8 +303,34 @@ def test_credentials_vault_wins_over_env(tmp_path):
 def test_credentials_fallback_env_with_warn(tmp_path, capsys):
     lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path))  # 保险箱无 roc 记录
     env, source = lc._credentials()
-    assert source == "env" and env["GH_TOKEN"] == "ghp_xyz"  # cfg.user_env() 兜底（切片 1 形态）
+    assert source == "env" and env["GH_TOKEN"] == "ghp_abcdefghij0123456789"  # cfg.user_env() 兜底（切片 1 形态）
     assert "降级" in capsys.readouterr().err  # warn 可见可追溯
+
+
+# ── 占位符形态检测（2026-10-23 首跑 #3 实证：hub.env 模板值未换真值）──
+def test_credentials_rejects_placeholder_env(tmp_path, capsys):
+    """env 分支：占位 token/host（hub.env 模板事故形态）→ (None, 报占位符) 不注入。"""
+    import dataclasses
+
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path))  # 无 vault 记录 → 降级 env
+    lc.cfg = dataclasses.replace(lc.cfg, anthropic_base_url="https://x",
+                                 anthropic_auth_token="t", gh_token="g")
+    env, msg = lc._credentials()
+    assert env is None and "占位符" in msg and "ANTHROPIC_BASE_URL" in msg and "GH_TOKEN" in msg
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    assert lc.tick_dispatch() is False
+    assert d.get_item(qid)["status"] == "failed"  # 派发前 fail-fast，不烧容器
+    assert not fake.containers
+
+
+def test_credentials_rejects_placeholder_vault_record(tmp_path):
+    """vault 分支：保险箱记录本身是占位符 → 同样拒绝（录入口漏拦的兜底）。"""
+    bad_rec = {"ANTHROPIC_BASE_URL": "https://litellm.example",
+               "ANTHROPIC_AUTH_TOKEN": "<roc 的 ANTHROPIC_AUTH_TOKEN>",  # 模板尖括号形态
+               "GH_TOKEN": "ghp-real-0123456789abcdef"}
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": bad_rec}))
+    env, msg = lc._credentials()
+    assert env is None and "占位符" in msg and "ANTHROPIC_AUTH_TOKEN" in msg
 
 
 def test_credentials_both_missing_fails_dispatch(tmp_path):
@@ -319,6 +346,63 @@ def test_credentials_both_missing_fails_dispatch(tmp_path):
     assert lc.tick_dispatch() is False
     assert d.get_item(qid)["status"] == "failed"  # 明确报错，不静默空值注入
     assert not fake.containers
+
+
+# ── add-forge-adapter 3.2：必需键按项目 profiles 的 forge 声明动态计算 ──
+_GITLAB_VAULT_ENV = {
+    "ANTHROPIC_BASE_URL": "https://litellm.example",
+    "ANTHROPIC_AUTH_TOKEN": "tok-from-vault-0123456789abcdef",
+    "GITLAB_TOKEN": "glpat-from-vault-0123456789",   # 无 GH_TOKEN（gitlab-only 用户）
+}
+
+
+def _declare_forge(data: Path, project: str, forge: str) -> None:
+    """profile 追加 forge 声明行（projects.py 落盘的同款 yaml 形态）。"""
+    p = data / project / "profiles" / f"{project}.yaml"
+    p.write_text(p.read_text(encoding="utf-8") + f'forge: "{forge}"\n', encoding="utf-8")
+
+
+def test_credentials_gitlab_project_missing_token_abandons(tmp_path):
+    """gitlab 项目 + 记录只有 GH_TOKEN → 缺 GITLAB_TOKEN：派发前 fail-fast abandon 明示，
+    不烧容器（同批 github 项目不受影响——必需键按项目独立计算）。"""
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _VAULT_ENV}))
+    _declare_forge(data, "proj-a", "gitlab")
+    env, msg = lc._credentials("roc", project="proj-a")
+    assert env is None and "GITLAB_TOKEN" in msg
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    assert lc.tick_dispatch() is False
+    assert d.get_item(qid)["status"] == "failed"
+    assert "GITLAB_TOKEN" in str(d.get_item(qid))   # abandon 消息列缺失键
+    assert not fake.containers
+
+
+def test_credentials_gitlab_only_user_without_gh_token_passes(tmp_path):
+    """gitlab-only 用户（无 GH_TOKEN）派发 gitlab 项目 → 凭据过检（不被迫造假 GH_TOKEN）。"""
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _GITLAB_VAULT_ENV}))
+    _declare_forge(data, "proj-a", "gitlab")
+    env, source = lc._credentials("roc", project="proj-a")
+    assert env is not None and source == "vault"
+    assert "GITLAB_TOKEN" in env and "GH_TOKEN" not in env
+    lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    assert lc.tick_dispatch() is True   # 凭据面通过，容器正常起（GH_TOKEN 缺席不拦）
+
+
+def test_credentials_github_project_still_requires_gh_token(tmp_path):
+    """无 forge 声明项目（github 缺省）行为零变化：缺 GH_TOKEN 仍 abandon（回归锚）。"""
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _GITLAB_VAULT_ENV}))
+    env, msg = lc._credentials("roc", project="proj-a")   # profile 未声明 forge
+    assert env is None and "GH_TOKEN" in msg
+
+
+def test_credentials_illegal_forge_declaration_abandons(tmp_path):
+    """profile 写非法 forge 值（gitee）→ (None, 声明非法)——不静默回落 github。"""
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _VAULT_ENV}))
+    _declare_forge(data, "proj-a", "gitee")
+    env, msg = lc._credentials("roc", project="proj-a")
+    assert env is None and "非法 forge" in msg and "gitee" in msg
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    assert lc.tick_dispatch() is False
+    assert d.get_item(qid)["status"] == "failed" and not fake.containers
 
 
 def test_dispatch_env_file_content_from_vault(tmp_path, monkeypatch):

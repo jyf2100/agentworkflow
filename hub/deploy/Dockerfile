@@ -12,8 +12,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # 运行依赖（对齐 hub/quality.sh 清单 + uvicorn/cryptography；httpx 2b 起为运行依赖——
-# MM OAuth2 出站调用，2a 时期曾标「仅测试」已翻案，见 add-hub-slice-2b D3/D8）
-RUN pip install --no-cache-dir fastapi uvicorn cryptography pypinyin httpx
+# MM OAuth2 出站调用，2a 时期曾标「仅测试」已翻案，见 add-hub-slice-2b D3/D8；
+# python-multipart：Starlette request.form() 解析必经（面板表单 POST——容器缺它
+# 500，本机因开发环境已装而单测全绿，2026-10-23 面板建档真机自测暴露）
+RUN pip install --no-cache-dir fastapi uvicorn cryptography pypinyin httpx python-multipart
 
 COPY . /opt/hub
 WORKDIR /opt/hub
