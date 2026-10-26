@@ -102,8 +102,8 @@ def test_remote_host_and_path_multilevel():
         ("gitlab.example.com", "group/sub/proj")
     assert remote_host_and_path("https://gitlab.example.com/group/sub/proj.git") == \
         ("gitlab.example.com", "group/sub/proj")
-    assert remote_host_and_path("https://github.com/jyf2100/cc-web-control.git") == \
-        ("github.com", "jyf2100/cc-web-control")
+    assert remote_host_and_path("https://github.com/octocat/example-repo.git") == \
+        ("github.com", "octocat/example-repo")
     assert remote_host_and_path("not a url") == (None, None)
 
 

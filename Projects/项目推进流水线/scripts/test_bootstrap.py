@@ -79,6 +79,15 @@ def test_template_root_layout(tmp_path):
     assert r.returncode == 0, r.stderr + r.stdout
 
 
+# 「缺装 claude」场景只能 PATH 模拟（fakebin 不放 claude 即算缺装）。但夹具 PATH 含
+# /usr/bin:/bin（bootstrap 要跑 git/python3）——机器若系统级装了 claude（如本服务器
+# 2026-10-22 /usr/bin/claude），fakebin 遮不住，「缺装」不可模拟且必然误报红。
+# 按 bootstrap/ 不在 checkout 同款 skip 处理：本机 skip，无系统 claude 机上真验证。
+_SYSTEM_CLAUDE_IN_TEST_PATH = any((Path(d) / "claude").exists() for d in ("/usr/bin", "/bin"))
+
+
+@pytest.mark.skipif(_SYSTEM_CLAUDE_IN_TEST_PATH,
+                    reason="/usr/bin:/bin 内有系统级 claude——「缺装」场景不可 PATH 模拟，须在无系统 claude 机验证")
 def test_missing_claude_fails_with_guidance(tmp_path):
     """claude CLI 缺失 → rc=2 + 明确指引，不继续后续步骤。"""
     root, _pa, home = _fixture_root(tmp_path)
