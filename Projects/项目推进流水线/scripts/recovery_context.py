@@ -80,7 +80,16 @@ def suggested_next_step(status_value: str) -> str:
 
 @dataclass(frozen=True)
 class RecoveryContext:
-    """retry 驱动器构造下一 iteration 输入所需的恢复上下文。"""
+    """retry 驱动器构造下一 iteration 输入所需的恢复上下文。
+
+    add-dev-handoff-artifact 组5 新增字段（无 handoff → 空默认，输出与现状 byte 级等价）：
+        ``handoff_path``/``handoff_digest`` — journal 引用的 handoff artifact（retry 驱动器透传
+        ``--handoff-artifact``/``--handoff-digest`` 注入下轮 prompt 的独立标记块）。
+        ``decisions``/``next_action`` — **优先取 dev 亲笔自述**（``tried_and_failed``+``rationale``
+        → decisions；``next`` → next_action；delta「in preference to mechanical derivation」）；
+        无 handoff → 空值，消费方回退 ``suggested_next_step`` 机械派生。
+        handoff 是上下文载体非判据：本 dataclass 无任何 verdict/gate/retry 决策字段（delta
+        「never gates verdicts」——决策在 RecoveryPlan/RetryPolicy，其输入不含本上下文）。"""
     iteration_id: str
     prd_id: str
     status: str
@@ -91,6 +100,10 @@ class RecoveryContext:
     last_exception_class: str | None = None
     last_failure_summary: str | None = None
     suggested_next_step: str = ""
+    handoff_path: str | None = None
+    handoff_digest: str | None = None
+    decisions: tuple[str, ...] = ()
+    next_action: str | None = None
 
 
 def _extract_artifact_path(payload: dict) -> str | None:
@@ -110,22 +123,56 @@ def _extract_artifact_path(payload: dict) -> str | None:
 
 def build_recovery_context(*, iteration_id: str, prd_id: str, status_value: str,
                            prd_content: str, events,
-                           session_meta=None) -> RecoveryContext:
+                           session_meta=None,
+                           handoff_content: str | None = None) -> RecoveryContext:
     """从 immutable PRD + journal events 派生 RecoveryContext（纯函数，只读）。
 
     ``events``：journal 事件序列（鸭子类型，需有 ``event_type`` 与 ``payload``）。
-    ``session_meta``：可选 SessionMeta，提供最后失败分类（喂 suggested_next_step 诊断）。"""
+    ``session_meta``：可选 SessionMeta，提供最后失败分类（喂 suggested_next_step 诊断）。
+    ``handoff_content``：add-dev-handoff-artifact 组5——同 PRD 上一 iteration 的 handoff
+        artifact 原文（**调用方读文件**，本函数保持纯函数零 IO/零 SDK）。并入条件（缺一不并入，
+        等同缺失回退机械派生）：journal 有同 ``prd_id`` 的 ``iteration_handoff`` 引用（取最新）+
+        content digest 与引用一致 + 契约校验通过。digest 不过（落盘后被改）→ 拒收——被改内容
+        绝不进恢复上下文（evidence-integrity；注入侧 dev-agent exit 10 才是显式报错面）。"""
+    import json
+
+    import handoff as HO
+
     objective, acceptance = parse_prd(prd_content)
     last_feedback: str | None = None
     artifact_paths: list[str] = []
+    h_ref: dict | None = None   # add-dev-handoff-artifact：最新同 PRD iteration_handoff 引用
     for ev in events or []:
         etype = getattr(ev, "event_type", None) or ""
         payload = getattr(ev, "payload", None) or {}
+        if etype == "iteration_handoff" and getattr(ev, "prd_id", None) == prd_id:
+            h_ref = payload if isinstance(payload, dict) else None   # 后写覆盖（多轮取最新）
+            continue
         path = _extract_artifact_path(payload)
         if path:
             artifact_paths.append(path)
             if etype == "verifier_feedback":
                 last_feedback = path
+    # handoff 并入（delta「Handoff supplies decisions and next action」）：journal 引用 +
+    # digest 双验 → decisions/next_action 取自述；任何一步不过 → 空默认（正常缺失，不伪造）。
+    h_path = h_digest = None
+    decisions: tuple[str, ...] = ()
+    next_action: str | None = None
+    if h_ref is not None and handoff_content is not None:
+        ref_digest = h_ref.get("digest")
+        if isinstance(ref_digest, str) and HO.verify_digest(handoff_content, ref_digest):
+            try:
+                obj = HO.validate_handoff(json.loads(handoff_content))
+            except (json.JSONDecodeError, ValueError):
+                obj = None   # 坏 JSON → 等同缺失（validate 不抛，这里兜 json.loads）
+            if obj:
+                tried = [str(x) for x in obj.get("tried_and_failed") or []]
+                rat = str(obj.get("rationale") or "").strip()
+                decisions = tuple(tried + ([f"rationale: {rat}"] if rat else []))
+                nxt = [str(x).strip() for x in obj.get("next") or [] if str(x).strip()]
+                next_action = "; ".join(nxt) if nxt else None
+                h_path = h_ref.get("path") if isinstance(h_ref.get("path"), str) else None
+                h_digest = ref_digest
     # 去重保序（同一 artifact 可能被多事件引用）
     seen: set[str] = set()
     uniq_paths = [p for p in artifact_paths if not (p in seen or seen.add(p))]
@@ -148,4 +195,8 @@ def build_recovery_context(*, iteration_id: str, prd_id: str, status_value: str,
         last_exception_class=last_exc,
         last_failure_summary=last_fail,
         suggested_next_step=suggested_next_step(status_value),
+        handoff_path=h_path,
+        handoff_digest=h_digest,
+        decisions=decisions,
+        next_action=next_action,
     )

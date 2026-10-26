@@ -86,6 +86,8 @@ def test_all_env_names_mapped():
         # 编排器主图切换是独立能力域，不属于 loop runtime 6 大渐进启用面）
         "pa_graph_shadow": "PA_GRAPH_SHADOW",
         "pa_graph_orchestrator": "PA_GRAPH_ORCHESTRATOR",
+        # add-dev-handoff-artifact D2：dev 亲笔交接（dev 会话连续性，loop runtime 域，PA_LOOP_ 前缀）
+        "dev_handoff": "PA_LOOP_DEV_HANDOFF",
     }
 
 

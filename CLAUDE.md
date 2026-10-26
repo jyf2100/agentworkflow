@@ -86,6 +86,8 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 | pa-progress | dev 内循环方向抽查（每 K=10 turn 判 on_track/off_track；off_track→redirect_hint 纠偏 1 次，连续 2 次止损；由 dev-agent.py 链式调用） |
 | pa-verify | dev 产出验证闸（审 diff + 全量测试，判绿/红，2 次重做机会） |
 
+dev 会话断点（verify revise / retry / 崩溃 kill）后还有 **dev 交接工件 (handoff)**——同 PRD 上一 iteration 的 dev 亲笔结构化自述（`scripts/handoff.py`，flag `PA_LOOP_DEV_HANDOFF` 默认 off）：dev-agent 写侧围栏 JSON 快照 → 编排器 content-addressed 归档 + journal 事件 `iteration_handoff`（dev_out 缺失时从快照收养）→ 下轮 `--handoff-artifact` 注入（仅上下文非判据）。详见 `openspec/specs/`（add-dev-handoff-artifact 归档后）与 RUNBOOK §18。
+
 ### 控制面标准执行器（ADR-0006）
 `dev-agent.py` 是驱动**所有**目标仓的唯一执行器，在目标仓 worktree 内经 `claude-agent-sdk` 的 `query()` 跑 dev loop。**SDK 版本钉 `>=0.2.128,<0.2.130`**（对齐 `pyproject.toml`，实装 0.2.128）：streaming 模式要求已由 `prompt_stream.py` 满足（prompt 包成 AsyncIterable，非 string-prompt，解决 0.2.123+ 的 `can_use_tool` streaming 冲突）；0.2.128 配本地 `sdk_compat_patch.py`（#1106 keep-alive 定向 ast patch，上游 PR OPEN 未合，合并后移除并放宽上界，独立 follow-up）。
 

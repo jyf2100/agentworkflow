@@ -68,6 +68,7 @@ class LoopFlags:
     verify_anchor_evidence: bool = False          # harden-pa-verify-determinism task 4.0（flag-gated rollout）
     pa_graph_shadow: bool = False                 # langgraph-workflow-upgrade task 5.1：graph 主图 shadow parity 开关。批 2 声明性（仅 preflight orchestrator⇒shadow 依赖占位 + run_cron 不读它）；批 3 task 5.3/3.10 实装 run_graph_shadow_parity_drill 才真正消费（不改 cron 真路径，仍走 run_daily）
     pa_graph_orchestrator: bool = False           # langgraph-workflow-upgrade task 5.1：cron 分流 graph_pa.py（gated on shadow+parity+canary；D7 flag off = run_daily 完整保留）
+    dev_handoff: bool = False                     # add-dev-handoff-artifact D2：dev 亲笔交接（--expect-handoff 写侧契约 + K-turn 快照收养 + 注入）。默认 off = dev-agent 全零变化（prompt/JSON/文件 byte-identical）
 
 
 # flag 名 → 环境变量名（运维/CI 文档化的稳定开关名）。改这些 = 改对外契约。
@@ -94,6 +95,8 @@ FLAGS_ENV_MAP: dict[str, str] = {
     # 切换是独立能力域，不属于 loop runtime 6 大渐进启用面）。env 名稳定（运维/CI 文档化的开关名），改 = 改对外契约。
     "pa_graph_shadow": "PA_GRAPH_SHADOW",
     "pa_graph_orchestrator": "PA_GRAPH_ORCHESTRATOR",
+    # add-dev-handoff-artifact：dev 会话连续性，loop runtime 域（同 session_aware_retry 前缀惯例）。
+    "dev_handoff": "PA_LOOP_DEV_HANDOFF",
 }
 
 # 真值集合（strip + lower 后判定）。其余一律 False（保守：未知字符串不开）。

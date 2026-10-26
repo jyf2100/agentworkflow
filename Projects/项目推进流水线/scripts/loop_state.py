@@ -156,6 +156,7 @@ class ArtifactKind(str, Enum):
     CUTOVER_SUITE = "cutover_suite"        # task 7.6：完整 cutover 套件通过 summary 归档（immutable passing evidence）
     REFLECTION = "reflection"              # add-cross-prd-learning-memory task 1.2：终态反思全量输出（sanitized）
     LESSONS_BLOCK = "lessons_block"        # add-cross-prd-learning-memory Section 5 接线：dispatch-entry 注入 dev-agent 的 lesson block（sanitized checklist；ADR-0001 控制面/目标面边界）
+    HANDOFF = "handoff"                    # add-dev-handoff-artifact 组4：dev 亲笔交接工件（```handoff``` 围栏 JSON → content-addressed 落盘 + iteration_handoff journal 事件引用）
 
 
 class AssuranceTier(str, Enum):

@@ -259,6 +259,26 @@ def default_resolver(repo_dir: str | Path = ".", gh_repo: str | None = None) -> 
     return CompositeResolver([LocalGitResolver(repo_dir), GhPrResolver(default_repo=gh_repo)])
 
 
+def _load_handoff_content(events, prd_id: str, artifact_root) -> str | None:
+    """本体论审核 B1（2026-10-26 裁决补接线）：journal 最新同 PRD ``iteration_handoff`` 引用 → 读 artifact。
+
+    只读文件不校验——digest 门 + 契约校验**单源于** ``build_recovery_context``（防双源漂移）。
+    无引用 / payload 无 path / 文件不可读 → None（等同缺失，正常回退非错误）。
+    """
+    ref = None
+    for ev in events or []:
+        if getattr(ev, "event_type", None) == "iteration_handoff" \
+                and getattr(ev, "prd_id", None) == prd_id:
+            p = getattr(ev, "payload", None)
+            ref = p if isinstance(p, dict) else None   # 后写覆盖（多轮取最新，同 build_recovery_context）
+    if ref is None or not isinstance(ref.get("path"), str):
+        return None
+    try:
+        return (Path(artifact_root) / ref["path"]).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 # ─── recovery driver：reconcile-before-retry 顶层入口（3.5 契约执行端）─────────
 @dataclass(frozen=True)
 class RecoveryPlan:
@@ -273,7 +293,7 @@ def recover_iteration(*, journal_path, run_id: str, prd_id: str, iteration_id: s
                       base: str, prd_content: str, targets, resolver: KeyResolver,
                       session_store: SessionStore, budget: RP.BudgetState,
                       verifier_signal: RP.VerifierSignal = RP.VerifierSignal.NONE,
-                      failure_history=None) -> RecoveryPlan:
+                      failure_history=None, artifact_root=None) -> RecoveryPlan:
     """reconcile-before-retry 主入口（真正能跑）。
 
     流程（spec L10-12）：read journal → reduce 归约态 → 查 session metadata → reconcile
@@ -294,9 +314,16 @@ def recover_iteration(*, journal_path, run_id: str, prd_id: str, iteration_id: s
     decision = RP.decide(budget=budget, session=session, fingerprint=fingerprint,
                          progress=None, external_known=report.external_known,
                          verifier_signal=verifier_signal, failure_history=failure_history)
+    # add-dev-handoff-artifact 本体论审核 B1：handoff 并入恢复摘要（decisions/next_action 取
+    # dev 自述）。decide 先于 context 构建（never-gates 结构保证）——handoff 内容不进决策。
+    # artifact_root=None（既有调用方）→ 不喂（诚实缺失回退，行为与变更前一致）。
+    _handoff_content = None
+    if artifact_root is not None:
+        _handoff_content = _load_handoff_content(events, prd_id, artifact_root)
     context = RC.build_recovery_context(iteration_id=iteration_id, prd_id=prd_id,
                                         status_value=state.status.value,
                                         prd_content=prd_content, events=events,
-                                        session_meta=session)
+                                        session_meta=session,
+                                        handoff_content=_handoff_content)
     return RecoveryPlan(decision=decision, context=context, reconciliation=report,
                         iteration_status=state.status.value)

@@ -554,3 +554,18 @@ hub 观察面三件套：读面会话守卫 + MM 通知 bot + 镜像陈旧检测
 **PA_REPORT_DIR（report 双写）**：hub 派发时给容器注入 `PA_REPORT_DIR=<容器内 state>/reports`（docker `-e` 直传，与凭据 env-file 分离）——pa report 段在该目录**追加**双写一份 `项目推进报告_<stamp>.md`（原落点不变，缺省零变化），落容器内 state 卷即 host `<data_root>/<project>/state/reports/` 可见，面板 run 详情页按 run stamp 对齐读。不注入（如本地 vault 直接跑 run_daily）= 行为与 4b 前完全一致。
 
 **无 run 放弃告警**：create_run 前的五类放弃（project 名非法 / PRD 缺失 / 启动必读面缺失 / 凭据缺失 / meta 署名失败）收敛经 `_abandon` → bot 私信管理员（含队列项 id + project + 原因摘要）；通道关闭 = stderr 降级留痕（fail_item 不受影响）。与 run 终态通知（4a notify_run）互补：无 run 的放弃也有可见性。
+
+## 18. dev 交接 Handoff（add-dev-handoff-artifact，2026-10）
+
+dev 亲笔交接工件：断点后新 dev 会话拿到上一 iteration 的结构化自述（写侧 → content-addressed 归档 → 下轮注入）。**默认 off**（flag `PA_LOOP_DEV_HANDOFF`，env > profile.loop > False；依赖 `journal_shadow`——preflight 静态阻断 dev_handoff on + journal_shadow off 组合）。off = dev-agent prompt/JSON/文件面 byte-identical baseline，关 flag 即回退。
+
+**链路与产物**（flag on 时）：
+- 写侧：dev-agent 每 turn 解析 assistant 回复的 ```handoff``` 围栏 JSON → `state["handoff_latest"]` + 原子快照 `wt/state/runs/handoff-latest.json`（tmp+rename；`--expect-handoff` 开契约）；
+- 归档：dispatch 在 `_run_dev_agent` 后、blocked_by_gate 短路前，落 content-addressed artifact（kind=handoff）+ journal 事件 `iteration_handoff`（payload 带 digest/size/path/round/adopted_from_snapshot）；
+- 收养（adopt）：dev_out 缺失（kill/超时/崩，`script_json=None`）但快照存在 → 从快照归档，事件标 `adopted_from_snapshot: true`；两者皆无 → 无事件（正常缺失，非错误）；
+- 注入：round≥2 经 `--handoff-artifact`+`--handoff-digest` 成对透传（digest 不匹配 → dev-agent exit 10 `handoff_integrity`，fail-closed 不静默降级）；recovery summary 的 decisions/next_action 优先取自述（`build_recovery_context` 入参 `handoff_content`，调用方读文件）。
+
+**运维要点**：
+- 观测层 fail-open：store/emit 失败只 log `⚠ iteration_handoff store 失败`，不拖垮 dispatch；handoff 永不进 verdict/gate/retry 决策（RetryPolicy 输入不含它）；
+- 排查：journal grep `iteration_handoff` 看每轮归档（含 adopted 标记）；artifact 在 `state/artifacts/<run>/handoff/`；dev 侧中途快照在 worktree `state/runs/handoff-latest.json`（roc cron 形态盘上幸存可收养；hub 容器形态 worktree 是容器可写层，容器死后 in-flight 快照随容器丢 = 诚实缺失回退，已归档的 journal/artifact 在 state 卷幸存——见 design.md Open Question 2 结案）；
+- 回退：`PA_LOOP_DEV_HANDOFF=false` 一键关回 baseline（env 压过 profile）。

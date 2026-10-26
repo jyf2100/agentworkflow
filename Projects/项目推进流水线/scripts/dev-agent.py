@@ -58,6 +58,7 @@ from claude_agent_sdk import (
 )
 
 from slug_utils import dev_slugify, make_branch   # ADR-0006 #5：dev_slugify 单一源头 + verify-loop-discipline A1 make_branch（均无依赖，避免顶部 import 触发 sdk 连带加载拖垮 cron）
+import handoff   # add-dev-handoff-artifact：dev 亲笔交接契约纯模块（写侧吸收/快照 + 读侧注入校验渲染；纯 stdlib）
 from bash_allowlist import decide_bash   # ADR-0006 #7：Bash 命令放行判定（无依赖模块，同上）
 from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # OpenSpec verified-dev-execution：结构化测试证据 + 发布硬门（无依赖模块，同上）
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
@@ -110,7 +111,11 @@ def parse_args(argv: list[str]) -> dict:
            # add-per-agent-model-routing：per-dev model（手动 --model / canary；不设=走 PA_DEV_MODEL env→roc 默认）
            "model": None,
            # add-forge-adapter tasks 2.2：PR 面分流（控制面 --forge/--forge-host 透传；None=github gh 基线零变化）
-           "forge": None, "forge_host": None}
+           "forge": None, "forge_host": None,
+           # add-dev-handoff-artifact：dev 亲笔交接。expect=写侧契约启用（控制面 dev_handoff flag 透传；
+           # SDK 0.2.128 无 append_system_prompt → 契约进 build_prompt，缺省 off 保 baseline byte-identical）；
+           # artifact/digest=读侧注入（同 --feedback-artifact 模式 + digest fail-closed，见 build_prompt）。
+           "expect_handoff": False, "handoff_artifact": None, "handoff_digest": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -137,6 +142,9 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--model": out["model"] = argv[i + 1]; i += 1                     # add-per-agent-model-routing：per-dev model（手动/canary；flag > PA_DEV_MODEL env > roc 默认）
         elif a == "--forge": out["forge"] = argv[i + 1]; i += 1                     # add-forge-adapter：gitlab/gitcode PR 面分流
         elif a == "--forge-host": out["forge_host"] = argv[i + 1]; i += 1           # add-forge-adapter：gitlab 自托管 host
+        elif a == "--expect-handoff": out["expect_handoff"] = True                  # add-dev-handoff-artifact：写侧契约启用
+        elif a == "--handoff-artifact": out["handoff_artifact"] = argv[i + 1]; i += 1  # 读侧注入：上一轮 dev 交接 artifact
+        elif a == "--handoff-digest": out["handoff_digest"] = argv[i + 1]; i += 1   # 注入完整性（sha256:<hex>；不匹配 fail-closed）
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
     return out
@@ -153,7 +161,9 @@ HELP = """dev-agent.py — 项目推进流水线·控制面标准执行器（ADR
   --dry-run        只跑到"改完代码 + 本地 test"，不 commit/push/开 PR
   --forge          Git 托管平台（github 缺省 | gitlab | gitcode；非 github → PR 面走 REST adapter）
   --forge-host     gitlab 自托管 host（forge=gitlab 必带）
-退出码: 0 OK | 10 无/读不到 PRD | 11 SDK 失败 | 12 stalled | 13 git/PR 失败 | 14 forge 配置类永久失败
+  --expect-handoff 启用 dev 交接契约（每阶段回复末尾携带 ```handoff``` 围栏块；控制面 dev_handoff flag 透传）
+  --handoff-artifact 上一轮 dev 交接 artifact path（+ --handoff-digest sha256:<hex> 完整性校验；baseline 不传）
+退出码: 0 OK | 10 无/读不到 PRD（或 handoff artifact 完整性失败） | 11 SDK 失败 | 12 stalled | 13 git/PR 失败 | 14 forge 配置类永久失败
         （401/403 token 无效/权限缺——重试必败，hub 队列对 14 不重派；本体论审核 M2，2026-10-26）
         | 15 off_track | 99 未捕获"""
 
@@ -435,7 +445,10 @@ def create_loop_state(run_log: Path) -> dict:
             # in-loop-semantic-checkpoint：方向抽查状态（stalled 之外的第二干预源）
             "judge_k": semantic_gate.JUDGE_K, "judge_rounds": 0, "off_track_count": 0,
             "last_verdict": None, "last_covered": [], "redirect_pending": None,
-            "off_track_exhausted": False, "judge_cost_acc": 0.0}
+            "off_track_exhausted": False, "judge_cost_acc": 0.0,
+            # add-dev-handoff-artifact D2：```handoff``` 围栏块最新规整版（None=从未产出，诚实缺失）。
+            # K-turn 吸收即写 run_dir 快照（D3）；此键供四个 JSON 收尾出口经 with_handoff 透传。
+            "handoff_latest": None}
 # 注：无 last_session_id——H1 review 后接受新 session 现实（break 拿不到流末 session_id），
 # redirect leg 开新 query 不 resume。未来若做 Path A（ClaudeSDKClient+interrupt 真·注入）再加锚点。
 
@@ -467,9 +480,11 @@ async def process_dev_loop(messages, state: dict, prd_text: str = "") -> ResultM
             blocks = msg.content or []
             has_write = False
             tool_uses = []
+            msg_text = ""   # add-dev-handoff-artifact：累积本条回复 TextBlock 文本，块循环后吸收 ```handoff``` 围栏块
             for b in blocks:
                 if isinstance(b, TextBlock):
                     sys.stderr.write(f"[dev] {b.text}\n")
+                    msg_text += b.text
                 elif isinstance(b, ToolUseBlock):
                     name = b.name or "?"
                     inp = b.input or {}
@@ -483,6 +498,12 @@ async def process_dev_loop(messages, state: dict, prd_text: str = "") -> ResultM
                         if is_clean_test_cmd(inp["command"].strip()):
                             state["pending_test_ids"].add(b.id)   # 等下个 user msg 配对 tool_result
                             state["last_test_cmd"] = inp["command"].strip()   # 记最后一次干净 test 命令，上报给 dispatch 重放
+            # add-dev-handoff-artifact D2/D3：吸收本条回复的 ```handoff``` 围栏块（每 AssistantMessage
+            # 一次 = 自然每 turn 检查，与 pa-progress K=10 抽查独立共存——无共享计时器/状态；不 gate
+            # expect_handoff，模型自发产出也捕获）。新块 → state["handoff_latest"] + run_dir 原子快照
+            # （断点③进程被杀时留最后版本供编排器收养）；无块/坏块 no-op（handoff.py 静默跳过）。
+            if msg_text:
+                handoff.absorb_assistant_text(state, msg_text, run_dir=state["run_log"].parent)
             if has_write:
                 state["no_write_streak"] = 0
                 # OpenSpec verified-dev-execution：绿后又发生候选写 → 证据过期（mark_stale 返回新副本，None 原样）
@@ -549,6 +570,14 @@ def build_env_for_sdk() -> dict:
     return env
 
 
+class HandoffIntegrityError(Exception):
+    """add-dev-handoff-artifact D4：注入侧完整性失败（artifact 不可读 / digest 缺失或不匹配）。
+
+    fail-closed 拒绝注入（evidence-integrity，spec durable-loop-state scenario「Recorded handoff
+    digest mismatch fails closed」），**不静默降级**；区别于「从未产出」的正常缺失（参数整个
+    不传 → 空块回退）。main 捕获 → 结构化 JSON + exit 10（输入类永久失败，重试同因必败）。"""
+
+
 def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     """通用 dev 守则 prompt（ADR-0005 B1 决策）。
     仓特定知识（目录/测试入口/保护路径/env 名）**不在此**——由各仓根 CLAUDE.md 承载，
@@ -570,6 +599,19 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     if args.get("feedback_artifact"):
         fb = read_text(args["feedback_artifact"]) or "(读不到 feedback artifact)"
         feedback_block = f"\n\n## ⚠️ 上轮 verify 反馈（journal artifact；driven 模式 PRD 不可变，按此落实后重做）\n```\n{fb}\n```"
+    # add-dev-handoff-artifact D4：读侧注入——上一轮 dev 交接 artifact + digest（fail-closed：文件不可读
+    # / digest 缺失或不匹配 → HandoffIntegrityError，**不静默降级**；区别于「从未产出」的正常缺失 =
+    # 参数整个不传 → 空块回退）。渲染为独立标记块（untrusted 边界：仅上下文非判据），位置在 feedback
+    # 之后、仓特定守则之前（feedback / handoff / lessons 三块各自独立标记，lessons 仍最末 append）。
+    handoff_injection = ""
+    if args.get("handoff_artifact"):
+        _hc = read_text(args["handoff_artifact"])
+        _dg = args.get("handoff_digest")
+        if _hc is None or not _dg or not handoff.verify_digest(_hc, _dg):
+            raise HandoffIntegrityError(
+                f"handoff artifact 完整性校验失败（fail-closed）: path={args['handoff_artifact']} "
+                f"readable={_hc is not None} digest_given={bool(_dg)}")
+        handoff_injection = handoff.render_block(_hc)
     # add-cross-prd-learning-memory Section 5 接线：lesson block（控制面检索的 prior-PRD 经验）经
     # ``--lessons-artifact`` path 传入（与 feedback_artifact 完全对称）。ADR-0001 控制面/目标面隔离：
     # dev-agent **只读传入的 path**，不读控制面 state；lesson_block 是 sanitized markdown checklist
@@ -581,6 +623,22 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
             lessons_block = lb
     # inject_into_prompt（learning_memory_retrieval）：lesson_block 非空 → append 到 prompt 末尾；
     # 空 → identity no-op（baseline prompt byte-identical，design 决策#7 fail-open）。
+    # add-dev-handoff-artifact D2：写侧契约段（--expect-handoff 才有——控制面 dev_handoff flag gate，
+    # 缺省 off = baseline prompt byte-identical；SDK 0.2.128 无 append_system_prompt 的实施期落点）。
+    # 契约位于收尾指令之前；空串与尾部指令行拼接保 byte 等价（回归锚 test_dev_handoff 钉死）。
+    handoff_contract = ""
+    if args.get("expect_handoff"):
+        handoff_contract = "\n".join([
+            "",
+            "## dev 交接契约（每轮收尾必带）",
+            "每次阶段性回复的**末尾**携带一个 ```handoff``` 围栏块（内为 JSON），收尾回复必须携带最终版。字段固定六项（缺失给空值，不编造）：",
+            '`{"done": [], "in_progress": [], "blockers": [], "tried_and_failed": [], "next": [], "rationale": ""}`',
+            "- done=已完成且有佐证 / in_progress=未收口半成品及位置 / blockers=阻塞与外部依赖 / "
+            "tried_and_failed=已试无效方案与原因（防下轮重蹈）/ next=建议下一步（按优先级）/ "
+            "rationale=关键决策理由（≤500字符）；每列表项 ≤200 字符。",
+            "这是给下一轮 dev 会话的亲笔交接（仅上下文），不是给验证闸的判据。",
+            "",
+        ])
     base_prompt = "\n".join([
         head,
         prot,
@@ -588,7 +646,7 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
         "## 你的任务（PRD）",
         prd_text,
         source_block,
-        feedback_block,
+        feedback_block + handoff_injection,
         "",
         "## 仓特定守则（必读）",
         "本仓的目录结构 / 测试入口 / 受保护路径 / 环境名等仓特定知识，详见仓库根 `CLAUDE.md`",
@@ -614,7 +672,7 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
         "分工纪律：用 Agent 工具 spawn 子代理，每个单一职责；给子代理明确目标 + 限定文件范围；",
         "子代理产出回你整合 + 跑本仓测试验证整体；commit/push 只由你（parent）守。",
         "",
-        "现在：读 CLAUDE.md → 读 PRD → 规划 → 改代码 → 跑本仓测试 → 到「可提交且 test 绿」即停。",
+        handoff_contract + "现在：读 CLAUDE.md → 读 PRD → 规划 → 改代码 → 跑本仓测试 → 到「可提交且 test 绿」即停。",
         "停下前用一段话总结：改了什么 / test 结果 / 遗留风险。",
     ])
     # add-cross-prd-learning-memory Section 5：lesson_block append（空=identity no-op，baseline prompt）
@@ -628,6 +686,13 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
             # 兜底：learning_memory_retrieval 不可用（不应发生——纯 stdlib）→ 原样返 baseline（fail-open）
             return f"{base_prompt}\n\n{lessons_block}"
     return base_prompt
+
+
+def with_handoff(payload: dict, state: dict) -> dict:
+    """add-dev-handoff-artifact D2：四个 JSON 收尾出口（publish / stalled 12 / off_track 15 / gate 14）
+    统一附带 handoff 字段（null=诚实缺失，绝不伪造；spec「Every JSON-emitting finish exit carries
+    a handoff」）。返回新 dict，不改入参。"""
+    return {**payload, "handoff": state.get("handoff_latest")}
 
 
 async def _can_use_tool(
@@ -978,8 +1043,14 @@ async def main() -> int:
         except Exception as e:
             sys.stderr.write(f"✗ 建分支失败: {e}\n"); return 13
 
-    # 2. 组 prompt
-    prompt = build_prompt(args, prd_text, None if args["dry_run"] else branch)
+    # 2. 组 prompt（add-dev-handoff-artifact D4：handoff 注入完整性失败 → 结构化 JSON + exit 10，
+    #    输入类永久失败（重试同因必败）；不静默降级、不走 exit 99 未捕获）
+    try:
+        prompt = build_prompt(args, prd_text, None if args["dry_run"] else branch)
+    except HandoffIntegrityError as e:
+        print(json.dumps({"ok": False, "error": "handoff_integrity", "detail": str(e),
+                          "branch": branch, "base": args["base"]}, ensure_ascii=False))
+        return 10
 
     # 3. SDK dev loop（acceptEdits + settingSources + 硬白名单 tools，对齐历史 mjs/py / SPEC §决策#23）
     run_log = STATE_RUNS_DIR / f"{branch.replace('/', '-')}-{s}.jsonl"
@@ -1096,17 +1167,17 @@ async def main() -> int:
     # 语义跑偏止损（pre-merge triage 出口，区别于 stalled(12)/发布门(14)）。优先于 stalled/gate/commit。
     # M4：控制流用 state[]（loud KeyError on typo）非 state.get（silent None→exit15 永不触发）。
     if state["off_track_exhausted"]:
-        print(json.dumps({"ok": False, "off_track": True, "exit_code": 15, "branch": branch, "base": base,
+        print(json.dumps(with_handoff({"ok": False, "off_track": True, "exit_code": 15, "branch": branch, "base": base,
                           "run_log": str(run_log), "cost": cost, "turns": turns,
                           "judge_rounds": state.get("judge_rounds"), "last_verdict": state.get("last_verdict"),
                           "test_cmd": state.get("last_test_cmd"),
-                          "test_passed": state.get("last_test") == "green"}, ensure_ascii=False))
+                          "test_passed": state.get("last_test") == "green"}, state), ensure_ascii=False))
         return 15
 
     # stalled：不 commit/不开 PR，吐 JSON + exit 12（SPEC #27；半成品靠 run_log 留痕）
     if state["stalled"]:
-        print(json.dumps({"ok": False, "stalled": True, "branch": branch, "base": base,
-                          "run_log": str(run_log), "cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd"), "test_passed": state.get("last_test") == "green"}, ensure_ascii=False))
+        print(json.dumps(with_handoff({"ok": False, "stalled": True, "branch": branch, "base": base,
+                          "run_log": str(run_log), "cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd"), "test_passed": state.get("last_test") == "green"}, state), ensure_ascii=False))
         return 12
 
     if result_msg and result_msg.is_error:
@@ -1127,12 +1198,12 @@ async def main() -> int:
         ev = state.get("test_evidence")
         gate_status = verdict   # test_not_run | test_failed | test_stale
         sys.stderr.write(f"🚫 发布门拦截（{gate_status}）: {reason}\n")
-        print(json.dumps({"ok": False, "blocked_by_gate": True, "gate_status": gate_status,
+        print(json.dumps(with_handoff({"ok": False, "blocked_by_gate": True, "gate_status": gate_status,
                           "gate_reason": reason, "branch": branch, "base": base,
                           "cost": cost, "turns": turns,
                           "test_cmd": (ev.command if ev else state.get("last_test_cmd")),
                           "test_status": ("green" if (ev and ev.exit_code == 0) else ("red" if ev else "none")),
-                          "evidence_fresh": bool(ev and ev.fresh)}, ensure_ascii=False))
+                          "evidence_fresh": bool(ev and ev.fresh)}, state), ensure_ascii=False))
         return 14
 
     # 5. commit + push + 开 PR（branch protection 要求走 PR；verify-loop-discipline A2 开 PR 幂等）
@@ -1140,7 +1211,7 @@ async def main() -> int:
     ev = state.get("test_evidence")
     return run_publish_phase(
         {**args, "branch": branch},
-        dev_out={"cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd")},
+        dev_out=with_handoff({"cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd")}, state),
         # 发布门已放行 → test_passed=True 现为可证（新鲜绿色证据），补结构化 gate/test 字段（2.5 truthful JSON）
         on_success={"test_passed": True, "test_status": "green",
                     "gate_status": GATE_PUBLISH, "evidence_fresh": bool(ev and ev.fresh)},

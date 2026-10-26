@@ -59,6 +59,7 @@ import recovery_context as RC              # task 3.4：driven retry prompt 从 
 from verify_anchors import derive_anchors  # harden-pa-verify-determinism task 1.1/4.0：机械锚点推导（纯 stdlib：re + dataclass，cron 安全）
 from verify_bundles import split_bundles    # harden-pa-verify-determinism task 3.1：大 diff 文件打包（纯 stdlib，cron 安全）
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
+import handoff                             # add-dev-handoff-artifact：dev 亲笔交接（快照收养 load_snapshot；纯 stdlib）
 import reconcile                           # task 4.4：ArtifactEvidenceResolver（publication 前 reconcile test evidence）
 import retry_policy as RP                  # task 3.3 P0-3：run_daily 驱动 retry（decide/recover_iteration/budget/session 参数生成）
 import cutover                             # add-cross-prd-learning-memory 批次 2 升级 A：injection 四重 gate（shadow+parity+quality+allowlist）
@@ -1816,7 +1817,10 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
              state_dir: str | None = None, iteration_seq: int = 0,
              resume_session: str | None = None, fork_session: bool = False,
              lessons_artifact: str | None = None,
-             round_n: int = 0) -> list[str] | None:
+             round_n: int = 0,
+             expect_handoff: bool = False,
+             handoff_artifact: str | None = None,
+             handoff_digest: str | None = None) -> list[str] | None:
     """构造 dev-agent 触发命令（ADR-0006：控制面标准执行器为唯一源）。
 
     始终调用控制面 ``scripts/dev-agent.py``（DEV_AGENT_PY）——执行器贴目标仓跑（cwd=调用方传入的
@@ -1847,6 +1851,15 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
         cmd += ["--feedback-artifact", feedback_artifact]
     if lessons_artifact:     # Section 5 接线：lesson block artifact path（None=不注入，dev-agent baseline prompt）
         cmd += ["--lessons-artifact", lessons_artifact]
+    # add-dev-handoff-artifact 组4：dev 亲笔交接透传（镜像 --feedback-artifact 模式，ADR-0001：path 送达、
+    #   dev-agent 不读控制面 state）。expect_handoff=dev_handoff flag（写侧契约启用，2.4）；artifact+digest
+    #   成对（round≥2 / retry 注入，digest 由 dev-agent fail-closed 校验）；baseline 缺省 → cmd 零 handoff 参数。
+    if expect_handoff:
+        cmd += ["--expect-handoff"]
+    if handoff_artifact:
+        cmd += ["--handoff-artifact", handoff_artifact]
+        if handoff_digest:
+            cmd += ["--handoff-digest", handoff_digest]
     if round_n > 0:          # verify-loop-discipline A4：轮次 marker（commit 边界锚；0=不标）
         cmd += ["--round", str(round_n)]
     # task 3.3 P0-3：session-aware retry 参数（run_daily 据 RetryPolicy.decide 生成 → dev-agent 透传 SDK）。
@@ -1995,6 +2008,32 @@ def _append_verify_feedback(prd_abs: str, feedback_section: str, round_n: int, *
         with open(prd_abs, "a", encoding="utf-8") as f:
             f.write(section)
     return digest
+
+
+def _store_iteration_handoff(sj, iter_id: str, prd_id: str, artifact_root: Path,
+                             handoff_obj: dict | None, *, round_n: int = 0,
+                             adopted: bool = False) -> dict | None:
+    """add-dev-handoff-artifact D3：dev 亲笔交接 → content-addressed artifact + journal 事件。
+
+    正常路径（dev_out.handoff，四个 JSON 出口均带）与收养路径（dev_killed 无 stdout JSON 时
+    run_dir 快照 ``handoff-latest.json``）共用；``adopted=True`` 时事件注明 ``adopted_from_snapshot``
+    （spec「Exits without a JSON emit are covered by snapshot adoption」）。返回 artifact ref
+    （digest/path/size）——round≥2 经 ``--handoff-artifact``+``--handoff-digest`` 注入下一轮。
+    幂等：content-addressed 同内容同 path（crash 重放不双份），事件 payload 带 digest 供消费方去重。
+    观测层契约（同 verifier_feedback shadow 面）：store/emit 失败吞异常——handoff 是增补非判据，
+    绝不拖垮 dispatch。handoff_obj 为 None → 无事件（正常缺失，非错误）。"""
+    if not handoff_obj:
+        return None
+    try:
+        content = json.dumps(handoff_obj, ensure_ascii=False)
+        ref = artifact_store.store(artifact_root, content, kind="handoff", sensitivity="internal")
+        sj.emit("iteration_handoff", iter_id, prd_id,
+                payload={"round": round_n, "digest": ref.digest, "path": ref.path, "size": ref.size,
+                         "type": "handoff", "adopted_from_snapshot": bool(adopted)})
+        return {"digest": ref.digest, "path": ref.path, "size": ref.size}
+    except Exception as e:
+        log(f"  ⚠ iteration_handoff store 失败（观测层，不拖垮 dispatch）: {e}")
+        return None
 
 
 def _pa_verify_round(rec: dict, prof: dict, prd_abs: str, cur_base: str,
@@ -2799,6 +2838,7 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
     cur_resume_session: str | None = None
     cur_fork_session = False
     _parent_fb_digest: str | None = None  # task 3.3：prior feedback artifact digest（next attempt 引用）
+    _parent_handoff_ref: dict | None = None  # add-dev-handoff-artifact 组4：prior round handoff artifact ref（round≥2 注入；每轮覆盖，无新 handoff → None 不携带 stale）
     for round_n in range(1, VERIFY_MAX_ROUNDS + 1):
         _iter = _coord.next_iteration(round_n)   # task 3.3：每轮 distinct deterministic iteration（seq=round_n；
         #   planned/running 用 run 级 seq0，每 attempt 一个新 iteration；distinct 使 reducer/recovery 可按 attempt 切片）
@@ -2831,14 +2871,38 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
                            state_dir=str(STATE_DIR), iteration_seq=round_n,
                            resume_session=cur_resume_session, fork_session=cur_fork_session,
-                           lessons_artifact=_lessons_artifact, round_n=round_n)
+                           lessons_artifact=_lessons_artifact, round_n=round_n,
+                           expect_handoff=_coord.flags.dev_handoff,
+                           handoff_artifact=(str((STATE_DIR / "artifacts" / _run) / _parent_handoff_ref["path"])
+                                             if _parent_handoff_ref else None),
+                           handoff_digest=(_parent_handoff_ref["digest"] if _parent_handoff_ref else None))
         else:
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
-                           lessons_artifact=_lessons_artifact, round_n=round_n)
+                           lessons_artifact=_lessons_artifact, round_n=round_n,
+                           expect_handoff=_coord.flags.dev_handoff,
+                           handoff_artifact=(str((STATE_DIR / "artifacts" / _run) / _parent_handoff_ref["path"])
+                                             if _parent_handoff_ref else None),
+                           handoff_digest=(_parent_handoff_ref["digest"] if _parent_handoff_ref else None))
         if cmd is None:
             rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
             _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
         script_json = _run_dev_agent(cmd, wt, slug, log_file)
+        # add-dev-handoff-artifact 组4：dev 亲笔交接归档（观测层 fail-open——handoff 是增补非判据，store/emit
+        # 失败不拖垮 dispatch）。正常路径：dev_out.handoff（publish/stalled/off_track/gate 四出口均带）；
+        # 收养路径（断点③）：dev_killed 无 stdout JSON → 读 dev-agent 原子快照 wt/state/runs/handoff-latest.json
+        # （adopted_from_snapshot=true）。产物 = content-addressed artifact + iteration_handoff journal 事件
+        # （断点③恢复的跨进程载体）+ _parent_handoff_ref（下轮经 --handoff-artifact/--handoff-digest 注入）。
+        # 必须在 blocked_by_gate 短路**之前**：gate 出口的 dev_out 同样带 handoff，须落档再 return。
+        if _coord.flags.dev_handoff and _sj.enabled:
+            _handoff_obj = (script_json or {}).get("handoff")
+            _adopted = False
+            if _handoff_obj is None and script_json is None:   # dev_killed → 收养 dev-agent 写侧快照
+                _snap = handoff.load_snapshot(wt / "state" / "runs")
+                if _snap is not None:
+                    _handoff_obj, _adopted = _snap, True
+            _parent_handoff_ref = _store_iteration_handoff(
+                _sj, _iter, _prd, STATE_DIR / "artifacts" / _run, _handoff_obj,
+                round_n=round_n, adopted=_adopted)   # None（无 handoff/失败）→ 下轮不注入（不携带 stale）
         # 5.1 测试发布门拦截（dev-agent exit 14 → blocked_by_gate）——终态短路，不进 verify/reconcile、不开 PR。
         # dev-agent 已跑完 dev loop 但结构化测试证据不达发布门（test_not_run / test_failed / test_stale）：
         # 门在 commit/push/PR **之前**触发 → 分支已建但无发布提交。宁拦勿错放：既不算 dispatch 成功、也不算
@@ -3148,13 +3212,20 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
                     targets=_publication_targets(owner_repo, rec, _vj),
                     resolver=_coord.resolver, session_store=_coord.session_store,
                     budget=_coord.retry_budget,
+                    # add-dev-handoff-artifact 本体论审核 B1：handoff 并入恢复摘要（journal 引用
+                    # → 读 artifact → digest 门在 build_recovery_context 单源）
+                    artifact_root=STATE_DIR / "artifacts" / _run,
                     verifier_signal=RP.VerifierSignal.LOCAL_FEEDBACK)   # revise=局部反馈，history 可信
                 _rmode = _rplan.decision.mode
                 _sj.emit("retry_decided", _iter, _prd, payload={
                     "round": round_n, "next_round": round_n + 1, "mode": _rmode.value,
                     "reason": _rplan.decision.reason, "consumes_retry": _rplan.decision.consumes_retry,
                     "external_known": _rplan.reconciliation.external_known,
-                    "iteration_status": _rplan.iteration_status})
+                    "iteration_status": _rplan.iteration_status,
+                    # add-dev-handoff-artifact 本体论审核 B1：恢复摘要并入面消费——digest 双验过的
+                    # dev 亲笔自述落 retry 决策事件（无 handoff → 空值，机械派生照旧）
+                    "handoff_decisions": list(_rplan.context.decisions),
+                    "handoff_next_action": _rplan.context.next_action})
                 if _rmode in (RP.RetryMode.BLOCK, RP.RetryMode.STOP):
                     log(f"  ⛔ {slug}: retry {_rmode.value}（{_rplan.decision.reason}）→ 不重试")
                     rec.update(status="retry_blocked" if _rmode is RP.RetryMode.BLOCK else "retry_budget_exhausted",

@@ -312,8 +312,30 @@ def make_devloop_node(*, name: str, stage: str = "dispatch",
             script = json.loads(tail[-1]) if tail else None
         except json.JSONDecodeError:
             script = None
+        # add-dev-handoff-artifact 组4/4.5：dev 亲笔交接归档（对称 dispatch_one _run_dev_agent 后插点；
+        # 观测层 fail-open，iteration_handoff 是 payload-only 事件——不在 shadow parity dispatch 终态对照面）。
+        # 正常路径 dev_out.handoff；收养路径（断点③）dev_killed → wt/state/runs/handoff-latest.json
+        # （adopted_from_snapshot=true）。必须在 blocked_by_gate terminal 之前（gate 出口同样归档）。
+        # _parent_handoff_ref 每轮覆盖进 state（None=下轮不携带 stale）；flag off → 零 handoff 逻辑。
+        _handoff_upd: dict = {}
+        if stage == "dispatch" and getattr(state.get("_coord_flags"), "dev_handoff", False):
+            _sj = state.get("_sj")
+            if _sj is not None and getattr(_sj, "enabled", False):
+                import handoff as _HO
+                from pathlib import Path
+                _ho = (script or {}).get("handoff")
+                _adopted = False
+                if _ho is None and script is None:   # dev_killed → 收养 dev-agent 写侧快照
+                    _snap = _HO.load_snapshot(Path(cwd) / "state" / "runs")
+                    if _snap is not None:
+                        _ho, _adopted = _snap, True
+                _handoff_upd["_parent_handoff_ref"] = run_daily._store_iteration_handoff(
+                    _sj, state.get("_iter", ""), state.get("_prd", ""),
+                    run_daily.STATE_DIR / "artifacts" / (ni.get("run_id") or ""),
+                    _ho, round_n=int(state.get("verify_round", 0)) + 1, adopted=_adopted)
         # dev 字段写入（对齐 dispatch_one L2232-2247）
         extra: dict = {"_dev_rc": rc, "_dev_script": script, "_dev_killed": script is None}
+        extra.update(_handoff_upd)   # add-dev-handoff-artifact：_parent_handoff_ref 每轮覆盖进 state（flag off=空 no-op）
         if script:
             extra["_dev_cost"] = script.get("cost")
             extra["_dev_turns"] = script.get("turns")
@@ -595,6 +617,14 @@ def _dev_build_cmd(state: dict) -> list[str] | None:
     src_abs = state.get("_src_abs", "")
     prd_abs = state.get("_prd_abs") or state.get("_prd_path", "")
     flags = state.get("_coord_flags")
+    # add-dev-handoff-artifact 组4/4.5：handoff kwargs 对称透传（镜像 dispatch_one 两分支；绝对 path——
+    #   dev-agent cwd 是 worktree；flag off / 无 ref → 零 handoff 参数 = baseline cmd byte-identical）。
+    _hr = state.get("_parent_handoff_ref")
+    _ho_root = run_daily.STATE_DIR / "artifacts" / (state.get("run_id") or "")
+    _ho_kw = dict(
+        expect_handoff=bool(flags and getattr(flags, "dev_handoff", False)),
+        handoff_artifact=(str(_ho_root / _hr["path"]) if _hr else None),
+        handoff_digest=(_hr["digest"] if _hr else None))
     if flags and getattr(flags, "session_aware_retry", False):
         return run_daily._dev_cmd(
             prof, prd_abs, base, src_abs,
@@ -604,12 +634,14 @@ def _dev_build_cmd(state: dict) -> list[str] | None:
             resume_session=state.get("_cur_resume_session"),
             fork_session=bool(state.get("_cur_fork_session", False)),
             lessons_artifact=state.get("_lessons_artifact"),
-            round_n=state.get("verify_round", 1))   # verify-loop-discipline A4：轮次 marker（commit 边界锚）
+            round_n=state.get("verify_round", 1),   # verify-loop-discipline A4：轮次 marker（commit 边界锚）
+            **_ho_kw)
     return run_daily._dev_cmd(
         prof, prd_abs, base, src_abs,
         feedback_artifact=state.get("_fb_artifact"),
         lessons_artifact=state.get("_lessons_artifact"),
-        round_n=state.get("verify_round", 1))   # verify-loop-discipline A4：轮次 marker（commit 边界锚）
+        round_n=state.get("verify_round", 1),   # verify-loop-discipline A4：轮次 marker（commit 边界锚）
+        **_ho_kw)
 
 
 def _state_log_path(state: dict) -> Any:

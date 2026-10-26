@@ -88,6 +88,10 @@ _Avoid_: merge request、patch、diff、变更说明。
 控制面在 terminal PRD 之后做的「经验沉淀 + 跨 PRD 复用」子系统。terminal 后跑 read-only SDK reflection 抽 candidate lesson → cross-PRD 等价 recurrence ≥2 后 promote → 之后相关 PRD dispatch 时注入 ≤5 条 lesson 进 dev prompt → terminal 后用 effectiveness loop 评估（followed/contradicted/unknown）→ 据此调整 confidence 与 active/retired 状态。**state 全在 ``.project-auto/state/lessons/``（candidates/events/usage JSONL + catalog projection），绝不入目标仓/commit/PR/immutable PRD**（ADR-0001 控制/目标面隔离）。**fail-open by construction**：任何 reflection/injection/catalog/effectiveness 故障都不改 PRD 结果/dispatch terminal outcome/verify verdict/publish gate。两个 disabled-by-default flag（``PA_LEARNING_SHADOW`` / ``PA_LEARNING_INJECTION``）+ profile ``learning_memory.enabled`` 项目级 canary 标记共同 gate（V1 project-only scope）。两级 rollback：关 injection 保留 shadow candidate generation；关 shadow 停 reflection（existing candidate facts inert + rebuildable）。
 _Avoid_: memory、cache、knowledge base（太泛）、RAG（V1 明确 Non-Goal）。
 
+**dev 交接 (Handoff)**:
+同 PRD 跨 iteration 的 **dev 亲笔**结构化自述（```handoff``` 围栏 JSON，五列表 done/in_progress/blockers/tried_and_failed/next + rationale，≤4KB）——dev 会话三类断点（verify revise / stalled·off_track retry / 崩溃 kill）后，新 dev 会话拿到的上一轮第一手进度。链路：dev-agent 写侧原子快照 `wt/state/runs/handoff-latest.json` → 编排器落 content-addressed artifact + journal 事件 `iteration_handoff`（dev_out 缺失时从快照**收养**，事件标 `adopted_from_snapshot: true`）→ 下轮经 `--handoff-artifact`+`--handoff-digest`（fail-closed 校验）注入 prompt 独立标记块，recovery summary 的 decisions/next_action 优先取自述。**仅上下文非判据**：任何 verdict/gate/retry 决策不读 handoff 内容；观测层 fail-open（store 失败不拖垮 dispatch）。范畴区分（vs 近邻）：feedback artifact 是 verify **判据**（编排器→dev）；lessons 是**跨 PRD** 先验；journal 事件是**机械**事实；handoff 是同 PRD 的 dev **亲笔**。disabled-by-default flag ``PA_LOOP_DEV_HANDOFF`` gate（⇒ journal_shadow），off = prompt/JSON/文件 byte-identical baseline。
+_Avoid_: handover、总结（太泛）、progress report（那是 run_log 过程日志）、claude-progress（参照系名，非本实现）。
+
 ## 编排拓扑（LangGraph 重构后引入）
 
 > 以下术语随 `langgraph-workflow-upgrade` 重构落地引入（见 `openspec/changes/langgraph-workflow-upgrade/`）。重构前 `drop`/`triaged` 已用于 `run_daily.py`，此处为机械/语义边界精化。

@@ -118,6 +118,7 @@ def recover_dispatch(*, journal_path: str, shell_inputs: dict, coord: _RecoveryC
     if missing:
         raise ValueError(f"recover_dispatch shell_inputs 缺必填字段：{missing}（对齐 _REQUIRED_SHELL）")
     import reconcile
+    import run_daily   # add-dev-handoff-artifact 本体论审核 B1：artifact_root 对称（与 dispatch_one retry 闭环同根）
     plan = reconcile.recover_iteration(
         journal_path=journal_path,
         run_id=shell_inputs["run_id"],
@@ -129,6 +130,7 @@ def recover_dispatch(*, journal_path: str, shell_inputs: dict, coord: _RecoveryC
         resolver=coord.resolver,
         session_store=coord.session_store,
         budget=coord.retry_budget,
+        artifact_root=run_daily.STATE_DIR / "artifacts" / shell_inputs["run_id"],
     )
     state = _rebuild_dispatch_state(shell_inputs, coord, plan)
     action, reason = _decide_action(plan)

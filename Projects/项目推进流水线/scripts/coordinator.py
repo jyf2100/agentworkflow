@@ -351,6 +351,10 @@ _FLAG_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
     # graph 主图未经双源对照验证，违 R7 shadow parity 前置）。
     ("pa_graph_orchestrator", "pa_graph_shadow",
      "pa_graph_orchestrator requires pa_graph_shadow (graph cutover needs shadow+parity first)"),
+    # add-dev-handoff-artifact 组4：handoff 的跨进程载体是 journal 事件 iteration_handoff（断点③ hub
+    # crash 收养靠 journal 引用 + snapshot 双通道），无 journal_shadow 则事件不落盘、收养链断裂。
+    ("dev_handoff", "journal_shadow",
+     "dev_handoff requires journal_shadow (handoff journal reference is the cross-process recovery carrier)"),
 )
 
 
