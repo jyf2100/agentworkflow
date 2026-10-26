@@ -8,9 +8,10 @@ import notify
 def _env(tmp_path: Path) -> dict:
     return {
         "HUB_USER_ID": "roc",
-        "HUB_USER_ANTHROPIC_BASE_URL": "https://x",
-        "HUB_USER_ANTHROPIC_AUTH_TOKEN": "tok",
-        "HUB_USER_GH_TOKEN": "ghp",
+        # 长值：vault-import 录入口有占位符判据（vault_store.placeholder_issues，MIN_TOKEN_LEN=8）
+        "HUB_USER_ANTHROPIC_BASE_URL": "https://litellm.example",
+        "HUB_USER_ANTHROPIC_AUTH_TOKEN": "tok-abcdef0123456789abcdef",
+        "HUB_USER_GH_TOKEN": "ghp_abcdefghij0123456789",
         "HUB_IMAGE_TAG_DEFAULT": "pa-executor:v0.1.3",
         "HUB_DATA_ROOT": str(tmp_path / "data"),
     }
@@ -47,18 +48,18 @@ def test_cli_vault_import_roundtrip_no_echo(tmp_path, capsys, monkeypatch):
     assert rc == 0
     out = capsys.readouterr().out
     assert "GH_TOKEN" in out and "ANTHROPIC_MODEL" in out  # 字段名可见
-    assert "ghp" not in out and "tok" not in out and "https://x" not in out  # 明文值不回显
+    assert "ghp_" not in out and "tok-abc" not in out and "litellm.example" not in out  # 明文值不回显
 
     vault = vs.CredentialVault(tmp_path / "data", key)
     assert vault.get_user_env("roc") == {
-        "ANTHROPIC_BASE_URL": "https://x",
-        "ANTHROPIC_AUTH_TOKEN": "tok",
-        "GH_TOKEN": "ghp",
+        "ANTHROPIC_BASE_URL": "https://litellm.example",
+        "ANTHROPIC_AUTH_TOKEN": "tok-abcdef0123456789abcdef",
+        "GH_TOKEN": "ghp_abcdefghij0123456789",
         "ANTHROPIC_MODEL": "haiku",
     }
-    monkeypatch.setenv("HUB_USER_GH_TOKEN", "ghp-rotated")
+    monkeypatch.setenv("HUB_USER_GH_TOKEN", "ghp-rotated-0123456789abcdef")
     assert cli.main(["vault-import", "--from-env"]) == 0  # 重复导入幂等覆盖
-    assert vault.get_user_env("roc")["GH_TOKEN"] == "ghp-rotated"
+    assert vault.get_user_env("roc")["GH_TOKEN"] == "ghp-rotated-0123456789abcdef"
 
 
 def test_cli_vault_import_missing_key_fails(tmp_path, capsys, monkeypatch):
@@ -68,6 +69,45 @@ def test_cli_vault_import_missing_key_fails(tmp_path, capsys, monkeypatch):
     rc = cli.main(["vault-import", "--from-env"])
     assert rc == 2
     assert "HUB_VAULT_MASTER_KEY" in capsys.readouterr().err
+
+
+def test_cli_vault_import_rejects_placeholder(tmp_path, capsys, monkeypatch):
+    """录入口拦截（2026-10-23 首跑 #3）：hub.env 模板占位值 → 拒导 rc=2，不落垃圾记录。"""
+    from cryptography.fernet import Fernet
+
+    import vault_store as vs
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("HUB_VAULT_MASTER_KEY", key.decode())
+    for k, v in _env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("HUB_USER_ANTHROPIC_BASE_URL", "https://x")   # 模板事故形态
+    monkeypatch.setenv("HUB_USER_ANTHROPIC_AUTH_TOKEN", "t")
+    rc = cli.main(["vault-import", "--from-env"])
+    assert rc == 2
+    assert "占位符" in capsys.readouterr().err
+    assert vs.CredentialVault(tmp_path / "data", key).get_user_env("roc") is None  # 未落记录
+
+
+def test_cli_vault_import_preserves_tokens_not_in_env(tmp_path, capsys, monkeypatch):
+    """审核修复 M4：vault 已有面板录入的平台 token 而 hub.env 未设 → 重导不抹（与面板 merge 同语义）。"""
+    from cryptography.fernet import Fernet
+
+    import vault_store as vs
+
+    key = Fernet.generate_key()
+    monkeypatch.setenv("HUB_VAULT_MASTER_KEY", key.decode())
+    for k, v in _env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    assert cli.main(["vault-import", "--from-env"]) == 0
+    vault = vs.CredentialVault(tmp_path / "data", key)
+    rec = dict(vault.get_user_env("roc"))
+    rec["GITLAB_TOKEN"] = "glpat-abcdef0123456789ab"   # 面板 merge 录入形态（hub.env 无此键）
+    vault.set_user("roc", rec)
+    assert cli.main(["vault-import", "--from-env"]) == 0   # 重导（env 无 GITLAB_TOKEN）
+    after = vault.get_user_env("roc")
+    assert after["GITLAB_TOKEN"] == "glpat-abcdef0123456789ab"   # 旧值保留（原整覆会静默抹掉）
+    assert after["GH_TOKEN"] == "ghp_abcdefghij0123456789"       # env 非空键照常覆盖（幂等不变）
 
 
 def test_cli_entrypoint_runs_as_script(tmp_path):

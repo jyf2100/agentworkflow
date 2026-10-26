@@ -67,6 +67,16 @@ def test_on_exit_retries_then_fails_after_limit(tmp_path):
     assert item["status"] == "failed" and item["attempt"] == 2  # 第二次失败：超限终态（spec scenario「重派超限止损」）
 
 
+def test_on_exit_14_permanent_no_retry(tmp_path):
+    """add-forge-adapter 审核修复 M2：exit 14（forge 配置类永久失败）不重派——直接终态 failed。"""
+    eng, d = _engine(tmp_path, max_retries=3)
+    a = d.enqueue("a", "/p", "t", "u")
+    _run_cycle(eng, a, rc=14)
+    item = d.get_item(a)
+    assert item["status"] == "failed" and item["attempt"] == 0   # 不 bump 不回 pending（401/403 重派必败）
+    assert "永久失败" in item["last_error"]
+
+
 def test_fail_item_is_terminal_with_reason_recorded(tmp_path):
     eng, d = _engine(tmp_path)
     a = d.enqueue("a", "/p", "pa-executor:v9.9.9", "u")

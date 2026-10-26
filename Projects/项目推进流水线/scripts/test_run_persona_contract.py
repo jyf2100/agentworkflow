@@ -56,6 +56,46 @@ def test_run_persona_contract_violation_budget_exhausted_failopen(monkeypatch):
     assert payload["prd_path"] == "a.md"                      # 降级返回现状 payload，未 raise
 
 
+# ─── exit_diag 镜像守（2026-10-23 hub 首跑 #3 实证修复；与 test_persona_call 同形态）──
+def test_run_persona_nonzero_exit_includes_stdout_envelope(monkeypatch):
+    """退出 1 + 信封 is_error（如 Not logged in 配置错）→ RuntimeError（permanent 臂，
+    不退避重试烧容器——本体论审核 B-MEDIUM 2026-10-23：与 returncode==0 的 is_error 臂同语义）。"""
+    env = json.dumps({"is_error": True, "result": "Not logged in · Please run /login"})
+    monkeypatch.setattr(run_daily.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(returncode=1, stdout=env, stderr=""))
+    with pytest.raises(RuntimeError) as ei:
+        run_daily.run_persona("pa-prd-critic", "prompt", "critic", "t-exit")
+    assert "Not logged in" in str(ei.value)
+    assert not isinstance(ei.value, run_daily.TransientPersonaError)   # 不是瞬态
+
+
+def test_run_persona_nonzero_exit_without_envelope_stays_transient(monkeypatch):
+    """退出 1 + 无信封 stdout（被杀/OOM 等瞬态形态）→ TransientPersonaError（重试合理）。"""
+    monkeypatch.setattr(run_daily.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(returncode=137, stdout="", stderr=""))
+    with pytest.raises(run_daily.TransientPersonaError) as ei:
+        run_daily.run_persona("pa-prd-critic", "prompt", "critic", "t-exit2")
+    assert "137" in str(ei.value)
+
+
+# ─── exit_diag 双实现直比守（本体论审核 B-LOW 2026-10-23：一个测试锁死全部形态不漂移）──
+def test_exit_diag_mirror_identical_across_implementations():
+    """同输入同输出：run_daily.exit_diag 与 persona_call.exit_diag 全形态直比
+    （镜像惯例此前只靠各自测试同形态锚定，直比锁死后任一侧单独改动立即红）。"""
+    import persona_call  # noqa: E402  （本地延迟 import：与 test_persona_call 同路径语义）
+    cases = [
+        (1, json.dumps({"is_error": True, "result": "Not logged in · Please run /login"}), ""),
+        (137, "", ""),
+        (1, "not json at all", "some stderr tail"),
+        (1, '{"is_error": false, "result": "ok"}', "stderr\nlines\ntail"),
+        (2, "", "短 stderr"),
+    ]
+    for rc, out, err in cases:
+        p1 = SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+        p2 = SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+        assert run_daily.exit_diag("lbl", p1) == persona_call.exit_diag("lbl", p2), (rc, out[:30])
+
+
 # ─── per-agent model routing：twin 镜像守（add-per-agent-model-routing）─────────
 # review HIGH（3 人共识）：persona_call 端有 env 注入测试，run_daily 端（7 persona）零守护。
 # 此处补 twin 守护——捕获 run_persona 拼的 cmd，断言 equals 形式注入 / 不设则无。

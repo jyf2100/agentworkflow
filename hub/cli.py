@@ -137,9 +137,25 @@ def _vault_import(cfg: config.HubConfig, *, from_env: bool) -> int:
         key = vault_store.load_key()
         vault = vault_store.CredentialVault(cfg.data_root, key)
         env = cfg.user_env()
-        missing = [k for k in vault_store.VAULT_REQUIRED_KEYS if not env.get(k)]
+        # 审核修复 M4：与面板 merge 同语义（旧记录打底 + env 非空覆盖）——原整覆会静默抹掉
+        # 用户面板录入而 hub.env 没有的平台 token；幂等性不变（同 env 重导 = 同结果）。
+        # 凭据轮换/删除走面板 merge 录新值（留空即保留），本命令只增不减。
+        try:
+            old = vault.get_user_env(cfg.user_id) or {}
+        except vault_store.VaultError:
+            old = {}   # 旧记录读失败不阻断导入（按无旧记录处理；placeholder 校验兜底）
+        env = {**old, **{k: v for k, v in env.items() if v}}
+        # add-forge-adapter 3.3 口径：ANTHROPIC 两值必需 + 平台 token 至少其一
+        # （gitlab/gitcode-only 用户不被迫造假 GH_TOKEN；user_env 已透传三平台）
+        missing = [k for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN") if not env.get(k)]
+        if not any(env.get(k) for k in vault_store.FORGE_TOKEN_KEYS.values()):
+            missing.append("平台 token（GH_TOKEN/GITLAB_TOKEN/GITCODE_TOKEN 至少其一）")
         if missing:
             print(f"✗ 缺必需凭据（{', '.join(missing)}）——hub 进程 env 不全，不猜", file=sys.stderr)
+            return 2
+        bad = vault_store.placeholder_issues(env)
+        if bad:
+            print(f"✗ 凭据形态非法（疑似模板占位未换真值）：{'；'.join(bad)}——不导，先换 hub.env 真值", file=sys.stderr)
             return 2
         vault.set_user(cfg.user_id, env)
     except vault_store.VaultError as e:

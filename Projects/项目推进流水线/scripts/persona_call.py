@@ -51,6 +51,30 @@ def resolve_claude_bin() -> str:
     sys.exit("✗ 找不到 claude CLI（试 PA_CLAUDE_BIN 环境变量或装 Claude Code）")
 
 
+# ─── claude 非零退出诊断（与 run_daily 内联副本镜像，行为对齐；基线=test_persona_call）──
+def exit_diag(label: str, proc) -> str:
+    """非零退出诊断串：stderr 尾 + stdout JSON 信封 is_error/result 摘要并入。
+
+    2026-10-23 hub 首跑实证：claude 退出 1 时原因常只在 stdout 信封
+    （is_error:true, result:"Not logged in · ..."）而 stderr 为空——
+    stderr-only 捕获会把这类失败吞成空错误信息。result 截 300、
+    非 JSON stdout 只取头 200（!r 防控制字符），不整段回吐。"""
+    stderr_tail = (proc.stderr or "").strip()[-400:]
+    parts = [f"[{label}] claude 退出 {proc.returncode}"]
+    if stderr_tail:
+        parts.append(f"stderr={stderr_tail}")
+    stdout = proc.stdout or ""
+    try:
+        outer = json.loads(stdout) if stdout.strip() else None
+    except json.JSONDecodeError:
+        outer = None
+    if isinstance(outer, dict) and outer.get("is_error"):
+        parts.append(f"envelope={str(outer.get('result',''))[:300]!r}")
+    elif not stderr_tail and stdout.strip():
+        parts.append(f"stdout头={stdout[:200]!r}")
+    return ": ".join(parts)
+
+
 # ─── 两层 JSON 容错（复制自 run_daily，行为对齐）──────────────────────
 _JSON_RETRY_SUFFIX = (
     "\n\n⚠ 上一次输出不是合法 JSON（含散文/解释/markdown）。本次【必须】只输出一个 JSON 对象——"
@@ -137,7 +161,7 @@ def run_persona_subproc(
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"[{agent_name}] wall-clock 超时（{timeout}s），已 kill")
         if proc.returncode != 0:
-            raise RuntimeError(f"[{agent_name}] claude 退出 {proc.returncode}: {proc.stderr[-400:].strip()}")
+            raise RuntimeError(exit_diag(agent_name, proc))
         try:
             outer = json.loads(proc.stdout)
         except json.JSONDecodeError as e:

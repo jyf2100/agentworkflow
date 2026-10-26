@@ -69,10 +69,10 @@ def _args():
 
 def _recon_recorder():
     """reconcile_pr mock：记录 interrupted 调用 + 按标志设 status（模拟真 reconcile 的 PR 状态语义）。
-    须匹配真签名 reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=...)。"""
+    须匹配真签名 reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=..., fapi=...)。"""
     calls: list[bool] = []
 
-    def fake(repo, owner_repo, rec, base, slug, interrupted=True):
+    def fake(repo, owner_repo, rec, base, slug, interrupted=True, fapi=None):
         calls.append(interrupted)
         rec["status"] = "interrupted_pr" if interrupted else "pr_open"
         rec["pr_url"] = "http://pr/1"

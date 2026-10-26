@@ -359,6 +359,17 @@ RULES: tuple[TransformRule, ...] = (
         old=_RUNBOOK_USAGE_OLD,
         new=_RUNBOOK_USAGE_NEW,
     ),
+    # F5 延伸（hub 镜像重建指引 2026-10 新增两处机器路径；apply_rule 单次替换 → 逐处独立锚）
+    TransformRule(
+        relpath="Projects/项目推进流水线/RUNBOOK.md",
+        old="（服务器 `/mnt/disk01/workspaces/worksummary/pa-instance`）",
+        new="（服务器本机 pa-instance 投影 checkout 路径）",
+    ),
+    TransformRule(
+        relpath="Projects/项目推进流水线/RUNBOOK.md",
+        old="-t pa-executor:<新tag> /mnt/disk01/workspaces/worksummary/pa-instance",
+        new="-t pa-executor:<新tag> <pa-instance 投影 checkout 绝对路径>",
+    ),
     *[TransformRule(relpath=r, old=o, new=n) for r, o, n in _UPSTREAM_ID_PAIRS],
 )
 

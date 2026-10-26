@@ -435,6 +435,13 @@ git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<bra
 - 登录流：`GET /auth/authorize` →（MM 授权页）→ `GET /auth/callback` 发会话 → `GET /auth/me` 确认。登录后本人 `PUT /auth/credentials` 录凭据入保险箱（key = mm_user_id；响应只含字段名不回显值）。会话入队时 `enqueued_by=mm_user_id`（vault 解密 key）、`initiator=username`（meta 人读署名）；该用户未录凭据 = 派发降级 hub env + warn。
 - auth 排障：**503** = MM 四项未配全（或 `PUT /auth/credentials` 时 `HUB_VAULT_MASTER_KEY` 未配）；**400 state** = 授权往返超 10 min 或非同浏览器发起（state 签名短期 cookie 校验）；**401** = 无有效会话（未登录/已 `GET /auth/logout`/cookie 过期，重登即可）；**502** = MM token 端点/`users/me` 拒绝或宕机（查 MM 侧 client_secret 与可用性）。
 
+**MM OAuth 真机实录（11.10.1，2026-10-23 定稿；编程式注册/自测时必读）**：
+
+- API 注册 `POST /api/v4/oauth/apps` 字段名是 **`callback_urls`**（蛇形数组）。字段名错（如 `callbacks`）时 MM 反序列化得空数组，与「URL 非法」报**同一错误码** `model.oauth.is_valid.callback.app_error`——报「URL 必须以 http:// 开头」先核字段名再怀疑 URL。
+- MM **忽略提交的 client_secret**，自生成 26 位（NewId 形态）——**只在注册响应 `client_secret` 字段出现一次**，`GET /api/v4/oauth/apps/{id}` 已脱敏不返回。注册脚本必须当场从响应捕获写盘（写前校验 id 为 26-hex）；丢了只能删 app 重注册。
+- token 端点是 **`POST {MM}/oauth/access_token`**（网页路由、form-encoded：grant_type/client_id/client_secret/code/redirect_uri）——`/api/v4/oauth/token` 与 `/api/v4/oauth/access_token` 均 404。hub `auth.py exchange_code` 已按此实现。
+- 编程式走授权流（自测用）：MM 网页会话 cookie 是 **`MMUSERID=<uid>; MMAUTHTOKEN=<API login Token>`**（MM 11 名，非老文档的 `MMTOKEN`）；app 设 `is_trusted=true` 时登录态 GET `/oauth/authorize` 直接 302 回 callback 带 code（无 Allow 页）。
+
 **F2 复审结论（2b D6，2026-10-22 两笔均维持现状）**：
 - **socket 挂载等效 root**：维持（内网单机形态成本最优）；**公网/多租户暴露前必须加 socket proxy（如 docker-socket-proxy 白名单化 API 面）**，此项为暴露硬门槛，不是可选优化。
 - **master key 经 compose env 注入、无轮换工具**：维持（YAGNI——单 key 单机，泄漏概率低且可整箱重录）；后手：真需轮换时做 re-encrypt 工具（新 key 重加密全 vault 记录 + 原子切换），届时同步补 vault-store spec。
@@ -484,7 +491,7 @@ PY
 
 **部署顺序（钉死——顺序错会产生双执行窗口）**：
 1. hub 侧先上：拉 main 重启 hub 容器（端点纯新增，不配 token = 内网无守卫，现有调用零影响）；
-2. pa-executor 镜像重建（critic prompt 改动硬依赖）：切 pa repo template tag checkout 作 build context，`docker build` 出新 tag → 服务器 `hub.env` 升 `HUB_IMAGE_TAG_DEFAULT` → 重启 hub。不重建则容器内 critic 仍是旧 prompt（静默不生效）；
+2. pa-executor 镜像重建（critic prompt 改动硬依赖）：build context = pa template 投影 checkout（服务器 `/mnt/disk01/workspaces/worksummary/pa-instance`），**build 前置检查：投影根须有 `.dockerignore`**（排除 `.project-auto/`、`.venv/`、`*.egg-info/` 等——本体论审核 C-F1 2026-10-23：.gitignore 只防入仓不防入镜像，全量 Dockerfile 的 `COPY . /opt/pa` 曾会把 428M 的 `.venv/` 与流水线本地状态打进镜像层）。Dockerfile 已归档 `hub/deploy/pa-executor.Dockerfile`（2026-10-23 从 v0.1.3 docker history 反提取重建——原始 build context 丢失的部署资产缺口已补；注意 FROM 是 node:22-slim 而 v0.1.3 实际基为 node 22 bookworm 完整版，含 yarn 等额外工具链，全量重建与 v0.1.3 行为面非严格等价）。**小改动走增量补丁版**（`hub/deploy/pa-executor.patch.Dockerfile`：`FROM` 上一 tag + `COPY` 变更文件，不重跑 apt/npm/pip 网络层，行为等价性风险最低；v0.1.4 即此法）；变更文件先打进投影 checkout 再 `docker build -f hub/deploy/pa-executor.patch.Dockerfile -t pa-executor:<新tag> /mnt/disk01/workspaces/worksummary/pa-instance` → 冒烟（例：`docker run --rm --entrypoint grep pa-executor:<新tag> -n "def exit_diag" "/opt/pa/Projects/项目推进流水线/scripts/persona_call.py"` + `docker run --rm --entrypoint python3 pa-executor:<新tag> /opt/pa/Projects/项目推进流水线/scripts/run_daily.py --help`）→ 服务器 `hub.env` **与 `hub.env.example` 同步**升 `HUB_IMAGE_TAG_DEFAULT`（example 是模板真理源，漂移会让照抄者静默回退 tag）→ `docker compose up -d` 重启 hub → `docker exec deploy-pa-hub-1 printenv HUB_IMAGE_TAG_DEFAULT` 确认。不重建则容器内 critic 仍是旧 prompt（静默不生效）；
 3. mac 侧**同一 cron 变更**一次切换：`run_cron.sh` 里 `--to-stage report` → `--to-stage prd` + 追加 `deliver_prd.py` 调用（物理分家与投递同时生效）。
 
 **token**：`hub.env` 配 `HUB_DELIVER_TOKEN=<random>`（注释态默认无守卫，内网可接受；公网暴露前是硬门槛），mac 侧投递器 env `PA_DELIVER_TOKEN` 传同值、`PA_HUB_URL=http://<hub-host>:<port>`。

@@ -63,6 +63,8 @@ from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # O
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
 import sdk_compat_patch                   # ADR-0006 #7（migrate-dev-agent-streaming-with-1106-patch）：#1106 keep-alive 定向 patch，根治 #1105（零依赖模块，apply 内延迟 import SDK）
 from external_state import sanitize   # C2 脱敏：git()/gh() stderr 进 JSON error 前抹 token（无依赖模块，同上）
+import forge_api   # add-forge-adapter：PR 面分流（github=gh CLI 基线零变化；gitlab/gitcode=REST 三态）
+from forge_api import ForgeConfigError, for_profile, repo_full_path
 from merge_phase import (classify_rebase, RebaseEvidence, RebaseOutcome,   # task 3.2：merge phase 三态判定（纯 stdlib 无依赖模块，同上避免顶部 SDK 连带加载拖垮 cron）
                          classify_post_merge, PostMergeEvidence, PostMergeVerdict,   # task 4.1/4.2：post-merge 三态
                          RevertOutcome)   # task 4.3：revert 三态
@@ -106,7 +108,9 @@ def parse_args(argv: list[str]) -> dict:
            # task 4.x：post-merge-test / revert phase 参数（--phase post-merge-test|revert 时用）
            "test_cmd": None, "merge_commit": None, "timeout": None,
            # add-per-agent-model-routing：per-dev model（手动 --model / canary；不设=走 PA_DEV_MODEL env→roc 默认）
-           "model": None}
+           "model": None,
+           # add-forge-adapter tasks 2.2：PR 面分流（控制面 --forge/--forge-host 透传；None=github gh 基线零变化）
+           "forge": None, "forge_host": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -131,6 +135,8 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--merge-commit": out["merge_commit"] = argv[i + 1]; i += 1       # task 4.3：待 revert 的单一 merge commit sha
         elif a == "--timeout": out["timeout"] = argv[i + 1]; i += 1                 # task 4.1：post-merge test wall-clock 上界（D10）
         elif a == "--model": out["model"] = argv[i + 1]; i += 1                     # add-per-agent-model-routing：per-dev model（手动/canary；flag > PA_DEV_MODEL env > roc 默认）
+        elif a == "--forge": out["forge"] = argv[i + 1]; i += 1                     # add-forge-adapter：gitlab/gitcode PR 面分流
+        elif a == "--forge-host": out["forge_host"] = argv[i + 1]; i += 1           # add-forge-adapter：gitlab 自托管 host
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
     return out
@@ -145,7 +151,11 @@ HELP = """dev-agent.py — 项目推进流水线·控制面标准执行器（ADR
   --feedback-artifact  上轮 verify 反馈 artifact path（driven 模式 retry 用；baseline 不传）
   --lessons-artifact   prior-PRD 经验 lesson block path（learning memory injection；baseline 不传）
   --dry-run        只跑到"改完代码 + 本地 test"，不 commit/push/开 PR
-退出码: 0 OK | 10 无/读不到 PRD | 11 SDK 失败 | 12 stalled | 13 git/PR 失败 | 15 off_track | 99 未捕获"""
+  --forge          Git 托管平台（github 缺省 | gitlab | gitcode；非 github → PR 面走 REST adapter）
+  --forge-host     gitlab 自托管 host（forge=gitlab 必带）
+退出码: 0 OK | 10 无/读不到 PRD | 11 SDK 失败 | 12 stalled | 13 git/PR 失败 | 14 forge 配置类永久失败
+        （401/403 token 无效/权限缺——重试必败，hub 队列对 14 不重派；本体论审核 M2，2026-10-26）
+        | 15 off_track | 99 未捕获"""
 
 
 def git(args: list[str]) -> str:
@@ -173,8 +183,39 @@ def gh(args: list[str]) -> str:
         raise RuntimeError("gh 不在 PATH")
 
 
+# ── add-forge-adapter tasks 2.2：PR 面分流器 ──────────────────────────────────
+# _FORGE_CONF 由 main() 按 --forge/--forge-host 填（控制面 _dev_cmd 透传；空=github 基线全走 gh 零变化）。
+_FORGE_CONF: dict = {}
+_FORGE_API_CACHE = None
+
+
+def _forge_dev_api():
+    """PR 面分流：forge 非 github → REST adapter（模块级缓存）；github/未声明 → None（调用方走 gh 基线）。
+
+    构造期 ForgeConfigError（非法值/缺 host/缺 token）→ RuntimeError（exit 13 契约：机械 phase fail-loud）。"""
+    global _FORGE_API_CACHE
+    forge = _FORGE_CONF.get("forge")
+    if not forge or forge == forge_api.FORGE_GITHUB:
+        return None
+    if _FORGE_API_CACHE is None:
+        try:
+            _FORGE_API_CACHE = for_profile(
+                {"forge": forge, "gitlab_host": _FORGE_CONF.get("forge_host")},
+                full_path=repo_full_path(str(REPO_ROOT)))
+        except ForgeConfigError as e:
+            raise RuntimeError(f"forge 配置错: {e}")
+    return _FORGE_API_CACHE
+
+
+def _forge_rest(res, what: str):
+    """REST 三态 ExtResult → 确定性结果（dev-agent 无重试面：UNKNOWN/缺值 → RuntimeError，fail-loud exit 13）。"""
+    if not res.is_decidable:
+        raise RuntimeError(f"{what}: {res.reason}")
+    return res.value
+
+
 def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> str:
-    """PR auto-merge（ADR-0008 §PR-path）：幂等 gh pr create → gh pr merge --merge --subject --body → 返回 PR merge 后 main tip。
+    """PR auto-merge（ADR-0008 §PR-path）：幂等 create → merge → 返回 PR merge 后 main tip。
 
     复用 _lookup_pr 幂等模板（``gh pr list --head --state open --json number``；cwd=REPO_ROOT 推断 owner/repo，
     无 -R）：已有 open PR → merge 已有；无 → create 后 merge。``gh pr merge --merge`` 造单一双 parent merge
@@ -182,10 +223,28 @@ def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> str:
     marker），故**必须显式传 ``--subject <title>``** 使 merge commit message = title（含 marker，可 git log
     --grep，守护栏#5）；``--body <body>`` 成 message 第二段。
 
+    add-forge-adapter tasks 2.2：forge≠github → 同幂等模板走 REST adapter（``pr_list(head)`` / ``pr_create`` /
+    ``pr_merge``——GitLab merge method 前置校验 + 双 parent 验证在 adapter 内；无请求级 subject → title/body
+    经 adapter 各平台机制尽力传递，双 parent 语义由 adapter 契约保证）；凭据经 GIT_ASKPASS（控制面注入 env），
+    gh 面 argv 与基线逐 token 一致（D1 行为等价）。
+
     **sha 陷阱（D12 ancestry）**：返回 ``fetch + rev-parse origin/<main>``（= PR merge 后 main tip），**非** head
     tip——``LocalGitResolver.merge-base --is-ancestor <target> origin/main`` 须 True；误记 head tip 或用 squash
     → is-ancestor False → 误判未 apply → 盲目重 merge。caller 须先 push rebased head branch（--force-with-lease）。
     """
+    fapi = _forge_dev_api()
+    if fapi is not None:
+        prs = _forge_rest(fapi.pr_list(state="open", head=head), f"PR 查询 {head}") or []
+        if prs:
+            pr_num = str(prs[0]["number"])
+        else:
+            cr = _forge_rest(fapi.pr_create(main_ref, head, title, body), "PR create")
+            pr_num = str((cr or {}).get("number") or "")
+            if not pr_num:
+                raise RuntimeError("PR create 未返回 number")
+        _forge_rest(fapi.pr_merge(pr_num, title, body), f"PR merge {pr_num}")
+        git(["fetch", "origin", main_ref])
+        return git(["rev-parse", f"origin/{main_ref}"])
     existing = gh(["pr", "list", "--head", head, "--state", "open", "--json", "number"])
     prs = json.loads(existing) if existing.strip() else []
     if prs:
@@ -269,15 +328,32 @@ def run_publish_phase(args: dict, *, dev_out: dict | None = None,
              "-m", f"项目推进流水线 dev-agent（控制面标准执行器，ADR-0005）自治产出（基点 {base}）。"]
             + (["-m", f"pa-dev: round {args['round']}"] if args.get("round") else []))   # verify-loop-discipline A4：轮边界 marker（同分支累积后 commit 级回滚锚）
         git(["push", "-u", "origin", branch])
-        existing = gh(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url"])
-        prs = json.loads(existing) if existing.strip() else []
-        pr_reused = bool(prs)
-        pr_url = prs[0]["url"] if prs else gh(["pr", "create", "--base", base, "--head", branch,
-                                               "--title", f"pa-dev: {title}",
-                                               "--body", "自治 dev agent 产出（PRD 见任务投递）。验证闸（dev-agent 自治）已绿。"])
+        fapi = _forge_dev_api()   # add-forge-adapter：PR 查重/开 PR 分流（github → gh 基线零变化）
+        if fapi is not None:
+            prs = _forge_rest(fapi.pr_list(state="open", head=branch), f"PR 查重 {branch}") or []
+            pr_reused = bool(prs)
+            if prs:
+                pr_url = prs[0].get("url")
+            else:
+                cr = _forge_rest(fapi.pr_create(base, branch, f"pa-dev: {title}",
+                                                "自治 dev agent 产出（PRD 见任务投递）。验证闸（dev-agent 自治）已绿。"),
+                                 "PR create")
+                pr_url = (cr or {}).get("url")
+        else:
+            existing = gh(["pr", "list", "--head", branch, "--state", "open", "--json", "number,url"])
+            prs = json.loads(existing) if existing.strip() else []
+            pr_reused = bool(prs)
+            pr_url = prs[0]["url"] if prs else gh(["pr", "create", "--base", base, "--head", branch,
+                                                   "--title", f"pa-dev: {title}",
+                                                   "--body", "自治 dev agent 产出（PRD 见任务投递）。验证闸（dev-agent 自治）已绿。"])
         print(json.dumps({"ok": True, "branch": branch, "base": base, "pr_url": pr_url,
                           "pr_reused": pr_reused, **dev_out, **(on_success or {})}, ensure_ascii=False))
         return 0
+    except ForgeConfigError as e:   # 审核修复 M2：401/403 permanent 分桶 exit 14（hub 队列不重派，13 会被无差别重派烧配额）
+        sys.stderr.write(f"✗ forge 配置类永久失败: {e}\n")
+        print(json.dumps({"ok": False, "error": f"forge 配置类永久失败: {e}", "branch": branch,
+                          "base": base, **dev_out, **(on_error or {})}, ensure_ascii=False))
+        return 14
     except Exception as e:
         sys.stderr.write(f"✗ git/push/PR 阶段失败: {e}\n")
         print(json.dumps({"ok": False, "error": str(e), "branch": branch,
@@ -864,6 +940,8 @@ def run_revert(args: dict) -> int:
 
 async def main() -> int:
     args = parse_args(sys.argv[1:])
+    if args.get("forge"):   # add-forge-adapter：main 填模块级 PR 面分流配置（None/github → 空dict=gh 基线）
+        _FORGE_CONF.update(forge=args["forge"], forge_host=args.get("forge_host"))
     if args["help"]:
         print(HELP); return 0
     # task 3.2：merge phase 早期分叉——机械执行 rebase→merge→push（不经建分支/prompt/SDK loop），

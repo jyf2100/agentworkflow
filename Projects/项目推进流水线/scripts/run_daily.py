@@ -49,6 +49,8 @@ from slug_utils import dev_slugify   # ADR-0006 #5：分支 slug 单一源头（
 from stage_contracts import validate_stage, render_repair_hint  # change 2026-07-28：stage 输出契约层（fail-open 校验 + 诊断重试提示；纯 stdlib，cron 安全）
 import model_routing  # add-per-agent-model-routing：per-agent 模型路由配置解析（config/model-routing.json，零依赖，cron 安全）
 from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
+import forge_api   # add-forge-adapter：三平台（github/gitlab/gitcode）Git 托管适配层（纯 stdlib；github=gh CLI thin wrapper 行为等价，gitlab/gitcode=REST 三态）
+from forge_api import ForgeConfigError, dispatch_identity   # permanent 配置类失败（单项目终态）+ dispatch 身份键（host × 全路径）
 from coordinator import build_coordinator, preflight  # task 2.1/2.5：runtime coordinator 边界 + flag 组合 preflight（design 决策#1；纯 stdlib，cron 安全）
 from feature_flags import resolve_flags  # add-cross-prd-learning-memory Section 7：learning flag 解析（V1 allowlist + env/profile 三态）
 from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写入器（类型注解用；纯 stdlib，cron 安全）
@@ -183,6 +185,27 @@ def load_sources() -> list[dict]:
             sys.exit(f"✗ sources.yaml root 被多源共用：{root}（一个 root 只属一个采集源）")
         seen_roots.add(root)
         src.setdefault("kind", "directory")   # 缺省 directory（消费侧零分支，决定 #2）
+        # add-forge-adapter 4.1：forge-repo 源 schema 装载校验（fail-fast 不猜——cron 03:17 无人值守，
+        # 配置错在装载期爆掉，不进 fetch 段半路炸）。github-repo kind 原样保留（零变更）。
+        if src.get("kind") == "forge-repo":
+            params = src.get("params") or {}
+            forge = str(params.get("forge") or "").strip().lower()
+            if forge not in forge_api.VALID_FORGES:
+                sys.exit(f"✗ sources.yaml {name}（forge-repo）非法 forge 值：{params.get('forge')!r}"
+                         f"（合法：{'/'.join(forge_api.VALID_FORGES)}）")
+            if forge == forge_api.FORGE_GITLAB and not params.get("gitlab_host"):
+                sys.exit(f"✗ sources.yaml {name}（forge: gitlab）缺 gitlab_host（自建实例不猜，显式声明）")
+            watch = [str(w) for w in (params.get("watch") or ["commits", "pulls"])]
+            bad_watch = [w for w in watch if w not in ("commits", "pulls", "issues")]
+            if bad_watch:
+                sys.exit(f"✗ sources.yaml {name} watch 非法值：{bad_watch}（合法：commits/pulls/issues）")
+            if "issues" in watch and forge == forge_api.FORGE_GITCODE:
+                sys.exit(f"✗ sources.yaml {name}（gitcode）watch 含 issues——API 字段快照 fixture 未锚定，"
+                         "暂不支持（add-forge-adapter tasks 5.2 人工 curl 验证后放开）")
+            if not (params.get("repos") or []):
+                sys.exit(f"✗ sources.yaml {name}（forge-repo）repos 为空（无监控仓无意义）")
+            if not re.fullmatch(r"\d+[dh]", str(params.get("window", "7d"))):
+                sys.exit(f"✗ sources.yaml {name} window 形态非法：{params.get('window')!r}（合法：Nd/Nh，如 7d、12h）")
         # fetcher 声明了但脚本不存在 → warn 不阻断（消费侧只看目录；未实现 kind 的源今日 0 产出、订阅项目不调 radar）
         fetcher = src.get("fetcher")
         if fetcher and not (PROJECT_DIR / fetcher).is_file():
@@ -405,13 +428,40 @@ def _extract_first_json(s: str) -> str | None:
     return None   # 花括号未配平（输出被截断）
 
 
+def exit_diag(label: str, proc) -> str:
+    """非零退出诊断串：stderr 尾 + stdout JSON 信封 is_error/result 摘要并入。
+
+    （与 persona_call.exit_diag 镜像，行为对齐；基线=test_persona_call。）
+    2026-10-23 hub 首跑实证：claude 退出 1 时原因常只在 stdout 信封
+    （is_error:true, result:"Not logged in · ..."）而 stderr 为空——
+    stderr-only 捕获会把这类失败吞成空错误信息。result 截 300、
+    非 JSON stdout 只取头 200（!r 防控制字符），不整段回吐。"""
+    stderr_tail = (proc.stderr or "").strip()[-400:]
+    parts = [f"[{label}] claude 退出 {proc.returncode}"]
+    if stderr_tail:
+        parts.append(f"stderr={stderr_tail}")
+    stdout = proc.stdout or ""
+    try:
+        outer = json.loads(stdout) if stdout.strip() else None
+    except json.JSONDecodeError:
+        outer = None
+    if isinstance(outer, dict) and outer.get("is_error"):
+        parts.append(f"envelope={str(outer.get('result',''))[:300]!r}")
+    elif not stderr_tail and stdout.strip():
+        parts.append(f"stdout头={stdout[:200]!r}")
+    return ": ".join(parts)
+
+
 def run_persona(name: str, prompt: str, stage: str, label: str,
-                allowed_tools: list[str] | None = None) -> tuple[dict, dict]:
+                allowed_tools: list[str] | None = None,
+                env: dict | None = None) -> tuple[dict, dict]:
     """调 `claude --agent <name> -p <prompt> --output-format json`，两层解析返回 (payload, meta)。
 
     内层 result 容错：先严格 json.loads，失败则 _extract_first_json 抽取（容忍散文前后缀）；
     仍失败重试 1 次（拼 _JSON_RETRY_SUFFIX 加强 JSON-only 契约）。两轮均失败才 raise。
-    allowed_tools：MCP 工具白名单透传（fetch 段调 exa 必须，--allowedTools 逗号分隔）。"""
+    allowed_tools：MCP 工具白名单透传（fetch 段调 exa 必须，--allowedTools 逗号分隔）。
+    env：subprocess env 覆写（None=继承全量，既有调用点零变化；add-forge-adapter 4.4
+    forge-repo 传剥平台 token 的窄 env——persona Read-only 用不到 token，纵深防御）。"""
     base_cmd = [resolve_claude_bin(), "--agent", name, "--output-format", "json",
                 "--max-turns", str(MAX_TURNS[stage])]
     # add-per-agent-model-routing：per-persona 模型路由 → --model（与 persona_call base_cmd 镜像；不设=零变更 baseline）
@@ -442,11 +492,20 @@ def run_persona(name: str, prompt: str, stage: str, label: str,
         cmd = base_cmd + ["-p", cur_prompt]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=TIMEOUT[stage], stdin=subprocess.DEVNULL)
+                                  timeout=TIMEOUT[stage], stdin=subprocess.DEVNULL, env=env)
         except subprocess.TimeoutExpired:
             raise TransientPersonaError(f"[{label}] wall-clock 超时（{TIMEOUT[stage]}s），已 kill")
         if proc.returncode != 0:
-            raise TransientPersonaError(f"[{label}] claude 退出 {proc.returncode}: {proc.stderr[-400:].strip()}")
+            # 信封 is_error = 确定性配置错（如 Not logged in）→ permanent（RuntimeError 不退避重试，
+            # 与下方 returncode==0 的 is_error 臂同语义）；无信封的非零退出（被杀/OOM/网络中断）
+            # 保持 Transient（进程未烧完 token，重试合理）。本体论审核 B-MEDIUM 2026-10-23。
+            try:
+                _outer = json.loads(proc.stdout) if (proc.stdout or "").strip() else None
+            except json.JSONDecodeError:
+                _outer = None
+            if isinstance(_outer, dict) and _outer.get("is_error"):
+                raise RuntimeError(exit_diag(label, proc))
+            raise TransientPersonaError(exit_diag(label, proc))
         try:
             outer = json.loads(proc.stdout)
         except json.JSONDecodeError as e:
@@ -510,7 +569,8 @@ def _current_stamp() -> str:
 
 
 def run_persona_with_backoff(name: str, prompt: str, stage: str, label: str,
-                             allowed_tools: list[str] | None = None) -> tuple[dict, dict]:
+                             allowed_tools: list[str] | None = None,
+                             env: dict | None = None) -> tuple[dict, dict]:
     """run_persona 的统一前置包裹（签名镜像，调用点只换函数名；flag 全 off = 等价直调，零行为变化）。
 
     职责切分（重试与熔断分离）：
@@ -524,7 +584,7 @@ def run_persona_with_backoff(name: str, prompt: str, stage: str, label: str,
     """
     SB.check(STATE_DIR, _current_stamp(), stage)
     try:
-        payload, meta = _persona_call_with_backoff(name, prompt, stage, label, allowed_tools)
+        payload, meta = _persona_call_with_backoff(name, prompt, stage, label, allowed_tools, env)
     except SB.CircuitBreakerTripped:
         raise   # pa-hardening P1-1：熔断终态非 persona 失败（重试前 SB.check 抛出场景），干净穿透不记账
     except TransientPersonaError:
@@ -562,7 +622,7 @@ def _jitter(base: float) -> float:
 
 
 def _persona_call_with_backoff(name: str, prompt: str, stage: str, label: str,
-                               allowed_tools: list[str] | None):
+                               allowed_tools: list[str] | None, env: dict | None = None):
     """P1-1 瞬态退避内循环（run_persona_with_backoff 专用）：TransientPersonaError → 按序列退避重试。
 
     ``PA_PERSONA_RETRY`` off（默认）→ 首次瞬态失败即上抛（零行为变化）；on → 最多 2 次重试，重试前
@@ -572,9 +632,13 @@ def _persona_call_with_backoff(name: str, prompt: str, stage: str, label: str,
     attempt = 0
     while True:
         try:
-            if allowed_tools is None:   # 保直通语义：不带 allowed_tools 的调用点与原 4 参调用形状一致
+            if allowed_tools is None and env is None:   # 保直通语义：不带 allowed_tools 的调用点与原 4 参调用形状一致
                 return run_persona(name, prompt, stage, label)
-            return run_persona(name, prompt, stage, label, allowed_tools)
+            # 按需传参（保既有调用形状契约）：tools-only → 原 5 参形状零变化（既有 fake/测试锚定）；
+            # env 是 forge-repo 4.4 新面（窄 env），仅 forge-repo 调用点出现。
+            if env is None:
+                return run_persona(name, prompt, stage, label, allowed_tools)
+            return run_persona(name, prompt, stage, label, allowed_tools, env)
         except TransientPersonaError as e:
             if attempt >= len(delays):
                 raise
@@ -888,6 +952,8 @@ def github_repo_prompt(src: dict) -> str:
 
 # kind → fetcher 配置。mode: "single"=一份合成 md（agent-deepresearch）；
 #       "items"=一次调用产 N 篇（wechat-url/github-repo，Contract A 每 item 一文件）。
+# forge-repo 不进本表：两段式（机械预取 forge_fetch.py → pa-fetch-forge-repo summarize），
+# stage_fetch 专属分支（_fetch_forge_repo）——不与纯 persona kind 假统一。
 FETCH_CONFIG: dict[str, dict] = {
     "agent-deepresearch": {"agent": FETCH_AGENT, "tools": FETCH_ALLOWED_TOOLS,
                            "prompt": fetch_prompt, "mode": "single"},
@@ -902,6 +968,129 @@ FETCH_CONFIG: dict[str, dict] = {
                            "tools": ["Bash"],
                            "prompt": github_repo_prompt, "mode": "items"},
 }
+
+
+FORGE_FETCH_AGENT = "pa-fetch-forge-repo"   # add-forge-adapter 4.4：预取产物 summarize（Read-only persona）
+
+
+def forge_repo_prompt(src: dict, pf_items: list[dict], out_dir: Path) -> str:
+    """④ forge-repo：预取产物（机械已拉并归一）→ pa-fetch-forge-repo Read + summarize，要 items JSON。"""
+    window = (src.get("params") or {}).get("window", "7d")
+    file_block = "\n".join(
+        f"- {out_dir / it['file']}（{it['repo']}：commits {it['commits']} / pulls {it['pulls']} / issues {it['issues']} 条）"
+        for it in pf_items)
+    return f"""你是 pa-fetch-forge-repo。以下 forge 预取文件已由编排器机械拉取并归一（窗口 {window}：commits=author date、PR/issue=updated_at，窗口外条目已过滤），你只读不改。
+预取文件（采集源 {src['name']}）：
+{file_block}
+
+逐仓 Read 对应文件，summarize 成 radar 可消费的 markdown digest（活跃主题、breaking/重要变更、值得关注的讨论——提炼，不复述全量列表）。只读上述文件，不调网络/写工具。
+严格按 persona 输出契约：只吐一行 JSON，结构 {{"items":[{{"repo":"<owner/repo 或全路径>","title":"<repo 窗口摘要（ascii 优先）>","markdown":"<digest md，换行 \\n 转义>","commits_count":N,"pulls_count":M,"issues_count":K}}]}}。"""
+
+
+def _env_no_platform_tokens() -> dict:
+    """forge-repo persona 窄 env：剥三平台 token（persona Read-only 用不到，纵深防御——4.4）。"""
+    return {k: v for k, v in os.environ.items() if k not in forge_api.FORGE_TOKEN_ENV.values()}
+
+
+def _forge_prefetch(src: dict, stamp: str) -> tuple[list[dict], list[dict], str | None]:
+    """forge-repo 机械预取（4.2）：forge_fetch.py 子进程 → (items, repo_failures, fail_reason)。
+
+    fail_reason 非 None = 源级失败（token 缺/超时/进程崩/全仓失败/无 stdout JSON）；repo_failures
+    = 部分仓失败清单（rc=0 时的 per-repo failed 数组，审核修复 H1 透传——此前被静默丢弃）。
+    token narrow-inject——子进程 env 只含该源 forge 的平台 token（其余剥掉），token 值不进 argv/日志。
+    预取产物落 STATE_DIR/forge_prefetch/<stamp>/（绝不落 source.root——radar 扫 YYYYMMDD_*.md
+    会重复消费 raw）。"""
+    params = src.get("params") or {}
+    forge = str(params.get("forge") or "").strip().lower()
+    token_key = forge_api.FORGE_TOKEN_ENV[forge]
+    if not os.environ.get(token_key):
+        return [], [], f"缺 {token_key}（预取未跑；本机 env 或 hub vault 注入）"
+    out_dir = STATE_DIR / "forge_prefetch" / stamp
+    out_dir.mkdir(parents=True, exist_ok=True)
+    window = str(params.get("window", "7d"))              # load_sources 已校验 Nd/Nh 形态
+    n = int(window[:-1])
+    since = datetime.now(timezone.utc) - timedelta(**({"days": n} if window.endswith("d") else {"hours": n}))
+    srcj = out_dir / f"src_{dev_slugify(src['name']) or 'src'}.json"
+    srcj.write_text(json.dumps({
+        "forge": forge, "gitlab_host": params.get("gitlab_host"),
+        "repos": params.get("repos") or [], "watch": params.get("watch") or ["commits", "pulls"],
+        "since": since.isoformat(), "now": datetime.now(timezone.utc).isoformat(),
+    }, ensure_ascii=False), encoding="utf-8")
+    # narrow-inject：剥全部平台 token 再只放回该 forge 的一个（token 值不进 argv/日志）
+    env = {k: v for k, v in os.environ.items() if k not in forge_api.FORGE_TOKEN_ENV.values()}
+    env[token_key] = os.environ[token_key]
+    cmd = [sys.executable, str(Path(__file__).resolve().parent / "forge_fetch.py"),
+           "--src-json", str(srcj), "--out-dir", str(out_dir)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=TIMEOUT["fetch"], env=env, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return [], [], f"forge 预取超时（{TIMEOUT['fetch']}s，按该源失败）"
+    if proc.returncode != 0:
+        return [], [], f"forge 预取失败（rc={proc.returncode}）：{(proc.stderr or '').strip()[:160]}"
+    try:
+        data = json.loads(proc.stdout.strip().splitlines()[-1])   # stdout 最后一行 = 结果 JSON
+    except (json.JSONDecodeError, IndexError):
+        return [], [], "forge 预取 stdout 无结果 JSON（按该源失败）"
+    return data.get("items") or [], data.get("failed") or [], None
+
+
+def _fetch_forge_repo(src: dict, stamp: str, produced: list, failed_sources: list) -> None:
+    """stage_fetch 的 forge-repo 分支（4.4）：机械预取 → persona summarize → 落盘 source.root。
+
+    源级二元失败（4.5）：预取 fail_reason / persona 异常 / summarize 零产出（预取非空）→
+    failed_sources 登记（report 可见）；预取零仓（窗口内无活动）→ 仅 log 正常静默。
+    部分仓失败（审核修复 H1）：登记 failed_sources 但成功仓继续走 persona，不整源丢。
+    CircuitBreakerTripped 穿透（与主循环 per-source 隔离同口径）。"""
+    try:
+        pf_items, pf_failures, pf_err = _forge_prefetch(src, stamp)
+        if pf_err:
+            failed_sources.append({"source": src["name"], "reason": pf_err})
+            log(f"[fetch] ✗ {src['name']} {pf_err}")
+            return
+        if pf_failures:   # 审核修复 H1：部分仓失败透传登记（成功仓不陪葬，继续 summarize）
+            detail = "、".join(f"{f.get('repo') or '?'}（{(f.get('reason') or '原因缺失')[:60]}）"
+                               for f in pf_failures[:3])
+            if len(pf_failures) > 3:
+                detail += f" 等 {len(pf_failures)} 仓"
+            failed_sources.append({"source": src["name"],
+                                   "reason": f"预取部分仓失败（{len(pf_failures)} 仓）：{detail}"[:160]})
+            log(f"[fetch] ✗ {src['name']} 预取部分仓失败（{len(pf_failures)} 仓，"
+                f"成功 {len(pf_items)} 仓继续 summarize）")
+            if not pf_items:
+                return   # 零成功仓：失败已登记，无需再跑 persona
+        if not pf_items:
+            log(f"[fetch] ⚠ {src['name']} 预取零仓产出（窗口内无活动，正常静默）")
+            return
+        out_dir = STATE_DIR / "forge_prefetch" / stamp
+        payload, meta = run_persona_with_backoff(
+            FORGE_FETCH_AGENT, forge_repo_prompt(src, pf_items, out_dir),
+            "fetch", f"fetch-{src['name']}", allowed_tools=["Read"],
+            env=_env_no_platform_tokens())
+        items = _payload_to_items(payload, "items", src)
+        if not items:
+            failed_sources.append({"source": src["name"],
+                                   "reason": f"summarize 零产出（预取 {len(pf_items)} 仓非空，语义层失败）"})
+            log(f"[fetch] ✗ {src['name']} summarize 零产出（登记源失败）")
+            return
+        root = VAULT_ROOT / src["root"]
+        root.mkdir(parents=True, exist_ok=True)
+        for title, md, raw in items:
+            if not md:
+                log(f"[fetch] ⚠ {src['name']} item「{title}」markdown 空（跳过该 item）")
+                continue
+            slug = dev_slugify(title) or src["name"]
+            out = root / f"{stamp}_{slug}.md"
+            out.write_text(md, encoding="utf-8")
+            produced.append({"source": src["name"], "title": title,
+                             "path": str(out.relative_to(VAULT_ROOT)),
+                             "cost": meta["cost"], "turns": meta["turns"]})
+            log(f"[fetch] ✅ {src['name']} → {out.relative_to(VAULT_ROOT)}｜「{title}」")
+    except SB.CircuitBreakerTripped:
+        raise   # 熔断终态穿透 per-source 隔离（与主循环同口径）
+    except Exception as e:   # 按源失败隔离（消息截断；forge 错误消息构造面不含 token）
+        failed_sources.append({"source": src["name"], "reason": f"{type(e).__name__}: {str(e)[:140]}"})
+        log(f"[fetch] ✗ {src['name']} 失败（跳过，不拖垮其他源）：{e}")
 
 
 def _payload_to_items(payload: dict, mode: str, src: dict) -> list[tuple[str, str, dict]]:
@@ -926,7 +1115,11 @@ def stage_fetch(args, sources, stamp) -> dict:
         log(f"[fetch] 复用已有 {fetch_file.name}（--force 重跑）")
         return json.loads(fetch_file.read_text(encoding="utf-8"))
     produced = []
+    failed_sources: list[dict] = []   # add-forge-adapter 4.5：源级二元失败登记（report 渲染可见）
     for src in sources:
+        if src.get("kind") == "forge-repo":   # 4.4：机械预取 → summarize 两段式（不与纯 persona kind 假统一）
+            _fetch_forge_repo(src, stamp, produced, failed_sources)
+            continue
         cfg = FETCH_CONFIG.get(src.get("kind"))
         if not cfg:                                   # directory/local-file/未知 → 无 fetcher，跳过
             continue
@@ -957,9 +1150,10 @@ def stage_fetch(args, sources, stamp) -> dict:
         except SB.CircuitBreakerTripped:
             raise   # pa-hardening P0-1：熔断终态须穿透 per-source 隔离层（吞掉=熔了还继续烧下一个源）
         except Exception as e:
+            failed_sources.append({"source": src["name"], "reason": f"{type(e).__name__}: {str(e)[:140]}"})
             log(f"[fetch] ✗ {src['name']} 失败（跳过，不拖垮其他源）：{e}")
             continue
-    out_json = {"produced": produced, "stamp": stamp}
+    out_json = {"produced": produced, "failed_sources": failed_sources, "stamp": stamp}
     fetch_file.write_text(json.dumps(out_json, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_json
 
@@ -1189,6 +1383,7 @@ def _critic_one(path: str, source_path: str, prof: dict) -> dict:
 # 分支设计 A：dispatch 建 detached worktree + 传 --branch-prefix auto；dev-agent.mjs 自建分支/开 PR（不改目标面）。
 def repo_owner_repo(repo: str) -> str | None:
     """从 git remote origin 提取 owner/repo（如 jyf2100/cc-web-control）。失败返 None。"""
+    # add-forge-adapter D4：两级提取保留（github -R 命令面身份）；多级全路径身份走 dispatch_key。
     try:
         url = subprocess.run(["git", "-C", repo, "remote", "get-url", "origin"],
                              capture_output=True, text=True, timeout=15).stdout.strip()
@@ -1196,6 +1391,87 @@ def repo_owner_repo(repo: str) -> str | None:
         return m.group(1) if m else None
     except Exception:
         return None
+
+
+def dispatch_key(repo: str, owner_repo: str | None) -> str:
+    """dispatch 身份键（add-forge-adapter D4：host × 仓库全路径）。
+
+    github.com host 恒定 → 键 = 旧 owner/repo 形态（现产 DISPATCH_LOCKS / slot / 分组键零变化）；
+    gitlab/gitcode → 显式 ``host/full/path``（两个 host 同路径是两个仓不共锁；gitlab 多级路径
+    不再被旧两级正则折叠成尾部两级而撞键）。提取失败兜底 owner_repo（行为同旧）。"""
+    host, full = forge_api.remote_origin(repo) if repo else (None, None)
+    if host and full:
+        return dispatch_identity(host, full)
+    return owner_repo or ""
+
+
+def _forge_api_for(prof: dict | None, repo: str, owner_repo: str | None):
+    """profile forge 声明 → forge adapter 实例（add-forge-adapter tasks 2.1/2.3）。
+
+    github / 未声明 → ``None``（dispatch 面走下方既有 gh 内联路径，行为零变化——D1 行为等价）；
+    gitlab / gitcode → REST adapter（三态按端点分型，401/403 抛 ForgeConfigError=单项目终态）。
+    构造期 fail-fast（非法 forge 值 / 缺 host / 缺 token env）由调用方 catch 映射准入早期 skip。"""
+    forge = (prof or {}).get("forge")
+    if not forge or forge == forge_api.FORGE_GITHUB:
+        return None
+    full_path = forge_api.repo_full_path(repo) if repo else None
+    return forge_api.for_profile(prof, full_path=full_path, owner_repo=owner_repo)
+
+
+# ── askpass 注入（add-forge-adapter D5：全部远程 git 操作凭据经 GIT_ASKPASS 脚本）──
+# 脚本本体只引用 env 键名（不含 token）；落点：容器形态（/.dockerenv 存在，hub state 是宿主挂载卷）
+# → /tmp 真随容器弃；本机形态 → state/runs/<proj>/，dispatch_one finally 引用计数归零清理（0700 幂等覆盖）。
+# 内容恒定·按 host 选键（审核修复 H2：原 GITLAB→GITCODE→GH 恒定级联在多 token 并存时错绑——hub
+# 整记录注入使容器内多平台 token 并存是常态；git 提示串恒含 host，按域特征分流：gitcode/github
+# → 各自 token，兜底 = 自建 gitlab host）→ 并发 dispatch 写同名同内容幂等，无进程级竞争。
+_askpass_lock = threading.Lock()
+_askpass_refcnt = 0
+
+
+def _askpass_env_setup(prof: dict, proj: str) -> dict[str, str]:
+    """forge≠github → 写 askpass 脚本 + 设进程级 env（GIT_ASKPASS / GIT_TERMINAL_PROMPT=0）+ refcnt+1。
+
+    进程级 os.environ 覆盖 dispatch 面直跑的全部远程 git（ls-remote / push --delete / worktree fetch /
+    dev-agent 子进程链继承）——私有仓读操作与 push 同通道，缺一即功能残缺。github/未声明 → {} 零行为变化。"""
+    global _askpass_refcnt
+    forge = prof.get("forge")
+    if not forge or forge == forge_api.FORGE_GITHUB:
+        return {}
+    script_dir = (Path("/tmp") if Path("/.dockerenv").exists()
+                  else STATE_DIR / "runs" / proj)          # 容器=/tmp（state 是挂载卷，落那里容器弃了脚本不弃）
+    script_dir.mkdir(parents=True, exist_ok=True)
+    script = script_dir / "pa-askpass.sh"
+    script.write_text('#!/bin/sh\ncase "$1" in\n'
+                      '  *Username*|*username*) echo "oauth2";;\n'
+                      '  *gitcode*) printf %s "$GITCODE_TOKEN";;\n'
+                      '  *github*) printf %s "$GH_TOKEN";;\n'
+                      '  *) printf %s "$GITLAB_TOKEN";;\n'
+                      'esac\n', encoding="utf-8")
+    script.chmod(0o700)                                    # 幂等覆盖（内容恒定，并发安全）
+    env = {"GIT_ASKPASS": str(script), "GIT_TERMINAL_PROMPT": "0"}
+    with _askpass_lock:
+        _askpass_refcnt += 1
+        os.environ.update(env)                             # 进程级：并发 dispatch 写同值幂等
+    return env
+
+
+def _askpass_teardown(prof: dict) -> None:
+    """dispatch 终态清理（引用计数归零才动全局：并发 dispatch 共享进程级 env，先退者不得拆台）。"""
+    global _askpass_refcnt
+    forge = prof.get("forge")
+    if not forge or forge == forge_api.FORGE_GITHUB:
+        return
+    with _askpass_lock:
+        _askpass_refcnt = max(0, _askpass_refcnt - 1)
+        if _askpass_refcnt == 0:
+            script = os.environ.get("GIT_ASKPASS")
+            os.environ.pop("GIT_ASKPASS", None)
+            os.environ.pop("GIT_TERMINAL_PROMPT", None)
+            if script:
+                try:
+                    Path(script).unlink(missing_ok=True)
+                except OSError:
+                    pass                                    # 清理失败不炸 run（脚本 0700 且不含 token）
 
 
 def _env_python(env_name: str) -> str:
@@ -1264,13 +1540,17 @@ def _retry_unknown(fn, label: str) -> ExtResult:
     return res
 
 
-def check_branch_protection(owner_repo: str, base: str) -> ExtResult:
+def check_branch_protection(owner_repo: str, base: str, fapi=None) -> ExtResult:
     """运行时实查 main 分支保护（SPEC §4.4：protection 是平台态可被外部改动，故运行时实查、不进静态 profile）。
 
     三态（OpenSpec fail-safe-dispatch）：
       FOUND(True)  200 → 已保护（可投）；
       NOT_FOUND    404 → 明确未保护（拒投，属「可决断」非阻断态）；
-      UNKNOWN      超时/非零/缺 gh/异常 → 状态不明，fail-safe：准入见之即 blocked_external_state。"""
+      UNKNOWN      超时/非零/缺 gh/异常 → 状态不明，fail-safe：准入见之即 blocked_external_state。
+    fapi（add-forge-adapter tasks 2.3）：gitlab/gitcode → adapter REST（401/403 抛 ForgeConfigError=
+    单项目终态）；None（github/未声明）→ 下方 gh 内联路径行为不变（D1 行为等价）。"""
+    if fapi is not None:
+        return _net_gate(lambda: fapi.branch_protection(base), "branch_protection")
     try:
         r = _net_gate(lambda: subprocess.run(
             ["gh", "api", f"repos/{owner_repo}/branches/{base}/protection", "--silent",
@@ -1289,11 +1569,20 @@ def check_branch_protection(owner_repo: str, base: str) -> ExtResult:
         return unknown(f"查询异常: {e}")
 
 
-def count_inflight_prs(owner_repo: str) -> ExtResult:
+def count_inflight_prs(owner_repo: str, fapi=None) -> ExtResult:
     """在途开放 PR 数（SPEC R1：≤ max_prs_in_flight）。
 
     三态：FOUND(count) 查询成功（0 个开放 PR 亦为 FOUND(0)，可决断）；UNKNOWN 查询失败。
-    旧版「失败返 0（容忍）」是 fail-open——可能超额投递；现改 fail-safe：UNKNOWN → 准入阻断。"""
+    旧版「失败返 0（容忍）」是 fail-open——可能超额投递；现改 fail-safe：UNKNOWN → 准入阻断。
+    fapi（add-forge-adapter）：gitlab/gitcode → adapter pr_list(state=open)（FOUND-空列表=FOUND(0)）；
+    None → gh 内联路径行为不变。"""
+    if fapi is not None:
+        # ForgeConfigError 不在此吞（审核修复 M1）：401/403 permanent 上抛 → 调用点（准入 4）落单项目 skip 终态。
+        # 不降级 UNKNOWN——降级会进 blocked 每轮重试臂，401/403 重试必败烧配额（对齐准入 2 / pr_create 既有语义）。
+        res = _net_gate(lambda: fapi.pr_list(state="open", limit=50), "inflight_prs")
+        if res.is_decidable:
+            return found(len(res.value or []))
+        return res
     try:
         js = _net_gate(lambda: subprocess.run(
             ["gh", "pr", "list", "-R", owner_repo, "--state", "open", "--limit", "50", "--json", "number"],
@@ -1428,15 +1717,17 @@ def stage_inject(args, profiles: dict, stamp: str) -> tuple[dict, str]:
     return manifest, actual
 
 
-def already_dispatched(owner_repo: str, repo: str, devslug: str) -> ExtResult:
-    """幂等前置闸（SPEC #30 ④ / ADR-0004 §4）：按 slug 子串查 GitHub PR(all state) + 远端 auto/* 分支。
+def already_dispatched(owner_repo: str, repo: str, devslug: str, fapi=None) -> ExtResult:
+    """幂等前置闸（SPEC #30 ④ / ADR-0004 §4）：按 slug 子串查平台 PR(all state) + 远端 auto/* 分支。
 
     三态（OpenSpec fail-safe-dispatch）：
       FOUND(True)  命中已有 PR 或远端 auto/* 分支（slug=date+24字描述够特异，子串误命中可忽略）；
       NOT_FOUND    两路查询都成功且无命中；
       UNKNOWN      任一查询失败（旧版「任一失败容忍返 (False,"")」是 fail-open——可能重复投递；现改 fail-safe 阻断）。
-    用 slug 子串而非精确 --head <branch>，因 dev-agent stamp()=YYYYMMDD-HHMM（含时分）不可预测。"""
-    pr_err, pr_hit = _scan_pr_list_for_slug(owner_repo, devslug)
+    用 slug 子串而非精确 --head <branch>，因 dev-agent stamp()=YYYYMMDD-HHMM（含时分）不可预测。
+    fapi（add-forge-adapter）：gitlab/gitcode → adapter pr_list(all) 归一面（head 字段 ↔ gh headRefName，
+    state 已归一封闭枚举）；分支扫描 git ls-remote 天然 host 无关（凭据经 GIT_ASKPASS），两平台共用。"""
+    pr_err, pr_hit = _scan_pr_list_for_slug(owner_repo, devslug, fapi)
     if pr_hit:
         return found(True, pr_hit)
     branch_err, branch_hit = _scan_remote_branches_for_slug(repo, devslug)
@@ -1447,8 +1738,20 @@ def already_dispatched(owner_repo: str, repo: str, devslug: str) -> ExtResult:
     return not_found()
 
 
-def _scan_pr_list_for_slug(owner_repo: str, devslug: str) -> tuple[str | None, str | None]:
-    """gh pr list(all state) 里找含 devslug 的分支名。返回 (err, hit_reason)；成功无命中→(None, None)。"""
+def _scan_pr_list_for_slug(owner_repo: str, devslug: str, fapi=None) -> tuple[str | None, str | None]:
+    """PR 列表(all state)里找含 devslug 的分支名。返回 (err, hit_reason)；成功无命中→(None, None)。
+
+    fapi=None → gh pr list（github，行为不变）；fapi → adapter pr_list(state=all, limit=100)，归一面
+    按 ``devslug in pr["head"]`` 匹配（adapter 已把各平台源分支字段归一为 head）。"""
+    if fapi is not None:
+        # ForgeConfigError 上抛（审核修复 M1）：调用点（准入 3 already_dispatched）落单项目 skip 终态，不降级 err 串
+        res = _net_gate(lambda: fapi.pr_list(state="all", limit=100), "pr_scan")
+        if not res.is_decidable:
+            return (res.reason or "PR 列表查询 UNKNOWN"), None
+        for pr in (res.value or []):
+            if devslug in (pr.get("head") or ""):
+                return None, f"已投递（PR #{pr.get('number')} {pr.get('state')}，分支 {pr.get('head')}）"
+        return None, None
     try:
         js = _net_gate(lambda: subprocess.run(
             ["gh", "pr", "list", "-R", owner_repo, "--state", "all", "--limit", "100",
@@ -1568,6 +1871,12 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
     if _dev_model:
         cmd += [f"--model={_dev_model}"]
         log(f"[dev] model route → {_dev_model}（{'env' if _dev_env else 'config'}）")
+    # add-forge-adapter tasks 2.2：forge 声明透传 dev-agent（PR path 分流；github/未声明不透传=dev-agent 基线）。
+    #   gitlab_host 单独透传（gitcode host 恒定 api.gitcode.com 无需）。
+    if prof.get("forge") and prof["forge"] != forge_api.FORGE_GITHUB:
+        cmd += ["--forge", prof["forge"]]
+        if prof.get("gitlab_host"):
+            cmd += ["--forge-host", prof["gitlab_host"]]
     return cmd
 
 
@@ -1601,10 +1910,22 @@ def _has_commits(repo: str, base_ref: str, branch: str) -> ExtResult:
         return unknown(f"查询异常: {e}")
 
 
-def _lookup_pr(owner_repo: str, branch: str) -> ExtResult:
-    """实查 GitHub 是否已有该分支的 PR（reconcile 对账用，OpenSpec fail-safe-dispatch）。
+def _lookup_pr(owner_repo: str, branch: str, fapi=None) -> ExtResult:
+    """实查平台是否已有该分支的 PR（reconcile 对账用，OpenSpec fail-safe-dispatch）。
 
-    三态：FOUND(pr_dict) 命中；NOT_FOUND 明确无；UNKNOWN 查询失败（reconcile 见之即保留分支不补开/删除）。"""
+    三态：FOUND(pr_dict) 命中；NOT_FOUND 明确无；UNKNOWN 查询失败（reconcile 见之即保留分支不补开/删除）。
+    fapi（add-forge-adapter）：gitlab/gitcode → adapter pr_list(head=branch) 取首条（归一面
+    number/url/state，state 封闭枚举小写 open/merged/closed——消费方按大小写不敏感比对）；
+    None → gh 内联路径行为不变。"""
+    if fapi is not None:
+        # ForgeConfigError 上抛（审核修复 M1）：调用点（reconcile_pr）落单项目 skip 终态，不降级 UNKNOWN
+        res = _net_gate(lambda: fapi.pr_list(state="all", head=branch, limit=5), "pr_lookup")
+        if res.is_decidable:
+            prs = res.value or []
+            if prs:
+                return found(prs[0])
+            return not_found(f"无 {branch} 的 PR")
+        return res
     try:
         js = _net_gate(lambda: subprocess.run(
             ["gh", "pr", "list", "-R", owner_repo, "--head", branch, "--state", "all",
@@ -2299,6 +2620,18 @@ def _sj_terminal(sj: ShadowJournal, rec: dict, iteration_id: str, prd_id: str,
 
 
 def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None) -> dict:
+    """单 PRD 全流程（add-forge-adapter D5：askpass 生命周期 wrapper）。
+
+    forge≠github → 进程级 GIT_ASKPASS 注入（inner 全部远程 git 覆盖）+ 终态 finally 引用计数归零清理；
+    github/未声明 → 两端 no-op（零行为变化）。实现见 ``_dispatch_one_inner``。"""
+    _askpass_env_setup(prof, prof.get("name", "?"))
+    try:
+        return _dispatch_one_inner(entry, prof, stamp, args, slot_handle=slot_handle)
+    finally:
+        _askpass_teardown(prof)
+
+
+def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None) -> dict:
     """单 PRD 全流程：准入→建 worktree→触发 dev-agent→对账→独立验证。返回记录 dict。
 
     task 3.2：全程用 ``ShadowJournal`` 旁路写 journal 事件（``journal_shadow`` flag 关→全 no-op，dispatch
@@ -2372,11 +2705,24 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
     if not (prof.get("admission") and prof.get("dev_agent_ready") and prof.get("type") == "code"):
         rec.update(status="skip", skip_reason="profile 不满足（admission/dev_agent_ready/type≠code）")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
+    # ── 准入 1.5（add-forge-adapter tasks 2.1）：forge 配置 fail-fast——非法 forge 值 / gitlab 缺 host /
+    #   声明 forge 而缺对应平台 token env → 单项目 skip 终态（准入早期报错，不烧 dev loop；不炸同批其他项目）。
+    #   github / 未声明 → fapi=None，下方全部查询走 gh 内联路径（D1 行为等价）。
+    try:
+        fapi = _forge_api_for(prof, repo, owner_repo)
+        forge_api.validate_profile(prof)
+    except ForgeConfigError as e:
+        rec.update(status="skip", skip_reason=f"跳过-forge 配置错（单项目终态）: {e}")
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 2：branch protection 运行时实查（三态）
     if not owner_repo:
         rec.update(status="skip", skip_reason="跳过-无 remote（取不到 owner/repo）")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
-    prot = _retry_unknown(lambda: check_branch_protection(owner_repo, base), "branch_protection")
+    try:
+        prot = _retry_unknown(lambda: check_branch_protection(owner_repo, base, fapi), "branch_protection")
+    except ForgeConfigError as e:   # add-forge-adapter：REST 401/403（token 无效）= permanent → 单项目终态 skip
+        rec.update(status="skip", skip_reason=f"跳过-forge 配置类失败（单项目终态）: {e}")
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     if prot.is_unknown:   # fail-safe：保护态不明 → 阻断，不起 dev loop（OpenSpec fail-safe-dispatch / tasks 4.3）
         rec.update(status="blocked_external_state", blocked_check="branch_protection",
                    skip_reason=f"阻断-分支保护态不明: {prot.reason}")
@@ -2385,7 +2731,11 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         rec.update(status="skip", skip_reason=f"跳过-{prot.reason}")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 3：幂等前置闸（SPEC #30 ④ / ADR-0004 §4：投递前去重，已投递→skip 不起 dev loop，省 SDK 启动+$）
-    idem = _retry_unknown(lambda: already_dispatched(owner_repo, repo, devslug), "idempotency")
+    try:
+        idem = _retry_unknown(lambda: already_dispatched(owner_repo, repo, devslug, fapi), "idempotency")
+    except ForgeConfigError as e:   # 审核修复 M1：permanent（401/403）不降级 UNKNOWN → 单项目 skip 终态（镜像准入 2）
+        rec.update(status="skip", skip_reason=f"跳过-forge 配置类失败（单项目终态）: {e}")
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     if idem.is_unknown:   # fail-safe：幂等态不明 → 阻断（旧版容忍可能重复投递）
         rec.update(status="blocked_external_state", blocked_check="idempotency",
                    skip_reason=f"阻断-幂等态不明: {idem.reason}")
@@ -2394,7 +2744,11 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         rec.update(status="skip", skip_reason=f"跳过-{idem.reason}")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 4：在途 PR 限量（R1）
-    inflight_res = _retry_unknown(lambda: count_inflight_prs(owner_repo), "inflight_count")
+    try:
+        inflight_res = _retry_unknown(lambda: count_inflight_prs(owner_repo, fapi), "inflight_count")
+    except ForgeConfigError as e:   # 审核修复 M1：permanent（401/403）不降级 UNKNOWN → 单项目 skip 终态（镜像准入 2）
+        rec.update(status="skip", skip_reason=f"跳过-forge 配置类失败（单项目终态）: {e}")
+        _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     if inflight_res.is_unknown:   # fail-safe：在途数不明 → 阻断（旧版返 0 容忍可能超额投递）
         rec.update(status="blocked_external_state", blocked_check="inflight_count",
                    skip_reason=f"阻断-在途PR数不明: {inflight_res.reason}")
@@ -2527,7 +2881,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         if rec.get("off_track"):
             log(f"  🧭 {slug}: semantic off_track（judge_rounds={script_json.get('judge_rounds')}, "
                 f"last_verdict={script_json.get('last_verdict')}）→ triage")
-            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True)
+            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True, fapi=fapi)
             _sj.emit("agent_finished", _iter, _prd, payload={
                 "round": round_n, "branch": rec.get("branch"), "off_track": True,
                 "judge_rounds": script_json.get("judge_rounds"), "last_verdict": script_json.get("last_verdict")})
@@ -2537,14 +2891,14 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
         branch = rec.get("branch")
         if not branch:                        # dev 建分支前就崩/超时 → 无可验证、无分支做下次 base，对账收尾（stall 救不了，§2 实证）
             log(f"  ✗ {slug}: dev r{round_n} 未吐 branch（建分支前崩/超时）→ 对账收尾")
-            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True); break
+            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True, fapi=fapi); break
 
         # verify-loop-discipline R3-A F2：round≥2 dev 零新 commit（publish no_changes）→ no_progress 提前终止。
         #   同分支累积（A4）后 has_commits(main,branch) 恒 True（上轮 commits 在）→ 不加此门会白跑一轮
         #   verify（同一全量 diff 大概率重复 revise）→ 耗尽 rounds 退化 interrupted_pr。
         if round_n > 1 and script_json and script_json.get("no_changes"):
             log(f"  ⏸ {slug}: r{round_n} 零增量（dev 未产出新 commit）→ no_progress 对账收尾")
-            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True)
+            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True, fapi=fapi)
             # reconcile 后重设终态（reconcile 只管 PR 对账副作用；终态归门——无代码红/无中断语义，是零增量停）
             rec["verify_round"] = round_n
             rec["status"] = "no_progress"
@@ -2570,7 +2924,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
             _sj.emit("test", _iter, _prd, payload={
                 "round": round_n, "test_pass": False, "install_rc": _vj.get("install_rc"),
                 "infra_blocked": True})
-            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True)
+            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True, fapi=fapi)
             # reconcile 后重设终态（reconcile 只管 PR 对账副作用；终态归门——基建失败是 UNKNOWN 升人工，非 verify 红）
             rec["verify_round"] = round_n
             rec["status"] = "blocked_infra"
@@ -2768,7 +3122,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
                         log(f"  👻 {slug}: shadow merge 决策={_decision}（serial_shadow：只 log 不改 main）")
                 # baseline：兜底开正常 PR 收尾（治 baostock 式 interrupted_pr；reconcile 查到 dev 自开 PR 则保持 pr_open）
                 log(f"  ✅ {slug}: verify 绿（r{round_n}）→ 兜底开 PR 收尾")
-                reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=False)
+                reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=False, fapi=fapi)
             break
         if vinfo and vinfo.get("verdict") == "revise" and round_n < VERIFY_MAX_ROUNDS:
             # 判红（机会未用满）：反馈追加进 PRD + 同分支累积重投（verify-loop-discipline A4：base 恒项目默认分支，
@@ -2822,7 +3176,7 @@ def dispatch_one(entry: dict, prof: dict, stamp: str, args, *, slot_handle=None)
             continue
         # 判红用满（round_n==VERIFY_MAX_ROUNDS）/ pa-verify 异常 / 无产出 → 对账降级 interrupted_pr（不 drop，半成品留 review）
         log(f"  ⏸ {slug}: verify 终止（r{round_n}, verdict={rec['verify_verdict']}）→ 对账收尾（中断 PR 不 drop）")
-        reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True); break
+        reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True, fapi=fapi); break
 
     _sj_terminal(_sj, rec, _iter, _prd, artifact_root=STATE_DIR / "artifacts" / _run)   # task 3.2 + 4.4：统一终态 emit（publication 前 reconcile test evidence）
     return rec
@@ -2847,20 +3201,27 @@ def _publication_targets(owner_repo: str, rec: dict, vj: dict) -> list:
 
 
 def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
-                 interrupted: bool = True) -> None:
-    """三态对账：有 PR 录入 / 无 PR 有 commit 补开 PR / 无 commit 删孤儿。以 GitHub 为真源。
+                 interrupted: bool = True, fapi=None) -> None:
+    """三态对账：有 PR 录入 / 无 PR 有 commit 补开 PR / 无 commit 删孤儿。以托管平台为真源。
 
     interrupted=True（默认：红/异常收尾）→ 补开「⏸ 中断」PR（interrupted_pr）；
     interrupted=False（verify 绿收尾）→ 补开正常 PR（pr_open，治 baostock 式 interrupted_pr）。
-    有 PR / 无 commit 两态与 interrupted 无关（真源对账 / 孤儿清理照旧）。"""
+    有 PR / 无 commit 两态与 interrupted 无关（真源对账 / 孤儿清理照旧）。
+    fapi（add-forge-adapter tasks 2.3）：gitlab/gitcode → PR 查/开走 adapter（state 归一封闭枚举，
+    消费按大小写不敏感比对——gh 大写 OPEN/MERGED 与 REST 小写 open/merged 同归）；None → gh 行为不变。
+    push origin --delete 天然 host 无关（凭据经 GIT_ASKPASS）。"""
     branch = rec.get("branch")
     if not branch:                                   # dev-agent 建分支前就崩 → 无可对账
         if rec.get("dev_killed"):
             rec["status"] = "fail"; rec["skip_reason"] = "dev loop 未吐 branch（建分支前崩/超时）"
         return
 
-    # 1) 实查 GitHub 是否已有该分支的 PR（三态；UNKNOWN → 保留分支，不补开/删除/覆盖，OpenSpec fail-safe-dispatch / tasks 4.4）
-    pr = _lookup_pr(owner_repo, branch)
+    # 1) 实查平台是否已有该分支的 PR（三态；UNKNOWN → 保留分支，不补开/删除/覆盖，OpenSpec fail-safe-dispatch / tasks 4.4）
+    try:
+        pr = _lookup_pr(owner_repo, branch, fapi)
+    except ForgeConfigError as e:   # 审核修复 M1：permanent（401/403）不降级 UNKNOWN → 单项目 skip 终态（镜像 pr_create 分支）
+        rec.update(status="skip", skip_reason=f"跳过-forge 配置类失败（单项目终态）: {e}")
+        log(f"  ⏭ {slug}: {rec['skip_reason']}"); return
     if pr.is_unknown:
         rec.update(status="blocked_external_state", blocked_check="pr_lookup",
                    skip_reason=f"保留分支-PR态不明不补开/删除: {pr.reason}")
@@ -2868,7 +3229,7 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
     if pr.state is ExtState.FOUND:
         pr_url, pr_state = pr.value.get("url"), pr.value.get("state")
         rec["pr_url"] = pr_url
-        rec["status"] = "pr_open" if pr_state == "OPEN" else f"pr_{(pr_state or '').lower()}"
+        rec["status"] = "pr_open" if (pr_state or "").upper() == "OPEN" else f"pr_{(pr_state or '').lower()}"
         log(f"  ✅ {slug}: 已开 PR {pr_url}（{pr_state}）"); return
 
     # 2) 无 PR（NOT_FOUND）：查分支有无 commit（三态；UNKNOWN → 保留分支不删——旧版容忍可能误删有产出分支）
@@ -2890,22 +3251,34 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
                 body = (f"dev-agent 产出经 pa-verify 判绿（verify 闭环收尾）。commit 在 `{branch}`。"
                         f"PRD：{rec.get('prd_path')}")
                 new_status = "pr_open"
-            r = _net_gate(lambda: subprocess.run(
-                ["gh", "pr", "create", "-R", owner_repo, "--base", base, "--head", branch,
-                 "--title", title, "--body", body],
-                capture_output=True, text=True, timeout=30), "pr_create")
-            if r.returncode != 0:   # fail-safe：补开 PR 失败 → 保留分支不臆断成功（旧版无视 rc → 空 url 却标 pr_open=幻影绿 PR）
-                # verify-loop-discipline A5：create 撞并发已开的同 branch open PR（TOCTOU：lookup 后、create 前
-                # 另一进程开了——graph 路径/并发 cron）→ 重查复用（对齐 A2 幂等语义），仍无才 blocked。
-                recheck = _lookup_pr(owner_repo, branch)
-                if recheck.state is ExtState.FOUND and recheck.value.get("state") == "OPEN":
-                    rec["pr_url"] = recheck.value.get("url"); rec["status"] = new_status
-                    log(f"  ♻ {slug}: 补开撞并发 open PR，复用 {rec['pr_url']}（A5 幂等对齐）")
-                    return
-                rec.update(status="blocked_external_state", blocked_check="pr_create",
-                           skip_reason=f"保留分支-补开PR失败(rc={r.returncode}): {sanitize(r.stderr)}")
-                log(f"  ⛔ {slug}: {rec['skip_reason']}"); return
-            url = r.stdout.strip()
+            if fapi is not None:   # add-forge-adapter：REST 面补开（FOUND(pr_dict) / UNKNOWN / ForgeConfigError）
+                try:
+                    cr = _net_gate(lambda: fapi.pr_create(base, branch, title, body), "pr_create")
+                except ForgeConfigError as e:
+                    rec.update(status="skip", skip_reason=f"跳过-forge 配置类失败（单项目终态）: {e}")
+                    log(f"  ⏭ {slug}: {rec['skip_reason']}"); return
+                if cr.is_unknown:
+                    rec.update(status="blocked_external_state", blocked_check="pr_create",
+                               skip_reason=f"保留分支-补开PR失败: {cr.reason}")
+                    log(f"  ⛔ {slug}: {rec['skip_reason']}"); return
+                url = (cr.value or {}).get("url") or ""
+            else:
+                r = _net_gate(lambda: subprocess.run(
+                    ["gh", "pr", "create", "-R", owner_repo, "--base", base, "--head", branch,
+                     "--title", title, "--body", body],
+                    capture_output=True, text=True, timeout=30), "pr_create")
+                if r.returncode != 0:   # fail-safe：补开 PR 失败 → 保留分支不臆断成功（旧版无视 rc → 空 url 却标 pr_open=幻影绿 PR）
+                    # verify-loop-discipline A5：create 撞并发已开的同 branch open PR（TOCTOU：lookup 后、create 前
+                    # 另一进程开了——graph 路径/并发 cron）→ 重查复用（对齐 A2 幂等语义），仍无才 blocked。
+                    recheck = _lookup_pr(owner_repo, branch)
+                    if recheck.state is ExtState.FOUND and (recheck.value.get("state") or "").upper() == "OPEN":
+                        rec["pr_url"] = recheck.value.get("url"); rec["status"] = new_status
+                        log(f"  ♻ {slug}: 补开撞并发 open PR，复用 {rec['pr_url']}（A5 幂等对齐）")
+                        return
+                    rec.update(status="blocked_external_state", blocked_check="pr_create",
+                               skip_reason=f"保留分支-补开PR失败(rc={r.returncode}): {sanitize(r.stderr)}")
+                    log(f"  ⛔ {slug}: {rec['skip_reason']}"); return
+                url = r.stdout.strip()
             rec["pr_url"] = url or None; rec["status"] = new_status
             log(f"  {'⏸' if interrupted else '✅'} {slug}: {'中断' if interrupted else '正常'} PR 已补开 {url}")
             return   # 坑3 修复（2026-07-17）：has_commit 且 PR 已补开 → 到此为止，不再落到下方删分支。原代码漏 return，导致失败时「开完中断 PR 又删它的分支 + status 被覆盖成 orphan_deleted + dev 工作 branch -D 丢失」
@@ -3114,27 +3487,29 @@ def _run_one(entry: dict, prof: dict | None, stamp: str, args) -> dict:
                 "status": "skip", "skip_reason": "profile 不存在"}
     repo = prof.get("repo", "")
     owner_repo = repo_owner_repo(repo) if repo else ""
+    dkey = dispatch_key(repo, owner_repo) if repo else ""   # add-forge-adapter D4：host×全路径身份键
+    #   （github.com 退化 owner_repo 两级形态 → 锁/slot 键零变化；gitlab 多级路径不撞尾两级同名仓）
 
     def _learn(rec: dict) -> None:
         _attach_learning_memory(rec, prof, entry, stamp,
                                 sdk_query_fn=getattr(args, "_learning_sdk_query_fn", None))
 
     # serial_shadow on → 跨进程 single-flight slot（task 2.2/2.3：flock + journal，跨 cron 存活）
-    if owner_repo and resolve_flags(env=os.environ).single_flight_serial_shadow:
+    if dkey and resolve_flags(env=os.environ).single_flight_serial_shadow:
         _run = loop_ids.run_id(stamp)
         _prd = loop_ids.prd_id(entry.get("prd_path", ""), None)
         _iter = loop_ids.iteration_id(_run, _prd, 0)
-        _scope = SF.slot_scope(STATE_DIR, owner_repo, run_id=_run, prd_id=_prd, iteration_id=_iter,
+        _scope = SF.slot_scope(STATE_DIR, dkey, run_id=_run, prd_id=_prd, iteration_id=_iter,
                                now_fn=_slot_now, stamp_fn=_now_iso)
         with _scope as _slot:
             if not _slot.acquired:                 # inflight/unknown/flock_busy → 不投递（让位/fail-safe）
-                rec = _slot_blocked_record(entry, owner_repo, _slot)
+                rec = _slot_blocked_record(entry, dkey, _slot)
                 _learn(rec); return rec
             # task 4.x：传 slot_handle 进 dispatch_one——post-merge UNKNOWN / revert 非 REVERTED 时 halt 整仓
             rec = dispatch_one(entry, prof, stamp, args, slot_handle=_scope.handle)
             _learn(rec); return rec
     # off → baseline：进程内 threading.Lock（同仓串行、跨仓并行；design 决策#8 不变）
-    lock = DISPATCH_LOCKS.get(owner_repo) if owner_repo else None
+    lock = DISPATCH_LOCKS.get(dkey) if dkey else None
     with lock if lock else contextlib.nullcontext():
         rec = dispatch_one(entry, prof, stamp, args)
         _learn(rec); return rec
@@ -3152,13 +3527,14 @@ def _dispatch_serial_by_repo(passed: list[dict], profiles: dict, stamp: str, arg
     ``stage_dispatch(..., worker=<graph worker>)`` 注入子图 invoke（D7：run_daily 不 import graph_pa_*，
     callable 由调用方传；flag off 仍走 ``_run_one``）。"""
     _worker = worker or _run_one   # task 3.9 worker hook（默认 legacy _run_one，byte-identical）
-    # 按 owner_repo 分组（保提交序；无 remote 的归 "" 组，彼此并行）
+    # 按仓身份分组（保提交序；无 remote 的归 "" 组，彼此并行）。add-forge-adapter D4：组键 = host×全路径
+    #   （github 退化 owner_repo 两级形态零变化；gitlab/gitcode 显式 host 前缀，多级路径不撞尾两级）
     groups: dict[str, list[dict]] = {}
     for e in passed:
         prof = profiles.get(e.get("project")) or {}
         repo = prof.get("repo", "")
         owner_repo = repo_owner_repo(repo) if repo else ""
-        groups.setdefault(owner_repo or "", []).append(e)
+        groups.setdefault(dispatch_key(repo, owner_repo) if repo else "", []).append(e)
 
     def _run_group_serial(entries: list[dict]) -> list[dict]:
         recs: list[dict] = []
@@ -3277,15 +3653,18 @@ def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str, *, worker
     log(f"[dispatch] 过闸 PRD {len(passed)} 份，投递（max-concurrent={args.max_concurrent}）"
         f"{'  [SKIP-DEV 零成本 smoke]' if getattr(args, 'dispatch_skip_dev', False) else ''}")
 
-    # 预建 per-owner_repo 串行锁（修并行下 count_inflight_prs check-then-act TOCTOU；同仓串行、跨仓并行）
+    # 预建 per-仓 串行锁（修并行下 count_inflight_prs check-then-act TOCTOU；同仓串行、跨仓并行）。
+    #   add-forge-adapter D4：锁键 = dispatch_key（host×全路径；github 退化 owner_repo 两级形态零变化）。
     for e in passed:
         prof = profiles.get(e.get("project"))
         if not prof:
             continue
         repo = prof.get("repo", "")
-        owner_repo = repo_owner_repo(repo) if repo else ""
-        if owner_repo and owner_repo not in DISPATCH_LOCKS:
-            DISPATCH_LOCKS[owner_repo] = threading.Lock()
+        if not repo:
+            continue
+        dkey = dispatch_key(repo, repo_owner_repo(repo))
+        if dkey and dkey not in DISPATCH_LOCKS:
+            DISPATCH_LOCKS[dkey] = threading.Lock()
 
     # single-flight-auto-merge task 2.1：串行单飞投递（flag gated）。on → 同 owner_repo 顺序、跨 owner_repo
     #   并行（_dispatch_serial_by_repo）；off → 现有全并行 ThreadPoolExecutor（baseline 不变，design 决策#8）。
@@ -3366,6 +3745,7 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
                       {"candidates": [], "today_new_count": 0, "stats": {}})
     gate = _read_json(STATE_DIR / f"prd_gate_{stamp}.json", [])
     disp = _read_json(STATE_DIR / f"dispatch_{stamp}.json", [])
+    fetch_state = _read_json(STATE_DIR / f"fetch_{stamp}.json", {})   # 4.5：采集源失败登记（旧 run 无此键 → 空）
 
     date_disp = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}"
     stats = cand.get("stats", {}) or {}
@@ -3428,6 +3808,12 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
                     f"失败/超时/跳过：{len([d for d in disp if d.get('status') in ('skip', 'planned', 'fail')])}｜"
                     f"阻断（未投递）：{len(blocked_external) + len(blocked_gate)}"
                     f"（远程态不明 {len(blocked_external)} / 测试门未过 {len(blocked_gate)}）", ""]
+    # add-forge-adapter 4.5：采集源失败可见（token 缺/预取超时/persona 异常——促 triage 不静默）。
+    # 仅失败非空才渲染 → baseline 报告零新增行（旧快照测试零漂移）。
+    fetch_failed = fetch_state.get("failed_sources") or []
+    if fetch_failed:
+        L.insert(4, "- ⚠ 采集源失败：" + "、".join(
+            f"{f.get('source')}（{str(f.get('reason'))[:60]}）" for f in fetch_failed))
     # pa-hardening P2-1/P0-1：run 成本聚合 + 熔断状态行（文件存在才渲染——flag off 的 baseline run 零新增行）。
     # checkpoint 按 run 起始 stamp（args.stamp）命名；breaker 按实际 stamp（inject 自增后）命名——与各自写点一致。
     _ck = CK.load_checkpoint(STATE_DIR, getattr(args, "stamp", stamp))   # run 起始 stamp（args.stamp；测试 harness 缺省回落段参数）

@@ -73,12 +73,13 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 - **机械活**（确定性、零 LLM、纯 Python）：今日新文件发现、date-marker、文件读写、去重清单、journal 事件、副作用的 exactly-once reconcile。
 - **语义活**（交给 headless persona）：抽信号 / 翻译 PRD / 对抗审 PRD / 审 dev 产出。
 
-### 8 个 headless persona（`.claude/agents/pa-*.md`）
+### 9 个 headless persona（`.claude/agents/pa-*.md`）
 每个 persona 由编排器经 `claude --agent <persona> -p --output-format json --max-turns N` 链式调用；stdout 是信封 JSON，**两层解析**：`json.loads(stdout)["result"]` 再 `json.loads` 一次得 payload。
 
 | persona | 角色 |
 |---|---|
 | pa-fetch-{github-repo,wechat-url,deepresearch} | 采集（Bash / web_reader / exa；github MCP 在 headless 不可用，故走 gh CLI） |
+| pa-fetch-forge-repo | forge-repo 源语义半段（Read-only）：编排器先跑 `forge_fetch.py` 机械预取三平台仓 commits/pulls/issues 归一落盘，persona 只 Read 预取文件逐仓 summarize 成 digest（token 不进其环境） |
 | pa-radar | 信号雷达（抽技术信号 + 比对打分去重） |
 | pa-prd | 信号 × profile → PRD |
 | pa-prd-critic | PRD 对抗质量闸（默认怀疑，只判「有据+可执行」） |

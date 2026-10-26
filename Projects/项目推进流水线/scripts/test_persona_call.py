@@ -157,6 +157,57 @@ def test_nonzero_exit_raises(monkeypatch):
         persona_call.run_persona_subproc("claude", "pa-progress", "P", max_turns=15, timeout=120)
 
 
+# ─── exit_diag：非零退出诊断并入 stdout 信封（2026-10-23 hub 首跑 #3 实证修复）──
+def test_nonzero_exit_includes_stdout_envelope(monkeypatch):
+    """生产形态回归锚：退出 1 + stderr 空 + 信封 is_error（"Not logged in"）→ 错误可见。
+
+    hub 首跑 #3 critic 段即此形态——stderr-only 捕获当时吞成空错误信息。"""
+    env = {"is_error": True, "result": "Not logged in · Please run /login"}
+    monkeypatch.setattr(persona_call.subprocess, "run",
+                        _fake_runner([_FakeProc(stdout=json.dumps(env), stderr="", returncode=1)]))
+    with pytest.raises(RuntimeError) as ei:
+        persona_call.run_persona_subproc("claude", "pa-progress", "P", max_turns=15, timeout=120)
+    assert "Not logged in" in str(ei.value)
+    assert "envelope=" in str(ei.value)
+
+
+def test_nonzero_exit_stderr_only_kept(monkeypatch):
+    """stderr 有值 → 尾部保留（原行为不劣化），stdout 头不重复贴。"""
+    monkeypatch.setattr(persona_call.subprocess, "run",
+                        _fake_runner([_FakeProc(stdout="", stderr="boom", returncode=2)]))
+    with pytest.raises(RuntimeError) as ei:
+        persona_call.run_persona_subproc("claude", "pa-progress", "P", max_turns=15, timeout=120)
+    assert "stderr=boom" in str(ei.value)
+    assert "stdout头" not in str(ei.value)
+
+
+def test_nonzero_exit_stdout_nonjson_head():
+    """stdout 非 JSON 且 stderr 空 → 只取头 200 线索（!r 防控制字符）。"""
+    p = _FakeProc(stdout="garbage not json " * 50, stderr="", returncode=1)
+    msg = persona_call.exit_diag("lab", p)
+    assert "claude 退出 1" in msg and "stdout头=" in msg
+    assert len(msg) < 400
+
+
+def test_nonzero_exit_nondict_json_no_crash():
+    """stdout 是合法非字典 JSON（如带引号字符串）→ 不炸（isinstance 守卫），走 stdout 头。
+
+    review MEDIUM：outer.get 对 str 会 AttributeError，掩盖原诊断信息。"""
+    p = _FakeProc(stdout='"Not logged in"', stderr="", returncode=1)
+    msg = persona_call.exit_diag("lab", p)
+    assert "claude 退出 1" in msg and "stdout头=" in msg
+    p2 = _FakeProc(stdout='["a", "b"]', stderr="", returncode=1)
+    assert "claude 退出 1" in persona_call.exit_diag("lab", p2)
+
+
+def test_nonzero_exit_huge_envelope_bounded():
+    """信封 result 巨大 → 摘要截 300，错误消息有界。"""
+    p = _FakeProc(stdout=json.dumps({"is_error": True, "result": "x" * 5000}),
+                  stderr="", returncode=1)
+    msg = persona_call.exit_diag("lab", p)
+    assert len(msg) < 500
+
+
 def test_is_error_envelope_raises(monkeypatch):
     monkeypatch.setattr(persona_call.subprocess, "run", _fake_runner([
         json.dumps({"result": "err", "is_error": True})]))

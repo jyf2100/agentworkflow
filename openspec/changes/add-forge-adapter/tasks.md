@@ -1,0 +1,43 @@
+# Tasks: add-forge-adapter
+
+排序依据 design D7：GitLab → GitCode → GitHub issue；每平台独立可交付。（本体论审核 2026-10-23 修订：分支保护第 4 操作、凭据全 git 操作覆盖、三态按端点分型、locked 归一、窗口口径钉死等已并入）
+
+## 1. forge adapter 基座（纯新增，零触旧路径）
+
+- [x] 1.1 `scripts/forge_api.py`：`ForgeConfigError`（permanent）+ `LookupOutcome`（FOUND/NOT_FOUND/UNKNOWN）+ `ForgeApi.for_profile(prof)` 工厂（forge 缺省 github；非法 forge 值 fail-fast 不回落 github；gitlab 缺 host fail-fast）；stdlib urllib 零新依赖
+- [x] 1.2 GitLab REST 实现：`pr_list`（`/api/v4/projects/{urlencoded}/merge_requests?state=…`）/ `pr_create` / `pr_merge` / `branch_protection`（protected-branches 端点）；PAT `PRIVATE-TOKEN` 头；三态按 D2 端点分型判据（列表端点 404 → UNKNOWN）；merge **无请求级参数**——项目 merge method 设置前置校验（≠ merge commit 即 permanent）+ merge 后双 parent 验证
+- [x] 1.3 GitCode REST 实现：`/api/v5/repos/{o}/{r}/pulls` 四操作（merge 带 `merge_method=merge`）+ branch_protection；Bearer 头；state 归一到封闭枚举 `{open, merged, closed}`（opened→open；gitlab locked→open 保守算在途）；同 D2 判据
+- [x] 1.4 github 分支 thin wrapper：按调用面两命名入口（dev-agent 面 cwd+抛异常契约 / run_daily 面 -R+三态契约）共享命令构造，委托既有 gh 调用序列；直比按调用面参数快照断言（4 种参考形态各锚各的，不做假统一）
+- [x] 1.5 多级路径：`repo_full_path`（全路径提取，两级形态与旧 `repo_owner_repo` 逐字节一致）+ 旧名 alias；GitLab URL-encode 全路径；dispatch 身份键 = host × 全路径（DISPATCH_LOCKS / already_dispatched / 查重键改造）
+- [x] 1.6 单测：mock urllib（注入状态码/响应体）——三平台 × 四操作 × 三态矩阵；列表端点 404→UNKNOWN、单对象 404→NOT_FOUND；401/403→ForgeConfigError；merge 405/409→permanent、406/429/5xx/坏 JSON→UNKNOWN；空列表→FOUND；locked 归一；错误消息不含 token 片段断言
+
+## 2. dispatch 链接入（forge 缺省 = 旧路径行为等价）
+
+- [x] 2.1 profile 装载：`forge` / `gitlab_host` 解析 + 校验（非法值 / 缺 host fail-fast）+ 声明 forge 而缺对应平台 token env 早期 fail-fast（准入期报错，不烧 dev loop）；缺省 github
+- [x] 2.2 `dev-agent.py` PR path 分流：`_pr_automerge` / `_lookup_pr` 幂等模板按 forge 走 adapter `pr_create/pr_list/pr_merge`（github 分支 gh 命令序列不变）；merge 双 parent 语义跨平台断言（gitlab 走前置校验 + merge 后验证）
+- [x] 2.3 `run_daily.py` dispatch 面分流 ×4：`check_branch_protection` + `_lookup_pr` + `count_inflight_prs` + devslug 分支查重；消费 adapter 三态（FOUND-空 按调用点既有语义映射）；UNKNOWN 阻断路径与现状 gh 分支一致；ForgeConfigError → 单项目 skip 终态 + 高声暴露（不炸整段）【实施回填：`reconcile_pr` 补开 PR 触点同步分流（pr_create REST 化 + pr_state 大小写归一），UNKNOWN → blocked_external_state 保留分支】
+- [x] 2.4 GIT_ASKPASS 注入：askpass 覆盖 run 内全部远程 git 操作（clone/fetch/ls-remote/push，进程级 env + `GIT_TERMINAL_PROMPT=0`）；脚本本体只读 env 不含 token；hub 形态落容器内非挂载路径（真随容器弃）、本机形态落 state 目录 run 终态清理（0700 幂等覆盖）；remote URL 保持无凭据
+- [x] 2.5 单测：对账三态消费（UNKNOWN → blocked_external_state）；401/403 → 单项目终态（不影响同批其他项目）；push/命令面无 token 断言；github 路径按调用面直比（无 forge 声明时参数快照一致）
+
+## 3. 凭据面（vault 增键 + 派发判定）
+
+- [x] 3.1 `vault_store.py`：placeholder 判据覆盖 GITLAB_TOKEN / GITCODE_TOKEN（同阈值黑名单口径）；`forge_required_keys(forge)` 映射（GH_TOKEN 仅 github/未声明项目）
+- [x] 3.2 `lifecycle._credentials`：必需键 = ANTHROPIC 两值 ∪ 按项目 forge 的平台 token（GH_TOKEN 仅 github/未声明项目必需，gitlab/gitcode-only 用户不被迫造假 GH_TOKEN）；缺 → fail-fast abandon 列缺失键
+- [x] 3.3 面板 + PUT/POST 录入：GH_TOKEN 与两平台 token 可选 password 框；留空 = **保留既有键值**（非 replace 抹除）+ 面板提示；占位拦截；响应只显字段名
+- [x] 3.4 hub 单测：gitlab 项目缺 GITLAB_TOKEN → abandon 明示；重提交留空保留既有平台 token；gitlab-only 用户无 GH_TOKEN 可正常派发；占位形态拒绝
+
+## 4. fetch 采集（forge-repo 源 + issue 维度）
+
+- [x] 4.1 `sources.yaml` schema：`kind: forge-repo`（forge/gitlab_host/repos/watch/window）；`github-repo` 原样保留；装载校验（非法 forge 值 / 缺 host fail-fast；gitcode+issues 在 fixture 锚定前报暂不支持）
+- [x] 4.2 `scripts/forge_fetch.py` 机械预取：三平台 × commits/pulls/issues 拉取 → 窗口过滤（时间戳口径钉死：commits=author date、pulls/issues=updated_at）→ state 归一 → 归一 markdown 落盘；token narrow-inject 给预取子进程（不进 persona env）；gitcode 串行节流（缺省 1s 可配）+ 429 退避一次；受 fetch 段 TIMEOUT 约束、超时按该源失败；失败非零退出（净化消息）
+- [x] 4.3 混入与敏感过滤：GitHub issues 剔除 `pull_request` 字段条目；GitLab 排除 `confidential=true` 条目
+- [x] 4.4 fetch persona 接线：预取产物 → summarize（persona 工具面收紧 Read-only 或复用既有，实施时定——若复用 Bash，平台 token 仍不进 persona 环境）；输出契约一行 JSON items 不变【实施回填：新建 pa-fetch-forge-repo persona（tools: Read），run_persona 三层 env 穿参；tools-only 调用形状保持原 5 参零变化（env 仅 forge-repo 面出现）】
+- [x] 4.5 fetch 失败登记：fetch 汇总 json 增 failed 源清单字段（源级二元失败，不借三态术语），report 渲染可见【实施回填：既有 kind 的 per-source exception 也进 failed_sources（泛化）；无失败时报告零新增行】
+- [x] 4.6 单测：源装载分支（含非法值 / gitcode+issues 拒绝）；预取归一（三平台 state → 封闭枚举）；窗口口径（updated_at 边界）；混入/confidential 过滤；节流/退避；radar 消费形态（items 结构与既有同构）【scripts/test_forge_fetch.py：40 测，quality 全绿（仅预存环境性失败）】
+
+## 5. 端到端验收
+
+- [ ] 5.1 GitLab 真实仓端到端：profile（forge: gitlab + host + 多级路径仓 + token env）→ hub 建项目 → 手写 PRD 入队 → dispatch 开 MR → 分支保护/对账三态 → merge 双 parent（含 merge method 设置前置校验路径）
+- [ ] 5.2 GitCode 真实仓端到端（含限速实测）+ GitCode issues API 字段快照 fixture（先人工 curl 验证 Open Question #2，锚定后放开 gitcode+issues）
+- [ ] 5.3 GitHub issue 监控冒烟：既有仓 + watch: [commits, pulls, issues]（与 github-repo kind 同窗口结果一致）
+- [ ] 5.4 回归：GitHub 全链（无 forge 声明）行为与基线一致（canary/既有测试套）；pa + hub 双质量门全绿；pa-executor 镜像重建（dev-agent.py 变更入镜像，确定步骤）后 hub 冒烟

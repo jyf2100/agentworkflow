@@ -159,6 +159,32 @@ _Avoid_: 把 UNKNOWN 当死信（UNKNOWN 是可恢复态：不写标记下轮重
 hub 落盘顺序钉死：先落盘 PRD（含 sha 校验）再持久化队列项——若 db-first，中间崩溃产生「队列项存在但 PRD 永不补写」不可恢复态。重复投递命中键时校验落盘完整（缺失/异容补写回原位），是双层幂等的文件侧执行点。
 _Avoid_: 当性能优化（是崩溃窗口收敛语义：六窗口全靠重扫重投+双层幂等收敛，零协调机制）。
 
+## forge 拓扑（add-forge-adapter 引入）
+
+**forge（Git 托管平台范畴）**:
+三平台抽象 github / gitlab / gitcode。profile 声明 `forge` 值决定 dispatch PR 面与凭据键（GH_TOKEN / GITLAB_TOKEN / GITCODE_TOKEN）；fetch 侧 forge-repo 源同参（`gitlab_host` 采集/dispatch 两侧独立声明互不引用）。缺省 github——既有 profile 不声明即零变更走基线。非法值装载期 fail-fast，绝不静默回落 github。
+_Avoid_: 把 forge 当「git 服务器」（它选择的是 **API/PR 面**——git 本体操作 clone/push 天然 host 无关，不经 adapter）。
+
+**forge adapter（forge_api.py）**:
+三平台统一 PR 操作契约（`pr_list` / `pr_create` / `pr_merge` / `branch_protection`）：github 分支委托既有 gh CLI（**M7 carve-out**：adapter 提供能力面但 dispatch 链对 github 不接线 wrapper——短路走既有内联 gh 调用，D1 行为等价路径选择），gitlab/gitcode 走纯 stdlib REST。三态判据按端点分型收进 adapter 契约（列表端点 404=UNKNOWN「看不见」、单对象端点 404=NOT_FOUND）；state 归一封闭枚举 open/merged/closed。
+_Avoid_: 在 adapter 内做调用语境映射（FOUND-空 = 0 在途还是无 PR，归调用点消费——adapter 恒返 FOUND-空）。
+
+**配置类永久失败（ForgeConfigError / exit 14）**:
+401/403 等 permanent 失败的分桶语义（区别于 UNKNOWN 瞬态重试臂）。dispatch 消费面（准入 2/3/4、reconcile 查/开）统一映射**单项目 skip 终态**（不炸同批其他项目、不进 blocked 每轮重试——401 重试必败烧配额，本体论审核 M1）；dev-agent publish 面分桶 **exit 14**（与 13 git/PR 失败区分——hub 队列对 14 不重派直接终态，审核 M2）。
+_Avoid_: 降级 UNKNOWN 兜住（旧形态——permanent 进重试臂每轮必败）；hub 侧对非零退出码无差别重派（14 必须短路）。
+
+**dispatch 身份键（host × 全路径）**:
+single-flight 锁、already_dispatched 幂等查重、分支查重的键 = host × 仓库全路径二元组——两个 host 上同路径是两个仓不共享锁。仓库标识用全路径（gitlab 多级 `组/子组/仓`；两级形态与旧正则提取逐字节一致）。gitlab REST 侧 URL-encode 全路径作 project 标识。
+_Avoid_: 只用 owner/repo（多级路径截断成两级）；只加 host 不加路径（同 host 重名仓互串）。
+
+**GIT_ASKPASS 注入（按 host 选键）**:
+run 内全部远程 git 操作（clone / fetch / ls-remote / push）的凭据通道：进程级 `GIT_ASKPASS=<脚本>` + `GIT_TERMINAL_PROMPT=0`，脚本按提示串里的 host 分流 env 键（gitcode→GITCODE_TOKEN / github→GH_TOKEN / 其余→GITLAB_TOKEN，审核 H2——多平台 token 并存时恒定级联会错绑）。remote URL 恒无凭据；hub 形态脚本落容器内非挂载路径随容器弃，本机形态 run 终态清理。
+_Avoid_: token 进 remote URL / 命令行（可见面泄漏）；per-forge 脚本（GIT_ASKPASS 进程级覆盖竞争——恒定单脚本内容幂等）。
+
+**forge-repo 源（机械预取 + 语义 summarize）**:
+采集链两半段：`forge_fetch.py` 机械预取（零 LLM，token narrow-inject 只进该子进程）拉 commits/pulls/issues 窗口过滤归一落盘（md 文件名 `forge__` 前缀防跨平台同路径互覆，L2；单页拉满上限即声明截断，M8）→ `pa-fetch-forge-repo` persona 只 Read 落盘产物逐仓 summarize（平台 token 不进 persona 环境）。采集面失败 = 源级二元失败登记（部分仓失败透传 H1：成功仓不陪葬继续 summarize）。
+_Avoid_: persona 内拼平台 curl（平台 API 差异进 prompt 违机械/语义分工）；gitcode+issues 组合（真实 fixture 未锚定，装载即拒）。
+
 **通知 (Notify)**:
 hub 观察面的 run 终态事件出口（add-hub-slice-4a，F14）——事件面钉死为 hub DB **自有 run 终态行**（succeeded/failed/failed_to_start），机械读行转发，零 pa 格式依赖；语义事件（critic pass/drop、PR 开出、verify verdict）与无 run 的队列放弃**不在事件面**（归后续切片事件出口）。「至多一次」由挂点结构保证（`_finish_run` 收敛点，无标记列无轮询）；fail-open（通知异常绝不阻断落库与状态机）；零持久写面（丢失兜底是读面查询）。
 _Avoid_: 与 SMTP 简讯混称（那是 vault 侧 report 段动作；hub 通知只认 run 终态行）；「通知失败阻断执行」的直觉（观察面永不阻断执行面——fail-open 是钉死语义）。

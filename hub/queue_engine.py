@@ -57,13 +57,19 @@ class QueueEngine:
         self._db.set_item_status(item_id, "running")
 
     def on_exit(self, item_id: int, exit_code: int) -> None:
-        """容器退出回调：rc=0 → done；否则按 attempt 判重派或放弃（A3）。
+        """容器退出回调：rc=0 → done；14 permanent 不重派；否则按 attempt 判重派或放弃（A3）。
 
         队列项 failed 是放弃决定（attempt 达上限），run 的 failed 是容器事实——
         两个生命周期分离；重派回 pending 保留 attempt，因入队更早天然 FIFO 优先。
+        exit 14（add-forge-adapter 审核修复 M2）= dev-agent forge 配置类永久失败
+        （401/403 token 无效）——重派必败烧 dev loop，直接终态 failed（镜像 F13 镜像缺失语义）。
         """
         if exit_code == 0:
             self._db.set_item_status(item_id, "done")
+            return
+        if exit_code == 14:
+            self._db.fail_item(item_id, "dev-agent exit 14：forge 配置类永久失败（token 无效/权限缺）"
+                                         "——重试必败不重派，修 vault 凭据后重新入队")
             return
         self._db.bump_attempt(item_id)
         attempt = self._db.get_item(item_id)["attempt"]
