@@ -4,12 +4,12 @@
 
 ## 1. forge adapter 基座（纯新增，零触旧路径）
 
-- [x] 1.1 `scripts/forge_api.py`：`ForgeConfigError`（permanent）+ `LookupOutcome`（FOUND/NOT_FOUND/UNKNOWN）+ `ForgeApi.for_profile(prof)` 工厂（forge 缺省 github；非法 forge 值 fail-fast 不回落 github；gitlab 缺 host fail-fast）；stdlib urllib 零新依赖
+- [x] 1.1 `scripts/forge_api.py`：`ForgeConfigError`（permanent）+ 三态结果（FOUND/NOT_FOUND/UNKNOWN）+ `ForgeApi.for_profile(prof)` 工厂（forge 缺省 github；非法 forge 值 fail-fast 不回落 github；gitlab 缺 host fail-fast）；stdlib urllib 零新依赖【实施回填：三态复用既有 `external_state.ExtState`/`ExtResult`（全 pa 单套三态枚举，未另造 LookupOutcome 实体）】
 - [x] 1.2 GitLab REST 实现：`pr_list`（`/api/v4/projects/{urlencoded}/merge_requests?state=…`）/ `pr_create` / `pr_merge` / `branch_protection`（protected-branches 端点）；PAT `PRIVATE-TOKEN` 头；三态按 D2 端点分型判据（列表端点 404 → UNKNOWN）；merge **无请求级参数**——项目 merge method 设置前置校验（≠ merge commit 即 permanent）+ merge 后双 parent 验证
 - [x] 1.3 GitCode REST 实现：`/api/v5/repos/{o}/{r}/pulls` 四操作（merge 带 `merge_method=merge`）+ branch_protection；Bearer 头；state 归一到封闭枚举 `{open, merged, closed}`（opened→open；gitlab locked→open 保守算在途）；同 D2 判据
 - [x] 1.4 github 分支 thin wrapper：按调用面两命名入口（dev-agent 面 cwd+抛异常契约 / run_daily 面 -R+三态契约）共享命令构造，委托既有 gh 调用序列；直比按调用面参数快照断言（4 种参考形态各锚各的，不做假统一）
 - [x] 1.5 多级路径：`repo_full_path`（全路径提取，两级形态与旧 `repo_owner_repo` 逐字节一致）+ 旧名 alias；GitLab URL-encode 全路径；dispatch 身份键 = host × 全路径（DISPATCH_LOCKS / already_dispatched / 查重键改造）
-- [x] 1.6 单测：mock urllib（注入状态码/响应体）——三平台 × 四操作 × 三态矩阵；列表端点 404→UNKNOWN、单对象 404→NOT_FOUND；401/403→ForgeConfigError；merge 405/409→permanent、406/429/5xx/坏 JSON→UNKNOWN；空列表→FOUND；locked 归一；错误消息不含 token 片段断言
+- [x] 1.6 单测：mock urllib（注入状态码/响应体）——三平台 × 四操作 × 三态矩阵；列表端点 404→UNKNOWN、单对象 404→NOT_FOUND；401/403→ForgeConfigError；merge 409→permanent、405→UNKNOWN（组5.1 实证修订：MR mergeability 瞬态窗口 / 已 merged 重放混装，permanent 会误杀可自愈路径——见 spec pr_merge 分类）、406/429/5xx/坏 JSON→UNKNOWN；空列表→FOUND；locked 归一；错误消息不含 token 片段断言
 
 ## 2. dispatch 链接入（forge 缺省 = 旧路径行为等价）
 
@@ -38,6 +38,7 @@
 ## 5. 端到端验收
 
 - [ ] 5.1 GitLab 真实仓端到端：profile（forge: gitlab + host + 多级路径仓 + token env）→ hub 建项目 → 手写 PRD 入队 → dispatch 开 MR → 分支保护/对账三态 → merge 双 parent（含 merge method 设置前置校验路径）
-- [ ] 5.2 GitCode 真实仓端到端（含限速实测）+ GitCode issues API 字段快照 fixture（先人工 curl 验证 Open Question #2，锚定后放开 gitcode+issues）
+  - 2026-10-26 **adapter 级**全过（术语：adapter 级 = forge_api 直调契约面；hub 全链 = hub 建项目→PRD 入队→容器内 dispatch）：183 自建 GitLab `http://172.32.153.183:8180`，`pa-qa/sub/proj` 多级路径，12/12（fetch 三维 + dispatch 四操作含分支保护 / MR merge 双 parent + 三态负例）。真实验收产出三修，契约细节已回填工件、此处只留指针：① `gitlab_host` scheme 形态（spec「三平台统一操作契约」Requirement）；② 405 permanent→UNKNOWN（spec pr_merge 失败分类 + tasks 1.6）；③ pr_merge 空 title 不发 merge_commit_message 字段（实现内注释锚定）。hub 全链待 5.4 镜像重建后补跑。
+- [ ] 5.2 GitCode 真实仓端到端（含限速实测）+ GitCode issues API 字段快照 fixture（先人工 curl 验证 design.md Open Question「GitCode issue 端点字段形态未实测」，锚定后放开 gitcode+issues）
 - [ ] 5.3 GitHub issue 监控冒烟：既有仓 + watch: [commits, pulls, issues]（与 github-repo kind 同窗口结果一致）
-- [ ] 5.4 回归：GitHub 全链（无 forge 声明）行为与基线一致（canary/既有测试套）；pa + hub 双质量门全绿；pa-executor 镜像重建（dev-agent.py 变更入镜像，确定步骤）后 hub 冒烟
+- [ ] 5.4 回归：GitHub 全链（无 forge 声明）行为与基线一致（canary/既有测试套）；pa + hub 双质量门全绿；pa-executor 镜像重建（**pa 变更面全量入镜像**：dev-agent.py + forge_api.py + forge_fetch.py + run_daily.py + persona 定义 + specs——缺一即容器内 ImportError；v0.1.5 早于 forge 三修，需重建 v0.1.6）后 hub 冒烟，冒烟含两点：①容器内 forge 面（forge_api import + 三态判据抽查）②**派发时点快照不变式**（execution-hub spec 声明：起容器后 vault 凭据记录变更不影响在跑 run，只影响后续派发——跑中改 vault 记录、在跑 run 行为不变的显式验收）

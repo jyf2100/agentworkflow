@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: 三平台统一 Git 托管操作契约
-forge adapter SHALL 以统一接口提供 `pr_list` / `pr_create` / `pr_merge` / `branch_protection` 四操作，覆盖三个 Git 托管平台：github（实现走既有 gh CLI，行为与现状等价——命令参数面逐 token 一致）、gitlab（REST API v4）、gitcode（api.gitcode.com/api/v5）。平台选择由调用方声明的 `forge` 值决定（`github` 为缺省，兼容既有 profile 不声明 forge 的形态）。`forge` 值非法（拼错 / 大小写漂移 / 尾空格 / 未知平台）MUST 装载期 fail-fast，MUST NOT 静默回落 github（错平台查询与副作用）。gitlab 平台 MUST 支持显式 `host`（本地实例地址）；gitcode 的 API base 固定，不接收 host。
+forge adapter SHALL 以统一接口提供 `pr_list` / `pr_create` / `pr_merge` / `branch_protection` 四操作，覆盖三个 Git 托管平台：github（实现走既有 gh CLI，行为与现状等价——命令参数面逐 token 一致）、gitlab（REST API v4）、gitcode（api.gitcode.com/api/v5）。平台选择由调用方声明的 `forge` 值决定（`github` 为缺省，兼容既有 profile 不声明 forge 的形态）。`forge` 值非法（拼错 / 大小写漂移 / 尾空格 / 未知平台）MUST 装载期 fail-fast，MUST NOT 静默回落 github（错平台查询与副作用）。gitlab 平台 MUST 支持显式 `gitlab_host`（本地实例地址）；gitcode 的 API base 固定，不接收 host。`gitlab_host` 值形态（2026-10-26 组5.1 实证补钉）：裸 host（缺省按 https 解析，现产零变化）/ 显式 `http(s)://` 前缀（内网无 TLS 实例，api_root 跟随 scheme）/ `host:port`（如 `172.32.153.183:8180`）；dispatch 身份键与 GIT_ASKPASS 分流恒用归一后的裸 host（含端口），与声明形态无关。
 
 github 分支按调用面提供两个命名入口（共享命令构造，不做假统一）：dev-agent 面（cwd 推断 repo、失败抛异常契约——与既有 dev-agent `gh()` 语义一致）；run_daily 面（`-R` 显式 repo、三态消费契约——与既有对账调用参数集一致）。两种调用面的参数集本就不同（`--state` / `--limit` / `--json` 字段各异），直比锚定按调用面各锚各的。
 
@@ -18,8 +18,8 @@ github 分支按调用面提供两个命名入口（共享命令构造，不做�
 - **THEN** 配置装载明确报错，不静默回落 github（避免对错误平台发起查询或副作用）
 
 #### Scenario: gitlab 项目声明 host
-- **WHEN** profile 声明 `forge: gitlab` 且提供 `gitlab_host`
-- **THEN** adapter 的全部 REST 调用以该 host 为 base（本地实例），不触碰 gitcode.com 或 github.com
+- **WHEN** profile 声明 `forge: gitlab` 且提供 `gitlab_host`（裸 host / `http(s)://` 前缀 / `host:port` 任一形态）
+- **THEN** adapter 的全部 REST 调用以该 host 为 base（本地实例；scheme 与端口按声明形态解析，裸 host 缺省 https），不触碰 gitcode.com 或 github.com
 
 #### Scenario: gitlab 项目缺 host
 - **WHEN** profile 声明 `forge: gitlab` 但缺 `gitlab_host`
@@ -34,11 +34,15 @@ github 分支按调用面提供两个命名入口（共享命令构造，不做�
 
 `FOUND`-空的消费语义按调用点既有规则完成（`_lookup_pr` 空 = 无既有 PR；`count_inflight_prs` 空 = 0 在途）；adapter 恒返回 `FOUND`-空、不感知调用语境，映射不在 adapter 内做。github 实现维持既有 gh CLI 退出码/stderr 判据。
 
-`pr_merge` 的失败分类：405/409（不可合并 / 冲突）= permanent 确定性失败（不进瞬态重试）；406（pipeline 未过等暂不可合）= `UNKNOWN`（外部状态未定，稍后可合）；网络/5xx/429 = `UNKNOWN`。
+`pr_merge` 的失败分类（2026-10-26 组5.1 自建实例实证修订）：409（真冲突，重试必败）= permanent 确定性失败（不进瞬态重试）；**405 = `UNKNOWN`**（实证：MR 创建后 mergeability 异步计算窗口内 PUT merge 返 405（同一 MR 数十秒后可合）、对已 merged MR 重放 merge 同样 405——同码混装瞬态/幂等/永久不可区分，permanent 会误杀可自愈路径；fail-safe 归 UNKNOWN 交 reconcile 重查 MR state 收敛）；406（pipeline 未过等暂不可合）= `UNKNOWN`（外部状态未定，稍后可合）；网络/5xx/429 = `UNKNOWN`。
 
 #### Scenario: GitCode 限速 429
 - **WHEN** gitcode `pr_list` 收到 HTTP 429
 - **THEN** 返回 `UNKNOWN`（外部状态无法建立），dispatch 按 fail-safe 语义阻断而非当作无 PR
+
+#### Scenario: GitLab MR 刚创建即 merge（405 瞬态窗口）
+- **WHEN** gitlab `pr_create` 成功后立即 `pr_merge`，GitLab 尚未完成 mergeability 异步计算（PUT merge 返 405）
+- **THEN** 返回 `UNKNOWN`（非 permanent），消费面经 reconcile 重查 MR state 收敛（merged → 已完成幂等；opened → 窗口后重试）——绝不把可自愈路径判成配置错
 
 #### Scenario: GitLab token 无效
 - **WHEN** gitlab 调用收到 HTTP 401

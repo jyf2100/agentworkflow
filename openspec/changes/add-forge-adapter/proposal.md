@@ -7,7 +7,7 @@ pa 流水线的 Git 远程面（开 PR、PR 对账、仓库监控采集）目前
 ## What Changes
 
 - **新增 forge adapter 层**（纯机械 Python）：`pr_list / pr_create / pr_merge / branch_protection` 四操作 × 三平台（github 走既有 gh CLI、gitlab 走 API v4、gitcode 走 api.gitcode.com/api/v5），按 per-project `forge` 声明分流（非法值 fail-fast 不回落 github）；三态 fail-safe 语义（FOUND / NOT_FOUND / UNKNOWN）从「gh stderr 文案判据」收进 adapter 契约（每实现必须返回三态；REST 分支按端点分型——列表端点 404 = UNKNOWN 看不见项目、单对象端点 404 = NOT_FOUND、401/403 = permanent 单项目终态）。
-- **fetch 采集泛化**：sources.yaml 新 `kind: forge-repo`（带 `forge` / `host` / `watch: [commits, pulls, issues]` 维度声明；既有 `github-repo` 保留兼容）；平台 API 调用收进机械脚本（token 经 env narrow-inject 给预取子进程，不进 persona 环境），persona 只做 summarize（语义活）。**issue 监控为全新维度**——现状连 GitHub 侧都只采 commits+pulls。采集失败为源级二元失败（failed 源清单登记、report 可见）。
+- **fetch 采集泛化**：sources.yaml 新 `kind: forge-repo`（带 `forge` / `gitlab_host` / `watch: [commits, pulls, issues]` 维度声明；既有 `github-repo` 保留兼容）；平台 API 调用收进机械脚本（token 经 env narrow-inject 给预取子进程，不进 persona 环境），persona 只做 summarize（语义活）。**issue 监控为全新维度**——现状连 GitHub 侧都只采 commits+pulls。采集失败为源级二元失败（failed 源清单登记、report 可见）。
 - **dispatch 路径适配**：`dev-agent.py` PR auto-merge 与 `run_daily.py` dispatch 面 ×4（准入分支保护 `check_branch_protection` + 对账 `_lookup_pr` / `count_inflight_prs` / 分支查重）按 forge 分流；git 远程操作天然 host 无关，全部（clone/fetch/ls-remote/push）经 GIT_ASKPASS 注入凭据（token 不进命令行/remote URL/日志）；声明 forge 而缺对应 token 在准入早期 fail-fast；dispatch 身份键 = host × 仓库全路径。
 - **凭据面增键**：vault 增可选键 `GITLAB_TOKEN` / `GITCODE_TOKEN`（`GH_TOKEN` 语义不漂移——每键=每平台，但从无条件必填改为按项目 forge 条件必需：gitlab/gitcode-only 用户不被迫造假 GH_TOKEN）；hub 面板凭据页加平台 token 可选框，**留空 = 保留既有键值**（重提交不清已存 token）；`lifecycle._credentials` 必需键按项目 forge 判定。
 - **仓库路径概念修正**：GitLab 仓库路径可多级（`组/子组/仓`），现 `repo_owner_repo` 正则按两级 `owner/repo` 写死——引入统一的「仓库路径」提取/归一（GitLab API 侧 URL-encode 全路径）。
@@ -16,7 +16,7 @@ pa 流水线的 Git 远程面（开 PR、PR 对账、仓库监控采集）目前
 ## Capabilities
 
 **New Capabilities**（各成新 spec）：
-- `forge-adapter` —— 三平台 Git 托管 API 适配层：三操作契约 + 三态 fail-safe 语义 + 凭据 env 约定 + 仓库路径归一。
+- `forge-adapter` —— 三平台 Git 托管 API 适配层：四操作契约 + 三态 fail-safe 语义 + 凭据 env 约定 + 仓库路径归一。
 - `forge-watch` —— 多平台仓库监控采集：sources.yaml `forge-repo` 源、`watch` 维度（commits/pulls/issues）、机械预取 + persona summarize 分工、token env 注入链。
 
 **Modified Capabilities**（需 delta spec）：
