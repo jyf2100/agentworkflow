@@ -114,7 +114,7 @@ def test_exchange_code_happy_path():
     uid, name = auth.exchange_code(_cfg(), "the-code", "https://hub/cb", client=c)
     assert (uid, name) == ("mmid1", "roc")
     post = [x for x in c.calls if x[0] == "post"][0]
-    assert post[1] == "https://mm.example.com/api/v4/oauth/token"
+    assert post[1] == "https://mm.example.com/oauth/access_token"  # MM 网页路由，非 /api/v4
     assert post[2]["code"] == "the-code" and post[2]["client_secret"] == "sec"
     get = [x for x in c.calls if x[0] == "get"][0]
     assert get[1] == "https://mm.example.com/api/v4/users/me" and get[2]["Authorization"] == "Bearer AT"
@@ -180,7 +180,7 @@ def _mk(tmp_path: Path, *, with_auth=True, with_vault=True):
     if with_vault:
         vault = CredentialVault(tmp_path, Fernet.generate_key())
     client = TestClient(api_mod.create_app(d, eng, lc, vault=vault))
-    return client, d, eng, lc, cfg
+    return client, d, eng, lc, cfg, vault
 
 
 def _login(client, monkeypatch, *, mm_user_id=_MK, username="zhang3", fail=None):
@@ -255,16 +255,27 @@ def test_me_401_without_session_and_logout_clears(tmp_path, monkeypatch):
 
 
 def test_put_credentials_happy_and_401(tmp_path, monkeypatch):
-    client, _, _, _, _ = _mk(tmp_path)
-    body = {"anthropic_base_url": "https://mm-x", "anthropic_auth_token": "at", "gh_token": "gt", "model": "glm-5.2"}
+    client, *_ = _mk(tmp_path)
+    body = {"anthropic_base_url": "https://mm-x", "anthropic_auth_token": "at-real-0123456789abcdef",
+            "gh_token": "gt-real-0123456789abcdef", "model": "glm-5.2"}
     r = client.put("/auth/credentials", json=body)
     assert r.status_code == 401
     _login(client, monkeypatch)
     r2 = client.put("/auth/credentials", json=body)
     assert r2.status_code == 200
     j = r2.json()
-    assert j["ok"] is True and j["user"] == _MK and "at" not in r2.text  # 不回显明文
+    assert j["ok"] is True and j["user"] == _MK and "at-real" not in r2.text  # 不回显明文
     # 响应只有字段名
+
+
+def test_put_credentials_rejects_placeholder(tmp_path, monkeypatch):
+    """录入口拦截（2026-10-23 首跑 #3）：占位值 → 400，vault 不落记录。"""
+    client, d, *_ = _mk(tmp_path)
+    _login(client, monkeypatch)
+    body = {"anthropic_base_url": "https://x", "anthropic_auth_token": "t", "gh_token": "g"}
+    r = client.put("/auth/credentials", json=body)
+    assert r.status_code == 400
+    assert "占位符" in r.text
 
 
 def test_put_credentials_missing_fields_atomic(tmp_path, monkeypatch):
@@ -282,8 +293,120 @@ def test_put_credentials_503_without_vault(tmp_path, monkeypatch):
     assert r.status_code == 503
 
 
+# ── 面板凭据页（2026-10-23：PUT 的 UI 补齐——值不过对话，会话人自录）──
+
+def test_panel_credentials_get_guard_and_form(tmp_path, monkeypatch):
+    """未登录 302 到 authorize；登录后 200 表单四字段 + 「未配置」状态（无值可回显）。"""
+    client, *_ = _mk(tmp_path)
+    r = client.get("/panel/credentials", follow_redirects=False)
+    assert r.status_code == 302
+    _login(client, monkeypatch)
+    r2 = client.get("/panel/credentials")
+    assert r2.status_code == 200 and "未配置" in r2.text
+    for f in ("anthropic_base_url", "anthropic_auth_token", "gh_token", "model"):
+        assert f'name="{f}"' in r2.text
+    assert 'type="password"' in r2.text   # token 双框不明文
+
+
+def test_panel_credentials_get_partial_record_warns(tmp_path, monkeypatch):
+    """有记录但三平台 token 全缺 → 状态行降级 warn（A-LOW 2026-10-23 + add-forge-adapter 3.3
+    口径：ANTHROPIC 两值必需、平台 token 按项目 forge 而定——页面无项目上下文，只提示全缺）。
+    残缺记录经 set_user 直写模拟（现产即此形态：docker exec 旁路实录三值中缺 GH_TOKEN）。"""
+    client, _, _, _, _, vault = _mk(tmp_path)
+    _login(client, monkeypatch)
+    vault.set_user(_MK, {"ANTHROPIC_BASE_URL": "http://10.1.2.3:9001",
+                         "ANTHROPIC_AUTH_TOKEN": "sk-short9",
+                         "ANTHROPIC_MODEL": "qwen3.8-27b-fast"})   # 三平台 token 全缺
+    r = client.get("/panel/credentials")
+    assert r.status_code == 200 and "已配置" in r.text
+    assert "平台 token" in r.text and "GH/GITLAB/GITCODE" in r.text   # 降级 warn 明示全缺
+    assert "sk-short9" not in r.text   # 仍不回显值
+
+
+def test_panel_credentials_post_saves_and_never_echoes(tmp_path, monkeypatch):
+    """form 提交 → 落 vault（GET 状态行翻转为已配置）；响应与状态行绝不回显值。
+    内网短 token（9 字符）合法形态——MIN_TOKEN_LEN=8 放行（2026-10-23 用户真值被 20 误拦实证）。"""
+    client, *_ = _mk(tmp_path)
+    _login(client, monkeypatch)
+    r = client.post("/panel/credentials", data={
+        "anthropic_base_url": "http://10.1.2.3:9001",
+        "anthropic_auth_token": "sk-short9",
+        "gh_token": "ghp_real0123456789abcdef0123456789abcd",
+        "model": "some-model-fast",
+    })
+    assert r.status_code == 200 and "已保存" in r.text
+    assert "sk-short9" not in r.text and "ghp_real" not in r.text   # 不回显值
+    # GET 读回：状态行已配置（含可选 MODEL 键名），同样无值
+    r3 = client.get("/panel/credentials")
+    assert "已配置" in r3.text and "ANTHROPIC_MODEL" in r3.text and "some-model-fast" not in r3.text
+
+
+def test_panel_credentials_post_missing_atomic(tmp_path, monkeypatch):
+    """三平台 token 全缺 → 422 明示「至少其一」（3.3：GH_TOKEN 不再无条件必需，
+    但一个平台 token 都没有 = 任何项目都派不动）；GET 仍「未配置」（原子不落部分记录）。"""
+    client, *_ = _mk(tmp_path)
+    _login(client, monkeypatch)
+    r = client.post("/panel/credentials", data={
+        "anthropic_base_url": "http://10.1.2.3:9001",
+        "anthropic_auth_token": "sk-short9",
+        "gh_token": "",
+    })
+    assert r.status_code == 422 and "缺平台 token" in r.text and "GH_TOKEN" in r.text
+    assert "未配置" in client.get("/panel/credentials").text
+
+
+# ── add-forge-adapter 3.3：token 框留空保留既有 + gitlab-only 录入 ──
+def test_panel_credentials_post_blank_keeps_existing_platform_tokens(tmp_path, monkeypatch):
+    """token 框留空 = 保留既有键值（非 replace 抹除）——重提交只录 gitlab 不丢既有 gh。"""
+    client, _, _, _, _, vault = _mk(tmp_path)
+    _login(client, monkeypatch)
+    vault.set_user(_MK, {"ANTHROPIC_BASE_URL": "http://10.1.2.3:9001",
+                         "ANTHROPIC_AUTH_TOKEN": "sk-old123",
+                         "GH_TOKEN": "ghp_real0123456789abcdef0123456789abcd"})
+    r = client.post("/panel/credentials", data={
+        "anthropic_base_url": "http://10.1.2.3:9001",
+        "anthropic_auth_token": "sk-new456",
+        "gitlab_token": "glpat-real-0123456789abcdef",
+        "gh_token": "",            # 留空 → 保留既有 GH_TOKEN
+    })
+    assert r.status_code == 200 and "已保存" in r.text
+    rec = vault.get_user_env(_MK)
+    assert rec["GH_TOKEN"] == "ghp_real0123456789abcdef0123456789abcd"   # 未被抹
+    assert rec["GITLAB_TOKEN"] == "glpat-real-0123456789abcdef"          # 新录生效
+    assert rec["ANTHROPIC_AUTH_TOKEN"] == "sk-new456"                    # 非空覆盖
+    assert "glpat-real" not in r.text and "ghp_real" not in r.text       # 不回显值
+
+
+def test_put_credentials_gitlab_only_without_gh_token_ok(tmp_path, monkeypatch):
+    """gitlab-only 用户（无 GH_TOKEN）可录入——不被迫造假 GH_TOKEN；响应只显字段名。"""
+    client, *_ = _mk(tmp_path)
+    _login(client, monkeypatch)
+    r = client.put("/auth/credentials", json={
+        "anthropic_base_url": "http://10.1.2.3:9001",
+        "anthropic_auth_token": "sk-short9",
+        "gitlab_token": "glpat-real-0123456789abcdef",
+    })
+    assert r.status_code == 200
+    assert r.json()["fields"] == sorted(
+        ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "GITLAB_TOKEN"])
+    assert "glpat-real" not in r.text   # 响应绝不回显值
+
+
+def test_panel_credentials_post_rejects_placeholder(tmp_path, monkeypatch):
+    """与 PUT 同口径：模板占位形态 → 422 拒录（面板是录入口，占位符跨重启持久更糟）。"""
+    client, *_ = _mk(tmp_path)
+    _login(client, monkeypatch)
+    r = client.post("/panel/credentials", data={
+        "anthropic_base_url": "https://x",
+        "anthropic_auth_token": "t",
+        "gh_token": "g",
+    })
+    assert r.status_code == 422 and "占位符" in r.text
+    assert "未配置" in client.get("/panel/credentials").text
+
+
 def test_post_queue_session_identity_takes_priority(tmp_path, monkeypatch):
-    client, d, eng, lc, cfg = _mk(tmp_path)
+    client, d, eng, lc, cfg, _vault = _mk(tmp_path)
     prd = tmp_path / "p.md"; prd.write_text("# x", encoding="utf-8")
     profs = tmp_path / "data" / "proj-a" / "profiles"; profs.mkdir(parents=True)
     (profs / "proj-a.yaml").write_text("x", encoding="utf-8")

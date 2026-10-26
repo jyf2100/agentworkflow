@@ -92,7 +92,7 @@ def exchange_code(cfg, code: str, redirect_uri: str, client=None) -> tuple[str, 
     c = client or httpx.Client(timeout=10)
     try:
         r = c.post(
-            f"{cfg.mm_base_url}/api/v4/oauth/token",
+            f"{cfg.mm_base_url}/oauth/access_token",  # MM 网页路由（非 /api/v4——真机 11.10.1 坐实，API 前缀形态 404）
             data={
                 "grant_type": "authorization_code",
                 "client_id": cfg.mm_client_id,

@@ -32,8 +32,9 @@ def _env(data_root: Path, **over) -> dict:
     env = {
         "HUB_USER_ID": "roc",
         "HUB_USER_ANTHROPIC_BASE_URL": "https://litellm.example",
-        "HUB_USER_ANTHROPIC_AUTH_TOKEN": "tok-abc",
-        "HUB_USER_GH_TOKEN": "ghp_xyz",
+        # 长值：_credentials 派发前占位符判据（vault_store.placeholder_issues，2026-10-23）
+        "HUB_USER_ANTHROPIC_AUTH_TOKEN": "tok-abcdef0123456789abcdef",
+        "HUB_USER_GH_TOKEN": "ghp_abcdefghij0123456789",
         "HUB_IMAGE_TAG_DEFAULT": "pa-executor:v0.1.3",
         "HUB_DATA_ROOT": str(data_root),
     }

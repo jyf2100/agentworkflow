@@ -45,7 +45,9 @@ def _page(title: str, body: str) -> str:
         f"<title>{_esc(title)} · pa-hub</title><style>{_STYLE}</style></head>"
         "<body><main>"
         "<nav><a href=\"/panel\">提交 PRD</a><a href=\"/panel/queue\">队列</a>"
-        "<a href=\"/panel/runs\">runs</a><a href=\"/auth/logout\">登出</a></nav>"
+        "<a href=\"/panel/runs\">runs</a><a href=\"/panel/projects/new\">建项目</a>"
+        "<a href=\"/panel/credentials\">凭据</a>"
+        "<a href=\"/auth/logout\">登出</a></nav>"
         f"{body}</main></body></html>"
     )
 
@@ -73,18 +75,89 @@ def render_submit(projects: list[str], *, error: str | None = None, success: str
     return _page("提交 PRD", body)
 
 
-def render_queue(rows: list[dict]) -> str:
+def render_project_new(*, error: str | None = None, success: str | None = None, current_user: str = "") -> str:
+    """建项目表单页（add-hub-panel-console D1）。单行 input（D1：只收单行文本）。"""
+    err = f'<div class="error">{_esc(error)}</div>' if error else ""
+    ok = f'<div class="ok">{_esc(success)}</div>' if success else ""
+    body = (
+        f"<h1>建项目</h1><p>已登录：{_esc(current_user)}</p>{ok}{err}"
+        "<form method=\"post\" action=\"/panel/projects\">"
+        "<h2>项目名（小写字母/数字/-/_）</h2>"
+        "<input name=\"name\" required placeholder=\"demo\">"
+        "<h2>目标仓（owner/repo 或 GitHub URL——流水线在其中开分支干活）</h2>"
+        "<input name=\"repo\" required placeholder=\"owner/repo\">"
+        "<h2>goal（一句话：这个项目要推进成什么）</h2>"
+        "<input name=\"goal\" required placeholder=\"…\">"
+        "<h2>match_surface（一句话：什么信号归这个项目）</h2>"
+        "<input name=\"surface\" required placeholder=\"…\">"
+        "<button type=\"submit\">建档</button></form>"
+    )
+    return _page("建项目", body)
+
+
+def render_credentials(*, configured_fields: list[str] | None = None,
+                       warning: str | None = None,
+                       error: str | None = None, success: str | None = None,
+                       current_user: str = "") -> str:
+    """凭据录入页（2026-10-23：PUT /auth/credentials 早已有，UI 补齐——值不过对话/不经手）。
+
+    configured_fields = 当前 vault 记录的字段名列表（None = 未配置）——只显示键名，
+    绝不回显值（与 PUT 响应同口径）。token 双框 type=password（浏览器不回显明文）。
+    model 可选（ANTHROPIC_MODEL 模型路由，如 qwen3.8-27b-fast）。
+    warning = 有记录但缺必需键时的降级提示（A-LOW 2026-10-23：「已配置」不等于可派发）。"""
+    if configured_fields is None:
+        status = '<p class="warn">当前：未配置（派发将明确报缺凭据）</p>'
+    else:
+        status = (f'<p class="ok">当前：已配置（字段：{_esc("、".join(configured_fields))}）'
+                  "——重新提交覆盖（token 框留空 = 保留既有值）</p>")
+    warn = f'<p class="warn">{_esc(warning)}</p>' if warning else ""
+    err = f'<div class="error">{_esc(error)}</div>' if error else ""
+    ok = f'<div class="ok">{_esc(success)}</div>' if success else ""
+    body = (
+        f"<h1>凭据</h1><p>已登录：{_esc(current_user)}</p>{status}{warn}{ok}{err}"
+        "<form method=\"post\" action=\"/panel/credentials\">"
+        "<h2>ANTHROPIC_BASE_URL（LiteLLM 代理地址，含 http:// 前缀）</h2>"
+        "<input name=\"anthropic_base_url\" required placeholder=\"http://172.32.0.1:9001\">"
+        "<h2>ANTHROPIC_AUTH_TOKEN</h2>"
+        "<input name=\"anthropic_auth_token\" type=\"password\" required placeholder=\"sk-…\">"
+        "<h2>平台 token（按项目 forge 按需——三框至少其一非空，留空 = 保留既有值）</h2>"
+        "<p>GH_TOKEN（GitHub 项目）</p>"
+        "<input name=\"gh_token\" type=\"password\" placeholder=\"ghp_…（github 项目必填）\">"
+        "<p>GITLAB_TOKEN（forge: gitlab 项目）</p>"
+        "<input name=\"gitlab_token\" type=\"password\" placeholder=\"glpat-…（gitlab 项目必填）\">"
+        "<p>GITCODE_TOKEN（forge: gitcode 项目）</p>"
+        "<input name=\"gitcode_token\" type=\"password\" placeholder=\"（gitcode 项目必填）\">"
+        "<h2>模型（可选，默认走代理侧默认模型）</h2>"
+        "<input name=\"model\" placeholder=\"如 qwen3.8-27b-fast（留空 = 保留既有）\">"
+        "<button type=\"submit\">保存进保险箱</button></form>"
+    )
+    return _page("凭据", body)
+
+
+def _queue_action(row: dict) -> str:
+    """行内操作（add-hub-panel-console D2/D3）：failed→重跑 / pending→放弃；其余空。"""
+    if row["status"] == "failed":
+        return (f"<form method=\"post\" action=\"/panel/queue/{row['id']}/retry\">"
+                "<button type=\"submit\">重跑</button></form>")
+    if row["status"] == "pending":
+        return (f"<form method=\"post\" action=\"/panel/queue/{row['id']}/abandon\">"
+                "<button type=\"submit\">放弃</button></form>")
+    return ""
+
+
+def render_queue(rows: list[dict], *, success: str | None = None) -> str:
     trs = "".join(
         f"<tr><td>#{r['id']}</td><td>{_esc(r['project'])}</td>"
         f"<td class=\"{_status_class(r['status'])}\">{_esc(r['status'])}</td>"
         f"<td>{r['attempt']}</td><td>{_esc(r.get('initiator') or r.get('enqueued_by'))}</td>"
-        f"<td>{_esc(r['last_error'] or '')}</td></tr>"
+        f"<td>{_esc(r['last_error'] or '')}</td><td>{_queue_action(r)}</td></tr>"
         for r in rows
     )
+    ok = f'<div class="ok">{_esc(success)}</div>' if success else ""
     body = (
-        f"<h1>队列（{len(rows)} 项）</h1>"
+        f"<h1>队列（{len(rows)} 项）</h1>{ok}"
         "<table><tr><th>id</th><th>project</th><th>status</th><th>attempt</th>"
-        f"<th>发起人</th><th>last_error</th></tr>{trs}</table>"
+        f"<th>发起人</th><th>last_error</th><th>操作</th></tr>{trs}</table>"
     )
     return _page("队列", body)
 

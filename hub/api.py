@@ -25,6 +25,7 @@ import auth
 import daemon
 import panel
 import prd_store
+import projects
 import queue_engine
 from lifecycle import PROJECT_RE
 from fastapi import FastAPI, HTTPException, Request
@@ -57,14 +58,39 @@ class DeliverBody(BaseModel):
 
 _DELIVER_MAX_BYTES = 1024 * 1024  # body 正文上限 1MB（超限 400 确定性拒绝）
 _DELIVER_ENQUEUED_BY = "vault-deliver"  # 机机通道来源字面量（队列面可辨识，非人身份）
+_PANEL_EVIDENCE_MAX = 2048  # 面板 evidence 上限（frontmatter 内单行，2026-10-23 修复新增）
+
+
+def _wrap_panel_prd(project: str, prd_content: str, evidence: str) -> str:
+    """面板 PRD frontmatter 包装（2026-10-23 首跑 #4 实证修复）：裸 markdown 会被容器内
+    pa stage_inject 的 frontmatter.project 校验确定性拒绝（run_daily.py inject 段）。
+    hub 在落盘点机械补 frontmatter——纯字符串拼接零语义判定：
+
+    - project：已过 PROJECT_RE 白名单的值，双引号 scalar；
+    - source_path：空串（手写注入无源是 pa 预期态，inject 仅 warn；**不伪造路径**——
+      source_path 在 pa 侧被 critic「Read 信息源」与 dispatch --source 当路径消费）；
+    - evidence：面板收的依据（此前「收了又扔」），落盘可审计、正文批评可读；单行化 +
+      双引号转义，超 _PANEL_EVIDENCE_MAX 抛 ValueError（端点转 422）。
+    包装后全文即落盘与 sha256 的对象——retry 复用同文件天然幂等。"""
+    ev = " ".join(evidence.split())  # 压成单行（换行/制表 → 空格，杜绝 frontmatter 逃逸）
+    if len(ev.encode("utf-8")) > _PANEL_EVIDENCE_MAX:
+        raise ValueError(f"evidence 超 {_PANEL_EVIDENCE_MAX} 字节上限（压缩单行后）")
+    esc = ev.replace("\\", "\\\\").replace('"', '\\"')
+    front = f"project: \"{project}\"\nsource_path: ''\nevidence: \"{esc}\"\n"
+    return f"---\n{front}---\n\n{prd_content.lstrip()}"
 
 
 class CredentialsBody(BaseModel):
     """模块级（不能进 create_app 闭包）：`from __future__ import annotations` 下
-    FastAPI 按模块全局解析注解字符串，闭包内定义会退化成 query 参数（422 实证）。"""
+    FastAPI 按模块全局解析注解字符串，闭包内定义会退化成 query 参数（422 实证）。
+
+    add-forge-adapter 3.3：平台 token 三键全可选（留空 = 保留既有键值，gitlab/gitcode-only
+    用户不被迫造假 GH_TOKEN）；必填校验在 endpoint 内按 merge 后记录判。"""
     anthropic_base_url: str
     anthropic_auth_token: str
-    gh_token: str
+    gh_token: str = ""
+    gitlab_token: str = ""
+    gitcode_token: str = ""
     model: str | None = None
 
 
@@ -164,6 +190,30 @@ def create_app(
         if auth.mm_configured(lc.cfg) and _session_identity(request) is None:
             raise HTTPException(status_code=401, detail="读面须有效会话（auth 已配置态）——先 /auth/authorize 登录")
 
+    def _require_admin(request: Request) -> dict:
+        """改行为操作守卫（add-hub-panel-console D4）：有效会话 + HUB_PANEL_ADMINS
+        白名单（空 = 任何有效会话放行，单用户回退态）。返回会话身份。"""
+        _require_configured()
+        ident = _session_identity(request)
+        if ident is None:
+            raise HTTPException(status_code=401, detail="面板操作须有效会话——先 /auth/authorize 登录")
+        if lc.cfg.panel_admins and ident["username"] not in lc.cfg.panel_admins:
+            raise HTTPException(status_code=403, detail=f"面板操作白名单外（HUB_PANEL_ADMINS 未含 {ident['username']}）")
+        return ident
+
+    def _abandon_queue_item(item_id: int, reason: str) -> dict:
+        """清队列原语（slice-3 2.5；add-hub-panel-console D3 两皮一芯）：仅 pending 可清。
+        清除 = 转终态 failed + last_error 记因（行保留审计，非物理删除）。"""
+        try:
+            item = engine.get_item(item_id)
+        except db.DBError:
+            raise HTTPException(status_code=404, detail=f"queue_item 不存在：{item_id}") from None
+        if item["status"] != "pending":
+            hint = "——先 drain（等 running 终态或停容器；「清 pending」不覆盖 running）" if item["status"] == "running" else ""
+            raise HTTPException(status_code=409, detail=f"仅 pending 可清（当前 {item['status']}）{hint}")
+        engine.fail_item(item_id, reason)
+        return engine.get_item(item_id)
+
     @app.get("/auth/authorize")
     def auth_authorize(request: Request):
         _require_configured()
@@ -193,7 +243,7 @@ def create_app(
         session = auth.sign_token(
             {"mm_user_id": mm_user_id, "username": username}, lc.cfg.session_secret, ttl_s=lc.cfg.session_ttl_s,
         )
-        resp = RedirectResponse("/auth/me", status_code=302)  # 纯 API 层：落 me 即会话生效证明
+        resp = RedirectResponse("/panel", status_code=302)  # 浏览器来处回浏览器去处：授权完直接落面板（/auth/me 仍是 API 验证端点）
         resp.set_cookie(
             auth.SESSION_COOKIE, session, max_age=lc.cfg.session_ttl_s,
             httponly=True, samesite="lax",
@@ -224,14 +274,36 @@ def create_app(
             raise HTTPException(status_code=401, detail="无有效会话")
         if vault is None:
             raise HTTPException(status_code=503, detail="保险箱未配置（HUB_VAULT_MASTER_KEY）——无法录入")
-        env = {
+        # add-forge-adapter 3.3：留空 = 保留既有键值（非 replace 抹除）——读旧记录 merge。
+        # 这是 get_user_env 的第三个读取点（派发 / vault-import / 本人自录 merge）：
+        # 按 user 读自己、只写回，不构成「列出全部明文」入口。
+        try:
+            old = vault.get_user_env(ident["mm_user_id"]) or {}
+        except vault_store.VaultError as e:
+            raise HTTPException(status_code=502, detail=f"保险箱读取失败（留空保留需读旧记录）：{e}") from None
+        env = dict(old)  # 旧记录打底：model + 平台 token 留空即原样保留
+        for k, v in {
             "ANTHROPIC_BASE_URL": body.anthropic_base_url,
             "ANTHROPIC_AUTH_TOKEN": body.anthropic_auth_token,
             "GH_TOKEN": body.gh_token,
-        }
-        missing = [k for k, v in env.items() if not v]
+            "GITLAB_TOKEN": body.gitlab_token,
+            "GITCODE_TOKEN": body.gitcode_token,
+        }.items():
+            if v:
+                env[k] = v
+        missing = [k for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN") if not env.get(k)]
         if missing:
-            raise HTTPException(status_code=400, detail=f"缺必需字段：{', '.join(missing)}（原子不落部分记录）")
+            raise HTTPException(
+                status_code=400,
+                detail=f"缺必需字段：{', '.join(missing)}（留空时按既有记录补全亦缺——原子不落部分记录）")
+        if not any(env.get(k) for k in vault_store.FORGE_TOKEN_KEYS.values()):
+            raise HTTPException(
+                status_code=400,
+                detail="缺平台 token：GH_TOKEN / GITLAB_TOKEN / GITCODE_TOKEN 至少录其一（dispatch 开 PR 必需）")
+        bad = vault_store.placeholder_issues(env)
+        if bad:
+            # 录入口拦截（2026-10-23 首跑 #3）：占位符进保险箱跨重启持久，比进 env 更糟
+            raise HTTPException(status_code=400, detail=f"凭据形态非法（疑似占位符）：{'；'.join(bad)}")
         if body.model:
             env["ANTHROPIC_MODEL"] = body.model
         try:
@@ -276,8 +348,10 @@ def create_app(
     @app.post("/panel/prd")
     async def panel_prd(request: Request):
         """提交闭环（spec scenario「会话提交闭环」）：会话身份 → evidence 机械必填
-        （空 422 回显）→ 落盘（复用 store_prd，文件名 stamp 前缀 + uuid hex8 唯一）
-        → 入队（enqueued_by = mm_user_id 直发路径）。evidence 值不落盘不入队。"""
+        （空 422 回显）→ 包装 frontmatter（_wrap_panel_prd——裸 md 必被容器内 pa inject
+        拒，evidence 落 frontmatter.evidence 键可审计）→ 落盘（复用 store_prd，文件名
+        stamp 前缀 + uuid hex8 唯一，sha = 包装后全文）→ 入队（enqueued_by = mm_user_id
+        直发路径）。"""
         if not auth.mm_configured(lc.cfg):
             return HTMLResponse(panel.render_503(), status_code=503)
         ident = _session_identity(request)
@@ -305,12 +379,16 @@ def create_app(
             return _reject(f"project {project!r} 不在可提交清单（data_root 必读面扫描未命中）")
         if len(prd_content.encode("utf-8")) > _DELIVER_MAX_BYTES:
             return _reject("PRD 内容超 1MB 上限——拒绝")
+        try:
+            wrapped = _wrap_panel_prd(project, prd_content, evidence)  # 裸 md 必被 inject 拒——落盘即包装
+        except ValueError as e:
+            return _reject(str(e))
 
         filename = f"{datetime.now():%Y%m%d}_hand-{uuid4().hex[:8]}.md"
         try:
             target = prd_store.store_prd(
-                lc.cfg.data_root, project, filename, prd_content,
-                declared_sha=prd_store.sha256_text(prd_content), overwrite=False,
+                lc.cfg.data_root, project, filename, wrapped,
+                declared_sha=prd_store.sha256_text(wrapped), overwrite=False,
             )
         except prd_store.PrdStoreError as e:
             return _reject(f"落盘失败：{e}")
@@ -323,6 +401,172 @@ def create_app(
             ),
             status_code=201,
         )
+
+    @app.get("/panel/projects/new")
+    def panel_project_new(request: Request):
+        """建项目表单页（add-hub-panel-console D1）：GET 面守卫同其余面板页。"""
+        guard = _panel_get(request)
+        if guard is not None:
+            return guard
+        ident = _session_identity(request)
+        return HTMLResponse(panel.render_project_new(current_user=ident["username"]))
+
+    @app.post("/panel/projects")
+    async def panel_project_create(request: Request):
+        """建档（D1）：admin 守卫（D4）→ 机械落盘两文件（projects.create_project，
+        零 YAML 库手写）→ 422 错误回显 / 201 成功回执。项目档案 = 运行时配置
+        （真相源 data_root），面板写它不构成控制面越界（proposal 边界定性）。"""
+        if not auth.mm_configured(lc.cfg):
+            return HTMLResponse(panel.render_503(), status_code=503)
+        ident = _require_admin(request)
+        form = await request.form()
+        name = str(form.get("name") or "").strip()
+        repo = str(form.get("repo") or "").strip()
+        goal = str(form.get("goal") or "").strip()
+        surface = str(form.get("surface") or "").strip()
+
+        def _reject(msg: str) -> HTMLResponse:
+            return HTMLResponse(
+                panel.render_project_new(error=msg, current_user=ident["username"]),
+                status_code=422,
+            )
+
+        if not name or not repo or not goal or not surface:
+            return _reject("四字段（name/repo/goal/match_surface）均必填")
+        try:
+            projects.create_project(lc.cfg.data_root, name, repo, goal, surface)
+        except projects.ProjectSetupError as e:
+            return _reject(str(e))
+        return HTMLResponse(
+            panel.render_project_new(
+                success=f"已建档：{name}——提交页 project 下拉已可见", current_user=ident["username"]
+            ),
+            status_code=201,
+        )
+
+    @app.post("/panel/queue/{item_id}/retry")
+    def panel_queue_retry(item_id: int, request: Request):
+        """重跑（D2）：仅 failed 可重跑（防双跑/防重复投递）——以原 project + 原 PRD
+        新建队列项（发起人 = 当前操作者），旧行留审计。PRD 文件不在则 404。"""
+        ident = _require_admin(request)
+        try:
+            item = engine.get_item(item_id)
+        except db.DBError:
+            raise HTTPException(status_code=404, detail=f"queue_item 不存在：{item_id}") from None
+        if item["status"] != "failed":
+            raise HTTPException(
+                status_code=409,
+                detail=f"仅 failed 可重跑（当前 {item['status']}）——pending/running 防双跑，done 防重复投递",
+            )
+        if not Path(item["prd_path"]).is_file():
+            raise HTTPException(status_code=404, detail=f"原 PRD 文件已不存在，无法重跑：{item['prd_path']}")
+        new_id = engine.enqueue(item["project"], item["prd_path"], ident["mm_user_id"], initiator=ident["username"])
+        return HTMLResponse(
+            panel.render_queue(database.list_items(), success=f"已重跑：新队列项 #{new_id}（原 #{item_id} 留审计）"),
+            status_code=201,
+        )
+
+    @app.post("/panel/queue/{item_id}/abandon")
+    def panel_queue_abandon(item_id: int, request: Request):
+        """放弃（D3）：复用清队列原语 _abandon_queue_item——与 REST DELETE /queue/{id}
+        同一语义同一实现（两皮一芯），仅 pending 可清、转 failed + last_error 记因。"""
+        _require_admin(request)
+        _abandon_queue_item(item_id, "面板人工放弃（add-hub-panel-console）")
+        return HTMLResponse(
+            panel.render_queue(database.list_items(), success=f"已放弃：#{item_id} → failed（行留审计）"),
+        )
+
+    @app.get("/panel/credentials")
+    def panel_credentials(request: Request):
+        """凭据录入页（2026-10-23）：PUT /auth/credentials 的面板 UI 补齐——会话人自录，
+        值不过对话。状态只显键名不显值（与 PUT 响应同口径）。"""
+        guard = _panel_get(request)
+        if guard is not None:
+            return guard
+        ident = _session_identity(request)
+        if vault is None:
+            return HTMLResponse(panel.render_credentials(
+                error="保险箱未配置（HUB_VAULT_MASTER_KEY）——无法录入",
+                current_user=ident["username"]), status_code=503)
+        try:
+            rec = vault.get_user_env(ident["mm_user_id"])
+        except vault_store.VaultError as e:
+            rec = None
+            _vault_err = str(e)
+        else:
+            _vault_err = None
+        if _vault_err:
+            return HTMLResponse(panel.render_credentials(
+                error=f"保险箱读取失败：{_vault_err}", current_user=ident["username"]), status_code=502)
+        # A-LOW 2026-10-23：有记录但缺必需键时降级提示——「已配置」≠可派发。
+        # add-forge-adapter 3.3 口径：ANTHROPIC 两值必需；平台 token 按项目 forge 而定
+        # （页面无项目上下文，只提示「三平台全缺」——任何项目都派不动）。
+        _warn = None
+        if rec:
+            _missing = [k for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN") if not rec.get(k)]
+            if not _missing and not any(rec.get(k) for k in vault_store.FORGE_TOKEN_KEYS.values()):
+                _missing = ["平台 token（GH/GITLAB/GITCODE 至少其一）"]
+            if _missing:
+                _warn = f"已配置但缺：{'、'.join(_missing)}——派发将按项目 forge 声明报缺凭据（补录即生效，留空字段保留）"
+        return HTMLResponse(panel.render_credentials(
+            configured_fields=(sorted(rec) if rec else None),
+            warning=_warn,
+            current_user=ident["username"]))
+
+    @app.post("/panel/credentials")
+    async def panel_credentials_save(request: Request):
+        """凭据录入提交：与 PUT /auth/credentials 同校验口径（missing + 占位符拦截），
+        差异只在错误呈现（面板回显表单 vs JSON 400）。成功响应只含字段名。"""
+        if not auth.mm_configured(lc.cfg):
+            return HTMLResponse(panel.render_503(), status_code=503)
+        ident = _session_identity(request)
+        if ident is None:
+            raise HTTPException(status_code=401, detail="凭据录入须有效会话——先 /auth/authorize 登录")
+        if vault is None:
+            return HTMLResponse(panel.render_credentials(
+                error="保险箱未配置（HUB_VAULT_MASTER_KEY）——无法录入",
+                current_user=ident["username"]), status_code=503)
+        form = await request.form()
+
+        def _reject(msg: str, status_code: int = 422) -> HTMLResponse:
+            return HTMLResponse(panel.render_credentials(
+                error=msg, current_user=ident["username"]), status_code=status_code)
+
+        # add-forge-adapter 3.3：与 PUT /auth/credentials 同 merge 口径——token 框留空保留既有
+        try:
+            old = vault.get_user_env(ident["mm_user_id"]) or {}
+        except vault_store.VaultError as e:
+            return _reject(f"保险箱读取失败（留空保留需读旧记录）：{e}", status_code=502)
+        env = dict(old)
+        for k, v in {
+            "ANTHROPIC_BASE_URL": str(form.get("anthropic_base_url") or "").strip(),
+            "ANTHROPIC_AUTH_TOKEN": str(form.get("anthropic_auth_token") or "").strip(),
+            "GH_TOKEN": str(form.get("gh_token") or "").strip(),
+            "GITLAB_TOKEN": str(form.get("gitlab_token") or "").strip(),
+            "GITCODE_TOKEN": str(form.get("gitcode_token") or "").strip(),
+        }.items():
+            if v:
+                env[k] = v
+        model = str(form.get("model") or "").strip()
+
+        missing = [k for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN") if not env.get(k)]
+        if missing:
+            return _reject(f"缺必需字段：{'、'.join(missing)}（留空时按既有记录补全亦缺——原子不落部分记录）")
+        if not any(env.get(k) for k in vault_store.FORGE_TOKEN_KEYS.values()):
+            return _reject("缺平台 token：GH_TOKEN / GITLAB_TOKEN / GITCODE_TOKEN 至少录其一（dispatch 开 PR 必需）")
+        bad = vault_store.placeholder_issues(env)
+        if bad:
+            return _reject(f"凭据形态非法（疑似占位符）：{'；'.join(bad)}")
+        if model:
+            env["ANTHROPIC_MODEL"] = model
+        try:
+            vault.set_user(ident["mm_user_id"], env)
+        except vault_store.VaultError as e:
+            return _reject(f"保险箱写入失败：{e}", status_code=502)
+        return HTMLResponse(panel.render_credentials(
+            configured_fields=sorted(env),
+            success=f"已保存 {len(env)} 个字段进保险箱（不回显值；留空字段保留既有）——派发即生效",
+            current_user=ident["username"]))
 
     @app.get("/panel/queue")
     def panel_queue(request: Request):
@@ -449,17 +693,10 @@ def create_app(
         """清队列原语（slice-3 2.5，回退序列 RUNBOOK §15 ③）：仅 pending 可清。
         清除 = 转终态 failed + last_error 记回退原因（行保留审计，非物理删除）；
         running 拒绝并提示先 drain（「清 pending」不覆盖 running——双跑撞目标仓
-        branch 命名空间）；done/failed 终态不清（回退序列只清 pending）。"""
+        branch 命名空间）；done/failed 终态不清（回退序列只清 pending）。
+        add-hub-panel-console D3：实现收敛 _abandon_queue_item（面板放弃同源）。"""
         _require_session(request)
-        try:
-            item = engine.get_item(item_id)
-        except db.DBError:
-            raise HTTPException(status_code=404, detail=f"queue_item 不存在：{item_id}") from None
-        if item["status"] != "pending":
-            hint = "——先 drain（等 running 终态或停容器；「清 pending」不覆盖 running）" if item["status"] == "running" else ""
-            raise HTTPException(status_code=409, detail=f"仅 pending 可清（当前 {item['status']}）{hint}")
-        engine.fail_item(item_id, "回退序列人工清除（RUNBOOK §15 ③——服务器投递回退）")
-        return engine.get_item(item_id)
+        return _abandon_queue_item(item_id, "回退序列人工清除（RUNBOOK §15 ③——服务器投递回退）")
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: int, request: Request) -> dict:
