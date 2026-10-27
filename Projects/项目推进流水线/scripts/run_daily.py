@@ -711,8 +711,14 @@ candidates / 上下文：
 
 def critic_prompt(prd_path: str, source_path: str, prof: dict) -> str:
     ms = prof.get("match_surface", {})
+    # source_path 空（投递/手写 PRD 常态）不留裸空白——尾随空白会诱导 critic 判无据（F12 单标准「不看出身」）
+    src_line = (
+        f"信息源原文：{source_path}"
+        if source_path
+        else "信息源原文：（无——投递/手写 PRD 常态形态，依据看 PRD 自带的背景交代/出处标注，不看出身，见你 persona traceability 硬规则）"
+    )
     return f"""待过闸 PRD：{prd_path}
-信息源原文：{source_path}
+{src_line}
 项目 profile：name={prof.get('name')} goal="{prof.get('goal','')}" match_surface.one_liner="{ms.get('one_liner','')}"
 
 按你的 persona 输出契约：Read PRD + 信息源 + profile，逐条验（有据/可执行/贴合/scope），只吐一行 gate JSON（verdict=pass|drop|revise）。"""

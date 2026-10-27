@@ -37,7 +37,17 @@
 #   engineering 面 20 skill 入库快照 hub/deploy/executor-skills/（352K + PROVENANCE），COPY 进
 #   投影 /opt/pa 并拷至 /home/pa/.claude/skills/ 供容器内 dev loop 会话发现；persona 工具面
 #   （agent 定义 tools: 收窄）不受影响。build context = v0.1.7 树 + skills 增量的投影副本。
-FROM pa-executor:v0.1.7
+# 2026-10-27 v0.1.9（critic 手写 PRD 判据修复）：cc-web-control codex 支持 PRD 三连 drop 实证
+#   模型只扫 source_path/inbox 两个机械锚点、不逐条核正文背景交代，违反 F12 单标准「不看出身」
+#   （agent 定义 §traceability 原文已写明「背景交代=手写常态形态，任一可溯即有据」）。
+#   修两面：①agent 定义加硬规则（信息源缺失不构成无据证据，必须先核正文出处形态）
+#   ②run_daily critic_prompt 空源不留裸空白（尾随「信息源原文：」空白正是诱导判无据的形态），
+#   显式交代手写形态语义 + 回归测试 test_critic_prompt.py。变更 3 文件（scripts/ 目录级 COPY
+#   天然覆盖前两个+测试；agent 定义须 RUN 重刷 /home/pa——base 层拷贝不随 patch 层 COPY 更新）。
+#   build context = v0.1.8 树 + 3 文件增量的投影副本：
+#   docker build -f hub/deploy/pa-executor.patch.Dockerfile \
+#     -t pa-executor:v0.1.9 /tmp/pa-template-v019
+FROM pa-executor:v0.1.8
 
 USER root
 # 运行面（编排器 + persona + 规约）：目录级覆盖
@@ -58,6 +68,10 @@ COPY hub/deploy/executor-skills /opt/pa/hub/deploy/executor-skills
 RUN mkdir -p /home/pa/.claude/skills \
     && cp -r /opt/pa/hub/deploy/executor-skills/. /home/pa/.claude/skills/ \
     && chown -R pa:pa /home/pa/.claude/skills
+# critic 手写 PRD 判据修复（v0.1.9）：/home/pa 侧 agent 定义在 base 层拷贝，
+# patch 层目录级 COPY 只覆盖 /opt/pa，须重刷 critic 定义到容器用户级目录。
+RUN cp /opt/pa/.claude/agents/pa-prd-critic.md /home/pa/.claude/agents/pa-prd-critic.md \
+    && chown pa:pa /home/pa/.claude/agents/pa-prd-critic.md
 # workspace 可写（组5.1 hub 全链 #13 实证）：dispatch 的目标仓 clone 落 vault 根下相对路径
 # （repo 字段相对 cwd=/opt/pa 解析），COPY 层目录 root 属主 → pa 用户 mkdir Permission denied。
 # chown 目录本身即可（内容只读消费；clone 目标子树 pa 自建）。容器形态仓随容器弃（run 级一次性
