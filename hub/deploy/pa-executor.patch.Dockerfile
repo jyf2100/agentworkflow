@@ -33,7 +33,11 @@
 # claude "Not logged in" 只在 stdout 信封、stderr 为空，旧镜像内 run_daily 吞成空错误。
 # 补丁只动两文件（run_daily.py / persona_call.py 的 exit_diag + raise 行），
 # 其余层与 v0.1.3 byte-identical（增量 build 不重跑 apt/npm/pip 网络层，行为等价性风险最低）。
-FROM pa-executor:v0.1.4
+# 2026-10-27 v0.1.8（add-executor-eng-skills）：镜像内置工程技能包——mattpocock-skills 1.3.1
+#   engineering 面 20 skill 入库快照 hub/deploy/executor-skills/（352K + PROVENANCE），COPY 进
+#   投影 /opt/pa 并拷至 /home/pa/.claude/skills/ 供容器内 dev loop 会话发现；persona 工具面
+#   （agent 定义 tools: 收窄）不受影响。build context = v0.1.7 树 + skills 增量的投影副本。
+FROM pa-executor:v0.1.7
 
 USER root
 # 运行面（编排器 + persona + 规约）：目录级覆盖
@@ -48,6 +52,12 @@ COPY Projects/项目推进流水线/bootstrap/samples/profile.example.yaml /opt/
 COPY CLAUDE.md /opt/pa/CLAUDE.md
 COPY Dockerfile /opt/pa/Dockerfile
 COPY .dockerignore /opt/pa/.dockerignore
+# 工程技能包（add-executor-eng-skills，v0.1.8）：进投影 + 拷至容器用户级技能目录（dev loop 可见；
+# PROVENANCE.md 随包进镜像，容器内可溯源）
+COPY hub/deploy/executor-skills /opt/pa/hub/deploy/executor-skills
+RUN mkdir -p /home/pa/.claude/skills \
+    && cp -r /opt/pa/hub/deploy/executor-skills/. /home/pa/.claude/skills/ \
+    && chown -R pa:pa /home/pa/.claude/skills
 # workspace 可写（组5.1 hub 全链 #13 实证）：dispatch 的目标仓 clone 落 vault 根下相对路径
 # （repo 字段相对 cwd=/opt/pa 解析），COPY 层目录 root 属主 → pa 用户 mkdir Permission denied。
 # chown 目录本身即可（内容只读消费；clone 目标子树 pa 自建）。容器形态仓随容器弃（run 级一次性

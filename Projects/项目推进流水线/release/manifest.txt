@@ -16,5 +16,8 @@ Projects/项目推进流水线/release/docs/CLAUDE.template.md
 Projects/项目推进流水线/release/Dockerfile
 Projects/项目推进流水线/release/.dockerignore
 .claude/agents/
+# executor 镜像内置技能快照（add-executor-eng-skills，spec: execution-hub）——patch.Dockerfile
+# COPY 引用该路径，投影不纳管 = 后续 tag build context 缺源 fail loud
+hub/deploy/executor-skills/
 openspec/specs/
 docs/adr/

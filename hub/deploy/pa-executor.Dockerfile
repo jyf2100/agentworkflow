@@ -31,9 +31,13 @@ COPY . /opt/pa
 
 ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# 工程技能包（add-executor-eng-skills）：快照随 COPY . 进投影 /opt/pa/hub/deploy/executor-skills，
+# 拷至容器用户级技能目录供 dev loop 会话发现（persona 工具面由 agent 定义 tools: 收窄，不受影响）
 RUN useradd -m -s /bin/bash pa \
     && mkdir -p /home/pa/.claude/agents \
     && cp /opt/pa/.claude/agents/*.md /home/pa/.claude/agents/ \
+    && mkdir -p /home/pa/.claude/skills \
+    && cp -r /opt/pa/hub/deploy/executor-skills/. /home/pa/.claude/skills/ \
     && mkdir -p /workspace \
     && chown -R pa:pa /home/pa /workspace /opt/pa/Projects/项目推进流水线
 
