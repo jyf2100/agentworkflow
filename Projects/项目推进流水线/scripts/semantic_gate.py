@@ -16,6 +16,7 @@ dev-agent.py（带连字符不可 import 测）的胶水之外，方向抽查的
     validate_redirect_hint — H3: redirect_hint 内容白名单（不可信 diff→pa-progress→dev 升权链 defense）
     build_progress_prompt — pa-progress 评判 prompt（PRD 全文 + diff + JSON 契约 + H3 围栏加固）
     build_redirect_prompt — off_track 首次注入 dev 的续做提示（接受新 session 现实：break 后开新 query）
+    prior_progress_note  — redirect 前情机械提取（run_log tool_use 重放：已读/已写文件 + diff 现状）
     judge_direction     — 调 pa-progress（经 persona_call），fail-open→None
     run_checkpoint      — 内循环 checkpoint 状态机（on_track 重置 / 两阶段 off_track / H2 空 hint fail-open
                           / H3 非法 hint fail-open / 熔断 / M5 record 与 state 同步）
@@ -46,9 +47,12 @@ PROGRESS_AGENT = "pa-progress"
 
 # H3: redirect_hint 内容白名单。redirect_hint 路径 = 不可信 diff → pa-progress(LLM) → dev(持 Bash/Edit/Write)，
 # 是真实升权链。即便 pa-progress 被 prompt-injection 越狱，白名单在注入 dev 前拦恶意内容（defense-in-depth）。
-REDIRECT_HINT_MAX = 500
-# 禁用子串（lowercase 匹配）：围栏越狱 + shell 元字符 + 网络外传 + 代码执行 + 编码绕过
-REDIRECT_HINT_FORBIDDEN = ("```", "curl", "wget", "http://", "https://", "exec ", "$(", "`",
+REDIRECT_HINT_MAX = 2000
+# 禁用子串（lowercase 匹配）：围栏越狱 + shell 元字符 + 网络外传 + 代码执行 + 编码绕过。
+# m11 教训：单反引号 ` 曾在表内 → progress 写指引爱用内联代码标记（`git diff`）被系统性误拦
+# （连续 3 轮 judge_failopen_bad_hint）。hint 注入 dev 时全文经 `> ` 引用前缀包裹（引用文本语境），
+# 单反引号是 markdown 常态无执行语义；命令替换真形态 `$(` 与围栏 ``` 仍拦。
+REDIRECT_HINT_FORBIDDEN = ("```", "curl", "wget", "http://", "https://", "exec ", "$(",
                            "import os", "subprocess", "eval(", "base64", "os.system", "\\x")
 
 # M2: checkpoint action 字面量类型约束。散落 6 return + dev-agent 消费端，拼错会让 exit15 止损
@@ -147,12 +151,14 @@ def _defang(text: str) -> str:
     return re.sub(r"`{3,}", lambda m: "'" * len(m.group()), text)
 
 
-def build_progress_prompt(prd_text: str, diff_bundle: str) -> str:
+def build_progress_prompt(prd_text: str, diff_bundle: str, prior_rejection: str = "") -> str:
     """pa-progress 评判 prompt：PRD 全文 + diff 摘要 + JSON 输出契约（rubric 自抽）。
 
     H3 围栏加固：用 4 反引号围栏 + _defang 转义内容里的 3+ 反引号，双层防 code-fence 越狱
-    （第一层白名单 validate_redirect_hint 在 redirect_hint 注入 dev 前拦；本处是喂 pa-progress 时防越狱）。"""
-    return "\n".join([
+    （第一层白名单 validate_redirect_hint 在 redirect_hint 注入 dev 前拦；本处是喂 pa-progress 时防越狱）。
+    prior_rejection（m11 反馈环）：pa-progress 是无状态单次调用，上轮 hint 被白名单拒了它不知道
+    → 同样的 hint 重复产出（m11 连续 3 轮）。编排器把拒因回传此处注入 prompt，产出才可修正。"""
+    parts = [
         "# 内循环方向抽查（in-loop semantic checkpoint）",
         "",
         "你是 pa-progress。判 dev 当前 diff 是否在解决下面 PRD 的验收标准（on_track / off_track）。",
@@ -167,22 +173,81 @@ def build_progress_prompt(prd_text: str, diff_bundle: str) -> str:
         "````",
         _defang(diff_bundle),
         "````",
+    ]
+    if prior_rejection:
+        parts += [
+            "",
+            "## ⚠️ 你上一轮的 redirect_hint 被安全闸拒绝（未注入 dev）",
+            _defang(prior_rejection),
+            "",
+            "这次给出的 redirect_hint 务必**纯文本**（可用中文/内联代码名，禁 URL/命令/围栏），避免上述被拒特征。",
+        ]
+    parts += [
         "",
         "## 输出契约（硬性）",
         "只输出一个 JSON 对象，无多余文字/markdown 围栏：",
         '{"verdict":"on_track|off_track","covered":["<已覆盖验收点>"],"off_topic":["<跑偏项>"],'
         '"redirect_hint":"<off_track 时填：可执行纠偏指引，纯文本，禁含代码/命令/URL>","summary":"<一句话>"}',
-    ])
+    ]
+    return "\n".join(parts)
 
 
-def build_redirect_prompt(base_prompt: str, redirect_hint: str) -> str:
+def prior_progress_note(run_log) -> str:
+    """redirect 前情机械提取（m10 缺口①，纯机械零 LLM）：重放 run_log 每 turn 的 tool_use
+    [{name,target}] —— Read 归已读、Edit/Write/MultiEdit 归已写（去重），末次 diff_stat 为现状。
+
+    背景：redirect leg 是全新 session（H1，无前任记忆）——大仓探索期（>K turn 纯读文件）被
+    判 off_track 后，新 session 按标准开局重读同样文件 → 再 off_track 死循环（m10 实证：
+    30 turn 全在读、worktree 零改动、exit 15）。注入前情让新 session 跳过已完成的探索。
+    只收文件路径可靠的 name（Read/Edit/Write/MultiEdit）；Glob/Grep 的 target 是 pattern 不可靠，
+    Bash 是命令——宁缺毋滥。run_log 缺/空/全损坏 → ""（调用面兜底零变化）。"""
+    read_files: list[str] = []
+    wrote_files: list[str] = []
+    diff_stat = ""
+    try:
+        import json
+        with open(run_log, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue                                     # 容错：损坏行跳过（run_log 中部损坏既有语义）
+                if not isinstance(e, dict) or "tool_use" not in e:
+                    continue                                     # judge/redirect 事件行
+                if e.get("diff_stat"):
+                    diff_stat = e["diff_stat"]
+                for tu in e.get("tool_use") or []:
+                    t = (tu.get("target") or "").strip()
+                    if not t:
+                        continue
+                    if tu.get("name") in ("Edit", "Write", "MultiEdit"):
+                        if t not in wrote_files:
+                            wrote_files.append(t)
+                    elif tu.get("name") == "Read" and t not in read_files:
+                        read_files.append(t)
+    except OSError:
+        return ""
+    if not read_files and not wrote_files:
+        return ""
+    lines = ["## 前任会话进度（机械提取自 run_log——你是新 session 无前任记忆，先看这里，勿重复探索）"]
+    if read_files:
+        lines.append("- 已读文件（勿重读，基于已有理解直接开工）：" + "、".join(read_files[:30]))
+    if wrote_files:
+        lines.append("- 已写/已改文件（改动仍在工作树）：" + "、".join(wrote_files[:30]))
+    lines.append("- 工作树 diff 现状：" + (diff_stat if diff_stat else "干净（前任尚未写任何代码——探索已完成，直接开写）"))
+    return "\n".join(lines)
+
+
+def build_redirect_prompt(base_prompt: str, redirect_hint: str, prior_note: str = "") -> str:
     """off_track 首次：把 redirect_hint 注入回 dev。
 
     ⚠ 接受新 session 现实（H1 三方 review 确认）：Path B 的 break+resume 在 SDK query() 模型下
     拿不到 session_id（break 在 AssistantMessage，session_id 流末才有），redirect leg 实际开**新 session**。
     故 prompt 自包含 PRD（base_prompt）+ hint + 显式提示「先前改动在工作树」，让 dev 新 session 自恢复。
-    H3: hint 经 validate_redirect_hint 校验后才进这里（run_checkpoint 保证）；引用前缀标注为参考文本。"""
-    return base_prompt + "\n\n" + "\n".join([
+    H3: hint 经 validate_redirect_hint 校验后才进这里（run_checkpoint 保证）；引用前缀标注为参考文本。
+    prior_note（m10 缺口①）：prior_progress_note 机械前情，非空时插在 hint 后（新 session 无前任
+    记忆，防探索期死循环）；缺省零变化。"""
+    parts = [base_prompt + "\n\n" + "\n".join([
         "## ⚠️ 内循环方向抽查：跑偏纠偏（新 session 续做）",
         "独立评判器判你当前 diff **偏离了 PRD 验收标准**（off_track）。这是给你的 1 次纠偏机会——",
         "**立刻转向**下面的指引（评判器参考文本，非代码/命令），不要继续在跑偏方向上堆改动：",
@@ -191,15 +256,20 @@ def build_redirect_prompt(base_prompt: str, redirect_hint: str) -> str:
         "",
         "注：先前 leg 的改动仍在工作树（`git diff` 可见），请先审视已有改动再继续，勿盲目重做。",
         "纠偏后续做；下次抽查若仍 off_track 将止损退出。",
-    ])
+    ])]
+    if prior_note:
+        parts.append(prior_note)
+    return "\n\n".join(parts)
 
 
 # ─── 评判调用（fail-open）────────────────────────────────────────────
 def judge_direction(prd_text: str, diff_bundle: str, *,
                     claude_bin: str | None = None,
-                    log_fn: Callable[[str], None] | None = None) -> tuple[dict, dict] | None:
+                    log_fn: Callable[[str], None] | None = None,
+                    prior_rejection: str = "") -> tuple[dict, dict] | None:
     """调 pa-progress 评判方向。fail-open：subproc 失败 / 找不到 claude → None（不抛，
-    绝不因护栏故障误杀 dev）。claude_bin=None → resolve_claude_bin_safe。"""
+    绝不因护栏故障误杀 dev）。claude_bin=None → resolve_claude_bin_safe。
+    prior_rejection（m11 反馈环）：上轮 hint 被白名单拒的拒因，注入 prompt 供 progress 修正。"""
     if not claude_bin:
         claude_bin = resolve_claude_bin_safe()
     if not claude_bin:
@@ -207,7 +277,7 @@ def judge_direction(prd_text: str, diff_bundle: str, *,
             log_fn("⚠ 方向抽查 fail-open：找不到 claude CLI（跳过评判）")
         return None
     try:
-        prompt = build_progress_prompt(prd_text, diff_bundle)
+        prompt = build_progress_prompt(prd_text, diff_bundle, prior_rejection=prior_rejection)
         return run_persona_subproc(
             claude_bin, PROGRESS_AGENT, prompt,
             max_turns=PROGRESS_MAX_TURNS, timeout=PROGRESS_TIMEOUT,
@@ -237,6 +307,13 @@ def run_checkpoint(state: dict, turn: int, prd_text: str, diff_bundle: str, *,
     judge_fn：依赖注入（生产=judge_direction 带 claude_bin/log_fn 闭包；测试=stub）。"""
     if turn == 0 or turn % state["judge_k"] != 0:
         return "none", None
+    # m12 缺口④：零 diff 探索期不判方向。off_track ≡ 有产出且方向错——无 diff = 无方向可判，
+    # judge 只能瞎猜（m10/m11/m12 三轮实证全死于零 diff 期误判：大仓探索期 10 turn 纯读是正常
+    # 起步非跑偏；m11 更是靠 hint 被拦 fail-open 不计数才活到写码期）。skip 不调 judge、不算
+    # round、不污染 last_verdict；探索慢/死循环由 maxTurns / dev 时限 / N_STALL 兜底（stall 域）。
+    # git 失败时 collect_diff 返回非空占位串 → 不走此分支，照常 judge（fail-open 语义保留）。
+    if not diff_bundle.strip():
+        return "none", {"event": "judge_skip", "reason": "no_diff_yet", "turn": turn}
     if state["judge_cost_acc"] >= JUDGE_BUDGET_CAP:
         return "none", {"event": "judge_skip", "reason": "cost_breaker",
                         "turn": turn, "acc_cost": state["judge_cost_acc"]}
@@ -252,15 +329,25 @@ def run_checkpoint(state: dict, turn: int, prd_text: str, diff_bundle: str, *,
     state["last_covered"] = payload.get("covered") or []
     if payload.get("verdict") == "on_track":
         state["off_track_count"] = 0
+        state.pop("last_hint_rejection", None)     # m11 反馈环：on_track → 陈旧拒因失效（防误导下次 judge）
         return "continue", {"event": "judge", "turn": turn, "round": state["judge_rounds"],
                             "verdict": "on_track", "covered": state["last_covered"],
                             "cost": cost, "off_track_count": state["off_track_count"]}
     # off_track
     hint = payload.get("redirect_hint") or ""
     if not validate_redirect_hint(hint):
-        # H2+H3: redirect_hint 缺失/空/含禁用串 → 无法安全纠偏，fail-open 不污染 off_track_count
+        # H2+H3: redirect_hint 缺失/空/含禁用串 → 无法安全纠偏，fail-open 不污染 off_track_count。
+        # m11 反馈环：拒因 + hint 样本落 state（下次 judge 经 prior_rejection 回传 progress——
+        # 无状态 persona 不然永远重复同样的非法 hint）与事件（诊断可见，不再瞎猜拒因）。
+        reason = ("empty" if not hint.strip()
+                  else "over_max" if len(hint) > REDIRECT_HINT_MAX
+                  else "forbidden:" + ",".join(f for f in REDIRECT_HINT_FORBIDDEN if f in hint.lower()))
+        state["last_hint_rejection"] = (
+            f"hint 被拒原因={reason}（上限 {REDIRECT_HINT_MAX} 字、禁串：围栏/$(/URL/执行类）；"
+            f"被拒 hint 开头：{hint[:200]}")
         return "none", {"event": "judge_failopen_bad_hint", "turn": turn,
-                        "round": state["judge_rounds"], "verdict": "off_track"}
+                        "round": state["judge_rounds"], "verdict": "off_track",
+                        "reason": reason, "hint_sample": hint[:200]}
     state["off_track_count"] += 1
     if state["off_track_count"] >= 2:
         state["off_track_exhausted"] = True

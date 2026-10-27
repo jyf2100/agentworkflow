@@ -281,12 +281,48 @@ def test_askpass_setup_teardown_refcount(tmp_path, monkeypatch):
     assert os_environ("GIT_TERMINAL_PROMPT") is None
 
 
-def test_askpass_github_noop(tmp_path, monkeypatch):
+def test_askpass_github_noop_local(tmp_path, monkeypatch):
+    """本机 github 面 no-op 不变（mac 真身 ssh/keychain 凭据通道，加 askpass 反而截胡）。"""
     _isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(run_daily, "_in_container", lambda: False)
     assert run_daily._askpass_env_setup({"forge": "github"}, PROJ) == {}
     assert run_daily._askpass_env_setup({}, PROJ) == {}
     run_daily._askpass_teardown({"forge": "github"})                 # no-op 不误删全局
     assert os_environ("GIT_TERMINAL_PROMPT") is None
+
+
+def test_askpass_github_container_writes_script(tmp_path, monkeypatch):
+    """m10 缺口②：github 面容器形态 push 无凭据（askpass no-op → git 交互挂起 30s 超时，
+    m10 止损清场 push --delete 实证）。容器内 GH_TOKEN 由 hub vault --env-file 注入
+    （m10 容器 Config.Env 实证存在），github 面对齐 forge 面同通道；脚本按 host 分流已含
+    github→GH_TOKEN 分支（H2）。teardown 对称（容器 github refcnt 不泄漏）。"""
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(run_daily, "_in_container", lambda: True)
+    env = run_daily._askpass_env_setup({"forge": "github"}, PROJ)
+    assert env and os_environ("GIT_ASKPASS") == env["GIT_ASKPASS"]
+    script = Path(env["GIT_ASKPASS"])
+    assert script.exists() and str(script).startswith("/tmp/")       # 容器=真 /tmp（挂载卷外）
+    body = script.read_text(encoding="utf-8")
+    assert "GH_TOKEN" in body and GITLAB_TOK not in body             # 只引 env 键名
+    run_daily._askpass_teardown({"forge": "github"})                 # 容器 github：对称清理
+    assert not script.exists() and os_environ("GIT_ASKPASS") is None
+
+
+def test_askpass_default_face_container_writes_script(tmp_path, monkeypatch):
+    """m13 缺口⑤：未声明 forge（= 历史默认 github 面）容器形态同样写 askpass。真跑常态：
+    github 项目 profile 不写 forge 字段（gitlab/gitcode 才显式声明），旧判定 ``not forge →
+    return {}`` 使默认面容器**永远**拿不到凭据——m13 全链走到 merge push 才暴露
+    ``could not read Username for 'https://github.com'``（GH_TOKEN 在容器 env 但 git 够不着）。
+    本机默认面仍 no-op（见 test_askpass_github_noop_local 的 {} 断言，语义不变）。"""
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(run_daily, "_in_container", lambda: True)
+    env = run_daily._askpass_env_setup({}, PROJ)                    # 未声明 forge
+    assert env and os_environ("GIT_ASKPASS") == env["GIT_ASKPASS"]
+    script = Path(env["GIT_ASKPASS"])
+    assert script.exists() and str(script).startswith("/tmp/")
+    assert "GH_TOKEN" in script.read_text(encoding="utf-8")         # 脚本按 host 分流含 github 分支
+    run_daily._askpass_teardown({})                                 # 未声明面：对称清理不泄漏
+    assert not script.exists() and os_environ("GIT_ASKPASS") is None
 
 
 def test_askpass_script_selects_token_by_host(tmp_path, monkeypatch):

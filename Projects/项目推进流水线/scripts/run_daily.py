@@ -67,6 +67,7 @@ import ids as loop_ids                     # single-flight-auto-merge task 2.2�
 import merge_phase as MP                   # single-flight-auto-merge task 3.2：merge phase 机械判定（classify_rebase/MergeResult/parse_merge_result/build_merge_cmd；纯 stdlib 零 git/SDK，cron 安全）
 import single_flight as SF                 # single-flight-auto-merge task 2.2/2.3：per-owner_repo 跨进程 slot（flock + journal；Linux fcntl，cron 安全）
 import circuit_breaker as CB               # single-flight-auto-merge task 4.4：revert 循环熔断（同幂等键 PRD cooldown 窗口内禁再 auto-merge→triage；纯 stdlib journal，cron 安全）
+import persona_call                        # 思考模式 medium：run_persona 镜像面取 _persona_effort/--effort flag（纯 stdlib）
 import critical_alert as CA                # single-flight-auto-merge task 4.5：CRITICAL 告警 durable 化（halt→独立 alerts journal，不受 flag gating，crash 不丢；纯 stdlib，cron 安全）
 import main_status as MS                   # single-flight-auto-merge task 4.6：main 瞬态红契约 + 可查询 post-merge 验证状态（per-owner_repo journal，不受 flag gating；纯 stdlib，cron 安全）
 import run_checkpoint as CK                # pa-hardening P0-2/P2-1：run 级 checkpoint 快照 + 当日断点续跑 + 成本聚合（PA_CHECKPOINT/PA_AUTO_RESUME 默认 off=no-op；纯 stdlib，cron 安全）
@@ -487,6 +488,11 @@ def run_persona(name: str, prompt: str, stage: str, label: str,
         log(f"[{label}] ponytail ON → --plugin-dir {_plugin_dir}")
     if allowed_tools:
         base_cmd += ["--allowedTools", ",".join(allowed_tools)]
+    # 思考模式 medium（与 persona_call 镜像，行为对齐；基线=test_persona_call）：--effort flag
+    # （env PA_PERSONA_EFFORT 可覆盖，不设=medium；空串=默认）。env 参数语义不变（None 继承/窄 env）。
+    _effort = persona_call._persona_effort()
+    if _effort:
+        base_cmd += ["--effort", _effort]
     cur_prompt = prompt
     last_err = "（未知）"
     for attempt in (1, 2):
@@ -1388,6 +1394,18 @@ def _critic_one(path: str, source_path: str, prof: dict) -> dict:
 # ─── dispatch 段（投递 + 对账 + 独立验证，纯机械，SPEC §4.4 / ADR-0004）───
 # dispatch 是「编排器逻辑」（SPEC §4.4 标题自证），不立 pa-dispatch persona（全机械无语义，persona 化只增成本）。
 # 分支设计 A：dispatch 建 detached worktree + 传 --branch-prefix auto；dev-agent.mjs 自建分支/开 PR（不改目标面）。
+def _repo_local_path(repo: str) -> str:
+    """repo URL 形态 → vault 根下 workspace/<name> 本地落点；其余形态原样。
+
+    github 面容器形态（2026-10-27 cc-web-control m9 实证）：hub profile repo 常态是 URL，
+    clone 落点若按 Path(repo) 解析会炸 https:/ 协议前缀。重映射到 vault 根 workspace/
+    下按仓库名（仓随容器弃，对齐 gitlab 面容器形态语义；幂等靠远端扫描不靠本地仓常驻）。"""
+    if re.match(r"^https?://", repo or ""):
+        name = re.sub(r"\.git$", "", Path(repo.rstrip("/")).name)
+        return str(VAULT_ROOT / "workspace" / name)
+    return repo
+
+
 def repo_owner_repo(repo: str) -> str | None:
     """从 git remote origin 提取 owner/repo（如 jyf2100/cc-web-control）。失败返 None。"""
     # add-forge-adapter D4：两级提取保留（github -R 命令面身份）；多级全路径身份走 dispatch_key。
@@ -1395,9 +1413,15 @@ def repo_owner_repo(repo: str) -> str | None:
         url = subprocess.run(["git", "-C", repo, "remote", "get-url", "origin"],
                              capture_output=True, text=True, timeout=15).stdout.strip()
         m = re.search(r"[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
-        return m.group(1) if m else None
+        if m:
+            return m.group(1)
     except Exception:
-        return None
+        pass
+    # 容器首跑回退（2026-10-27 cc-web-control hub 首跑实证）：仓不存在时 git 提取空，
+    # 而准入 2（github 面无 fapi）先于 clone 段判 owner_repo → 必 skip 死锁。hub 容器
+    # profile repo 是 URL 形态（mac 真身是本地路径走上方 git 提取）→ URL 正则解析兜底。
+    m = re.search(r"^https?://[^/]+/(?:.+/)?([^/]+/[^/]+?)(?:\.git)?/?$", repo or "")
+    return m.group(1) if m else None
 
 
 def dispatch_key(repo: str, owner_repo: str | None, prof: dict | None = None) -> str:
@@ -1445,20 +1469,31 @@ def _forge_api_for(prof: dict | None, repo: str, owner_repo: str | None):
 # 内容恒定·按 host 选键（审核修复 H2：原 GITLAB→GITCODE→GH 恒定级联在多 token 并存时错绑——hub
 # 整记录注入使容器内多平台 token 并存是常态；git 提示串恒含 host，按域特征分流：gitcode/github
 # → 各自 token，兜底 = 自建 gitlab host）→ 并发 dispatch 写同名同内容幂等，无进程级竞争。
+# github 面：容器形态（hub executor）同走此通道（m10 缺口②——push 凭据）；本机 github 不写
+# （mac 真身 ssh/keychain，askpass 截胡反而破坏）。
 _askpass_lock = threading.Lock()
 _askpass_refcnt = 0
+
+
+def _in_container() -> bool:
+    """容器形态判定（hub executor；抽函数便于单测 monkeypatch）。"""
+    return Path("/.dockerenv").exists()
 
 
 def _askpass_env_setup(prof: dict, proj: str) -> dict[str, str]:
     """forge≠github → 写 askpass 脚本 + 设进程级 env（GIT_ASKPASS / GIT_TERMINAL_PROMPT=0）+ refcnt+1。
 
     进程级 os.environ 覆盖 dispatch 面直跑的全部远程 git（ls-remote / push --delete / worktree fetch /
-    dev-agent 子进程链继承）——私有仓读操作与 push 同通道，缺一即功能残缺。github/未声明 → {} 零行为变化。"""
+    dev-agent 子进程链继承）——私有仓读操作与 push 同通道，缺一即功能残缺。github 面（含**未声明
+    forge 的历史默认面**——真跑常态：github 项目 profile 不写 forge，gitlab/gitcode 才显式声明）
+    **容器形态**也生效（m10 缺口② + m13 缺口⑤：旧判定 ``not forge → return {}`` 使默认面容器永远
+    拿不到凭据，merge push 实证 ``could not read Username``）；本机 github/未声明 → {} 零行为变化
+    （mac 真身 ssh/keychain 凭据通道不动）。"""
     global _askpass_refcnt
     forge = prof.get("forge")
-    if not forge or forge == forge_api.FORGE_GITHUB:
+    if (not forge or forge == forge_api.FORGE_GITHUB) and not _in_container():
         return {}
-    script_dir = (Path("/tmp") if Path("/.dockerenv").exists()
+    script_dir = (Path("/tmp") if _in_container()
                   else STATE_DIR / "runs" / proj)          # 容器=/tmp（state 是挂载卷，落那里容器弃了脚本不弃）
     script_dir.mkdir(parents=True, exist_ok=True)
     script = script_dir / "pa-askpass.sh"
@@ -1477,10 +1512,13 @@ def _askpass_env_setup(prof: dict, proj: str) -> dict[str, str]:
 
 
 def _askpass_teardown(prof: dict) -> None:
-    """dispatch 终态清理（引用计数归零才动全局：并发 dispatch 共享进程级 env，先退者不得拆台）。"""
+    """dispatch 终态清理（引用计数归零才动全局：并发 dispatch 共享进程级 env，先退者不得拆台）。
+
+    github 面判定与 setup 对称（含未声明 forge 的默认面；容器生效/本机 no-op）——否则容器
+    github refcnt 只增不减泄漏。"""
     global _askpass_refcnt
     forge = prof.get("forge")
-    if not forge or forge == forge_api.FORGE_GITHUB:
+    if (not forge or forge == forge_api.FORGE_GITHUB) and not _in_container():
         return
     with _askpass_lock:
         _askpass_refcnt = max(0, _askpass_refcnt - 1)
@@ -1747,13 +1785,21 @@ def already_dispatched(owner_repo: str, repo: str, devslug: str, fapi=None) -> E
       UNKNOWN      任一查询失败（旧版「任一失败容忍返 (False,"")」是 fail-open——可能重复投递；现改 fail-safe 阻断）。
     用 slug 子串而非精确 --head <branch>，因 dev-agent stamp()=YYYYMMDD-HHMM（含时分）不可预测。
     fapi（add-forge-adapter）：gitlab/gitcode → adapter pr_list(all) 归一面（head 字段 ↔ gh headRefName，
-    state 已归一封闭枚举）；分支扫描 git ls-remote 天然 host 无关（凭据经 GIT_ASKPASS），两平台共用。"""
+    state 已归一封闭枚举）；分支扫描 git ls-remote 天然 host 无关（凭据经 GIT_ASKPASS），两平台共用。
+    分支扫描通道（v0.1.18，m15-m17 三连实证）：github 面（fapi=None 且有 owner_repo）改走 gh api
+    ——同容器内 gh（api.github.com）三轮全稳，git ls-remote（github.com smart HTTP）分钟级间歇
+    挂死（实测 132s 才 fatal 同时 curl 1s 通 = 端点间歇抽非封锁）；与 PR 扫描并轨同通道同凭据。
+    forge 面（无 gh）保留 ls-remote（含超时重试）。"""
     pr_err, pr_hit = _scan_pr_list_for_slug(owner_repo, devslug, fapi)
     if pr_hit:
         return found(True, pr_hit)
-    # forge 分支：fapi.web_url 直连（容器首跑无本地仓，-C repo 必炸）；github → None 走旧路径
-    branch_err, branch_hit = _scan_remote_branches_for_slug(
-        repo, devslug, remote_url=getattr(fapi, "web_url", None))
+    if fapi is None and owner_repo:
+        branch_err, branch_hit = _scan_branches_via_gh(owner_repo, devslug)
+    else:
+        # forge 分支：fapi.web_url 直连（容器首跑无本地仓，-C repo 必炸）；github 无
+        # owner_repo 的退化形态 → 旧路径 -C repo（真机 workspace 布局，行为不变）。
+        branch_err, branch_hit = _scan_remote_branches_for_slug(
+            repo, devslug, remote_url=getattr(fapi, "web_url", None))
     if branch_hit:
         return found(True, branch_hit)
     if pr_err or branch_err:
@@ -1796,6 +1842,33 @@ def _scan_pr_list_for_slug(owner_repo: str, devslug: str, fapi=None) -> tuple[st
         return f"PR 查询异常: {e}", None
 
 
+def _scan_branches_via_gh(owner_repo: str, devslug: str) -> tuple[str | None, str | None]:
+    """gh api 列远端分支找 auto/* 且含 devslug（github 面，v0.1.18 幂等通道加固）。
+
+    替代动机（m15-m17 三连 blocked_external_state 实证）：github.com 的 git smart HTTP
+    面分钟级间歇挂死（容器内实测 ls-remote 132s 才 fatal，同秒 curl 1s 通；下一分钟又
+    秒通 = 端点间歇抽），而同容器 gh（api.github.com）与 PR 扫描三轮全稳——分支扫描
+    并轨 gh 同通道同凭据，数据同源（远端分支真态）。--paginate 翻页取全，--jq 端侧
+    收敛只吐分支名。失败形态与 _scan_pr_list_for_slug 对齐（err 串 → UNKNOWN fail-safe）。"""
+    try:
+        js = _net_gate(lambda: subprocess.run(
+            ["gh", "api", f"repos/{owner_repo}/branches", "--paginate", "--jq", ".[].name"],
+            capture_output=True, text=True, timeout=20), "gh_branch_scan")
+        if js.returncode != 0:
+            return f"gh branches rc={js.returncode}: {(js.stderr or '').strip()[:80]}", None
+        for ref in (js.stdout or "").splitlines():
+            ref = ref.strip()
+            if ref.startswith("auto/") and devslug in ref:
+                return None, f"已投递（远端分支 {ref}，无 PR）"
+        return None, None
+    except subprocess.TimeoutExpired:
+        return "gh branches 超时", None
+    except FileNotFoundError:
+        return "缺 gh 命令", None
+    except Exception as e:
+        return f"gh branches 异常: {e}", None
+
+
 def _scan_remote_branches_for_slug(repo: str, devslug: str,
                                    remote_url: str | None = None) -> tuple[str | None, str | None]:
     """git ls-remote origin 里找 auto/* 且含 devslug 的分支。返回 (err, hit_reason)；成功无命中→(None, None)。
@@ -1803,12 +1876,31 @@ def _scan_remote_branches_for_slug(repo: str, devslug: str,
     remote_url（forge 分支，组5.1 hub 全链 #12 实证补）：直接对 remote URL ls-remote（无需本地仓
     ——容器首跑 workspace 无仓，``git -C repo`` 把 profile repo 字符串当本地路径必炸 No such
     directory；token 经 GIT_ASKPASS 进 git，URL 保持无凭据）。None（github/未声明）→ 旧路径
-    ``git -C repo``（真机 workspace 布局镜像 owner/repo，行为零变化）。"""
+    ``git -C repo``（真机 workspace 布局镜像 owner/repo，行为零变化）。
+    超时重试 1 次（v0.1.17，m15 #69 / m16 #70 连续死于同一处）：单次 20s 无重试时
+    时段性网络抖一下 → UNKNOWN → fail-safe 阻断（事后实测 1s 通 = 抖动非持续故障）。
+    TimeoutExpired 重试 1 次，两次都超时才返错（fail-safe 语义不破）；rc≠0（401 凭据
+    错等永久形态）不重试——重试只救瞬态，不给永久错多烧 20s。"""
+    if not remote_url and re.match(r"^https?://", repo or ""):
+        # github 面容器形态（2026-10-27 cc-web-control m8 实证）：repo 为 URL 形态且无 fapi
+        # ——同 forge 路径直连 URL（容器无本地仓，-C repo 必炸 No such directory；公开仓无
+        # 凭据可行，私有仓 401 → UNKNOWN fail-safe 阻断语义不变）。
+        remote_url = repo
     argv = (["git", "ls-remote", "--heads", remote_url] if remote_url
             else ["git", "-C", repo, "ls-remote", "--heads", "origin"])
+    out = None
+    for attempt in (1, 2):
+        try:
+            out = _net_gate(lambda: subprocess.run(argv,
+                                                   capture_output=True, text=True, timeout=20), "ls_remote")
+            break
+        except subprocess.TimeoutExpired:
+            if attempt == 2:
+                return "ls-remote 超时（2 次尝试均超时）", None
+            log("[dispatch] ls-remote 超时（attempt 1/2，疑网络抖动，重试一次）")
+        except FileNotFoundError:
+            return "缺 git 命令", None
     try:
-        out = _net_gate(lambda: subprocess.run(argv,
-                                               capture_output=True, text=True, timeout=20), "ls_remote")
         if out.returncode != 0:
             return f"ls-remote rc={out.returncode}: {(out.stderr or '').strip()[:80]}", None
         for line in out.stdout.splitlines():
@@ -1818,10 +1910,6 @@ def _scan_remote_branches_for_slug(repo: str, devslug: str,
             if ref.startswith("auto/") and devslug in ref:
                 return None, f"已投递（远端分支 {ref}，无 PR）"
         return None, None
-    except subprocess.TimeoutExpired:
-        return "ls-remote 超时", None
-    except FileNotFoundError:
-        return "缺 git 命令", None
     except Exception as e:
         return f"ls-remote 异常: {e}", None
 
@@ -2853,6 +2941,9 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
     #    ``No such directory``。URL：forge 分支 fapi.web_url（GIT_ASKPASS 注入凭据，URL 无凭据）；
     #    github/未声明 → https://github.com/{owner_repo}.git。已存在不 fetch（现产行为零变化）。
     if not (Path(repo) / ".git").exists():
+        # github 面容器形态：repo URL → 落点重映射 vault/workspace/<name>（URL 当 Path 炸
+        # https:/ 协议前缀）；重绑后下方 clone/绝对化/worktree 全走本地路径。
+        repo = _repo_local_path(repo)
         _clone_url = (getattr(fapi, "web_url", None) if fapi is not None
                       else (f"https://github.com/{owner_repo}.git" if owner_repo else None))
         if not _clone_url:

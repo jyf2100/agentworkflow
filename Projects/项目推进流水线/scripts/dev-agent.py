@@ -444,15 +444,26 @@ def classify_test_exit(tool_result: ToolResultBlock, text: str) -> str | None:
 
 def is_clean_test_cmd(cmd: str) -> bool:
     """判定 Bash command 是否为「干净」的测试运行（SPEC #27：捕获端过滤）。
-    跟踪无管道/重定向/链式的裸测试命令——这类 tool_result 的 exit code 才可信；
-    带 |>&; 的变体结果无意义。跨语言：python tests / pytest / unittest / npm test / npx|yarn。"""
+
+    exit code 可信性过滤（非安全过滤——dev 本就能跑任意 Bash）：采信裸测试命令与
+    ``a && b`` / ``a; b`` 链（链的 exit code = 末端命令的；``&&`` 短路 = 前置失败码
+    ≠ 0，fail-safe 方向安全）。要求**末端段**匹配测试命令形态，且**每段**不含
+    ``|><&``` 与 ``$(``（管道吞 exit code=假绿风险；重定向/替换/后台为变形面）。
+    跨语言：python tests / pytest / unittest / npm test / npx|yarn / node --test。
+    m11 缺口③：旧版对链式一概拒收，dev 合理形态 ``rm tmp.js && npm test`` 的全绿
+    证据不被采信，门停在修复前的红证据上误拦（1132 pass 被当 test_failed）。"""
     c = (cmd or "").strip()
-    if re.search(r"[|>&;]", c):
+    if not c:
+        return False
+    segs = [s.strip() for s in re.split(r";|&&", c) if s.strip()]
+    if not segs or any(re.search(r"[|><&`]|\$\(", s) for s in segs):
         return False
     pat_py = r"^\s*(\S*/)?python\d?(\.\d+)?\s+(tests/|src/.*run_|-\s*m\s+(pytest|unittest)\b)"
     pat_pt = r"^\s*(\S*/)?pytest\b"
     pat_npm = r"^\s*(\S*/)?(npm\s+(test|run\s+(test|spec))|npx\s+(mocha|jest|vitest)|yarn\s+(test|test:unit))\b"
-    return bool(re.match(pat_py, c) or re.match(pat_pt, c) or re.match(pat_npm, c))
+    pat_node = r"^\s*(\S*/)?node\s+--test\b"   # node 内建 runner 单文件/全目录形态
+    return bool(re.match(pat_py, segs[-1]) or re.match(pat_pt, segs[-1])
+                or re.match(pat_npm, segs[-1]) or re.match(pat_node, segs[-1]))
 
 
 def append_run_line(run_log: Path, obj: dict) -> None:
@@ -496,8 +507,11 @@ async def process_dev_loop(messages, state: dict, prd_text: str = "") -> ResultM
             _judge_bin = semantic_gate.resolve_claude_bin_safe()   # "" 也缓存：claude 缺失不重复 resolve
         if not _judge_bin:
             return None   # claude 缺失 → fail-open（已缓存，不调 judge_direction 免双重 resolve）
+        # m11 反馈环：上轮 hint 被白名单拒的拒因回传 progress（无状态 persona 不然重复同样的
+        # 非法 hint）；取用即清（防拒因跨轮陈旧误导）。
+        rejection = state.pop("last_hint_rejection", "") or ""
         return semantic_gate.judge_direction(
-            pt, db, claude_bin=_judge_bin,
+            pt, db, claude_bin=_judge_bin, prior_rejection=rejection,
             log_fn=lambda m: append_run_line(state["run_log"], {"event": "judge_log", "msg": m}))
 
     async for msg in messages:
@@ -1160,7 +1174,11 @@ async def main() -> int:
             if redirects_done > 0 and state["redirect_pending"]:
                 # H1：接受新 session 现实。redirect hint 注入新 query（非 resume 续做）。
                 # 用完即清 redirect_pending（已注入本段 prompt），防下轮 checkpoint 误读残留。
-                leg_prompt = semantic_gate.build_redirect_prompt(prompt, state["redirect_pending"])
+                # m10 缺口①：附带 prior_progress_note 机械前情（新 session 无前任记忆——大仓
+                # 探索期重读同样文件再 off_track 死循环，m10 实证 exit 15）。
+                leg_prompt = semantic_gate.build_redirect_prompt(
+                    prompt, state["redirect_pending"],
+                    prior_note=semantic_gate.prior_progress_note(state["run_log"]))
                 state["redirect_pending"] = None
                 append_run_line(state["run_log"], {"event": "redirect_new_session",
                                                    "redirects_done": redirects_done})

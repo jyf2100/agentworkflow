@@ -143,6 +143,46 @@ def test_contract_violation_failopen_when_no_retry_budget(monkeypatch):
 
 
 # ─── raise 路径 ──────────────────────────────────────────────────────
+def test_persona_cmd_carries_medium_effort_flag(monkeypatch):
+    """思考模式 medium（m14 critic revise 偶发超时后用户拍板）：persona base_cmd 挂
+    --effort medium——长思考在 revise 回环（300s 壳内含 PRD 全文重写）偶发贴爆，压 effort
+    档位换响应稳定。dev loop（SDK 会话）不经此面不受影响。"""
+    payload = {"verdict": "pass"}
+    outer = {"result": json.dumps(payload), "is_error": False,
+             "total_cost_usd": 0.01, "num_turns": 1, "session_id": "s", "duration_ms": 1}
+    cmds = []
+
+    def _run(cmd, **k):
+        cmds.append(cmd)
+        return _FakeProc(stdout=json.dumps(outer))
+    monkeypatch.setattr(persona_call.subprocess, "run", _run)
+    monkeypatch.delenv("PA_PERSONA_EFFORT", raising=False)
+    persona_call.run_persona_subproc("claude", "pa-prd", "P", max_turns=5, timeout=60)
+    i = cmds[0].index("--effort")
+    assert cmds[0][i:i+2] == ["--effort", "medium"]
+
+
+def test_persona_effort_env_override(monkeypatch):
+    """外部 PA_PERSONA_EFFORT 覆盖默认（canary A/B）；空串=回落默认 medium。"""
+    payload = {"verdict": "pass"}
+    outer = {"result": json.dumps(payload), "is_error": False,
+             "total_cost_usd": 0.01, "num_turns": 1, "session_id": "s", "duration_ms": 1}
+    cmds = []
+
+    def _run(cmd, **k):
+        cmds.append(cmd)
+        return _FakeProc(stdout=json.dumps(outer))
+    monkeypatch.setattr(persona_call.subprocess, "run", _run)
+    monkeypatch.setenv("PA_PERSONA_EFFORT", "low")
+    persona_call.run_persona_subproc("claude", "pa-prd", "P", max_turns=5, timeout=60)
+    i = cmds[0].index("--effort")
+    assert cmds[0][i:i+2] == ["--effort", "low"]
+    monkeypatch.setenv("PA_PERSONA_EFFORT", "")
+    persona_call.run_persona_subproc("claude", "pa-prd", "P", max_turns=5, timeout=60)
+    i = cmds[1].index("--effort")
+    assert cmds[1][i:i+2] == ["--effort", "medium"]
+
+
 def test_timeout_raises(monkeypatch):
     monkeypatch.setattr(persona_call.subprocess, "run",
                         _fake_runner([subprocess.TimeoutExpired(cmd=["claude"], timeout=120)]))

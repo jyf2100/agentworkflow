@@ -48,6 +48,26 @@ def test_run_persona_contract_violation_retries_then_succeeds(monkeypatch):
     assert payload["prd_path"] == "a.md"
 
 
+def test_run_persona_cmd_carries_medium_effort_flag(monkeypatch):
+    """思考模式 medium（与 persona_call 镜像，基线=test_persona_call）：base_cmd 挂
+    --effort medium（env PA_PERSONA_EFFORT 可覆盖）；env 参数（None 继承/forge 窄 env）语义不变。"""
+    cmds = []
+    seq = [_envelope({"verdict": "pass", "prd_path": "a.md"}),
+           _envelope({"verdict": "pass", "prd_path": "a.md"})]
+
+    def _fake(cmd, **k):
+        cmds.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=seq.pop(0), stderr="")
+    monkeypatch.setattr(run_daily.subprocess, "run", _fake)
+    monkeypatch.delenv("PA_PERSONA_EFFORT", raising=False)
+    run_daily.run_persona("pa-prd-critic", "p", "critic", "t")
+    i = cmds[0].index("--effort")
+    assert cmds[0][i:i+2] == ["--effort", "medium"]
+    # 窄 env 面（forge-repo）：flag 同样在，env 语义不变
+    run_daily.run_persona("pa-fetch-forge-repo", "p", "fetch", "t2", env={"PATH": "/usr/bin"})
+    assert "--effort" in cmds[1]
+
+
 def test_run_persona_contract_violation_budget_exhausted_failopen(monkeypatch):
     """critic 连续缺 verdict → 重试预算用尽 → fail-open 降级返回现状 payload，不 raise。"""
     bad = _envelope({"prd_path": "a.md", "project": "p1"})     # 持续缺 verdict

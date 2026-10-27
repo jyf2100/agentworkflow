@@ -122,8 +122,9 @@ def test_idempotency_auth_fail_sanitized(monkeypatch):
 
 
 def test_idempotency_lsremote_failure(monkeypatch):
-    # gh 成功（空 PR 列表）但 git ls-remote 失败 → UNKNOWN（任一查询不明即 fail-safe）
-    calls = iter([_FakeProc(0, stdout="[]"), None])
+    # gh 成功（空 PR 列表）但 git ls-remote 两次都超时 → UNKNOWN（任一查询不明即 fail-safe；
+    # v0.1.17 起超时重试 1 次——两次都挂才判不明，单次抖动被重试吸收）
+    calls = iter([_FakeProc(0, stdout="[]"), None, None])
 
     def _f(*a, **k):
         nxt = next(calls)

@@ -114,6 +114,21 @@ def _extract_first_json(s: str) -> str | None:
 
 
 # ─── 核心：调 persona 子进程 ─────────────────────────────────────────
+# 思考模式 medium（用户拍板 2026-10-27，m14 critic revise 偶发 300s 贴爆后）：persona 调用
+# 挂 --effort medium（claude CLI flag；原 MAX_THINKING_TOKENS env 方案废弃——CLI 正道是 flag，
+# 2.1.220 实证支持）。revise 回环 = critic 300s 壳内含 PRD 全文重写（正常单跑 900s 量级）——
+# 长思考 + 长输出偶发贴爆（m13 过 / m14 挂的同路径偶发尾部）；压 effort 档位换响应稳定。
+# 外部可经 PA_PERSONA_EFFORT env 覆盖（canary A/B；不设=medium）。dev loop（SDK 会话）不经
+# 此面，不受影响。
+PERSONA_EFFORT_DEFAULT = "medium"
+
+
+def _persona_effort() -> str | None:
+    """persona 调用 effort 档：env PA_PERSONA_EFFORT > 默认 medium；空串=回落默认（对齐
+    per-agent model routing 的空串语义：配错不废整个 flag，回落可跑）。"""
+    return os.environ.get("PA_PERSONA_EFFORT") or PERSONA_EFFORT_DEFAULT
+
+
 def run_persona_subproc(
     claude_bin: str,
     agent_name: str,
@@ -136,6 +151,10 @@ def run_persona_subproc(
     """
     base_cmd = [claude_bin, "--agent", agent_name, "--output-format", "json",
                 "--max-turns", str(max_turns)]
+    # 思考模式 medium：--effort flag（env PA_PERSONA_EFFORT 可覆盖；空串=默认 medium）
+    _effort = _persona_effort()
+    if _effort:
+        base_cmd += ["--effort", _effort]
     # add-per-agent-model-routing：per-persona 模型路由 → --model（不设=零变更 baseline）
     # 优先级：env PA_PERSONA_MODEL_<AGENT>（canary 覆盖）> config/model-routing.json（主配置）> roc 默认。
     # equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 对 dash-leading value flag
