@@ -8,8 +8,10 @@
 
 name: demo-repo            # 项目名（PRD frontmatter 的 project 值须等于它）
 admission: true            # 准入开关（false = radar/dispatch 均跳过）
-repo: /abs/path/to/demo-repo   # 目标仓本地 clone 路径（绝对路径；dispatch 在其中建 .worktrees/ 跑 dev loop，
-                               # owner/repo 从该仓 git remote origin 自动提取——不要直接填 owner/repo 字符串）
+repo: /abs/path/to/demo-repo   # 目标仓本地 clone 路径（github 缺省形态；绝对路径；dispatch 在其中建
+                               # .worktrees/ 跑 dev loop，owner/repo 从该仓 git remote origin 自动提取——
+                               # 不要直接填 owner/repo 字符串）。⚠ forge 形态（见下方注释块）下 repo 语义
+                               # 不同：填 forge 全路径字符串，且仓不须本机 clone（dispatch 直接打 forge API）
 type: code                 # 准入门合法值仅 code（run_daily 准入 1 硬判 type=="code"，其余值 dispatch 必跳
                            # 「profile 不满足」）。测试驱动是探测式（见 package.json → npm，否则重放
                            # dev 上报 test_cmd），与 type 无关——不要填 node/python
@@ -21,6 +23,22 @@ match_surface:             # radar 信号匹配面（dict！one_liner + keywords
 conda_env: null            # Python 仓专用：conda env 名（非 Python 仓保持 null）
 max_prs_in_flight: 2       # 该仓同时在飞的 PR 上限（对账计数超过则本轮跳过）
 dev_agent_ready: true      # 目标仓可跑 dev loop（标准测试入口 scripts.test 已配置）
+
+# ── forge 形态（gitlab / gitcode，add-forge-adapter 2026-10）───────────────
+# 自建 GitLab / GitCode 目标仓不须本机 clone——profile 声明 forge 键后 dispatch 直接打 forge
+# API（fetch 面 forge_fetch.py 同源消费）。整块取消注释、按需删减 github 形态独有键即可。
+# 凭据（hub 形态入保险箱/面板凭据页；本机形态 env）：gitlab 需 GITLAB_TOKEN（PAT，api scope），
+# gitcode 需 GITCODE_TOKEN；gitlab-only 项目不须 GH_TOKEN。
+#
+# forge: gitlab                        # gitlab | gitcode（不写 = github 缺省，即上面样例形态）
+# gitlab_host: http://172.32.153.183:8180   # gitlab 必填：自建实例地址（带 scheme，可带端口；自建实例不猜）
+#                                      # ⚠ gitcode 无 host 键：固定 SaaS api.gitcode.com，不需要也不能配
+# repo: my-group/sub-team/demo-repo    # ⚠ forge 形态下 repo 语义不同：forge 全路径字符串——gitlab 可
+#                                      # 多级（组/子组/仓），gitcode 只两级 owner/repo（无多级路径形态）。
+#                                      # 绝不要再填 /abs/path 本地 clone 路径（那是 github 缺省形态的语义）
+# 凭据面服务端前提（gitlab）：PAT 须 api scope；项目 merge method 必须是 merge commit
+# （squash/fast-only 会被派发前置校验 permanent 拒——GitLab 管理员改 Settings→Merge requests）
+# match_surface 形态与 github 形态完全一致（dict：one_liner + keywords，见上）。
 
 # ── 维护注记（E3 学习回流约定）────────────────────────────────────────────
 # 本样例 = generic profile 的教学载体。实例运营中发现的可复用经验（profile 字段语义坑、
