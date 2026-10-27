@@ -160,6 +160,15 @@ def test_parse_merge_result_malformed_is_unknown():
     assert MP.parse_merge_result(None).rebase_outcome is RebaseOutcome.UNKNOWN   # 非 dict
 
 
+def test_parse_merge_result_pr_fields():
+    # fix(pa) pr_url 缺失：merge 经 PR 做（_pr_automerge），PR 身份须随 MergeResult 流到 dispatch record
+    r = MP.parse_merge_result(_payload(pr_number="59", pr_url="https://github.com/o/r/pull/59"))
+    assert r.merged and r.pr_number == "59" and r.pr_url == "https://github.com/o/r/pull/59"
+    # 缺字段 → None（fail-safe：旧 dev-agent 输出 / 非 PR 路径兼容）
+    r2 = MP.parse_merge_result(_payload())
+    assert r2.pr_number is None and r2.pr_url is None
+
+
 # ─── build_merge_cmd（控制面构造 dev-agent --phase merge 命令）──────────────────
 def test_build_merge_cmd_shape(tmp_path):
     cmd = MP.build_merge_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",

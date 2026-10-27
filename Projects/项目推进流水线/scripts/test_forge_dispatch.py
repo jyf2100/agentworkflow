@@ -425,12 +425,15 @@ def _reset_dev_forge(mod):
 
 
 def test_dev_agent_github_face_gh_argv_baseline(dev_mod, monkeypatch):
-    """_FORGE_CONF 空（github 基线）→ gh 序列 argv 逐 token 与既有实现一致（装载代码零变化）。"""
+    """_FORGE_CONF 空（github 基线）→ gh 序列 argv 逐 token 与既有实现一致（装载代码零变化）。
+
+    fix(pa) pr_url：``pr list`` 带 ``--json number,url``（PR 身份随返回值带出）。
+    """
     argv: list[list[str]] = []
     monkeypatch.setattr(dev_mod, "gh", lambda a: (argv.append(a), "[]" if "list" in a else "http://pr/9")[1])
     monkeypatch.setattr(dev_mod, "git", lambda a: "sha-tip")
     dev_mod._pr_automerge("auto/x", "main", "T", "B")
-    assert argv[0] == ["pr", "list", "--head", "auto/x", "--state", "open", "--json", "number"]
+    assert argv[0] == ["pr", "list", "--head", "auto/x", "--state", "open", "--json", "number,url"]
     assert argv[-1] == ["pr", "merge", "9", "--merge", "--subject", "T", "--body", "B"]
 
 
@@ -450,8 +453,9 @@ def test_dev_agent_rest_face_uses_adapter(dev_mod, monkeypatch):
     monkeypatch.setattr(dev_mod, "for_profile", lambda *a, **k: _Api())
     monkeypatch.setattr(dev_mod, "repo_full_path", lambda r: "g/p")
     monkeypatch.setattr(dev_mod, "git", lambda a: "tip")
-    sha = dev_mod._pr_automerge("auto/x", "main", "T", "B")
-    assert sha == "tip" and calls[0] == "list" and calls[1] == ("create", "main", "auto/x", "T")
+    sha, pr_num, pr_url = dev_mod._pr_automerge("auto/x", "main", "T", "B")
+    assert sha == "tip" and pr_num == "12" and pr_url == "u"   # fix(pa)：三元组带出 PR 身份
+    assert calls[0] == "list" and calls[1] == ("create", "main", "auto/x", "T")
     assert calls[2] == ("merge", "12", "T")
     # UNKNOWN → RuntimeError（exit 13 契约，不静默）
     class _ApiBad:

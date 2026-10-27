@@ -1172,6 +1172,7 @@ def _publish_merge_op(ni: dict, state: dict):
     if pmr.verdict is MP.PostMergeVerdict.PASS:                    # merged（L2399-2402）
         ML.record_event(sd, owner_repo, prd_id, "merge_completed", stamp_fn=run_daily._now_iso, merge_commit=mr.merge_commit)
         return ([], {"_exit_status": "merged", "_merge_commit": mr.merge_commit,
+                     "_pr_number": mr.pr_number, "_pr_url": mr.pr_url,   # fix(pa)：PR 身份随 merge 结果流到 record
                      "_post_merge_verdict": pmr.verdict.value}, {"publish_merge": "merged"})
     if pmr.verdict is MP.PostMergeVerdict.FAIL:                    # auto-revert（L2403-2425）
         ML.record_event(sd, owner_repo, prd_id, "revert_started", stamp_fn=run_daily._now_iso, merge_commit=mr.merge_commit)

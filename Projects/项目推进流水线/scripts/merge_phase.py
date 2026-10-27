@@ -112,6 +112,8 @@ class MergeResult:
     push_failed: bool
     evidence: RebaseEvidence
     error: str | None = None
+    pr_number: str | None = None   # fix(pa)：PR auto-merge 的 PR 身份（merged 时非 None；非 PR 路径/旧输出 None）
+    pr_url: str | None = None
 
     @property
     def merged(self) -> bool:
@@ -166,8 +168,14 @@ def parse_merge_result(payload) -> MergeResult:
     merge_commit = payload.get("merge_commit")
     if not isinstance(merge_commit, str):
         merge_commit = None
+    # fix(pa) pr_url 缺失（hub 实证 PR #59 已 merge 而 record pr_url=null）：PR auto-merge 经 PR 做，
+    # dev-agent 末行 JSON 上报 PR 身份；非 str / 缺字段 → None（fail-safe，旧输出兼容）。
+    pr_number = payload.get("pr_number")
+    pr_url = payload.get("pr_url")
+    pr_number = pr_number if isinstance(pr_number, str) and pr_number else None
+    pr_url = pr_url if isinstance(pr_url, str) and pr_url else None
     return MergeResult(outcome, merge_commit, bool(payload.get("push_failed", False)),
-                       evidence, error=err)
+                       evidence, error=err, pr_number=pr_number, pr_url=pr_url)
 
 
 def build_merge_cmd(*, python: str, dev_agent_py, branch: str, main_ref: str,

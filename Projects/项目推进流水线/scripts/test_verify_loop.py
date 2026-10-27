@@ -329,6 +329,53 @@ def test_dispatch_green_round1(tmp_path, monkeypatch):
     assert rec["status"] == "pr_open"
 
 
+def test_dispatch_merged_records_pr_identity(tmp_path, monkeypatch):
+    """fix(pa) pr_url 缺失（hub 实证 PR #59 已 merge 而 record pr_url=null）：auto-merge merged 路径
+    须把 merge phase 末行 JSON 的 PR 身份（pr_number/pr_url）写进 rec——PR 身份不再在 _pr_automerge 丢弃。"""
+    _setup(tmp_path, monkeypatch)
+    _admit(monkeypatch)
+    monkeypatch.delenv("PA_SINGLE_FLIGHT_AUTO_MERGE", raising=False)
+    monkeypatch.delenv("PA_SINGLE_FLIGHT_SERIAL_SHADOW", raising=False)
+    repo = _repo(tmp_path)
+
+    def _fake_run_agent(cmd, *a, **k):
+        argv = cmd if isinstance(cmd, list) else [str(cmd)]
+        if "--phase" in argv:
+            ph = argv[argv.index("--phase") + 1]
+            if ph == "merge":
+                return {"phase": "merge", "rebase_outcome": "clean", "merge_commit": "m3rg3c0ffee",
+                        "push_failed": False, "pr_number": "59",
+                        "pr_url": "https://github.com/o/r/pull/59",
+                        "rebase": {"fetch_ok": True, "rebase_rc": 0, "worktree_clean": True,
+                                   "conflict_files": 0, "timed_out": False}}
+            if ph == "post-merge-test":
+                return {"phase": "post-merge-test", "verdict": "pass", "ran": True,
+                        "test_rc": 0, "timed_out": False}
+        return {"branch": "auto/r1", "cost": 0.1, "turns": 5, "test_cmd": "npm test"}
+    monkeypatch.setattr(run_daily, "_run_dev_agent", _fake_run_agent)
+    monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: found(True))
+    _green_log = tmp_path / "green_pm.out"
+    _green_log.write_text("all tests passed", encoding="utf-8")
+    monkeypatch.setattr(run_daily, "independent_verify",
+                        lambda *a, **k: {"pass": True, "test_rc": 0, "test_cmd": "npm test",
+                                         "test_log": str(_green_log)})
+    monkeypatch.setattr(run_daily, "_dump_branch_diff", lambda *a, **k: None)
+    monkeypatch.setattr(run_daily, "run_persona",
+                        lambda *a, **k: ({"verdict": "pass"}, {"cost": 0.0, "turns": 1}))
+    recon_calls, fake_rec = _recon_recorder()
+    monkeypatch.setattr(run_daily, "reconcile_pr", fake_rec)
+
+    prof = {**_prof(repo), "loop": {"single_flight_auto_merge": True, "single_flight_serial_shadow": True}}
+    rec = run_daily.dispatch_one(_entry(), prof, "20260718", _args())
+    # merged 路径：status=merged + PR 身份落 record（不进兜底开 PR → reconcile 未被调）
+    assert rec["status"] == "merged"
+    assert rec["merge_commit"] == "m3rg3c0ffee"
+    assert rec["pr_number"] == "59"
+    assert rec["pr_url"] == "https://github.com/o/r/pull/59"
+    assert rec["verify_verdict"] == "pass"
+    assert recon_calls == []
+
+
 def test_dispatch_green_evidence_artifact_failure_blocks_not_published(tmp_path, monkeypatch):
     """task 4.2 evidence integrity：green test result（机械绿）但 evidence artifact 持久化失败
     （artifact_store.store raise → 模拟磁盘满/IO 错）→ 不当 fresh green evidence → ``blocked_evidence``

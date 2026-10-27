@@ -15,9 +15,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import graph_pa_aggregate as AGG
 
 
-# dispatch_one rec 基础字段集（恒在，run_daily L2046-2056 初始 rec，shadow parity 对照基准）。
+# dispatch_one rec 基础字段集（恒在，run_daily 初始 rec，shadow parity 对照基准）。
+# fix(pa) pr_url：+pr_number（PR auto-merge 的 PR 号；pr_url 本就在基础集）。
 _BASE_REC_KEYS = {
-    "project", "prd_path", "slug", "base", "status", "pr_url", "branch",
+    "project", "prd_path", "slug", "base", "status", "pr_url", "pr_number", "branch",
     "dev_killed", "stalled", "run_log", "dev_cost", "dev_turns", "verify",
     "skip_reason", "dev_test_cmd", "verify_verdict", "verify_round",
     "merge_commit", "reverted", "triage_reason", "post_merge_verdict",
@@ -29,9 +30,9 @@ _CONDITIONAL_KEYS = {"blocked_check", "gate_status", "gate_reason"}
 
 
 def test_record_schema_matches_dispatch_one():
-    """基础 21 字段恒在（对齐 dispatch_one L2046-2056 初始 rec）；条件 3 字段子图未产则不写（对齐
-    dispatch_one 仅 blocked/gate 路径 rec.update）。shadow parity 1:1 要求 graph rec 与 legacy rec
-    逐字段一致——legacy skip/正常路径只产基础 21，graph 亦应只产基础 21。"""
+    """基础 22 字段恒在（对齐 dispatch_one 初始 rec，含 fix(pa) pr_number）；条件 3 字段子图未产则不写
+    （对齐 dispatch_one 仅 blocked/gate 路径 rec.update）。shadow parity 1:1 要求 graph rec 与 legacy rec
+    逐字段一致——legacy skip/正常路径只产基础 22，graph 亦应只产基础 22。"""
     result = {"_exit_status": "pr_open", "_pr_url": "https://x", "_branch": "pa-dev-x",
               "_dev_cost": 0.5, "_dev_turns": 12, "_verify_verdict": "pass",
               "_verify_payload": {"x": 1}, "verify_round": 1, "_slug": "x",

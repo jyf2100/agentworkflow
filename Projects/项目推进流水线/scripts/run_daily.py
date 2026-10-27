@@ -3009,7 +3009,9 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
                  #   reverted：post-merge 测试红→auto-revert 是否已执行（revert commit sha 另由 reconcile 记录）。
                  #   triage_reason：PRD 出队进 triage 池的固定枚举原因（task 5.1）。
                  #   post_merge_verdict：merge 后 main 全量测试三态判决（PASS/FAIL/UNKNOWN，task 4.2）。
-                 "merge_commit": None, "reverted": False, "triage_reason": None, "post_merge_verdict": None}
+                 #   pr_number：fix(pa) pr_url 缺失——PR auto-merge 的 PR 号（merged 时记；pr_url 初始键同理）。
+                 "merge_commit": None, "reverted": False, "triage_reason": None, "post_merge_verdict": None,
+                 "pr_number": None}
 
     # ── task 2.1：coordinator 集中 own 运行时设施（design 决策#1；替代散建 _run/_prd/_iter/_sj）。
     #    一次解析所有 loop flag + 建 IDs/journal/artifact_root；flag 全关→baseline no-op（dispatch 决策零变化）。
@@ -3514,6 +3516,7 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
                 _mr = MP.parse_merge_result(_merge_json)
                 if _mr.merged:
                     rec["merge_commit"] = _mr.merge_commit
+                    rec["pr_number"], rec["pr_url"] = _mr.pr_number, _mr.pr_url   # fix(pa)：PR 身份随 merge 结果进 record
                     log(f"  🎉 {slug}: verify 绿 + rebase CLEAN → 已合 main（merge {_mr.merge_commit[:8]}）")
                     # task 4.x post-merge 闸（D8：基线=集成后 main 全量 suite，≠ verify candidate branch；三态经
                     #   classify_post_merge）。PASS→放行 merged；FAIL→revert(4.3)；UNKNOWN→keep+halt+CRITICAL（不 auto-revert）。
@@ -4112,7 +4115,8 @@ def _slot_blocked_record(entry: dict, owner_repo: str, slot_res) -> dict:
                  "base": None, "status": "pending", "pr_url": None, "branch": None, "dev_killed": False,
                  "stalled": False, "run_log": None, "dev_cost": None, "dev_turns": None, "verify": None,
                  "skip_reason": None, "dev_test_cmd": None, "verify_verdict": None, "verify_round": None,
-                 "merge_commit": None, "reverted": False, "triage_reason": None, "post_merge_verdict": None}
+                 "merge_commit": None, "reverted": False, "triage_reason": None, "post_merge_verdict": None,
+                 "pr_number": None}
     qreason = slot_res.query.reason
     if slot_res.blocked_reason == "unknown":
         rec.update(status="blocked_external_state", blocked_check="single_flight_slot",

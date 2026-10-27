@@ -266,6 +266,7 @@ def _subgraph_result_to_record(result: dict, entry: dict, prof: dict) -> dict:
         "verify_verdict": result.get("_verify_verdict"),
         "verify_round": result.get("verify_round"),
         "merge_commit": result.get("_merge_commit"),
+        "pr_number": result.get("_pr_number"),   # fix(pa)：PR 身份随 merge 结果流到 record（None=非 PR 路径/旧输出）
         "reverted": result.get("_reverted", False),
         "triage_reason": result.get("_triage_reason"),
         "post_merge_verdict": result.get("_post_merge_verdict"),

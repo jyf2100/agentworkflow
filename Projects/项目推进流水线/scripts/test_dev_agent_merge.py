@@ -199,6 +199,18 @@ def _make_linked_worktree_repo(tmp_path: Path):
     return primary, wt
 
 
+# ─── fix(pa) pr_url 缺失：merge phase 末行 JSON 须带 PR 身份（_pr_automerge 不再丢弃）──────────
+def test_merge_emits_pr_identity(tmp_path):
+    """merge CLEAN 走 PR 路径 → 末行 JSON 带 pr_number/pr_url（fake gh create 第一个 PR → #1）。
+    回归锚：hub 实证 PR #59 已 merge 但 dispatch record pr_url=null——PR 身份在 _pr_automerge 第一跳即丢。"""
+    wt = _make_repo(tmp_path)
+    _add_branch_commit(wt, "auto/x", "x.txt", "x\n")
+    r, payload = _run_merge(wt, "auto/x")
+    assert payload and payload.get("merge_commit")
+    assert payload.get("pr_number") == "1"
+    assert payload.get("pr_url") == "https://fake-gh.test/pr/1"
+
+
 # ─── canary bug 修复：main 已在主工作目录检出时 merge phase 仍须 CLEAN（ref 级合并，永不 checkout main）──
 def test_merge_clean_when_main_checked_out_elsewhere(tmp_path):
     """canary 实测 bug（task 7.2，cc-web-control）：main 已在 primary 主工作目录检出，merge phase 在

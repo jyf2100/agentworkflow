@@ -79,7 +79,8 @@ def _capture_halts(monkeypatch):
 
 
 # MR/PMR/RVR fixtures
-_mr_ok = types.SimpleNamespace(merged=True, merge_commit="abc123", triage_reason="")
+_mr_ok = types.SimpleNamespace(merged=True, merge_commit="abc123", triage_reason="",
+                               pr_number="59", pr_url="https://github.com/o/r/pull/59")
 _mr_fail = types.SimpleNamespace(merged=False, triage_reason="rebase_conflict")
 _pmr_pass = types.SimpleNamespace(verdict=MP.PostMergeVerdict.PASS)
 _pmr_fail = types.SimpleNamespace(verdict=MP.PostMergeVerdict.FAIL)
@@ -178,6 +179,8 @@ def test_publish_merge_merged(monkeypatch):
     upd = GN.node_publish_merge(_auto_state())
     assert upd["_exit_status"] == "merged"
     assert upd["_merge_commit"] == "abc123"
+    assert upd["_pr_number"] == "59"                           # fix(pa)：PR 身份随 merge 结果流到 record
+    assert upd["_pr_url"] == "https://github.com/o/r/pull/59"
     assert not upd.get("terminal")                             # merged 不 terminal，交 terminal_emit
     assert [e[0] for e in events] == ["merge_started", "merge_completed"]
 

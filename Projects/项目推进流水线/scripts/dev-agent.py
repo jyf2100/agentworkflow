@@ -233,14 +233,17 @@ def _forge_rest(res, what: str):
     return res.value
 
 
-def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> str:
-    """PR auto-merge（ADR-0008 §PR-path）：幂等 create → merge → 返回 PR merge 后 main tip。
+def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> tuple[str, str, str]:
+    """PR auto-merge（ADR-0008 §PR-path）：幂等 create → merge → 返回 ``(PR merge 后 main tip, pr_num, pr_url)``。
 
-    复用 _lookup_pr 幂等模板（``gh pr list --head --state open --json number``；cwd=REPO_ROOT 推断 owner/repo，
+    复用 _lookup_pr 幂等模板（``gh pr list --head --state open --json number,url``；cwd=REPO_ROOT 推断 owner/repo，
     无 -R）：已有 open PR → merge 已有；无 → create 后 merge。``gh pr merge --merge`` 造单一双 parent merge
     commit（非 squash/rebase，守 D7 回滚粒度）。``gh pr merge --merge`` 默认 message = "Merge pull request #N"（**不含**
     marker），故**必须显式传 ``--subject <title>``** 使 merge commit message = title（含 marker，可 git log
     --grep，守护栏#5）；``--body <body>`` 成 message 第二段。
+
+    fix(pa) pr_url 缺失（hub 实证 merged 而 record pr_url=null）：PR 身份（num/url）随返回值带出供 caller
+    上报控制面（url 取平台 web_url / create 返回 url；取不到 → 空串，控制面 fail-safe 落 None）。
 
     add-forge-adapter tasks 2.2：forge≠github → 同幂等模板走 REST adapter（``pr_list(head)`` / ``pr_create`` /
     ``pr_merge``——GitLab merge method 前置校验 + 双 parent 验证在 adapter 内；无请求级 subject → title/body
@@ -256,24 +259,27 @@ def _pr_automerge(head: str, main_ref: str, title: str, body: str) -> str:
         prs = _forge_rest(fapi.pr_list(state="open", head=head), f"PR 查询 {head}") or []
         if prs:
             pr_num = str(prs[0]["number"])
+            pr_url = str(prs[0].get("url") or "")   # adapter _norm_pr 归一键（gitlab web_url / gitcode html_url）
         else:
-            cr = _forge_rest(fapi.pr_create(main_ref, head, title, body), "PR create")
-            pr_num = str((cr or {}).get("number") or "")
+            cr = _forge_rest(fapi.pr_create(main_ref, head, title, body), "PR create") or {}
+            pr_num = str(cr.get("number") or "")
+            pr_url = str(cr.get("url") or "")
             if not pr_num:
                 raise RuntimeError("PR create 未返回 number")
         _forge_rest(fapi.pr_merge(pr_num, title, body), f"PR merge {pr_num}")
         git(["fetch", "origin", main_ref])
-        return git(["rev-parse", f"origin/{main_ref}"])
-    existing = gh(["pr", "list", "--head", head, "--state", "open", "--json", "number"])
+        return git(["rev-parse", f"origin/{main_ref}"]), pr_num, pr_url
+    existing = gh(["pr", "list", "--head", head, "--state", "open", "--json", "number,url"])
     prs = json.loads(existing) if existing.strip() else []
     if prs:
         pr_num = str(prs[0]["number"])
+        pr_url = str(prs[0].get("url") or "")
     else:
-        url = gh(["pr", "create", "--base", main_ref, "--head", head, "--title", title, "--body", body])
-        pr_num = url.rstrip("/").split("/")[-1]
+        pr_url = gh(["pr", "create", "--base", main_ref, "--head", head, "--title", title, "--body", body])
+        pr_num = pr_url.rstrip("/").split("/")[-1]
     gh(["pr", "merge", pr_num, "--merge", "--subject", title, "--body", body])
     git(["fetch", "origin", main_ref])
-    return git(["rev-parse", f"origin/{main_ref}"])
+    return git(["rev-parse", f"origin/{main_ref}"]), pr_num, pr_url
 
 
 def _ensure_feature_branch(branch: str, base: str) -> None:
@@ -879,14 +885,19 @@ def _safe_revparse(ref: str) -> str | None:
 
 
 def _emit_merge(rebase_outcome, merge_commit=None, push_failed=False,
-                evidence=None, error=None) -> int:
-    """merge phase 末行 JSON（控制面 ``parse_merge_result`` 消费）。CLEAN+push 成功=exit0；其余非0。"""
+                evidence=None, error=None, pr_number=None, pr_url=None) -> int:
+    """merge phase 末行 JSON（控制面 ``parse_merge_result`` 消费）。CLEAN+push 成功=exit0；其余非0。
+
+    fix(pa) pr_url 缺失：PR auto-merge 成功时上报 PR 身份（pr_number/pr_url，str|None；非 PR 路径 None），
+    控制面随 MergeResult 流到 dispatch record。
+    """
     ev = ({"fetch_ok": evidence.fetch_ok, "rebase_rc": evidence.rebase_rc,
            "worktree_clean": evidence.worktree_clean, "conflict_files": evidence.conflict_files,
            "timed_out": evidence.timed_out} if evidence else {})
     ok = rebase_outcome is RebaseOutcome.CLEAN and not push_failed and bool(merge_commit)
     print(json.dumps({"phase": "merge", "rebase_outcome": rebase_outcome.value,
                       "merge_commit": merge_commit, "push_failed": push_failed,
+                      "pr_number": pr_number, "pr_url": pr_url,
                       "rebase": ev, "error": error}, ensure_ascii=False))
     return 0 if ok else 13
 
@@ -945,13 +956,14 @@ def run_merge_phase(args: dict) -> int:
             return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, push_failed=True,
                                evidence=evidence, error=f"push rebased branch {branch} 失败: {e}")
         try:
-            merge_commit = _pr_automerge(branch, main_ref,
-                                         title=f"pa-merge: {prd_id} (Pipeline-Merge: {prd_id})",
-                                         body=f"项目推进流水线自动合入（Pipeline-Merge: {prd_id}）。")
+            merge_commit, pr_num, pr_url = _pr_automerge(branch, main_ref,
+                                                         title=f"pa-merge: {prd_id} (Pipeline-Merge: {prd_id})",
+                                                         body=f"项目推进流水线自动合入（Pipeline-Merge: {prd_id}）。")
         except Exception as e:
             return _emit_merge(RebaseOutcome.CLEAN, merge_commit=None, push_failed=True,
                                evidence=evidence, error=f"PR auto-merge 失败: {e}")
-        return _emit_merge(RebaseOutcome.CLEAN, merge_commit=merge_commit, evidence=evidence)
+        return _emit_merge(RebaseOutcome.CLEAN, merge_commit=merge_commit, evidence=evidence,
+                           pr_number=pr_num or None, pr_url=pr_url or None)
     except Exception as e:
         return _emit_merge(RebaseOutcome.UNKNOWN, error=f"merge phase 未预期异常: {e}")
 
@@ -1088,9 +1100,9 @@ def run_revert(args: dict) -> int:
         try:
             git(["branch", "-f", revert_branch, revert_sha])   # detached HEAD 上建/移 revert_branch ref（不锁 main）
             git(["push", "--force-with-lease", "origin", f"{revert_branch}:{revert_branch}"])
-            revert_commit = _pr_automerge(revert_branch, main_ref,
-                                          title=f"pa-revert: {prd_id} (Pipeline-Revert: {prd_id})",
-                                          body=f"项目推进流水线自动回滚 {prd_id}（revert merge commit {merge_commit}）。")
+            revert_commit, _, _ = _pr_automerge(revert_branch, main_ref,
+                                                title=f"pa-revert: {prd_id} (Pipeline-Revert: {prd_id})",
+                                                body=f"项目推进流水线自动回滚 {prd_id}（revert merge commit {merge_commit}）。")
         except Exception:
             return _emit_revert(RevertOutcome.UNKNOWN, revert_commit=None, revert_rc=revert_rc,
                                 push_failed=True, error="revert PR auto-merge 失败（远端 main 未回滚）")
