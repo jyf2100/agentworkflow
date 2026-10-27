@@ -20,6 +20,18 @@ Any anchor violation invalidates the result fail-closed. A session that exceeds 
 - **WHEN** the verify agent session completes and the orchestrator extracts exit code zero for the declared test command from its captured raw stream, with both immutability anchors clean
 - **THEN** verification records green with the exit-code extraction and anchor checks as evidence — the agent's own summary of the run is not verdict evidence
 
+#### Scenario: Command-form variants preserve exit-code semantics are matchable
+
+- **WHEN** the verify agent executes the declared test command in a chained or prefixed form whose exit code is still semantically the test command's (e.g. `cd <worktree> && npm test`, `rm tmp && npm test` — chain exit code = tail command's; a short-circuited chain yields the failed prefix's non-zero code)
+- **THEN** the orchestrator's stream matching uses tail-segment semantics (the same exit-code-trust function as the dev-side evidence collector) and the tool_result exit code is admitted as verdict evidence
+- **BUT WHEN** the executed form corrupts exit-code semantics (pipes, output redirection, command substitution, backgrounding)
+- **THEN** the command is not matchable and the result is `unresolved` → invalid — never guessed green
+
+#### Scenario: Invalid verdict has a contract slot, not a bool
+
+- **WHEN** an anchor violation, a session wall-clock timeout, or an unmatchable declared command produces an invalid result on the agent track (or a timeout on the mechanical track)
+- **THEN** the verification return contract carries a three-state verdict (`green` / `red` / `invalid`) and every consumer (dispatch record test status, pa-verify input, report stage, triage routing) reads the three-state field — an invalid result is never coerced into `pass=false` and never enters the dev revise loop
+
 #### Scenario: Agent edits source or project tests
 
 - **WHEN** the session ends and `git diff` on the verify worktree is non-empty

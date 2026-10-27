@@ -48,6 +48,11 @@ The orchestrator SHALL inject the same content-addressed acceptance suite into b
 - **WHEN** independent verification builds its fresh worktree
 - **THEN** the orchestrator (not any agent) copies the stored suite into the worktree and records the exact injected file set before the verify agent session starts
 
+#### Scenario: Both injection points consume the same digest within one dispatch iteration
+
+- **WHEN** a dispatch iteration injects the suite into the dev loop and later into the verify worktree
+- **THEN** both injections carry the same content-addressed digest — a re-authored (superseded) digest version takes effect only on the next dispatch, and an oracle-defect re-run of verification reuses the digest version the dev implementation was built against, so a rewritten oracle never introduces an untested new examination surface mid-iteration
+
 ### Requirement: Injection integrity is mechanically checked
 
 Every consumer of the injected suite MUST verify its digest against the journaled artifact digest at consumption time. In the verify worktree, after the verify agent session ends, the orchestrator SHALL re-hash the injected files; any mismatch (agent-edited test) invalidates the verification result fail-closed. In the dev worktree, edits to injected files count as candidate file changes for the evidence-freshness gate.

@@ -10,7 +10,7 @@
 ## What Changes
 
 - **验收测试成为控制面工件**（新）：critic pass 后由新 persona（pa-test-author）从 PRD 验收点（稳定 id）编写可执行验收测试（harness 由 profile 声明），content-addressed 存 artifact store，digest 随 journal 事件落账。
-- **双注入**（新）：dev loop 注入 `--acceptance-tests`（实现目标，管线级 TDD，注入件 dev 可读不可改——digest 对账）+ verify worktree 注入（独立门：编排器机械拷入，agent 跑完 sha256 复核）。
+- **双注入**（新）：dev loop 注入 `--acceptance-tests`（**TDD 目标引导（软）**——管线级 TDD 实现目标，注入件 dev 可读不可改（digest 对账）；dev 发布门不机械强制执行注入套件，验收点独立判定完全由 verify 侧承担，见 design D10）+ verify worktree 注入（独立门：编排器机械拷入，agent 跑完 sha256 复核；**同一次 dispatch iteration 两注入点消费同一 digest 版本**，重编写新版本只对下一次 dispatch 生效，见 design D9）。
 - **verify 执行面 agent 化**：headless claude 进 verify worktree，任务 = 按注入环境 spec 装环境 + 跑注入验收测试 + 项目全量门；围栏 = 只准动环境/依赖，**不准碰源码与一切测试文件**。Node / 非 Node **全轨统一**（用户裁决）。flag-gated（`PA_VERIFY_AGENT`，默认 off = 现行为零变更）。
 - **机械锚定三件套**（判定权不进 agent）：① 退出码取证——编排器捕获 stream-json 原始流，机械扫出注入测试命令的 tool_result exit code；② tracked 文件不变性——`git diff` 为空，改源码/改项目测试即判废；③ 注入件 digest 复核——跑完重算 sha256 对账，偷改注入测试即判废。
 - **吸收 harden-verify-test-scope**（用户裁决）：`verify_test_cmd` 优先序（profile 声明 > dev 上报 hint > 跳过+注明）成为 agent 执行的命令声明源之一；其 change 目录与未施 delta 归并进本题。

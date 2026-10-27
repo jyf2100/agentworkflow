@@ -36,11 +36,25 @@
 headless `claude -p --output-format stream-json`（编排器捕获原始字节流）于 verify worktree，`--allowedTools "Bash"`（Read 可给可不给——判定不靠它读；给了便于诊断，v1 给）。**stream-json 仓内零先例**（persona 走 json 信封、SDK 流在 prompt_stream 另路）——tasks 2.0 前置冒烟锚定事件结构（本体论审核 B3）。prompt 结构化注入：env spec + 验收测试位置 + 全量门命令（优先序：profile `verify_test_cmd` > dev hint > 无则只跑注入测试），明确围栏（禁改任何文件，装依赖/工具链可）。超时沿用 `VERIFY_INSTALL_TIMEOUT` / `VERIFY_TEST_TIMEOUT` 量级合并为会话墙钟上限。install 失败（agent 跑不到 test cmd）→ transcript 无匹配 tool_result → `unresolved` → invalid/triage（基建红语义，沿 verify-loop-discipline B2 三分管方向，不进 revise 回环）。**会话墙钟超时同映射 invalid（非红）**——对齐机械轨 `_run_capture` 超时抛 RuntimeError 的非失败码语义（run_daily.py:1806），超时是不可判读不是失败（测试学二审 T4）。
 
 ### D5 三锚实现 + 证据落盘
-1. **退出码 + stdout**：解析编排器捕获的 stream-json，匹配 declared cmd（shell 归一化后前缀匹配注入命令串），取对应 tool_result 的 **exit code**（判绿红）与 **stdout**（落 `test_log`——runner 原始输出保留，主 spec「Line-anchored verify feedback」的行锚解析输入在新轨不断供，本体论审核 B1）。匹配不到 → `unresolved` → invalid（保守，绝不猜绿）。
+1. **退出码 + stdout**：解析编排器捕获的 stream-json，匹配 declared cmd，取对应 tool_result 的 **exit code**（判绿红）与 **stdout**（落 `test_log`——runner 原始输出保留，主 spec「Line-anchored verify feedback」的行锚解析输入在新轨不断供，本体论审核 B1）。**匹配语义 = 末端段匹配（本体论二审 F1/F2，2026-10-27）**：链式拆段（`;` / `&&`），末端段匹配 declared cmd 即采信——`a && npm test` 的 exit code 语义上就是末端命令的（短路 = 前置失败码 ≠ 0，fail-safe 方向安全）；段内含 `|` `>` `<` `` ` `` `$(` 不匹配（管道吞 exit code = 假绿风险）。**与 dev 侧证据面同源**（`dev-agent.py is_clean_test_cmd` v0.1.14 起的语义——m11 实证：85 turn 会话里 LLM 对「跑测试」只有 1 次裸命令、其余全是 `rm x && npm test` / `cd wt && npm test` 形态变体；旧版前缀匹配设计会在此形态下高频 unmatched → invalid 率把 agent 轨打成不可用）。实现面复用/抽出同一判定函数，两消费点（dev 采集端 + verify 锚①）一份语义。匹配不到 → `unresolved` → invalid（保守，绝不猜绿）。
 2. **tracked 不变**：会话后 `git -C vt diff --quiet && git diff --cached --quiet`；untracked 检查 = `git status --porcelain` 的非 ignored 项必须 ⊆ 注入集。
 3. **注入件 digest**：对注入文件集逐个重算 sha256（`artifact_store.compute_digest`）对账注入时 digest。
 4. **证据落盘 + 完整测试报告（B2 + 用户追加 2026-10-26）**：原始 stream（或锚证据子集 + digest）持久化到 `state/runs/`，与 test_log 同目录同生命周期——agent 轨的判定证据必须 durable 可复核（invalid triage / crash 复核有可回看对象），与机械轨 test_log / journal 同类别。**每次 verify 完成（绿/红/invalid，两轨统一）编排器产完整结构化测试报告**落 `state/runs/<stamp>.verify-report.json`：run 身份（PRD/iteration/branch/stamp）+ 命令来源与 declared 命令清单 + 逐命令 exit code 与输出指针（test_log 路径）+ 锚检查结果（agent 轨）或 install/test rc（机械轨）+ 判定与证据指针（test_log / 原始 stream / 注入件 digest 清单）+ 会话元（turns/时长/命令来源 profile|dev-reported|none）+ **环境奇偶节**（declared env spec vs transcript 观测到的实际组装事实——Bash 命令机械提取；v1 记录不阻断，奇偶分歧升门留 v2，测试学二审 T3）；dispatch record 持报告路径。报告是 verify 阶段的输出契约，机械可查（零 LLM 组装），pa-verify / triage / report 阶段共消费。
 三锚任一违反 → result invalid（非红非绿），dispatch record 记录违反详情，走 triage。
+
+### D8 invalid 三态的契约面（本体论二审 F3，2026-10-27）
+`independent_verify` 既有返回五元组 `{test_cmd, pass, install_rc, test_rc, note}` 的 `pass: bool` 是二态，装不下 invalid。实施时返回契约扩三态（`verdict: green|red|invalid` 替代或伴生 `pass`），**全部消费方同步对齐**：dispatch record 的 `test_status`/`pass` 字段、pa-verify 输入面、report 阶段、triage 路由——否则 invalid 落进 `pass=False` 槽被当红喂 revise 回环（正是 verify-loop-discipline B2 要消除的回环）。机械轨同扩（timeout 已是 RuntimeError 非失败码，契约化后同归 invalid 态）。
+
+### D9 双注入版本一致性（本体论二审 F4，2026-10-27）
+不变式：**同一次 dispatch iteration 内，dev 注入与 verify 注入必须消费同一 digest 版本**。supersedes 重编写（T2 oracle 缺陷路径）产出的新 digest 只对**下一次 dispatch** 生效；「重编写 → 重跑 verify」场景下，若 dev 实现基于旧 digest，verify 重跑仍用旧 digest 同版本重跑（oracle 缺陷修复不引入新考面是 persona 编写契约要求，但同版本重跑让这点机械可保）。journal 事件的 supersedes 版本链补 iteration 绑定字段。
+
+### D10 dev 侧注入的语义定位收窄（本体论二审 F5，2026-10-27）
+dev 侧注入定位为 **TDD 目标引导（软）**：注入件给 dev 可见的实现目标（红到绿），但 dev 发布门（verified-dev-execution）**不**把「执行注入套件」列为独立必要条件——dev 门的职责是「不破坏项目」（项目自测绿），验收点的独立判定完全由 verify 侧注入承担（锚①强制执行）。理由：dev 侧机械强制「必须跑到注入文件」需按文件粒度记 TestEvidence，与「测试归项目自治」（ADR-0002）存在张力；且独立性本来就不能建立在被验证方的自我执行上。取舍已在 proposal 的价值声明中同步（「dev loop 注入 = 管线级 TDD 目标」）。
+
+### D11 pa-test-author 不建拒因反馈环（本体论二审 F6，2026-10-27——显式决策非遗漏）
+对比 m11 缺口②为 progress persona 建的拒因回传环：pa-test-author 的产出被收集级自检扣留后**直接缺席不重试**（fail-open 不拦 dispatch，全量门兜底）。显式决策：编写是单次会话、无循环可回传；oracle 缺陷的修正走 T2 supersedes 版本链（triage 确认后重编写），不靠编写时自纠。若未来缺席率高再立反馈环，不预先建。
+
+依赖注记（F7）：注入测试进 dev worktree 后被 `npx jest test/x` / `node --test test/x` 形态跑到、且被 `is_clean_test_cmd` 认定为可信证据——依赖 dev-agent v0.1.14 起的形态识别（链式/node --test/npx），本 change 实施基线须含该版本，勿从旧基线分叉。
 
 ### D6 flag-gated + canary cutover + graph 对称
 `PA_VERIFY_AGENT`（feature_flags.py，默认 off = 现行为 byte-identical）。`graph_pa_verify` / `graph_pa_nodes` 直调面对称同改（flag off 零变化）。cutover 证据：双跑 canary（机械轨 vs agent 轨同 PRD 对账绿红分布；分歧样本人工 triage）≥3 轮后可切默认——默认切换独立决策，不在本 change 内完成。**shadow parity / graph cutover canary 一律 `PA_VERIFY_AGENT=off` 跑**（本体论审核 C2：on 会把 LLM 非确定性注入 dispatch 终态分布，污染 matched 判定——与 `--dispatch-skip-dev` 零 LLM 原则同源）。
