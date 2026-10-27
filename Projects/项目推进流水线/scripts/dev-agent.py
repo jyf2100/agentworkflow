@@ -329,6 +329,14 @@ def run_publish_phase(args: dict, *, dev_out: dict | None = None,
     title = Path(args["prd"]).stem if args.get("prd") else branch
     try:
         git(["add", "-A"])
+        # 执行面垃圾过滤（组5.1 hub 全链 #19 实证）：add -A 把 dev 遥测 jsonl（dev-agent 写在
+        # worktree state/runs/ 的会话日志）与 __pycache__ 字节码收进 MR——verify 闸抓到的真污染，
+        # 且 dev 按 feedback rm --cached 清掉后这里又 add 回来（死循环，MR 5 实证 5 文件）。
+        # 清单与 judge 的 diff_stat 视图共享（is_exec_junk）；--cached 保留工作区（遥测继续写）。
+        _indexed = [l.strip() for l in git(["ls-files", "--cached"]).splitlines() if l.strip()]
+        _junk = [p for p in _indexed if is_exec_junk(p)]
+        if _junk:
+            git(["rm", "--cached", "--quiet", *_junk])
         diff_stat = git(["diff", "--cached", "--stat"])
         if not diff_stat:
             print(json.dumps({"ok": True, "no_changes": True, "branch": branch,
@@ -388,10 +396,28 @@ def trunc(s, n: int) -> str:
     return x if len(x) <= n else x[:n] + "…[trunc]"
 
 
+def is_exec_junk(path: str) -> bool:
+    """执行面产物谓词（组5.1 hub 全链 #19/#20 实证）：dev 遥测（worktree state/runs/auto-*.jsonl）、
+    __pycache__ 字节码——既不入 MR（publish 过滤），也不进 judge 的 diff_stat 视图（遥测文件名
+    挤占产出证据，pa-progress 误判 off_track）。两处共享同一清单，不猜业务文件。"""
+    p = (path or "").strip()
+    return (p.endswith(".pyc") or "/__pycache__/" in p
+            or (p.startswith("state/runs/auto-") and p.endswith(".jsonl")))
+
+
 def git_diff_stat() -> str:
     try:
         out = git(["diff", "--stat"])
         lines = [l for l in out.splitlines() if l.strip()]
+        # untracked 新文件 git diff 不可见（组5.1 hub 全链 #17 实证：dev Write 两个新文件后
+        # diff_stat 恒空，pa-progress judge 以 diff 为产出证据 → 3 轮判 off_track 误止损）。
+        # 补 ls-files others 段让纯新增文件 PRD 的产出可见；不用 add -N（避免 index 副作用，
+        # publish 的 add -A 语义不受扰）。执行面遥测经 is_exec_junk 排除（同 publish 清单）。
+        untracked = git(["ls-files", "--others", "--exclude-standard"])
+        un = [l.strip() for l in untracked.splitlines()
+              if l.strip() and not is_exec_junk(l.strip())]
+        if un:
+            lines.append(f"untracked+: {', '.join(un[:5])}")
         return " | ".join(lines[-3:])[:200]
     except Exception:
         return ""
@@ -520,7 +546,12 @@ async def process_dev_loop(messages, state: dict, prd_text: str = "") -> ResultM
             if prd_text:
                 action, record = semantic_gate.run_checkpoint(
                     state, state["turn"], prd_text,
-                    semantic_gate.collect_diff(git, log_fn=lambda m: append_run_line(state["run_log"], m)),
+                    # #21：untracked 新文件内容进 judge 证据面（read_fn/junk_pred 注入，语义见
+                    # collect_diff docstring）；junk 清单与 publish/diff_stat 共享 is_exec_junk。
+                    semantic_gate.collect_diff(
+                        git, log_fn=lambda m: append_run_line(state["run_log"], m),
+                        read_fn=lambda p: Path(REPO_ROOT, p).read_text(encoding="utf-8", errors="replace"),
+                        junk_pred=is_exec_junk),
                     judge_fn=_judge_fn)
                 if record:
                     append_run_line(state["run_log"], record)
@@ -755,9 +786,14 @@ def _count_conflict_files() -> int:
 
 
 def _worktree_clean() -> bool:
-    """``git status --porcelain`` 为空 → 工作树干净。非 raise（查询失败→False，配合其他证据判 UNKNOWN）。"""
+    """``git status --porcelain --untracked-files=no`` 为空 → 工作树干净。非 raise（查询失败→False，配合其他证据判 UNKNOWN）。
+
+    组5.1 hub 全链 #24 实证：worktree 常驻执行面 untracked 产物（state/runs 遥测 jsonl、
+    tests/__pycache__ 字节码）让 porcelain 恒非空 → rebase rc=0 也判 UNKNOWN 不强合。untracked
+    不参与 rebase/merge/push 语义（merge 推的是 commit 非工作区；is_exec_junk 家族第四处），
+    ``--untracked-files=no`` 用 git 原生口径排除——tracked 修改/staged/冲突仍照常判脏。"""
     try:
-        r = subprocess.run(["git", "status", "--porcelain"], cwd=REPO_ROOT,
+        r = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPO_ROOT,
                            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
         return (r.stdout or "").strip() == ""
     except Exception:

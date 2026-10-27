@@ -50,6 +50,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import subprocess
 import urllib.error
 import urllib.parse
@@ -75,6 +76,11 @@ _REST_TIMEOUT = 20
 #: PR state 封闭枚举（归一目标；spec forge-adapter「平台差异归一」）
 STATE_OPEN, STATE_MERGED, STATE_CLOSED = "open", "merged", "closed"
 
+# 405 收敛轮询参数（#28，测试经 monkeypatch 缩短）：GitLab MR create 后 mergeability 异步
+# 计算，实测数十秒内转 mergeable——30s 上限覆盖绝大多数窗口，超时归 UNKNOWN 上抛。
+MR_MERGE_WAIT_S = 30
+MR_MERGE_POLL_S = 3
+
 #: 平台原生 state → 封闭枚举（locked/progress 保守归 open：在途形态，防 single-flight 低报超额投递）
 _STATE_MAP = {
     "open": STATE_OPEN, "opened": STATE_OPEN, "progress": STATE_OPEN, "locked": STATE_OPEN,
@@ -98,9 +104,14 @@ def remote_host_and_path(url: str) -> tuple[str | None, str | None]:
     """从 git remote URL 提取 (host, 仓库全路径)。多级路径（GitLab 组/子组/仓）全保留。
 
     ``git@host:group/sub/repo.git`` / ``https://host/group/sub/repo.git`` → ("host", "group/sub/repo")。
-    提不出 → (None, None)。"""
+    提不出 → (None, None)。
+
+    组5.1 hub 全链 #26 实证：带端口 http URL（内网自建 GitLab 常态 ``http://host:8180/组/仓.git``）
+    旧正则分隔符只吃一个 ``:`` → 端口沦为路径首段（full_path="8180/pa-qa/sub/proj"）→ API
+    项目 404。host 组显式容纳 ``:port``（``git@host:路径`` 的 ``:`` 后非数字不匹配端口组，
+    原有形态行为不变）。"""
     url = (url or "").strip()
-    m = re.match(r"^(?:https?://|git@)([^/:]+)[/:](.+?)(?:\.git)?/?$", url)
+    m = re.match(r"^(?:https?://|git@)([^/:]+(?::\d+)?)[/:](.+?)(?:\.git)?/?$", url)
     if not m:
         return None, None
     return m.group(1), m.group(2)
@@ -135,6 +146,18 @@ def dispatch_identity(host: str | None, full_path: str) -> str:
     if host in (None, "github.com"):
         return full_path
     return f"{host}/{full_path}"
+
+
+def bare_host(host: str) -> str:
+    """``gitlab_host`` 声明值 → 裸 host（scheme 剥离 + 尾斜杠去）。
+
+    裸 host / ``http(s)://`` 前缀 / ``host:port`` 任一声明形态恒归一出同一裸 host——
+    身份键（dispatch_key）与 ``_GitlabApi`` 归一同一套（同源不重复），声明形态只影响
+    api_root 的 scheme，不影响身份。空/None → 空串（调用方 fail-fast 报缺 host）。"""
+    h = (host or "").strip().rstrip("/")
+    if h.startswith(("http://", "https://")):
+        return h.partition("://")[2]
+    return h
 
 
 # ── REST 基座（gitlab/gitcode 共用；github 走 gh wrapper 不经此类）────
@@ -244,15 +267,18 @@ class _GitlabApi(_RestApi):
             raise ForgeConfigError("gitlab 缺 gitlab_host（自建实例不猜，profile 显式声明）")
         # scheme 归一（组5.1 真实验收发现：内网自建实例常为 http 无 TLS——https 硬编码会让
         # http 实例全部网络异常进 UNKNOWN）：host 显式带 ``http(s)://`` 前缀时 api_root 跟随；
-        # 无 scheme 缺省 https（现产零变化）。self.host 恒归一为裸 host——GIT_ASKPASS 按 git
-        # 提示串域分流、dispatch 身份键 host 取自 remote 提取，均与声明形态无关不受影响。
+        # 无 scheme 缺省 https（现产零变化）。self.host 恒归一为裸 host（bare_host 同源）——
+        # GIT_ASKPASS 按 git 提示串域分流、dispatch 身份键 host，均与声明形态无关不受影响。
         h = host.strip().rstrip("/")
         if h.startswith(("http://", "https://")):
-            scheme, _, bare = h.partition("://")
+            scheme = h.partition("://")[0]
         else:
-            scheme, bare = "https", h
-        self.host = bare
+            scheme = "https"
+        self.host = bare_host(host)
         self.api_root = f"{scheme}://{self.host}/api/v4"
+        # git 直连面（ls-remote / clone / push）：scheme://裸host/未encode全路径.git——身份与 api_root
+        # 同一 scheme/host 源；token 经 GIT_ASKPASS 注入绝不进 URL（run_daily askpass 接线）。
+        self.web_url = f"{scheme}://{self.host}/{full_path}.git"
         self.project = urllib.parse.quote(full_path, safe="")   # v4 官方形态：URL-encode 全路径
         self.api_repo = self.project
 
@@ -315,10 +341,40 @@ class _GitlabApi(_RestApi):
         res = self._call("PUT", f"/projects/{self.project}/merge_requests/{number}/merge",
                          body={"merge_commit_message": msg} if msg else None,
                          list_endpoint=False)
+        if res.state is ExtState.UNKNOWN and "405" in (res.reason or ""):
+            res = self._merge_405_converge(number, msg)   # #28：瞬态窗口收敛（实装 recheck 面）
         if res.state is not ExtState.FOUND:
             return res
         # ③ 双 parent 验证（squash 形态暴露：merge 成功但单 parent → permanent，不静默）
         return self._verify_two_parents(number)
+
+    def _merge_405_converge(self, number, msg: str) -> ExtResult:
+        """PUT /merge 405 收敛（组5.1 hub 全链 #28 实装：「recheck 收敛面」从文案落成代码）。
+
+        MR create 后 mergeability 异步计算窗口内 PUT 405（容器内实证：create→立即 merge 连发）。
+        收敛路径：GET MR——``merged`` → 幂等成功（对已 merged MR 重放 merge 同 405）；``opened``
+        且 mergeable → 重试 PUT 一次（非 405 失败原样上抛，409 冲突 permanent 语义不变）；未
+        mergeable → 轮询至 ``MR_MERGE_WAIT_S`` 上限，超时归 UNKNOWN。FOUND 后双 parent 验证
+        由调用方统一做。"""
+        deadline = time.monotonic() + MR_MERGE_WAIT_S
+        while True:
+            mr = self._call("GET", f"/projects/{self.project}/merge_requests/{number}",
+                            list_endpoint=False)
+            if mr.state is not ExtState.FOUND:
+                return unknown(f"gitlab 405 收敛回查不可用: {mr.reason[:80]}")
+            val = mr.value or {}
+            if val.get("state") == "merged":
+                return found(None, "gitlab MR 已 merged（405 幂等重放收敛）")
+            if val.get("detailed_merge_status") == "mergeable" or \
+                    val.get("merge_status") == "can_be_merged":
+                retry = self._call("PUT", f"/projects/{self.project}/merge_requests/{number}/merge",
+                                   body={"merge_commit_message": msg} if msg else None,
+                                   list_endpoint=False)
+                if retry.state is ExtState.FOUND or "405" not in (retry.reason or ""):
+                    return retry
+            if time.monotonic() >= deadline:
+                return unknown(f"gitlab 405 收敛超时（{MR_MERGE_WAIT_S}s 内 mergeable 未就绪）")
+            time.sleep(MR_MERGE_POLL_S)
 
     def _verify_two_parents(self, number) -> ExtResult:
         mr = self._call("GET", f"/projects/{self.project}/merge_requests/{number}",
@@ -391,6 +447,7 @@ class _GitcodeApi(_RestApi):
         super().__init__(FORGE_GITCODE, FORGE_TOKEN_ENV[FORGE_GITCODE], token)
         self.api_root = GITCODE_API
         self.api_repo = full_path   # 两级 owner/repo（gitcode 无多级路径形态）
+        self.web_url = f"https://gitcode.com/{full_path}.git"   # git 直连面（同 gitlab.web_url 语义）
 
     def headers(self, extra=None):
         return {"Authorization": f"Bearer {self.token}"}

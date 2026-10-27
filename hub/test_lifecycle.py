@@ -298,6 +298,21 @@ def test_credentials_vault_wins_over_env(tmp_path):
     lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _VAULT_ENV}))
     env, source = lc._credentials()
     assert source == "vault" and env == _VAULT_ENV  # 命中保险箱，不经 hub 进程 env
+    assert lc.cfg.user_model is None or "ANTHROPIC_MODEL" not in env  # 未配路由 = 零键混入
+
+
+def test_credentials_vault_merges_user_model(tmp_path):
+    """组5.1 hub 全链实证修复：vault 有记录时 HUB_USER_MODEL→ANTHROPIC_MODEL 仍须注入——
+    vault payload 只存凭据面，模型路由（非凭据）不 merge 则容器内 claude 落 CLI 内置
+    默认模型（claude-opus-5），roc 代理 400 拒裸 Anthropic id。"""
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _VAULT_ENV}))
+    import dataclasses
+
+    lc.cfg = dataclasses.replace(lc.cfg, user_model="glm-5.3")  # HubConfig frozen，整体替换
+    env, source = lc._credentials()
+    assert source == "vault"
+    assert env["ANTHROPIC_MODEL"] == "glm-5.3"  # 路由键恒注入（F9 同 env-file 通道）
+    assert env["GH_TOKEN"] == _VAULT_ENV["GH_TOKEN"]  # 凭据面原样（非替换式 merge）
 
 
 def test_credentials_fallback_env_with_warn(tmp_path, capsys):

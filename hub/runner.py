@@ -143,7 +143,12 @@ class DockerRunner:
         return False
 
     def _docker_cmd(self, spec: RunSpec) -> list[str]:
-        argv = [self._bin, "run", "-d", "--cpus", spec.cpus, "--memory", spec.memory]
+        # --workdir=vault 根：镜像默认 WORKDIR=/workspace，而 run_daily 的约定是「从 vault 根跑」
+        # （CLAUDE.md）——persona 收到的 PRD/profile 路径都是相对 VAULT_ROOT 的相对路径，
+        # persona 子进程继承编排器 cwd，WORKDIR 不对则 Read 解析错位 → critic 读不到 PRD
+        # 机械 drop（组5.1 hub 全链 #8 实证：/workspace/.project-auto/... 不存在）。
+        argv = [self._bin, "run", "-d", "--workdir", CONTAINER_VAULT,
+                "--cpus", spec.cpus, "--memory", spec.memory]
         if spec.env_file is not None:
             argv += ["--env-file", str(spec.env_file)]
         for kv in spec.container_env:  # 非凭据 env 直传（4b：PA_REPORT_DIR 等，与 env-file 分离）

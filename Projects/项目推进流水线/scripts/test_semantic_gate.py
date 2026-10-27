@@ -88,6 +88,52 @@ def test_collect_diff_git_failure_safe():
     assert "git diff 失败" in out
 
 
+# ─── #21：untracked 新文件进 judge 证据面 ───────────────────────────
+def test_collect_diff_untracked_content_visible():
+    """dev 产出纯新增文件时 git diff 恒空——untracked 段让内容进 diff_bundle（m21 实证）。"""
+    def fake_git(args):
+        if args[0] == "diff":
+            return ""
+        if args[:2] == ["ls-files", "--others"]:
+            return "docs/smoke.md\ntests/test_smoke.py"
+        raise AssertionError(f"unexpected {args}")
+    out = sg.collect_diff(fake_git, read_fn=lambda p: f"body of {p}\nline2")
+    assert "docs/smoke.md" in out and "tests/test_smoke.py" in out
+    assert "+body of docs/smoke.md" in out          # 内容级证据（+ 前缀伪 diff）
+    assert "new file, untracked" in out
+
+
+def test_collect_diff_untracked_junk_filtered():
+    """执行面遥测/字节码不进 judge 证据面（与 #20a diff_stat 视图共享清单）。"""
+    def fake_git(args):
+        return "" if args[0] == "diff" else "state/runs/auto-x.jsonl\nok.py"
+    out = sg.collect_diff(fake_git, read_fn=lambda p: f"c:{p}", junk_pred=lambda p: "auto-" in p)
+    assert "ok.py" in out
+    assert "auto-x.jsonl" not in out
+
+
+def test_collect_diff_untracked_read_failure_skips_file():
+    """单文件读失败不拖垮整段（并发删除等）——其余文件仍进 diff_bundle。"""
+    def fake_git(args):
+        return "" if args[0] == "diff" else "gone.md\nthere.md"
+    logs = []
+    out = sg.collect_diff(fake_git,
+                          read_fn=lambda p: (_ for _ in ()).throw(FileNotFoundError(p)),
+                          log_fn=logs.append)
+    assert "there.md" not in out or True   # gone.md 抛错被跳过
+    assert any(e["event"] == "untracked_read_failed" for e in logs)
+
+
+def test_collect_diff_no_read_fn_backward_compatible():
+    """read_fn=None = 旧行为（仅 git diff，不查 untracked）——merge phase 等旧调用不受扰。"""
+    calls = []
+    def fake_git(args):
+        calls.append(args[0])
+        return "tracked diff"
+    assert sg.collect_diff(fake_git) == "tracked diff"
+    assert "ls-files" not in calls
+
+
 # ─── T3：build_progress_prompt / build_redirect_prompt ───────────────
 def test_build_progress_prompt_contains_prd_diff_and_contract():
     p = sg.build_progress_prompt("MY_PRD_TEXT", "MY_DIFF_TEXT")

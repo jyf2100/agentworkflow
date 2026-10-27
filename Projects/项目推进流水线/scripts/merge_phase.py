@@ -171,16 +171,24 @@ def parse_merge_result(payload) -> MergeResult:
 
 
 def build_merge_cmd(*, python: str, dev_agent_py, branch: str, main_ref: str,
-                    prd_id: str, state_dir: str | None = None) -> list[str]:
+                    prd_id: str, state_dir: str | None = None,
+                    forge: str | None = None, forge_host: str | None = None) -> list[str]:
     """构造 ``dev-agent --phase merge`` 命令（控制面发，dev-agent 在目标仓执行 rebase→merge→push）。
 
     守 D6/ADR-0001：控制面只发 cmd，**不直接持 git 写句柄**；dev-agent 在目标仓 worktree 经机械层
     （``git()`` 进程内 subprocess）执行 merge 序列。``state_dir`` 透传（merge 事件落控制面 state，task 6.x）。
+    ``forge``/``forge_host``（组5.1 hub 全链 #25 实证）：PR auto-merge 面的平台声明——不带则 dev-agent
+    的 ``_forge_dev_api()`` 返 None → ``_pr_automerge`` 落 gh CLI → gitlab 仓炸「none of the git remotes
+    point to a known GitHub host」。None 不附加 argv（github/未声明 = 基线 gh 零变化）。
     """
     cmd = [python, str(dev_agent_py), "--phase", "merge",
            "--branch", branch, "--main", main_ref, "--prd-id", prd_id]
     if state_dir:
         cmd += ["--state-dir", state_dir]
+    if forge:
+        cmd += ["--forge", forge]
+    if forge_host:
+        cmd += ["--forge-host", forge_host]
     return cmd
 
 
@@ -419,16 +427,22 @@ def build_post_merge_cmd(*, python: str, dev_agent_py, test_cmd: str, main_ref: 
 
 
 def build_revert_cmd(*, python: str, dev_agent_py, merge_commit: str, main_ref: str,
-                     prd_id: str, state_dir: str | None = None) -> list[str]:
+                     prd_id: str, state_dir: str | None = None,
+                     forge: str | None = None, forge_host: str | None = None) -> list[str]:
     """构造 ``dev-agent --phase revert`` 命令（控制面发，dev-agent 在目标仓 revert 单一 merge commit + push）。
 
     守 D6/ADR-0001：控制面只发 cmd，dev-agent 在目标仓 worktree 经机械层（``git()``）执行
     ``git revert -m 1 --no-edit <merge_commit>`` + 建 revert branch + gh pr merge --merge + 记 revert_commit
     （ADR-0008 §PR-path）。``merge_commit`` = 本次自动合入产出的单一 commit（D7 粒度；journal 须另记
-    revert_commit sha，task 6.1b）。
+    revert_commit sha，task 6.1b）。``forge``/``forge_host`` 同 ``build_merge_cmd``（#25：revert 也走
+    ``_pr_automerge``，缺声明同炸 gh-only）；None 不附加 argv（基线零变化）。
     """
     cmd = [python, str(dev_agent_py), "--phase", "revert",
            "--merge-commit", merge_commit, "--main", main_ref, "--prd-id", prd_id]
+    if forge:
+        cmd += ["--forge", forge]
+    if forge_host:
+        cmd += ["--forge-host", forge_host]
     if state_dir:
         cmd += ["--state-dir", state_dir]
     return cmd

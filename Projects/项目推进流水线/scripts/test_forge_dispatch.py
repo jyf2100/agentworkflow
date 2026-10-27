@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import pytest
 from external_state import ExtState, found, not_found, unknown
 
-import forge_api
 import run_daily
 
 PROJ = "forge_t"
@@ -331,16 +330,29 @@ def test_askpass_concurrent_refcount(tmp_path, monkeypatch):
 
 
 # ── dispatch_key（D4：host × 全路径身份键）────────────────────────────
-def test_dispatch_key_github_degrades_to_owner_repo(monkeypatch):
-    monkeypatch.setattr(forge_api, "remote_origin", lambda r: ("github.com", "o/r"))
-    assert run_daily.dispatch_key("/repo", "o/r") == "o/r"           # 锁/slot/分组键零变化
-    monkeypatch.setattr(forge_api, "remote_origin", lambda r: (None, None))
-    assert run_daily.dispatch_key("/repo", "o/r") == "o/r"           # 提取失败兜底旧行为
+# 组5.1 hub 全链 #10 实证修订：dispatch 链 repo 输入是 profile repo 字符串非本地仓路径——
+# 旧 remote_origin 提取路径从未生效（恒 fallback owner_repo）。身份来源 = profile 声明面。
+def test_dispatch_key_github_degrades_to_owner_repo():
+    assert run_daily.dispatch_key("o/r", "o/r") == "o/r"             # 锁/slot/分组键零变化
+    assert run_daily.dispatch_key("o/r", "o/r", {"forge": "github"}) == "o/r"
+    assert run_daily.dispatch_key("o/r", "o/r", None) == "o/r"       # 未声明 forge → 旧键形态
 
 
-def test_dispatch_key_gitlab_multilevel(monkeypatch):
-    monkeypatch.setattr(forge_api, "remote_origin", lambda r: ("gitlab.a.com", "g/sub/proj"))
-    assert run_daily.dispatch_key("/repo", "sub/proj") == "gitlab.a.com/g/sub/proj"   # 旧尾两级撞键已修
+def test_dispatch_key_gitlab_multilevel():
+    prof = {"forge": "gitlab", "gitlab_host": "gitlab.a.com"}
+    assert run_daily.dispatch_key("g/sub/proj", "sub/proj", prof) == "gitlab.a.com/g/sub/proj"   # 旧尾两级撞键已修
+    # 声明形态（scheme 前缀 / host:port）恒归一同一裸 host——身份与声明形态解耦（bare_host 同源）
+    assert run_daily.dispatch_key("g/sub/proj", "sub/proj",
+                                  {"forge": "gitlab", "gitlab_host": "https://gitlab.a.com"}) \
+        == "gitlab.a.com/g/sub/proj"
+    assert run_daily.dispatch_key("g/sub/proj", "sub/proj",
+                                  {"forge": "gitlab", "gitlab_host": "http://gitlab.a.com:8180"}) \
+        == "gitlab.a.com:8180/g/sub/proj"
+
+
+def test_dispatch_key_gitcode_two_segment():
+    prof = {"forge": "gitcode"}
+    assert run_daily.dispatch_key("o/r", "o/r", prof) == "gitcode.com/o/r"   # 单实例 host 恒定
 
 
 # ── _dev_cmd forge flag 透传（tasks 2.2）─────────────────────────────

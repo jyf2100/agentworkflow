@@ -179,6 +179,22 @@ def test_build_merge_cmd_state_dir_optional(tmp_path):
     assert "--state-dir" not in cmd
 
 
+def test_build_merge_cmd_forge_flags(tmp_path):
+    """#25：forge 平台声明进 argv——缺则 dev-agent PR auto-merge 面落 gh-only（gitlab 仓炸）。"""
+    cmd = MP.build_merge_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
+                             branch="auto/x", main_ref="main", prd_id="p", state_dir=None,
+                             forge="gitlab", forge_host="http://172.32.153.183:8180")
+    assert cmd[cmd.index("--forge") + 1] == "gitlab"
+    assert cmd[cmd.index("--forge-host") + 1] == "http://172.32.153.183:8180"
+
+
+def test_build_merge_cmd_no_forge_backward_compatible(tmp_path):
+    """forge=None 不附加 argv（github/未声明 = 基线 gh 面零变化）。"""
+    cmd = MP.build_merge_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
+                             branch="auto/x", main_ref="main", prd_id="p", state_dir=None)
+    assert "--forge" not in cmd and "--forge-host" not in cmd
+
+
 # ─── build_classify_cmd（task 7.1a shadow：控制面构造 dev-agent --phase merge --classify-only）─────
 def test_build_classify_cmd_carries_classify_only_flag(tmp_path):
     cmd = MP.build_classify_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
@@ -342,6 +358,15 @@ def test_build_revert_cmd_shape(tmp_path):
     assert "--phase" in cmd and cmd[cmd.index("--phase") + 1] == "revert"
     assert "--merge-commit" in cmd and "abc123" in cmd
     assert "--main" in cmd and "--prd-id" in cmd and "--state-dir" in cmd
+
+
+def test_build_revert_cmd_forge_flags(tmp_path):
+    """#25：revert 走同一 _pr_automerge——forge 声明同缺同炸。"""
+    cmd = MP.build_revert_cmd(python="python3", dev_agent_py=tmp_path / "dev-agent.py",
+                              merge_commit="abc123", main_ref="main", prd_id="p", state_dir=None,
+                              forge="gitlab", forge_host="http://172.32.153.183:8180")
+    assert cmd[cmd.index("--forge") + 1] == "gitlab"
+    assert cmd[cmd.index("--forge-host") + 1] == "http://172.32.153.183:8180"
 
 
 def test_build_post_merge_cmd_shape(tmp_path):

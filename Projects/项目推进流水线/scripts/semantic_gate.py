@@ -39,6 +39,7 @@ JUDGE_K = 10                      # 每 K turn 抽一次方向（max_turns=150 �
 #   judge_cost_acc 实际累加 0，本熔断为防御纵深、当前不触发。修复依赖 ADR-0006 #6 cost 上报修复。
 JUDGE_BUDGET_CAP = 0.40           # 评判累计成本熔断（USD）；见上，当前实际失效
 JUDGE_DIFF_MAX_CHARS = 10000      # 喂给评判的 diff 截断上界（防 MB 级 diff）
+JUDGE_UNTRACKED_MAX_FILES = 5     # untracked 新文件进 diff_bundle 的数量上界（防 prompt 爆炸）
 PROGRESS_MAX_TURNS = 15           # pa-progress max_turns（prompt-only 判方向，无 tool loop）
 PROGRESS_TIMEOUT = 120            # pa-progress wall-clock（glm-5.2 + 小 prompt 常态 5-30s）
 PROGRESS_AGENT = "pa-progress"
@@ -84,13 +85,38 @@ def truncate_diff(diff_text: str, max_chars: int = JUDGE_DIFF_MAX_CHARS) -> str:
 
 
 def collect_diff(git_fn: Callable[[list[str]], str], max_chars: int = JUDGE_DIFF_MAX_CHARS, *,
-                 log_fn: Callable[[dict], None] | None = None) -> str:
-    """经注入的 git_fn 取 worktree 未 staged diff + 截断；git 失败 → 安全占位（fail-open）。
+                 log_fn: Callable[[dict], None] | None = None,
+                 read_fn: Callable[[str], str] | None = None,
+                 junk_pred: Callable[[str], bool] | None = None) -> str:
+    """经注入的 git_fn 取 worktree 未 staged diff + untracked 新文件内容 + 截断；git 失败 → 安全占位（fail-open）。
+
+    组5.1 hub 全链 #21 实证：dev 产出纯新增文件（PRD 恰是「新增两文件」形态）时 `git diff`
+    恒空 → pa-progress 两轮 covered=[] off_track 误止损（m21：文件早已写出，judge 证据面
+    看不见）。同 #17 家族——#17 只修了 jsonl 快照显示面，这里是 judge 实际吃的 diff_bundle。
+    untracked 段需 read_fn 注入（内容级证据；不用 add -N 保持 index 无副作用，不用
+    diff --no-index——有差异时 rc=1 会被 git() 的 rc 检查抛异常）；junk_pred 过滤执行面
+    遥测/字节码（与 #20a 的 diff_stat 视图共享清单）。两者 None = 兼容旧行为（跳过该段）。
 
     silent-failure M4：失败时经 log_fn 落 diff_collect_failed 事件进 run_log（否则占位串被
     喂给 pa-progress 但 run_log 无独立痕迹，postmortem 无从反推 verdict 奇怪是因为 diff 没抓到）。"""
     try:
-        return truncate_diff(git_fn(["diff"]), max_chars)
+        parts = [git_fn(["diff"])]
+        if read_fn is not None:
+            untracked = [l.strip() for l in
+                         git_fn(["ls-files", "--others", "--exclude-standard"]).splitlines()
+                         if l.strip()]
+            if junk_pred is not None:
+                untracked = [p for p in untracked if not junk_pred(p)]
+            for p in untracked[:JUDGE_UNTRACKED_MAX_FILES]:
+                try:
+                    body = read_fn(p)
+                except Exception as e:   # 单文件读失败不拖垮整段（如并发删除）
+                    if log_fn:
+                        log_fn({"event": "untracked_read_failed", "path": p, "error": str(e)})
+                    continue
+                head = "\n".join("+" + ln for ln in body.splitlines()[:80])
+                parts.append(f"--- /dev/null\n+++ b/{p} (new file, untracked)\n{head}")
+        return truncate_diff("\n".join(x for x in parts if x.strip()), max_chars)
     except Exception as e:
         if log_fn:
             log_fn({"event": "diff_collect_failed", "error": str(e)})

@@ -8,6 +8,7 @@ Runner.status + 卷上证据（journal 有无）归档终态，绝不把未知�
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -152,6 +153,12 @@ class Lifecycle:
                 bad = vault_store.placeholder_issues(rec)
                 if bad:
                     return None, f"保险箱记录凭据形态非法：{'；'.join(bad)}"
+                # F9 模型路由（非凭据配置键）恒注入：vault payload 只存凭据面，
+                # HUB_USER_MODEL→ANTHROPIC_MODEL 与凭据同 env-file 通道——vault 有记录时
+                # 不 merge 则模型路由仅在「无记录降级 env 直注」分支生效（组5.1 hub 全链
+                # 实证：容器内 claude 落 CLI 内置默认模型，roc 代理 400 拒裸 Anthropic id）。
+                if self.cfg.user_model:
+                    rec = {**rec, "ANTHROPIC_MODEL": self.cfg.user_model}
                 return rec, "vault"
             print(
                 f"[warn] 保险箱无 user={user} 记录——降级 hub 进程 env 直注"
@@ -275,8 +282,14 @@ class Lifecycle:
                 project=project, prd_input=prd, profiles_root=profiles_root,
                 sources_file=sources_file, env_file=ef,
                 # 4b 任务 3.3：report 双写出口（docker -e 直传——非凭据，与 env-file 分离）；
-                # 落容器内 state 卷（host 可见），run 详情页按 stamp 对齐读
-                container_env=(f"PA_REPORT_DIR={CONTAINER_STATE}/reports",),
+                # 落容器内 state 卷（host 可见），run 详情页按 stamp 对齐读。
+                # 组5.1 hub 全链 #22：hub 进程 env 的 PA_* 透传（编排器 feature flag 如
+                # PA_SINGLE_FLIGHT_AUTO_MERGE 经 hub.env → hub 进程 env → run 容器；破坏性
+                # flag 默认关，部署机按需在 hub.env 本地面开，不进 compose/仓）。sorted 保
+                # 确定性；PA_REPORT_DIR 本处生成，排除防重复。
+                container_env=(f"PA_REPORT_DIR={CONTAINER_STATE}/reports",
+                               *(f"{k}={v}" for k, v in sorted(os.environ.items())
+                                 if k.startswith("PA_") and k != "PA_REPORT_DIR")),
             )
             try:
                 ref = self._runner.start(spec)

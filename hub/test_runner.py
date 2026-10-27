@@ -95,6 +95,7 @@ def test_docker_cmd_pins_mounts_envfile_limits_and_tag():
     assert f"{spec.sources_file}:/opt/pa/.project-auto/sources.yaml:ro" in join  # _run_pipeline 顶部无条件必读
     assert f"{spec.prd_input}:/input/{spec.prd_input.name}:ro" in join           # PRD 只读输入卷（A2）
     assert "--env-file /tmp/e.env" in join                                    # 与切片 2 同通道（D6）
+    assert "--workdir /opt/pa" in join  # vault 根 = run_daily 约定 cwd（persona 相对路径基；#8 实证缺它 critic 读不到 PRD）
     assert "--cpus 2" in join and "--memory 4g" in join
     assert "pa-executor:v0.1.3" in argv
     cmd_at = argv.index("pa-executor:v0.1.3") + 1

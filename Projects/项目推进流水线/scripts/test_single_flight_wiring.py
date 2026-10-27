@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import sys
 import types
+import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -280,3 +282,46 @@ def test_apply_state_dir_none_is_noop():
     finally:
         run_daily.STATE_DIR = before_sd
         run_daily.RUN_LOCK = before_rl
+
+
+# ── run 锁跨 host 接管（组5.1 hub 全链 #27）──────────────────────────
+def test_run_lock_cross_host_stale(tmp_path, monkeypatch):
+    """#27：锁 host ≠ 本机 → 判陈旧自动接管（hub 每 run 一个新容器，残锁 pid=1 在新容器
+    PID namespace 恒判活 → 90min 全堵）。锁文件由 acquire_run_lock 重建（带本机 host）。"""
+    lock = tmp_path / ".run.lock"
+    lock.write_text(json.dumps({"pid": 1, "host": "dead-container-abc",
+                                "started": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+    before = run_daily.RUN_LOCK
+    try:
+        run_daily.RUN_LOCK = lock
+        assert run_daily.acquire_run_lock(break_lock=False) is True   # 跨 host → 接管成功
+        info = json.loads(lock.read_text(encoding="utf-8"))
+        assert info["host"] == os.uname().nodename                    # 重建后带本机 host
+    finally:
+        run_daily.RUN_LOCK = before
+
+
+def test_run_lock_same_host_live_pid_blocks(tmp_path, monkeypatch):
+    """同 host 活 pid（自身）→ 拒绝启动（同机 cron/wka 互斥语义不变；旧锁无 host 字段同理）。"""
+    lock = tmp_path / ".run.lock"
+    lock.write_text(json.dumps({"pid": os.getpid(), "host": os.uname().nodename,
+                                "started": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+    before = run_daily.RUN_LOCK
+    try:
+        run_daily.RUN_LOCK = lock
+        assert run_daily.acquire_run_lock(break_lock=False) is False
+    finally:
+        run_daily.RUN_LOCK = before
+
+
+def test_run_lock_legacy_no_host_same_behavior(tmp_path):
+    """旧锁无 host 字段（现产 cron 锁）→ 沿用 PID 判活：活 pid 照堵、死 pid 照接管。"""
+    lock = tmp_path / ".run.lock"
+    lock.write_text(json.dumps({"pid": 99999999,          # 不存在的 pid → 失活
+                                "started": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+    before = run_daily.RUN_LOCK
+    try:
+        run_daily.RUN_LOCK = lock
+        assert run_daily.acquire_run_lock(break_lock=False) is True
+    finally:
+        run_daily.RUN_LOCK = before

@@ -50,7 +50,7 @@ from stage_contracts import validate_stage, render_repair_hint  # change 2026-07
 import model_routing  # add-per-agent-model-routing：per-agent 模型路由配置解析（config/model-routing.json，零依赖，cron 安全）
 from external_state import ExtResult, ExtState, found, not_found, unknown, sanitize   # OpenSpec fail-safe-dispatch：三态远程查询结果 + 诊断脱敏（纯 stdlib 模块，cron 安全）
 import forge_api   # add-forge-adapter：三平台（github/gitlab/gitcode）Git 托管适配层（纯 stdlib；github=gh CLI thin wrapper 行为等价，gitlab/gitcode=REST 三态）
-from forge_api import ForgeConfigError, dispatch_identity   # permanent 配置类失败（单项目终态）+ dispatch 身份键（host × 全路径）
+from forge_api import ForgeConfigError   # permanent 配置类失败（单项目终态）；dispatch_identity 经 forge_api. 前缀（身份键）
 from coordinator import build_coordinator, preflight  # task 2.1/2.5：runtime coordinator 边界 + flag 组合 preflight（design 决策#1；纯 stdlib，cron 安全）
 from feature_flags import resolve_flags  # add-cross-prd-learning-memory Section 7：learning flag 解析（V1 allowlist + env/profile 三态）
 from loop_runtime import ShadowJournal     # task 3.2：shadow journal 旁路写入器（类型注解用；纯 stdlib，cron 安全）
@@ -1394,15 +1394,25 @@ def repo_owner_repo(repo: str) -> str | None:
         return None
 
 
-def dispatch_key(repo: str, owner_repo: str | None) -> str:
+def dispatch_key(repo: str, owner_repo: str | None, prof: dict | None = None) -> str:
     """dispatch 身份键（add-forge-adapter D4：host × 仓库全路径）。
 
     github.com host 恒定 → 键 = 旧 owner/repo 形态（现产 DISPATCH_LOCKS / slot / 分组键零变化）；
     gitlab/gitcode → 显式 ``host/full/path``（两个 host 同路径是两个仓不共锁；gitlab 多级路径
-    不再被旧两级正则折叠成尾部两级而撞键）。提取失败兜底 owner_repo（行为同旧）。"""
-    host, full = forge_api.remote_origin(repo) if repo else (None, None)
-    if host and full:
-        return dispatch_identity(host, full)
+    不再被旧两级正则折叠成尾部两级而撞键）。
+
+    身份来源（组5.1 hub 全链 #10 实证修订）：dispatch 链的 ``repo`` 是 profile repo 字符串非
+    本地仓路径——remote_origin（本地仓 remote 提取）输入类型错位恒 (None,None)，D4 的
+    host×全路径从未生效。gitlab/gitcode → profile 声明面（归一 host × repo 全路径字段）；
+    github/未声明 → owner_repo 两级（host 恒定省略，与旧键 byte-identical）。"""
+    prof = prof or {}
+    forge = prof.get("forge")
+    if forge == forge_api.FORGE_GITLAB and repo:
+        host = forge_api.bare_host(prof.get("gitlab_host") or "")
+        if host:
+            return forge_api.dispatch_identity(host, repo)
+    elif forge == forge_api.FORGE_GITCODE and repo:
+        return forge_api.dispatch_identity("gitcode.com", repo)
     return owner_repo or ""
 
 
@@ -1411,12 +1421,16 @@ def _forge_api_for(prof: dict | None, repo: str, owner_repo: str | None):
 
     github / 未声明 → ``None``（dispatch 面走下方既有 gh 内联路径，行为零变化——D1 行为等价）；
     gitlab / gitcode → REST adapter（三态按端点分型，401/403 抛 ForgeConfigError=单项目终态）。
-    构造期 fail-fast（非法 forge 值 / 缺 host / 缺 token env）由调用方 catch 映射准入早期 skip。"""
+    构造期 fail-fast（非法 forge 值 / 缺 host / 缺 token env）由调用方 catch 映射准入早期 skip。
+
+    full_path 来源（组5.1 hub 全链 #10 实证修订）：dispatch 链的 ``repo`` 是 profile repo
+    **字符串**（gitlab 约定即仓库全路径 组/子组/仓，clone URL 同源构造），非本地 worktree
+    路径——``repo_full_path``（本地仓 remote 提取）输入类型错位恒 None（容器首跑无本地仓）。
+    字段即唯一真相源，直接用；remote 提取只适用于 dev-agent 面（worktree 内有真仓）。"""
     forge = (prof or {}).get("forge")
     if not forge or forge == forge_api.FORGE_GITHUB:
         return None
-    full_path = forge_api.repo_full_path(repo) if repo else None
-    return forge_api.for_profile(prof, full_path=full_path, owner_repo=owner_repo)
+    return forge_api.for_profile(prof, full_path=repo or None, owner_repo=owner_repo)
 
 
 # ── askpass 注入（add-forge-adapter D5：全部远程 git 操作凭据经 GIT_ASKPASS 脚本）──
@@ -1731,7 +1745,9 @@ def already_dispatched(owner_repo: str, repo: str, devslug: str, fapi=None) -> E
     pr_err, pr_hit = _scan_pr_list_for_slug(owner_repo, devslug, fapi)
     if pr_hit:
         return found(True, pr_hit)
-    branch_err, branch_hit = _scan_remote_branches_for_slug(repo, devslug)
+    # forge 分支：fapi.web_url 直连（容器首跑无本地仓，-C repo 必炸）；github → None 走旧路径
+    branch_err, branch_hit = _scan_remote_branches_for_slug(
+        repo, devslug, remote_url=getattr(fapi, "web_url", None))
     if branch_hit:
         return found(True, branch_hit)
     if pr_err or branch_err:
@@ -1774,10 +1790,18 @@ def _scan_pr_list_for_slug(owner_repo: str, devslug: str, fapi=None) -> tuple[st
         return f"PR 查询异常: {e}", None
 
 
-def _scan_remote_branches_for_slug(repo: str, devslug: str) -> tuple[str | None, str | None]:
-    """git ls-remote origin 里找 auto/* 且含 devslug 的分支。返回 (err, hit_reason)；成功无命中→(None, None)。"""
+def _scan_remote_branches_for_slug(repo: str, devslug: str,
+                                   remote_url: str | None = None) -> tuple[str | None, str | None]:
+    """git ls-remote origin 里找 auto/* 且含 devslug 的分支。返回 (err, hit_reason)；成功无命中→(None, None)。
+
+    remote_url（forge 分支，组5.1 hub 全链 #12 实证补）：直接对 remote URL ls-remote（无需本地仓
+    ——容器首跑 workspace 无仓，``git -C repo`` 把 profile repo 字符串当本地路径必炸 No such
+    directory；token 经 GIT_ASKPASS 进 git，URL 保持无凭据）。None（github/未声明）→ 旧路径
+    ``git -C repo``（真机 workspace 布局镜像 owner/repo，行为零变化）。"""
+    argv = (["git", "ls-remote", "--heads", remote_url] if remote_url
+            else ["git", "-C", repo, "ls-remote", "--heads", "origin"])
     try:
-        out = _net_gate(lambda: subprocess.run(["git", "-C", repo, "ls-remote", "--heads", "origin"],
+        out = _net_gate(lambda: subprocess.run(argv,
                                                capture_output=True, text=True, timeout=20), "ls_remote")
         if out.returncode != 0:
             return f"ls-remote rc={out.returncode}: {(out.stderr or '').strip()[:80]}", None
@@ -2754,7 +2778,11 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
         rec.update(status="skip", skip_reason=f"跳过-forge 配置错（单项目终态）: {e}")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     # ── 准入 2：branch protection 运行时实查（三态）
-    if not owner_repo:
+    # owner_repo 是两级正则（owner/repo）——gitlab 多级路径（组/子组/仓）恒 None（组5.1 hub
+    # 全链 #11 实证：准入被「无 remote」误拒）。forge 分支身份在 fapi（full_path 已构造），
+    # 下方 check_branch_protection / 幂等 / 限量闸的 fapi 路径均不消费 owner_repo——守卫只对
+    # github/未声明面（gh -R 身份）生效，行为零变化。
+    if fapi is None and not owner_repo:
         rec.update(status="skip", skip_reason="跳过-无 remote（取不到 owner/repo）")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ⏭ {slug}: {rec['skip_reason']}"); return rec
     try:
@@ -2814,17 +2842,56 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
     # ── 投递：detached worktree on main → 触发控制面 dev-agent.py（ADR-0006 vault-only 执行器）
     if not log_file.exists():
         log_file.parent.mkdir(parents=True, exist_ok=True)
-    wt = Path(repo) / ".worktrees" / devslug   # verify-loop-discipline A3：worktree 名跟 devslug（非 stamp-slug）——
+    # ── 仓准备（组5.1 hub 全链 #12 补）：本地仓不存在 → clone。真机契约 workspace 仓常驻
+    #    （bootstrap/人工初始化），容器首跑 workspace 空——worktree add 的 ``-C repo`` 直接
+    #    ``No such directory``。URL：forge 分支 fapi.web_url（GIT_ASKPASS 注入凭据，URL 无凭据）；
+    #    github/未声明 → https://github.com/{owner_repo}.git。已存在不 fetch（现产行为零变化）。
+    if not (Path(repo) / ".git").exists():
+        _clone_url = (getattr(fapi, "web_url", None) if fapi is not None
+                      else (f"https://github.com/{owner_repo}.git" if owner_repo else None))
+        if not _clone_url:
+            rec.update(status="fail", skip_reason="仓不存在且无法构造 clone URL（repo/owner_repo 缺）")
+            _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
+        try:
+            Path(repo).parent.mkdir(parents=True, exist_ok=True)
+            # 目标用 name（相对 cwd=parent 解析）——argv 若写全相对路径 repo，git 会相对 parent 再拼
+            # 一次 → 双重嵌套 pa-qa/sub/pa-qa/sub/proj，后续 worktree 的 cwd=repo 随即 Errno 2。
+            _run_capture(["git", "clone", _clone_url, Path(repo).name], str(Path(repo).parent),
+                         600, f"[{slug}:clone]", log_file)
+        except RuntimeError as e:
+            rec.update(status="fail", skip_reason=f"clone 目标仓失败: {e}")
+            _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
+    # owner_repo clone 后重取（组5.1 hub 全链 #23 实证）：dispatch_one 开头的提取在仓准备
+    # 之前——容器首跑仓还不存在，git get-url rc≠0 且 stdout 空（不抛异常）→ None 一路带到
+    # auto-merge 段（circuit_breaker fail-open 吞 TypeError，merge_loop.record_event 炸
+    # 'NoneType' object has no attribute 'replace'）。真机 workspace 仓常驻从未暴露。clone
+    # 段已保证仓存在，此处重取必有值；仍 None（仓真无 remote）保持 fail-loud。
+    if not owner_repo:
+        owner_repo = repo_owner_repo(repo)
+    # repo 绝对形态（组5.1 hub 全链 #15 实证）：worktree add 的 argv 带 ``-C repo`` 且 cwd=repo，
+    # 两者同为相对路径时 git 先 chdir 到 cwd 再把 ``-C`` 解析一次 → repo/repo 双重嵌套 fatal。
+    # 真机 profile repo 是绝对路径（真身机 workspace 布局）从未暴露；容器首跑 repo 为相对形态即炸。
+    # 绝对化一处（clone 段已保证存在），remove/add 的 ``-C`` 全走它。
+    _repo_dir = Path(repo).resolve()
+    wt = _repo_dir / ".worktrees" / devslug   # 绝对形态（#16 实证）：git worktree add 的路径参数相对
+    #   ``-C`` 目录解析——相对 repo 形态会再嵌套一层（/repo/repo/.worktrees/...），add 成功但位置错，
+    #   dev 的 cwd=wt 随即 Errno 2。绝对路径在 git argv / subprocess cwd / Path 操作三处解析无歧义。
+    #   verify-loop-discipline A3：worktree 名跟 devslug（非 stamp-slug）——
     #   同 PRD 各轮 / 崩溃恢复重入确定性清理（同 slug → 同路径 → remove-if-exists 自清；跨 cron 新 PRD
     #   新 slug，见 slug_utils.make_branch 收敛边界注）+ 与分支名一致（A1 branch=auto/<devslug>，
     #   故用 devslug 非原始 stem——stem 含下划线，与分支名会漂）。
     #   worktree 本就跨 verify 轮复用（循环外建一次），此处只改名（R2-A-7）。
     if wt.exists():
-        subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
+        subprocess.run(["git", "-C", str(_repo_dir), "worktree", "remove", "--force", str(wt)],
                        capture_output=True, text=True, timeout=60)
     try:
-        _run_capture(["git", "-C", repo, "worktree", "add", "--detach", str(wt), base],
-                     repo, 120, f"[{slug}:worktree]", log_file)
+        # rc 必须接（#15 实证续）：_run_capture 只在超时抛 RuntimeError，git rc≠0 静默通过会让
+        # verify 闭环深处对不存在的 wt 炸裸 [Errno 2]，skip_reason 误导排障。
+        wrc, _, werr = _run_capture(["git", "-C", str(_repo_dir), "worktree", "add", "--detach", str(wt), base],
+                                    str(_repo_dir), 120, f"[{slug}:worktree]", log_file)
+        if wrc != 0:
+            rec.update(status="fail", skip_reason=f"建 worktree 失败: git rc={wrc} {werr}".strip())
+            _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
     except RuntimeError as e:
         rec.update(status="fail", skip_reason=f"建 worktree 失败: {e}")
         _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
@@ -3106,7 +3173,8 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
                 ML.record_event(STATE_DIR, owner_repo, _prd, "merge_started", stamp_fn=_now_iso, branch=branch, main_ref=base)
                 _merge_cmd = MP.build_merge_cmd(
                     python=_env_python(prof.get("conda_env", "")), dev_agent_py=DEV_AGENT_PY,
-                    branch=branch, main_ref=base, prd_id=_prd, state_dir=str(STATE_DIR))
+                    branch=branch, main_ref=base, prd_id=_prd, state_dir=str(STATE_DIR),
+                    forge=prof.get("forge"), forge_host=prof.get("gitlab_host"))   # #25：PR auto-merge 面平台声明（缺则 gh-only 炸）
                 _merge_json = _run_dev_agent(_merge_cmd, wt, slug, log_file)   # 复用末行 JSON 解析（同 dev loop）
                 _mr = MP.parse_merge_result(_merge_json)
                 if _mr.merged:
@@ -3134,7 +3202,8 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
                         ML.record_event(STATE_DIR, owner_repo, _prd, "revert_started", stamp_fn=_now_iso, merge_commit=_mr.merge_commit)   # task 6.x：revert intent（revert 是独立破坏性 push；crash 在 revert push 中→下轮 has_open_intent True→halt 防重复 revert）
                         _rv_cmd = MP.build_revert_cmd(
                             python=_env_python(prof.get("conda_env", "")), dev_agent_py=DEV_AGENT_PY,
-                            merge_commit=_mr.merge_commit, main_ref=base, prd_id=_prd, state_dir=str(STATE_DIR))
+                            merge_commit=_mr.merge_commit, main_ref=base, prd_id=_prd, state_dir=str(STATE_DIR),
+                            forge=prof.get("forge"), forge_host=prof.get("gitlab_host"))   # #25：同 merge 面（revert 走同一 _pr_automerge）
                         _rvr = MP.parse_revert_result(_run_dev_agent(_rv_cmd, wt, slug, log_file))
                         if _rvr.outcome is MP.RevertOutcome.REVERTED:
                             rec["reverted"] = True
@@ -3400,13 +3469,16 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
             out["note"] = "dev-agent 未上报 test_cmd，跳过独立验证（测试归项目自治）"; return out
         out["test_cmd"] = test_cmd_hint
 
-    vt = Path(repo) / ".worktrees" / f"verify-{stamp}-{slug}"
+    _repo_dir = Path(repo).resolve()  # 绝对形态归一（组5.1 hub 全链 #15：相对 repo × cwd=repo 双重解析）
+    vt = _repo_dir / ".worktrees" / f"verify-{stamp}-{slug}"   # 绝对形态（#16 同因：相对 -C 目录再嵌套）
     if vt.exists():
-        subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(vt)],
+        subprocess.run(["git", "-C", str(_repo_dir), "worktree", "remove", "--force", str(vt)],
                        capture_output=True, text=True, timeout=60)
     try:
-        _run_capture(["git", "-C", repo, "worktree", "add", "--detach", str(vt), branch],
-                     repo, 120, f"[{slug}:verify-wt]", log_file)
+        vrc, _, verr = _run_capture(["git", "-C", str(_repo_dir), "worktree", "add", "--detach", str(vt), branch],
+                                    str(_repo_dir), 120, f"[{slug}:verify-wt]", log_file)
+        if vrc != 0:  # rc 必须接（同 #15）：静默通过 → 后续 npm/测试对不存在 vt 炸裸 Errno 2
+            out["note"] = f"建验证 worktree 失败: git rc={vrc} {verr}".strip(); return out
     except RuntimeError as e:
         out["note"] = f"建验证 worktree 失败: {e}"; return out
     try:
@@ -3450,7 +3522,7 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
         log(f"  {'✅' if trc == 0 else '🔴'} {slug}: 独立验证 {out['note']}")
         return out
     finally:
-        subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(vt)],
+        subprocess.run(["git", "-C", str(_repo_dir), "worktree", "remove", "--force", str(vt)],
                        capture_output=True, text=True, timeout=60)
 
 
@@ -3558,7 +3630,7 @@ def _run_one(entry: dict, prof: dict | None, stamp: str, args) -> dict:
                 "status": "skip", "skip_reason": "profile 不存在"}
     repo = prof.get("repo", "")
     owner_repo = repo_owner_repo(repo) if repo else ""
-    dkey = dispatch_key(repo, owner_repo) if repo else ""   # add-forge-adapter D4：host×全路径身份键
+    dkey = dispatch_key(repo, owner_repo, prof) if repo else ""   # add-forge-adapter D4：host×全路径身份键（prof=身份声明面）
     #   （github.com 退化 owner_repo 两级形态 → 锁/slot 键零变化；gitlab 多级路径不撞尾两级同名仓）
 
     def _learn(rec: dict) -> None:
@@ -3605,7 +3677,7 @@ def _dispatch_serial_by_repo(passed: list[dict], profiles: dict, stamp: str, arg
         prof = profiles.get(e.get("project")) or {}
         repo = prof.get("repo", "")
         owner_repo = repo_owner_repo(repo) if repo else ""
-        groups.setdefault(dispatch_key(repo, owner_repo) if repo else "", []).append(e)
+        groups.setdefault(dispatch_key(repo, owner_repo, prof) if repo else "", []).append(e)
 
     def _run_group_serial(entries: list[dict]) -> list[dict]:
         recs: list[dict] = []
@@ -3627,8 +3699,13 @@ def _dispatch_serial_by_repo(passed: list[dict], profiles: dict, stamp: str, arg
 
 def acquire_run_lock(break_lock: bool) -> bool:
     """获取 run 级互斥锁（SPEC #30 ③ / ADR-0004 §4）。
-    O_CREAT+O_EXCL 原子获取；已存在则判陈旧（PID 失活 OR 锁龄>MAX_RUN_WALL）→ 自动接管（删+重建）；
-    活锁（PID 活且未超龄）→ 返回 False（main exit 2）；--break-lock 强拆重建。"""
+    O_CREAT+O_EXCL 原子获取；已存在则判陈旧（跨 host / PID 失活 OR 锁龄>MAX_RUN_WALL）→ 自动接管
+    （删+重建）；活锁（PID 活且未超龄）→ 返回 False（main exit 2）；--break-lock 强拆重建。
+
+    组5.1 hub 全链 #27 实证：hub 每 run 一个新容器，上个容器异常退出残留的锁（pid=1）在**下一个**
+    容器的 PID namespace 里恒判活（entrypoint 即 pid 1）→ 90min 内所有 run 全堵。锁 payload 加
+    ``host``（uname().nodename = 容器 ID）：锁 host ≠ 本机 → pid 面孔全非直接判陈旧。旧锁无
+    host 字段（现产 cron 锁）→ 沿用原 PID 判活，同机 cron/wka 互斥语义零变化。"""
     if break_lock and RUN_LOCK.exists():
         log(f"🔒 --break-lock：强拆旧 run 锁 {RUN_LOCK.name}")
         try:
@@ -3638,6 +3715,7 @@ def acquire_run_lock(break_lock: bool) -> bool:
     try:
         fd = os.open(RUN_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, json.dumps({"pid": os.getpid(),
+                                 "host": os.uname().nodename,
                                  "started": datetime.now(timezone.utc).isoformat()}).encode())
         os.close(fd)
         return True
@@ -3646,11 +3724,13 @@ def acquire_run_lock(break_lock: bool) -> bool:
     try:
         info = json.loads(RUN_LOCK.read_text(encoding="utf-8"))
         pid = int(info.get("pid", 0))
+        lock_host = info.get("host", "")
         started = info.get("started", "")
     except Exception:
-        pid, started = 0, ""
+        pid, lock_host, started = 0, "", ""
+    stale_host = bool(lock_host) and lock_host != os.uname().nodename   # 跨容器/跨机残留 → 可接管
     stale_pid = False
-    if pid:
+    if pid and not stale_host:
         try:
             os.kill(pid, 0)
         except OSError:
@@ -3662,10 +3742,11 @@ def acquire_run_lock(break_lock: bool) -> bool:
             stale_age = age > MAX_RUN_WALL
         except ValueError:
             stale_age = True            # 时间戳解析不了 → 当陈旧
-    if stale_pid or stale_age:
-        why = ("PID 失活" if stale_pid else "") + ("、" if stale_pid and stale_age else "") + \
-              ("锁龄超限" if stale_age else "")
-        log(f"🔒 检测到陈旧 run 锁（{why}）→ 自动接管（pid={pid}, started={started}）")
+    if stale_host or stale_pid or stale_age:
+        why_parts = [w for w, hit in (("跨 host 残留", stale_host), ("PID 失活", stale_pid),
+                                       ("锁龄超限", stale_age)) if hit]
+        log(f"🔒 检测到陈旧 run 锁（{'、'.join(why_parts)}）→ 自动接管"
+            f"（pid={pid}, host={lock_host or '-'}, started={started}）")
         try:
             RUN_LOCK.unlink()
         except FileNotFoundError:
@@ -3733,7 +3814,7 @@ def stage_dispatch(args, gate: list[dict], profiles: dict, stamp: str, *, worker
         repo = prof.get("repo", "")
         if not repo:
             continue
-        dkey = dispatch_key(repo, repo_owner_repo(repo))
+        dkey = dispatch_key(repo, repo_owner_repo(repo), prof)
         if dkey and dkey not in DISPATCH_LOCKS:
             DISPATCH_LOCKS[dkey] = threading.Lock()
 

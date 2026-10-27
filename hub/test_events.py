@@ -9,6 +9,7 @@ reconcile_running 转发（(run,seq) 去重、频道规则 critic drop/verify �
 D7 接缝：FakeMMClient 记 (recipient, text) 清单，全离线。
 """
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -213,7 +214,11 @@ def test_notifier_none_channel_off_zero_behavior(tmp_path, capsys):
 # ── 3.3 PA_REPORT_DIR env 注入 ───────────────────────────────────
 
 
-def test_container_env_pa_report_dir(tmp_path):
+def test_container_env_pa_report_dir(tmp_path, monkeypatch):
+    """#22：PA_* 透传后本断言须在受控 env 下跑（宿主 PA_* env 不渗进 spec）。"""
+    for k in list(os.environ):
+        if k.startswith("PA_"):
+            monkeypatch.delenv(k)
     lc, d, fake, data = _mk(tmp_path)
     prd = tmp_path / _PRD_NAME
     prd.write_text("# PRD\n", encoding="utf-8")
@@ -223,6 +228,28 @@ def test_container_env_pa_report_dir(tmp_path):
     spec = fake.containers[ref]["spec"]
     assert spec.container_env == (f"PA_REPORT_DIR={CONTAINER_STATE}/reports",)
     assert spec.env_file is not None and spec.env_file.suffix == ".env"  # 凭据通道不混（分离）
+
+
+def test_container_env_passes_pa_flags(tmp_path, monkeypatch):
+    """#22：hub 进程 env 的 PA_* 透传进 run 容器（feature flag 通道，与凭据 env-file 分离）。"""
+    for k in list(os.environ):
+        if k.startswith("PA_"):
+            monkeypatch.delenv(k)
+    monkeypatch.setenv("PA_SINGLE_FLIGHT_AUTO_MERGE", "1")
+    monkeypatch.setenv("PA_GRAPH_ORCHESTRATOR", "0")
+    lc, d, fake, data = _mk(tmp_path)
+    prd = tmp_path / _PRD_NAME
+    prd.write_text("# PRD\n", encoding="utf-8")
+    lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is True
+    ref = d.runs_for_item(1)[0]["container_ref"]
+    spec = fake.containers[ref]["spec"]
+    assert spec.container_env == (
+        f"PA_REPORT_DIR={CONTAINER_STATE}/reports",            # 生成项在前
+        "PA_GRAPH_ORCHESTRATOR=0",                              # sorted 确定性
+        "PA_SINGLE_FLIGHT_AUTO_MERGE=1")
+    # 非 PA_ 前缀不透传（如 HUB_* 面板配置不渗进 run 容器）
+    assert not any(kv.startswith("HUB_") for kv in spec.container_env)
 
 
 # ── 4.1/4.2 无 run 放弃告警 ──────────────────────────────────────

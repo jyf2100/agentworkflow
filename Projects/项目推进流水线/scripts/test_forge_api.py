@@ -119,6 +119,17 @@ def test_remote_host_and_path_multilevel():
     assert remote_host_and_path("not a url") == (None, None)
 
 
+def test_remote_host_and_path_port():
+    """#26：带端口 http URL——端口属 host 不属路径（内网自建 GitLab 常态）。"""
+    assert remote_host_and_path("http://172.32.153.183:8180/pa-qa/sub/proj.git") == \
+        ("172.32.153.183:8180", "pa-qa/sub/proj")
+    assert remote_host_and_path("https://gitlab.example.com:8443/group/repo.git") == \
+        ("gitlab.example.com:8443", "group/repo")
+    # git@host:路径 的 : 后非数字——不匹配端口组，host 停在 :（原有形态行为不变）
+    assert remote_host_and_path("git@gitlab.example.com:group/sub/proj.git") == \
+        ("gitlab.example.com", "group/sub/proj")
+
+
 def test_dispatch_identity_github_omits_host():
     # github.com host 恒定 → 键 = 旧 owner/repo 形态（现产锁键零变化）
     assert dispatch_identity("github.com", "o/r") == "o/r"
@@ -232,12 +243,58 @@ def test_gitlab_merge_409_permanent(gitlab, monkeypatch, status):
 def test_gitlab_merge_405_unknown(gitlab, monkeypatch):
     """组5.1 183 实例实证：MR 创建后 mergeability 异步计算窗口内 PUT /merge 405（同一 MR
     数十秒后可合）；对已 merged MR 重放 merge 也 405——同码混装瞬态/幂等/永久，fail-safe
-    归 UNKNOWN 供 reconcile 重查 MR state 收敛（merged→已完成 / opened→窗口后重试）。"""
+    归 UNKNOWN。#28 起 405 走收敛轮询：不可收敛（永无 mergeable）超时归 UNKNOWN。"""
+    monkeypatch.setattr(forge_api, "MR_MERGE_WAIT_S", 0)
+    monkeypatch.setattr(forge_api, "MR_MERGE_POLL_S", 0)
     install_http(monkeypatch, gitlab, {
         ("GET", "/projects/group"): (200, '{"merge_method":"merge"}'),
         ("PUT", "/projects/"): (405, "{}")})
+    r = gitlab.pr_merge(1, "t", "b")   # default (200,'{}')：MR 回查无 state/mergeable → 即时超时
+    assert r.state is ExtState.UNKNOWN and "收敛超时" in (r.reason or "")
+
+
+def _seq_http(monkeypatch, steps):
+    """按全局调用序号回放 (期望method, (status, body))——405 收敛场景同路径多次调用需序敏感。"""
+    calls = {"n": 0}
+
+    def fake_http(self, method, path, *, query=None, body=None):
+        i = calls["n"]
+        calls["n"] += 1
+        exp_method, resp = steps[i]
+        assert method == exp_method, f"call {i + 1}: {method} != 预期 {exp_method}"
+        return resp
+
+    monkeypatch.setattr(_GitlabApi, "_http", fake_http)
+    return calls
+
+
+def test_gitlab_merge_405_converge_retry_succeeds(gitlab, monkeypatch):
+    """#28：405 → 收敛回查 mergeable → 重试 PUT 200 → 双 parent 验证 FOUND。"""
+    monkeypatch.setattr(forge_api, "MR_MERGE_POLL_S", 0)
+    _seq_http(monkeypatch, [
+        ("GET", (200, '{"merge_method":"merge"}')),                                # 1 项目设置
+        ("PUT", (405, "{}")),                                                      # 2 首次 merge（窗口）
+        ("GET", (200, '{"state":"opened","detailed_merge_status":"mergeable"}')),  # 3 收敛回查
+        ("PUT", (200, "{}")),                                                      # 4 重试 merge
+        ("GET", (200, '{"state":"merged","merge_commit_sha":"shaaaa"}')),          # 5 verify MR
+        ("GET", (200, '{"parent_ids":["p1","p2"]}')),                              # 6 verify commit
+    ])
     r = gitlab.pr_merge(1, "t", "b")
-    assert r.state is ExtState.UNKNOWN and "405" in (r.reason or "")
+    assert r.state is ExtState.FOUND and r.value == "shaaaa"
+
+
+def test_gitlab_merge_405_converge_already_merged(gitlab, monkeypatch):
+    """#28 幂等面：对已 merged MR 重放 merge 同 405 → 收敛回查 state=merged → 幂等成功 + 双 parent。"""
+    monkeypatch.setattr(forge_api, "MR_MERGE_POLL_S", 0)
+    _seq_http(monkeypatch, [
+        ("GET", (200, '{"merge_method":"merge"}')),                        # 1 项目设置
+        ("PUT", (405, "{}")),                                              # 2 已 merged 重放
+        ("GET", (200, '{"state":"merged","merge_commit_sha":"shaaaa"}')),  # 3 收敛回查
+        ("GET", (200, '{"state":"merged","merge_commit_sha":"shaaaa"}')),  # 4 verify MR
+        ("GET", (200, '{"parent_ids":["p1","p2"]}')),                      # 5 verify commit
+    ])
+    r = gitlab.pr_merge(1, "t", "b")
+    assert r.state is ExtState.FOUND and r.value == "shaaaa" and "双 parent" in (r.reason or "")
 
 
 # ── pr_create 409：幂等 recheck 复用（审核修复 M6，对齐 gh 面 A5）─────
