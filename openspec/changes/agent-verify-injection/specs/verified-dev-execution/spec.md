@@ -23,7 +23,7 @@ Any anchor violation invalidates the result fail-closed. A session that exceeds 
 #### Scenario: Command-form variants preserve exit-code semantics are matchable
 
 - **WHEN** the verify agent executes the declared test command in a chained or prefixed form whose exit code is still semantically the test command's (e.g. `cd <worktree> && npm test`, `rm tmp && npm test` — chain exit code = tail command's; a short-circuited chain yields the failed prefix's non-zero code)
-- **THEN** the orchestrator's stream matching uses tail-segment semantics (the same exit-code-trust function as the dev-side evidence collector) and the tool_result exit code is admitted as verdict evidence
+- **THEN** the orchestrator's stream matching uses tail-segment semantics (sharing the same tail-segment and exit-code-semantics primitives as the dev-side evidence collector, while the identity predicate here — executed command ≡ declared command — stays a separate implementation from the dev side's trust predicate) and the tool_result exit code is admitted as verdict evidence
 - **BUT WHEN** the executed form corrupts exit-code semantics (pipes, output redirection, command substitution, backgrounding)
 - **THEN** the command is not matchable and the result is `unresolved` → invalid — never guessed green
 

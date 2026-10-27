@@ -157,6 +157,7 @@ class ArtifactKind(str, Enum):
     REFLECTION = "reflection"              # add-cross-prd-learning-memory task 1.2：终态反思全量输出（sanitized）
     LESSONS_BLOCK = "lessons_block"        # add-cross-prd-learning-memory Section 5 接线：dispatch-entry 注入 dev-agent 的 lesson block（sanitized checklist；ADR-0001 控制面/目标面边界）
     HANDOFF = "handoff"                    # add-dev-handoff-artifact 组4：dev 亲笔交接工件（```handoff``` 围栏 JSON → content-addressed 落盘 + iteration_handoff journal 事件引用）
+    ACCEPTANCE_SUITE = "acceptance_suite"  # agent-verify-injection 1.1：验收测试套件 bundle（persona 外部编写 → content-addressed 落盘 + acceptance_tests journal 事件；逐文件 digest 供 verify 锚③ 复核）
 
 
 class AssuranceTier(str, Enum):

@@ -73,7 +73,7 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 - **机械活**（确定性、零 LLM、纯 Python）：今日新文件发现、date-marker、文件读写、去重清单、journal 事件、副作用的 exactly-once reconcile。
 - **语义活**（交给 headless persona）：抽信号 / 翻译 PRD / 对抗审 PRD / 审 dev 产出。
 
-### 9 个 headless persona（`.claude/agents/pa-*.md`）
+### 10 个 headless persona（`.claude/agents/pa-*.md`）
 每个 persona 由编排器经 `claude --agent <persona> -p --output-format json --max-turns N` 链式调用；stdout 是信封 JSON，**两层解析**：`json.loads(stdout)["result"]` 再 `json.loads` 一次得 payload。
 
 | persona | 角色 |
@@ -83,6 +83,7 @@ bash install_cron.sh              # 系统级改动，须用户本人在终端�
 | pa-radar | 信号雷达（抽技术信号 + 比对打分去重） |
 | pa-prd | 信号 × profile → PRD |
 | pa-prd-critic | PRD 对抗质量闸（默认怀疑，只判「有据+可执行」） |
+| pa-test-author | 验收测试编写（critic pass 后）：过闸 PRD 验收点（稳定 id）× profile harness 声明 → 可执行验收测试 bundle（每测试标注 criterion id；产物 content-addressed 入 `acceptance_store`，dev/verify 双注入；观测面 fail-open 不拦 dispatch） |
 | pa-progress | dev 内循环方向抽查（每 K=10 turn 判 on_track/off_track；off_track→redirect_hint 纠偏 1 次，连续 2 次止损；由 dev-agent.py 链式调用） |
 | pa-verify | dev 产出验证闸（审 diff + 全量测试，判绿/红，2 次重做机会） |
 
@@ -103,7 +104,7 @@ cron 会崩，所以调度是 journal-driven 的：`journal.py`（事件流）�
 persona 调用**默认省略 model 参数** → 走 roc LiteLLM 代理默认（`glm-5.2`）。**切勿传裸 Anthropic model id**（会被代理拒绝）。
 
 **per-agent 模型路由**（spec: `openspec/specs/per-agent-model-routing/`，默认零变更）：每个 agent 可经 env 单独配模型，不设 = 走 roc 默认（baseline 不变）。
-- **persona**（8 个）：env `PA_PERSONA_MODEL_<AGENT>` → CLI `--model=<值>`（equals 单 token）。`<AGENT>` = `agent_name.upper().replace('-', '_')`（如 pa-progress → `PA_PERSONA_MODEL_PA_PROGRESS`、pa-fetch-github-repo → `PA_PERSONA_MODEL_PA_FETCH_GITHUB_REPO`）。两处 base_cmd 镜像（`scripts/persona_call.py` + `scripts/run_daily.py`）；空串 env warn、命中记 route 审计 log。
+- **persona**（9 个）：env `PA_PERSONA_MODEL_<AGENT>` → CLI `--model=<值>`（equals 单 token）。`<AGENT>` = `agent_name.upper().replace('-', '_')`（如 pa-progress → `PA_PERSONA_MODEL_PA_PROGRESS`、pa-fetch-github-repo → `PA_PERSONA_MODEL_PA_FETCH_GITHUB_REPO`、pa-test-author → `PA_PERSONA_MODEL_PA_TEST_AUTHOR`）。两处 base_cmd 镜像（`scripts/persona_call.py` + `scripts/run_daily.py`）；空串 env warn、命中记 route 审计 log。
 - **dev loop**：`PA_DEV_MODEL` env（cron 经 subprocess 继承）或 `dev-agent.py --model`（手动/canary）；优先级 flag > env > roc 默认（flag 精确语义 `is not None`：空 flag 胜出不回退 env）。
 - **值约束**：roc fast alias（`haiku` / `sonnet` / `opus` / `fable`）或裸 `glm-*`。`haiku` = glm-5.1（更轻），其余 = glm-5.2[1M]。裸 Anthropic id 被 roc 拒（运行时）。详见 `openspec/specs/per-agent-model-routing/`。
 - **配置点（主）**：`Projects/项目推进流水线/config/model-routing.json`（独立文件，纯 JSON）——`model_routing.py` 解析，3 消费点（`persona_call`/`run_persona`/`_dev_cmd`）读它。例：`{"pa-progress": "haiku", "dev": "sonnet"}`。不设 = 默认 glm-5.2。

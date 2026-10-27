@@ -6,6 +6,7 @@
 
 **项目 (Project)**:
 roc 自有的代码仓库（github.com/jyf2100/ 或 okwinds/ 下），位于 /Users/roc/workspace/，有 GitHub remote，经白名单准入。是 [[开发 agent]] 唯一会改动、开 PR 的对象。
+profile 可选字段（agent-verify-injection 1.5 扩展，均缺省 = 无验收套件）：`harness`（验收测试载体，v1 支持集 jest/pytest，集外显式降级 no_harness 不猜测）、`verify_test_cmd`（verify agent 会话内跑测试的命令）、`env`（工具链级环境声明，v1 记录不阻断）。
 _Avoid_: 仓/代码库（太泛）、vault 子目录（那些不是项目）、上游 fork 作为目标。
 
 **大脑 (Brain)**:
@@ -91,6 +92,22 @@ _Avoid_: memory、cache、knowledge base（太泛）、RAG（V1 明确 Non-Goal�
 **dev 交接 (Handoff)**:
 同 PRD 跨 iteration 的 **dev 亲笔**结构化自述（```handoff``` 围栏 JSON，五列表 done/in_progress/blockers/tried_and_failed/next + rationale，≤4KB）——dev 会话三类断点（verify revise / stalled·off_track retry / 崩溃 kill）后，新 dev 会话拿到的上一轮第一手进度。链路：dev-agent 写侧原子快照 `wt/state/runs/handoff-latest.json` → 编排器落 content-addressed artifact + journal 事件 `iteration_handoff`（dev_out 缺失时从快照**收养**，事件标 `adopted_from_snapshot: true`）→ 下轮经 `--handoff-artifact`+`--handoff-digest`（fail-closed 校验）注入 prompt 独立标记块，recovery summary 的 decisions/next_action 优先取自述。**仅上下文非判据**：任何 verdict/gate/retry 决策不读 handoff 内容；观测层 fail-open（store 失败不拖垮 dispatch）。范畴区分（vs 近邻）：feedback artifact 是 verify **判据**（编排器→dev）；lessons 是**跨 PRD** 先验；journal 事件是**机械**事实；handoff 是同 PRD 的 dev **亲笔**。disabled-by-default flag ``PA_LOOP_DEV_HANDOFF`` gate（⇒ journal_shadow），off = prompt/JSON/文件 byte-identical baseline。
 _Avoid_: handover、总结（太泛）、progress report（那是 run_log 过程日志）、claude-progress（参照系名，非本实现）。
+
+**验收套件 (Acceptance Suite)**:
+PRD 验收点（稳定 id）经 [[pa-test-author]] 编写成的可执行测试 bundle——content-addressed 落 `state/acceptance_store/`（digest 寻址），每测试标注 criterion id（traceability 机械可查），重编写走 supersedes 版本链（新 digest 只对**下一次 dispatch** 生效；iteration 开始快照 digest，mid-iteration 重编写不换考卷）。critic pass 后编写（fail-open 不拦 dispatch）；收集级自检破损 → 扣留缺席。dev 与 verify **双注入**同源同 digest（同 iteration 不变式：dev 上报 ≠ 快照 → invalid 分流）。
+_Avoid_: 测试用例（太泛）、unit tests（那是项目自有的）、verify 测试（无此词）。
+
+**注入件 (Injected Test Files)**:
+编排器**机械拷入** dev worktree 与 verify worktree 的考卷文件集（非 agent 自写）——位置 = bundle 内 rel path（锚② untracked 白名单的判定基准），身份 = digest（dev 经 `--acceptance-tests`+`--acceptance-digest` 拿到，verify 侧机械拷贝同源）。dev 侧注入测试是 recognized project test（红 → `test_failed` 拦发布），注入件被编辑 = 证据新鲜度破坏；verify 侧逐文件 sha256 复核（锚③）。
+_Avoid_: fixture（泛）、考卷（口语，正式写 acceptance suite）。
+
+**三锚 (Three Anchors)**:
+verify agent 轨的**机械判定锚**（零 LLM 判读，防 agent 会话谎报）：① 命令同一性——transcript Bash 命令链末端段与 declared cmd（`declared_suite_cmds_for` 机械构造，与 prompt 指令同一来源）全等；② 工作区净——`git diff`/`--cached` 空 + untracked ⊆ 注入集；③ 注入件 digest——逐文件 sha256 复核。全过+exit 0 → green；跑完有非零 → red；unresolved/锚 violation/超时/load 失败 → **invalid**（不可判读 ≠ 红，不进 revise 回环，triage 收尾）。
+_Avoid_: checkpoint、evidence（那是 test_evidence 发布门证据）。
+
+**verify agent 轨 (Verify Agent Track)**:
+`PA_VERIFY_AGENT` flag（默认 off）开的 verify 第二轨——verify worktree 内 headless verify agent 会话（编排器**机械拷入**考卷非 agent 自写），三锚判定 + verify-report（含环境奇偶节）落 `state/runs/`。off = 机械轨 byte-identical（npm ci+test / dev 上报命令重放）。invalid 三态契约：green/red/invalid，invalid → `status=verify_invalid`（terminal `external_blocked`）+ triage_reason 候选 `acceptance_suite_defective_candidate`。
+_Avoid_: verify 闭环（那是 dispatch 整个 for-round 循环）、pa-verify（那是语义审查 persona，两道闸）。
 
 ## 编排拓扑（LangGraph 重构后引入）
 

@@ -33,10 +33,10 @@
 在 critic 后写：测试从**过闸的** PRD 派生（不过闸的 PRD 不值得写测试）。对 dev 可见（TDD 语义：验收点本来就在 PRD 里可见，测试不隐藏信息增量；防 overfit 靠「测试锚定验收点语义」而非隐藏）。备选 verify 前写且对 dev 隐藏——否决：错位风险大于 overfit 风险，且 dev 盲做命中率低浪费轮次。
 
 ### D4 verify agent 会话形态
-headless `claude -p --output-format stream-json`（编排器捕获原始字节流）于 verify worktree，`--allowedTools "Bash"`（Read 可给可不给——判定不靠它读；给了便于诊断，v1 给）。**stream-json 仓内零先例**（persona 走 json 信封、SDK 流在 prompt_stream 另路）——tasks 2.0 前置冒烟锚定事件结构（本体论审核 B3）。prompt 结构化注入：env spec + 验收测试位置 + 全量门命令（优先序：profile `verify_test_cmd` > dev hint > 无则只跑注入测试），明确围栏（禁改任何文件，装依赖/工具链可）。超时沿用 `VERIFY_INSTALL_TIMEOUT` / `VERIFY_TEST_TIMEOUT` 量级合并为会话墙钟上限。install 失败（agent 跑不到 test cmd）→ transcript 无匹配 tool_result → `unresolved` → invalid/triage（基建红语义，沿 verify-loop-discipline B2 三分管方向，不进 revise 回环）。**会话墙钟超时同映射 invalid（非红）**——对齐机械轨 `_run_capture` 超时抛 RuntimeError 的非失败码语义（run_daily.py:1806），超时是不可判读不是失败（测试学二审 T4）。
+headless `claude -p --output-format stream-json`（编排器捕获原始字节流）于 verify worktree，`--allowedTools "Bash"`（Read 可给可不给——判定不靠它读；给了便于诊断，v1 给）。**stream-json 仓内零先例**（persona 走 json 信封、SDK 流在 prompt_stream 另路）——tasks 2.0 前置冒烟锚定事件结构（本体论审核 B3）。prompt 结构化注入：env spec + 验收测试位置 + 全量门命令（优先序：profile `verify_test_cmd` > dev hint > 无则只跑注入测试），明确围栏（禁改任何文件，装依赖/工具链可）。超时会话墙钟上限按 run 环境分档（D13）：本机形态沿用 `VERIFY_INSTALL_TIMEOUT` / `VERIFY_TEST_TIMEOUT` 量级合并；hub 容器形态对齐 dev 会话语义量级（容器 `npm ci` 冷缓存数分钟——m14 教训：预算贴爆表现为 300s 壳装 900s 活）。install 失败（agent 跑不到 test cmd）→ transcript 无匹配 tool_result → `unresolved` → invalid/triage（基建红语义，沿 verify-loop-discipline B2 三分管方向，不进 revise 回环）。**会话墙钟超时同映射 invalid（非红）**——对齐机械轨 `_run_capture` 超时抛 RuntimeError 的非失败码语义（run_daily.py:1806），超时是不可判读不是失败（测试学二审 T4）。
 
 ### D5 三锚实现 + 证据落盘
-1. **退出码 + stdout**：解析编排器捕获的 stream-json，匹配 declared cmd，取对应 tool_result 的 **exit code**（判绿红）与 **stdout**（落 `test_log`——runner 原始输出保留，主 spec「Line-anchored verify feedback」的行锚解析输入在新轨不断供，本体论审核 B1）。**匹配语义 = 末端段匹配（本体论二审 F1/F2，2026-10-27）**：链式拆段（`;` / `&&`），末端段匹配 declared cmd 即采信——`a && npm test` 的 exit code 语义上就是末端命令的（短路 = 前置失败码 ≠ 0，fail-safe 方向安全）；段内含 `|` `>` `<` `` ` `` `$(` 不匹配（管道吞 exit code = 假绿风险）。**与 dev 侧证据面同源**（`dev-agent.py is_clean_test_cmd` v0.1.14 起的语义——m11 实证：85 turn 会话里 LLM 对「跑测试」只有 1 次裸命令、其余全是 `rm x && npm test` / `cd wt && npm test` 形态变体；旧版前缀匹配设计会在此形态下高频 unmatched → invalid 率把 agent 轨打成不可用）。实现面复用/抽出同一判定函数，两消费点（dev 采集端 + verify 锚①）一份语义。匹配不到 → `unresolved` → invalid（保守，绝不猜绿）。
+1. **退出码 + stdout**：解析编排器捕获的 stream-json，匹配 declared cmd，取对应 tool_result 的 **exit code**（判绿红）与 **stdout**（落 `test_log`——runner 原始输出保留，主 spec「Line-anchored verify feedback」的行锚解析输入在新轨不断供，本体论审核 B1）。**匹配语义 = 末端段匹配（本体论二审 F1/F2，2026-10-27）**：链式拆段（`;` / `&&`），末端段匹配 declared cmd 即采信——`a && npm test` 的 exit code 语义上就是末端命令的（短路 = 前置失败码 ≠ 0，fail-safe 方向安全）；段内含 `|` `>` `<` `` ` `` `$(` 不匹配（管道吞 exit code = 假绿风险）。**与 dev 侧证据面同源**（`dev-agent.py is_clean_test_cmd` v0.1.14 起的语义——m11 实证：85 turn 会话里 LLM 对「跑测试」只有 1 次裸命令、其余全是 `rm x && npm test` / `cd wt && npm test` 形态变体；旧版前缀匹配设计会在此形态下高频 unmatched → invalid 率把 agent 轨打成不可用）。实现面**共享拆段原语**（链式拆段、末端段提取、危险结构检测——`|` `>` `<` `` ` `` `$(`），一份语义两消费点（dev 采集端 + verify 锚①）；两个**谓词分开实现勿合一**（本体论再审 2026-10-27）：dev 采集端 `is_clean_test_cmd` 是**信任谓词**（这条自报命令可信吗——白名单/上限），verify 锚①是**同一性谓词**（执行的命令 ≡ declared cmd）。若照「同一函数」合一，信任谓词的段数/形态上限会泄漏进匹配面，把 agent 会话里合法的链式变体（`cd wt && rm tmp && npm test`）错杀成 unmatched——共享的正确粒度是原语层，不是整判定函数。匹配不到 → `unresolved` → invalid（保守，绝不猜绿）。
 2. **tracked 不变**：会话后 `git -C vt diff --quiet && git diff --cached --quiet`；untracked 检查 = `git status --porcelain` 的非 ignored 项必须 ⊆ 注入集。
 3. **注入件 digest**：对注入文件集逐个重算 sha256（`artifact_store.compute_digest`）对账注入时 digest。
 4. **证据落盘 + 完整测试报告（B2 + 用户追加 2026-10-26）**：原始 stream（或锚证据子集 + digest）持久化到 `state/runs/`，与 test_log 同目录同生命周期——agent 轨的判定证据必须 durable 可复核（invalid triage / crash 复核有可回看对象），与机械轨 test_log / journal 同类别。**每次 verify 完成（绿/红/invalid，两轨统一）编排器产完整结构化测试报告**落 `state/runs/<stamp>.verify-report.json`：run 身份（PRD/iteration/branch/stamp）+ 命令来源与 declared 命令清单 + 逐命令 exit code 与输出指针（test_log 路径）+ 锚检查结果（agent 轨）或 install/test rc（机械轨）+ 判定与证据指针（test_log / 原始 stream / 注入件 digest 清单）+ 会话元（turns/时长/命令来源 profile|dev-reported|none）+ **环境奇偶节**（declared env spec vs transcript 观测到的实际组装事实——Bash 命令机械提取；v1 记录不阻断，奇偶分歧升门留 v2，测试学二审 T3）；dispatch record 持报告路径。报告是 verify 阶段的输出契约，机械可查（零 LLM 组装），pa-verify / triage / report 阶段共消费。
@@ -54,10 +54,19 @@ dev 侧注入定位为 **TDD 目标引导（软）**：注入件给 dev 可见�
 ### D11 pa-test-author 不建拒因反馈环（本体论二审 F6，2026-10-27——显式决策非遗漏）
 对比 m11 缺口②为 progress persona 建的拒因回传环：pa-test-author 的产出被收集级自检扣留后**直接缺席不重试**（fail-open 不拦 dispatch，全量门兜底）。显式决策：编写是单次会话、无循环可回传；oracle 缺陷的修正走 T2 supersedes 版本链（triage 确认后重编写），不靠编写时自纠。若未来缺席率高再立反馈环，不预先建。
 
+### D12 verify agent 会话归类 persona 范畴，参数面共享非手拼（本体论再审 2026-10-27）
+verify agent 的**存在方式**与 persona 同构（headless、`-p` 单发、编排器 subprocess 链式调、stdout 机器面）——它是 persona 范畴的新实例，不是新调用范畴；差异仅 `--output-format stream-json`（vs json 信封）与解析面。实施含义：**base_cmd 参数面经 persona_call 共享**（model routing equals 形式、`--effort`（默认 medium）、PA_PONYTAIL、PA_CLAUDE_BIN 解析——m16/m18 后这些已是既定行为面），不在 verify_agent.py 第三处手拼；否则参数本体三处分叉（persona_call / run_daily.run_persona 镜像面 / verify_agent），twin 测试锁不住第三处。stream-json 解析面与信封面各自独立实现。per-agent model routing 是否为 verify agent 开 env key 留实施定（默认走 roc 默认即可；归入 persona 范畴后架构上自然获得该能力）。
+
+### D13 run 环境实体：本机 cron / hub 容器两态（本体论再审 2026-10-27）
+verify 的实施面随 run 环境变，工件显式持两态而非默认本机（m10-m18 六缺口中②⑤⑥本质是此实体缺失的学费）：
+- **路径**：hub 容器内 `state/runs/` 落盘必须命中挂载卷（`/data/pa/...`）——run 容器销毁后证据必须在宿主侧可复核（B2 durable 语义的容器面）；VAULT_ROOT 推导链在容器内取挂载点。
+- **claude CLI**：容器内是 `/usr/local/bin/claude`（无 nvm）；`PA_CLAUDE_BIN` 覆盖语义不变，解析经 persona_call 共享面自然继承（D12）。
+- **超时预算**：本机形态沿用 `VERIFY_*` 量级；容器形态对齐 dev 会话语义（3600s 量级）——容器 `npm ci` 冷缓存数分钟，沿用本机量级会重演 m14 型贴爆（D4 已同步）。
+
 依赖注记（F7）：注入测试进 dev worktree 后被 `npx jest test/x` / `node --test test/x` 形态跑到、且被 `is_clean_test_cmd` 认定为可信证据——依赖 dev-agent v0.1.14 起的形态识别（链式/node --test/npx），本 change 实施基线须含该版本，勿从旧基线分叉。
 
 ### D6 flag-gated + canary cutover + graph 对称
-`PA_VERIFY_AGENT`（feature_flags.py，默认 off = 现行为 byte-identical）。`graph_pa_verify` / `graph_pa_nodes` 直调面对称同改（flag off 零变化）。cutover 证据：双跑 canary（机械轨 vs agent 轨同 PRD 对账绿红分布；分歧样本人工 triage）≥3 轮后可切默认——默认切换独立决策，不在本 change 内完成。**shadow parity / graph cutover canary 一律 `PA_VERIFY_AGENT=off` 跑**（本体论审核 C2：on 会把 LLM 非确定性注入 dispatch 终态分布，污染 matched 判定——与 `--dispatch-skip-dev` 零 LLM 原则同源）。
+`PA_VERIFY_AGENT`（feature_flags.py，默认 off = 现行为 byte-identical）。`graph_pa_verify` / `graph_pa_nodes` 直调面对称同改（flag off 零变化）。cutover 证据：双跑 canary（机械轨 vs agent 轨同 PRD 对账绿红分布；分歧样本人工 triage）≥3 轮后可切默认——默认切换独立决策，不在本 change 内完成。**shadow parity / graph cutover canary 一律 `PA_VERIFY_AGENT=off` 跑**（本体论审核 C2：on 会把 LLM 非确定性注入 dispatch 终态分布，污染 matched 判定——与 `--dispatch-skip-dev` 零 LLM 原则同源）。**分歧 triage 第一刀（canary 绿红谓词不同源的显式化，本体论再审 2026-10-27）**：机械轨 green 谓词 = 全量门过；agent 轨 green 谓词 = 注入验收测试 ∧ 全量门 ∧ 三锚净——两谓词不同源，分歧 ≠ 单一噪声源。triage 先按象限分解：**机械绿/agent 红 ≈ 注入面语义增量**（预期分歧——正是本 change 要抓的）；**机械红/agent 绿 ≈ agent 执行面救活了基建红**（意外——查 verify-report 环境奇偶节归因）；**双红但红因不同 ≈ 执行面噪声**。对账结论按象限报分布，不报单一差异率。
 
 ### D7 harden-verify-test-scope 归并
 其唯一 delta requirement「Independent verification test scope」的场景（优先序/来源标注/回归锚）已逐条并入本题 ADDED「Independent verification execution and scope」。原目录（0/9 未施）归档，tasks 含收尾步骤。
@@ -66,7 +75,7 @@ dev 侧注入定位为 **TDD 目标引导（软）**：注入件给 dev 可见�
 
 - [每次 verify 烧一次 agent 会话（绿路径不再零 token）] → 会话 max-turns 收紧（执行型任务 ~10 turn 量级）+ 只在 dispatch 到 verify 步才起会话；成本换环境自适应，用户已裁决接受。
 - [agent 越权改文件] → 锚②③机械拦截，invalid fail-closed + triage；围栏同时写进 prompt（软）与锚（硬）。
-- [stream-json 命令匹配误判] → 归一化前缀匹配 + 匹配不到一律 `unresolved`→invalid（宁可 triage 不猜绿）；测试锁归一化器。
+- [stream-json 命令匹配误判] → 末端段匹配（F1/F2）+ 匹配不到一律 `unresolved`→invalid（宁可 triage 不猜绿）；测试锁拆段原语与两谓词（信任/同一性分开——D5.1）。
 - [验收测试与项目意图错位（persona 写偏）] → 编写依据=过闸 PRD 验收点 + traceability（每测试标 criterion id，机械可查覆盖）；错位残余由 pa-verify 语义审查兜底。
 - [harness 面外项目（profile 没声明 harness）] → 不编写、显式记缺席（不造假测试面）；全量门仍跑 `verify_test_cmd`。
 - [oracle 缺陷误归为代码红] → 收集级失败签名机械可辨（pytest exit 2 / jest suite-level）+ triage 语义确认双闸；重编写走 digest 版本链不烧 revise 预算（测试学二审 T2）。

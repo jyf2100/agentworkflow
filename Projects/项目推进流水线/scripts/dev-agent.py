@@ -61,6 +61,7 @@ from slug_utils import dev_slugify, make_branch   # ADR-0006 #5：dev_slugify �
 import handoff   # add-dev-handoff-artifact：dev 亲笔交接契约纯模块（写侧吸收/快照 + 读侧注入校验渲染；纯 stdlib）
 from bash_allowlist import decide_bash   # ADR-0006 #7：Bash 命令放行判定（无依赖模块，同上）
 from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # OpenSpec verified-dev-execution：结构化测试证据 + 发布硬门（无依赖模块，同上）
+import test_cmd_primitives   # agent-verify-injection 2.2：链式拆段原语层（D5.1 一份语义两消费点；无依赖模块，同上）
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
 import sdk_compat_patch                   # ADR-0006 #7（migrate-dev-agent-streaming-with-1106-patch）：#1106 keep-alive 定向 patch，根治 #1105（零依赖模块，apply 内延迟 import SDK）
 from external_state import sanitize   # C2 脱敏：git()/gh() stderr 进 JSON error 前抹 token（无依赖模块，同上）
@@ -115,7 +116,11 @@ def parse_args(argv: list[str]) -> dict:
            # add-dev-handoff-artifact：dev 亲笔交接。expect=写侧契约启用（控制面 dev_handoff flag 透传；
            # SDK 0.2.128 无 append_system_prompt → 契约进 build_prompt，缺省 off 保 baseline byte-identical）；
            # artifact/digest=读侧注入（同 --feedback-artifact 模式 + digest fail-closed，见 build_prompt）。
-           "expect_handoff": False, "handoff_artifact": None, "handoff_digest": None}
+           "expect_handoff": False, "handoff_artifact": None, "handoff_digest": None,
+           # agent-verify-injection 1.6：验收测试套件注入。控制面在 critic pass 后经 pa-test-author
+           # 编写、content-addressed store 落 bundle；dispatch 把 bundle path + digest 透传至此（同
+           # --handoff-artifact 模式 digest fail-closed）。baseline 不传 → 空 block，prompt byte-identical。
+           "acceptance_tests": None, "acceptance_digest": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -145,6 +150,8 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--expect-handoff": out["expect_handoff"] = True                  # add-dev-handoff-artifact：写侧契约启用
         elif a == "--handoff-artifact": out["handoff_artifact"] = argv[i + 1]; i += 1  # 读侧注入：上一轮 dev 交接 artifact
         elif a == "--handoff-digest": out["handoff_digest"] = argv[i + 1]; i += 1   # 注入完整性（sha256:<hex>；不匹配 fail-closed）
+        elif a == "--acceptance-tests": out["acceptance_tests"] = argv[i + 1]; i += 1    # agent-verify-injection 1.6：验收套件 bundle path（红→绿注入面）
+        elif a == "--acceptance-digest": out["acceptance_digest"] = argv[i + 1]; i += 1  # 注入完整性（sha256:<hex>；不匹配 fail-closed，同 handoff 模式）
         elif a in ("-h", "--help"): out["help"] = True
         i += 1
     return out
@@ -163,6 +170,8 @@ HELP = """dev-agent.py — 项目推进流水线·控制面标准执行器（ADR
   --forge-host     gitlab 自托管 host（forge=gitlab 必带）
   --expect-handoff 启用 dev 交接契约（每阶段回复末尾携带 ```handoff``` 围栏块；控制面 dev_handoff flag 透传）
   --handoff-artifact 上一轮 dev 交接 artifact path（+ --handoff-digest sha256:<hex> 完整性校验；baseline 不传）
+  --acceptance-tests 验收测试套件 bundle path（agent-verify-injection；+ --acceptance-digest sha256:<hex>
+                    fail-closed；控制面 dispatch 传入，baseline 不传）
 退出码: 0 OK | 10 无/读不到 PRD（或 handoff artifact 完整性失败） | 11 SDK 失败 | 12 stalled | 13 git/PR 失败 | 14 forge 配置类永久失败
         （401/403 token 无效/权限缺——重试必败，hub 队列对 14 不重派；本体论审核 M2，2026-10-26）
         | 15 off_track | 99 未捕获"""
@@ -443,7 +452,7 @@ def classify_test_exit(tool_result: ToolResultBlock, text: str) -> str | None:
 
 
 def is_clean_test_cmd(cmd: str) -> bool:
-    """判定 Bash command 是否为「干净」的测试运行（SPEC #27：捕获端过滤）。
+    """判定 Bash command 是否为「干净」的测试运行（SPEC #27：捕获端过滤）——**信任谓词**。
 
     exit code 可信性过滤（非安全过滤——dev 本就能跑任意 Bash）：采信裸测试命令与
     ``a && b`` / ``a; b`` 链（链的 exit code = 末端命令的；``&&`` 短路 = 前置失败码
@@ -451,12 +460,16 @@ def is_clean_test_cmd(cmd: str) -> bool:
     ``|><&``` 与 ``$(``（管道吞 exit code=假绿风险；重定向/替换/后台为变形面）。
     跨语言：python tests / pytest / unittest / npm test / npx|yarn / node --test。
     m11 缺口③：旧版对链式一概拒收，dev 合理形态 ``rm tmp.js && npm test`` 的全绿
-    证据不被采信，门停在修复前的红证据上误拦（1132 pass 被当 test_failed）。"""
+    证据不被采信，门停在修复前的红证据上误拦（1132 pass 被当 test_failed）。
+
+    agent-verify-injection 2.2：拆段/危险结构检测改经 ``test_cmd_primitives`` **原语层**
+    （一份语义两消费点——本谓词是 dev 采集端信任面；verify 锚①同一性谓词另实现，D5.1
+    勿合一）。行为 byte-identical（test_clean_test_cmd 既有锁）。"""
     c = (cmd or "").strip()
     if not c:
         return False
-    segs = [s.strip() for s in re.split(r";|&&", c) if s.strip()]
-    if not segs or any(re.search(r"[|><&`]|\$\(", s) for s in segs):
+    segs = test_cmd_primitives.split_chain(c)
+    if not test_cmd_primitives.chain_all_clean(c):
         return False
     pat_py = r"^\s*(\S*/)?python\d?(\.\d+)?\s+(tests/|src/.*run_|-\s*m\s+(pytest|unittest)\b)"
     pat_pt = r"^\s*(\S*/)?pytest\b"
@@ -623,6 +636,13 @@ class HandoffIntegrityError(Exception):
     不传 → 空块回退）。main 捕获 → 结构化 JSON + exit 10（输入类永久失败，重试同因必败）。"""
 
 
+class AcceptanceIntegrityError(Exception):
+    """agent-verify-injection 1.6：验收套件注入完整性失败（bundle 不可读 / digest 缺失或不匹配 /
+    bundle 畸形）。fail-closed 拒绝运行——静默降级成「无套件跑」等于退回 dev 自测自证的被削弱
+    验证面。区别于「该 PRD 无套件」的正常缺失（控制面不传参数 → 空块回退）。main 捕获 →
+    结构化 JSON + exit 16（输入类永久失败，与 handoff 10 同族不同码）。"""
+
+
 def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     """通用 dev 守则 prompt（ADR-0005 B1 决策）。
     仓特定知识（目录/测试入口/保护路径/env 名）**不在此**——由各仓根 CLAUDE.md 承载，
@@ -657,6 +677,35 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
                 f"handoff artifact 完整性校验失败（fail-closed）: path={args['handoff_artifact']} "
                 f"readable={_hc is not None} digest_given={bool(_dg)}")
         handoff_injection = handoff.render_block(_hc)
+    # agent-verify-injection 1.6：验收测试套件注入——控制面 pa-test-author 独立编写的 PRD 验收点
+    # 可执行测试（bundle: files[{path,digest,content}] + criteria_ids + harness），红→绿是 dev 的
+    # 完成判据。digest fail-closed 同 handoff 模式。文件**不机械拷入 worktree**：摆放位置是仓特定
+    # 语义活（CLAUDE.md 测试目录约定，ADR-0001 目标面自治），dev 自治决定；注入件进 worktree 后被
+    # 编辑天然走既有候选写 stale 化（TestEvidence 新鲜度门对候选写不分文件），零新增判定。
+    acceptance_injection = ""
+    if args.get("acceptance_tests"):
+        _at = read_text(args["acceptance_tests"])
+        _adg = args.get("acceptance_digest")
+        if _at is None or not _adg or not handoff.verify_digest(_at, _adg):
+            raise AcceptanceIntegrityError(
+                f"acceptance suite 完整性校验失败（fail-closed）: path={args['acceptance_tests']} "
+                f"readable={_at is not None} digest_given={bool(_adg)}")
+        try:
+            _suite = [(f["path"], f["content"]) for f in json.loads(_at)["files"]]
+            if not _suite or any(not p or c is None for p, c in _suite):
+                raise ValueError("bundle files 空 or path/content 缺项")
+        except AcceptanceIntegrityError:
+            raise
+        except Exception as e:
+            raise AcceptanceIntegrityError(f"acceptance bundle 畸形: {e}") from e
+        _files_md = "\n\n".join(f"### `{p}`\n```\n{c}\n```" for p, c in _suite)
+        acceptance_injection = (
+            "\n\n## 验收测试套件（控制面独立编写；红→绿是完成判据）\n"
+            "以下是本 PRD 验收标准的可执行测试（控制面 pa-test-author 编写，非你写，**不要改写或删除**）。\n"
+            "- 把每个文件放到本仓 harness 惯例位置（读 CLAUDE.md 定测试目录；`criterion:` 标注原样保留——它是控制面 traceability 锚）。\n"
+            "- 实现功能使这些测试全绿（连同你自写的测试）；跑它们时用**纯净测试命令**（见下方守则 2，退出码才是发布证据）。\n"
+            "- 它们还红 = 没做完；删改它们不会让验证通过（发布门要求绿后无任何再写）。\n"
+            f"{_files_md}")
     # add-cross-prd-learning-memory Section 5 接线：lesson block（控制面检索的 prior-PRD 经验）经
     # ``--lessons-artifact`` path 传入（与 feedback_artifact 完全对称）。ADR-0001 控制面/目标面隔离：
     # dev-agent **只读传入的 path**，不读控制面 state；lesson_block 是 sanitized markdown checklist
@@ -691,7 +740,7 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
         "## 你的任务（PRD）",
         prd_text,
         source_block,
-        feedback_block + handoff_injection,
+        feedback_block + handoff_injection + acceptance_injection,
         "",
         "## 仓特定守则（必读）",
         "本仓的目录结构 / 测试入口 / 受保护路径 / 环境名等仓特定知识，详见仓库根 `CLAUDE.md`",
@@ -1101,6 +1150,11 @@ async def main() -> int:
         print(json.dumps({"ok": False, "error": "handoff_integrity", "detail": str(e),
                           "branch": branch, "base": args["base"]}, ensure_ascii=False))
         return 10
+    except AcceptanceIntegrityError as e:
+        # agent-verify-injection 1.6：套件完整性永久失败（重试同因必败）→ exit 16 与 handoff 10 区分
+        print(json.dumps({"ok": False, "error": "acceptance_integrity", "detail": str(e),
+                          "branch": branch, "base": args["base"]}, ensure_ascii=False))
+        return 16
 
     # 3. SDK dev loop（acceptEdits + settingSources + 硬白名单 tools，对齐历史 mjs/py / SPEC §决策#23）
     run_log = STATE_RUNS_DIR / f"{branch.replace('/', '-')}-{s}.jsonl"
@@ -1265,7 +1319,10 @@ async def main() -> int:
     ev = state.get("test_evidence")
     return run_publish_phase(
         {**args, "branch": branch},
-        dev_out=with_handoff({"cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd")}, state),
+        dev_out=with_handoff({"cost": cost, "turns": turns, "test_cmd": state.get("last_test_cmd"),
+                              # agent-verify-injection 1.9：dev 注入 digest 上报（dispatch 机械对账
+                              # dev 注入 == verify 注入，同 iteration；None=本 iteration 无注入面）
+                              "acceptance_digest": args.get("acceptance_digest")}, state),
         # 发布门已放行 → test_passed=True 现为可证（新鲜绿色证据），补结构化 gate/test 字段（2.5 truthful JSON）
         on_success={"test_passed": True, "test_status": "green",
                     "gate_status": GATE_PUBLISH, "evidence_fresh": bool(ev and ev.fresh)},

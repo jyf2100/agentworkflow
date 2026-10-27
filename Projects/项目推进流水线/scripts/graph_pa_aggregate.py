@@ -165,6 +165,9 @@ def _critic_main_op(ni: dict, state: dict):
         entries.extend(sub_entries)
 
     gate_file.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    # agent-verify-injection 1.4 对称：主循环出口编验收套件（镜像 stage_critic 末尾；复用门/skip_critic
+    # 面不调——与 legacy 链语义对齐：同 stamp 幂等在登记文件层，skip = canary 零额外面）
+    run_daily._author_acceptance_for_gate(entries, profiles, stamp)
     return ([], {"critic_results": entries},
             {"stage": "critic", "n_gate": len(entries),
              "n_pass": sum(1 for e in entries if e.get("verdict") == "pass")})

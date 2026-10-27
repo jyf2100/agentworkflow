@@ -123,6 +123,34 @@ def _extract_first_json(s: str) -> str | None:
 PERSONA_EFFORT_DEFAULT = "medium"
 
 
+def shared_persona_args(agent_name: str | None = None,
+                        log: Callable[[str], None] | None = None) -> list[str]:
+    """persona 范畴调用的共享参数面（agent-verify-injection D12：一份语义两消费点）。
+
+    覆盖 effort 档（PA_PERSONA_EFFORT > medium）+ per-agent model 路由（env
+    PA_PERSONA_MODEL_<AGENT> > config/model-routing.json > roc 默认；equals 单 token 形式）。
+    claude bin 解析在 ``resolve_claude_bin``（另一共享点）。消费方：run_persona_subproc
+    （persona json 信封面）+ verify_agent.ClaudeHeadlessExecutor（stream-json 面）——
+    **勿在任何调用方手拼第三份**（参数本体三处分叉 twin 测试锁不住）。
+    ``agent_name`` None 时只出 effort 段（无路由名可查）。
+    """
+    args: list[str] = []
+    _effort = _persona_effort()
+    if _effort:
+        args += ["--effort", _effort]
+    if agent_name:
+        _env_key = f"PA_PERSONA_MODEL_{agent_name.upper().replace('-', '_')}"
+        _env_model = os.environ.get(_env_key)
+        if _env_model == "" and log:
+            log(f"[{agent_name}] ⚠ {_env_key} 设为空串（忽略→走文件/roc 默认）")
+        _model = _env_model or model_routing.resolve_persona_model(agent_name)
+        if _model:
+            args += [f"--model={_model}"]
+            if log:
+                log(f"[{agent_name}] model route → {_model}（{'env' if _env_model else 'config'}）")
+    return args
+
+
 def _persona_effort() -> str | None:
     """persona 调用 effort 档：env PA_PERSONA_EFFORT > 默认 medium；空串=回落默认（对齐
     per-agent model routing 的空串语义：配错不废整个 flag，回落可跑）。"""
@@ -151,23 +179,10 @@ def run_persona_subproc(
     """
     base_cmd = [claude_bin, "--agent", agent_name, "--output-format", "json",
                 "--max-turns", str(max_turns)]
-    # 思考模式 medium：--effort flag（env PA_PERSONA_EFFORT 可覆盖；空串=默认 medium）
-    _effort = _persona_effort()
-    if _effort:
-        base_cmd += ["--effort", _effort]
-    # add-per-agent-model-routing：per-persona 模型路由 → --model（不设=零变更 baseline）
-    # 优先级：env PA_PERSONA_MODEL_<AGENT>（canary 覆盖）> config/model-routing.json（主配置）> roc 默认。
-    # equals 形式 `--model=X`（review follow-up：跟随 SDK subprocess_cli.py 对 dash-leading value flag
-    #   的安全惯例，单 token 绑定消 parser 灰色地带）；空串 env 显式 warn（配错反馈）；命中经 log 记 route 行。
-    _env_key = f"PA_PERSONA_MODEL_{agent_name.upper().replace('-', '_')}"
-    _env_model = os.environ.get(_env_key)
-    if _env_model == "" and log:
-        log(f"[{agent_name}] ⚠ {_env_key} 设为空串（忽略→走文件/roc 默认）")
-    _model = _env_model or model_routing.resolve_persona_model(agent_name)
-    if _model:
-        base_cmd += [f"--model={_model}"]
-        if log:
-            log(f"[{agent_name}] model route → {_model}（{'env' if _env_model else 'config'}）")
+    # 共享参数面（agent-verify-injection D12）：effort（PA_PERSONA_EFFORT > medium）+ per-persona
+    # model 路由（env > config/model-routing.json > roc 默认；equals 单 token 形式）。本函数是共享面
+    # 第一消费点（json 信封面）；verify_agent.ClaudeHeadlessExecutor 是第二消费点（stream-json 面）。
+    base_cmd += shared_persona_args(agent_name, log=log)
     if allowed_tools:
         base_cmd += ["--allowedTools", ",".join(allowed_tools)]
     cur_prompt = prompt

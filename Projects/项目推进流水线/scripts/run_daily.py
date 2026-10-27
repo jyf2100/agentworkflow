@@ -60,6 +60,9 @@ from verify_anchors import derive_anchors  # harden-pa-verify-determinism task 1
 from verify_bundles import split_bundles    # harden-pa-verify-determinism task 3.1：大 diff 文件打包（纯 stdlib，cron 安全）
 import artifact_store                      # task 3.3：内容寻址工件存储（verify feedback artifact；纯 stdlib）
 import handoff                             # add-dev-handoff-artifact：dev 亲笔交接（快照收养 load_snapshot；纯 stdlib）
+import acceptance_tests                    # agent-verify-injection 1.4：验收套件工件链（store_suite/缺席/覆盖闭合；纯 stdlib）
+import verify_agent as VA_MOD              # agent-verify-injection 2.4：verify agent 执行器（D12 参数面经 persona_call 共享；纯 stdlib + subprocess）
+import verify_stream as VS_MOD             # agent-verify-injection 2.4：stream 解析 + 三机械锚 + verify-report（纯函数 + git subprocess 面）
 import reconcile                           # task 4.4：ArtifactEvidenceResolver（publication 前 reconcile test evidence）
 import retry_policy as RP                  # task 3.3 P0-3：run_daily 驱动 retry（decide/recover_iteration/budget/session 参数生成）
 import cutover                             # add-cross-prd-learning-memory 批次 2 升级 A：injection 四重 gate（shadow+parity+quality+allowlist）
@@ -115,8 +118,10 @@ def _nvm_claude() -> Path | None:
 
 # 每段 wall-clock 超时（秒）——防挂死，非成本控制（SPEC §6/R2）
 # verify=pa-verify 裁判段（dev 产出验证闸，docs/verify-commit-loop-design.md §5-②）
-TIMEOUT = {"fetch": 1500, "radar": 600, "prd": 900, "critic": 300, "verify": 300}
-MAX_TURNS = {"fetch": 40, "radar": 60, "prd": 90, "critic": 40, "verify": 30}
+TIMEOUT = {"fetch": 1500, "radar": 600, "prd": 900, "critic": 300, "verify": 300,
+           "test-author": 600}
+MAX_TURNS = {"fetch": 40, "radar": 60, "prd": 90, "critic": 40, "verify": 30,
+             "test-author": 40}
 
 STAGES = ["fetch", "radar", "prd", "inject", "critic", "dispatch", "report"]
 
@@ -842,6 +847,172 @@ def _extract_acceptance_ids(prd_path: Path | str, slug: str) -> list[dict]:
     return out
 
 
+# ─── agent-verify-injection 1.3/1.4：验收测试编写接线（critic pass 后，观测面 fail-open）───
+# 三权分立 D1：pa-test-author 持编写权（本段）；verify agent 持执行权（阶段 2）；机械锚持判定权。
+# 套件是 PRD 级工件（critic 后、dispatch/run 前存在）→ store root 是 PRD 级常驻（STATE_DIR/acceptance_store，
+# 非 per-run artifacts——supersedes 版本链跨 iteration 累积在此）；journal acceptance_tests 事件延到
+# dispatch 注入时经 sj 补发（iteration 绑定 1.9 那时才真实——critic 段无 run/journal 上下文）。
+# 机械载体 = 登记文件 acceptance_<stamp>_<proj>_<slug>.json（gate_file 模式：同 stamp 幂等复用不重复烧 LLM）。
+_CRIT_TAG_RE = re.compile(r"criterion:\s*([A-Za-z0-9_:\-]+)")
+_JEST_FILE_RE = re.compile(r"\.test\.[jt]sx?$")
+
+
+def _test_author_prompt(prd_path: str, acs: list[dict], harness: str,
+                        out_dir: Path, prof: dict) -> str:
+    """pa-test-author 输入面：PRD 路径 + 验收点稳定 id 清单 + harness + 输出目录。"""
+    ac_lines = "\n".join(f"- {a['id']}: {a['text']}" for a in acs)
+    shape = ("*.test.js / *.test.ts（只 import 仓内已有依赖面，不引新 devDependency）"
+             if harness == "jest" else "test_*.py（纯标准库 + 仓内已有 fixtures，不引新第三方）")
+    return f"""为过闸 PRD 编写验收测试（harness={harness}）。
+
+PRD（先 Read 它了解上下文）：{prd_path}
+验收点清单（稳定 id，逐条覆盖或显式 uncovered）：
+{ac_lines}
+
+项目 tech_stack：{prof.get('tech_stack', '')}
+输出目录（Write 仅限此目录下）：{out_dir}
+
+硬性要求：
+- 每个测试的 describe/test 名或文件头注释必须带 criterion id 标注（如 `// criterion: {acs[0]['id']}` 或 `# criterion: {acs[0]['id']}`）——编排器机械解析此标注做覆盖闭合。
+- 测行为不测实现；确定性纪律：禁 sleep/墙钟断言/网络依赖/随机不钉种子（不确定测试是废考卷）。
+- harness 文件形态：{shape}。
+- 无法编写可执行测试的点放 uncovered 带原因，绝不静默漏。
+
+输出契约：只输出一行 JSON（无多余文字）：
+{{"files":[{{"path":"<输出目录下文件路径>","criteria_ids":["<id>"]}}],"uncovered":[{{"id":"<id>","reason":"<原因>"}}],"refused":null}}"""
+
+
+def _parse_criterion_annotations(content: str) -> set[str]:
+    """机械解析文件内 criterion 标注（`// criterion: <id>` / `# criterion: <id>`）。"""
+    return set(_CRIT_TAG_RE.findall(content))
+
+
+def _collect_authored_files(payload: dict, out_dir: Path) -> tuple[dict[str, str], set[str]]:
+    """manifest payload → ({rel_path: content}, 套件声明 ids 并集)。声明但不存在/读不了的文件跳过。"""
+    files: dict[str, str] = {}
+    suite_ids: set[str] = set()
+    for f in payload.get("files") or []:
+        suite_ids.update(f.get("criteria_ids") or [])
+        try:
+            p = Path(f["path"])
+            content = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        try:
+            rel = str(p.relative_to(out_dir))
+        except ValueError:
+            rel = p.name
+        files[rel] = content
+    return files, suite_ids
+
+
+def _structural_self_check(files: dict[str, str], harness: str,
+                           valid_ids: set[str]) -> tuple[bool, str]:
+    """控制面可跑的结构自检（T2 第一层）：文件形态 + criterion 标注可解析且 ⊆ PRD id 集。
+
+    收集级自检（pytest --collect-only 类）需要目标仓依赖环境，留注入面在 worktree 内跑（第二层）。
+    """
+    ann: set[str] = set()
+    for rel, content in files.items():
+        if harness == "jest" and not _JEST_FILE_RE.search(rel):
+            return False, f"jest 套件含非 *.test.* 文件: {rel}"
+        if harness == "pytest" and not re.match(r"test_.*\.py$", Path(rel).name):
+            return False, f"pytest 套件文件名不符 test_*.py: {rel}"
+        ann |= _parse_criterion_annotations(content)
+    if not ann:
+        return False, "零 criterion 标注（覆盖闭合不可机械审计）"
+    bad = ann - valid_ids
+    if bad:
+        return False, f"标注了不存在的 criterion id: {sorted(bad)[:3]}"
+    return True, "ok"
+
+
+def _author_acceptance_suite(entry: dict, prof: dict, stamp: str) -> dict | None:
+    """agent-verify-injection 1.4：critic pass 的单 PRD → pa-test-author 编写 → 结构自检 → store。
+
+    登记文件幂等（同 stamp 复用，--force 重跑）；观测面 fail-open——persona 失败/自检扣留/
+    store 异常 → absent 记录，绝不拦 dispatch（全量门兜底）。返回登记 dict（status=stored 带
+    SuiteRef 面 / absent 带 reason），供 dispatch 注入消费（journal 事件那时经 sj 补发）。
+    """
+    prd_path = entry.get("prd_path")
+    proj = entry.get("project") or "unknown"
+    slug = Path(prd_path or "x").stem
+    reg_path = STATE_DIR / f"acceptance_{stamp}_{dev_slugify(proj)}_{dev_slugify(slug)}.json"
+    if reg_path.is_file():
+        try:
+            return json.loads(reg_path.read_text(encoding="utf-8"))   # 同 stamp 幂等复用
+        except Exception:
+            pass   # 登记损坏 → 重编（fail-open）
+
+    harness_raw = str(prof.get("harness") or "").strip()
+    # tasks 1.5（T5）：harness 声明面 v1 收窄到行锚解析器支持集（jest/pytest）——集外显式降级
+    # 按未声明处理（不猜测测试面），detail 记原值供运维改 profile。
+    harness_invalid = harness_raw not in ("", "jest", "pytest")
+    harness = "" if harness_invalid else harness_raw
+    acs = _extract_acceptance_ids(prd_path, slug) if prd_path else []
+    valid_ids = {a["id"] for a in acs}
+    result: dict | None = None
+    if not acs:
+        result = {"status": "absent", "reason": "no_criteria", "prd_id": slug}
+    elif not harness:
+        result = {"status": "absent", "reason": "no_harness", "prd_id": slug,
+                  **({"detail": f"harness={harness_raw} 不在 v1 支持集（jest/pytest），显式降级"}
+                     if harness_invalid else {})}
+    else:
+        out_dir = STATE_DIR / "acceptance" / stamp / f"{dev_slugify(proj)}_{dev_slugify(slug)}"
+        try:
+            payload, meta = run_persona(
+                "pa-test-author", _test_author_prompt(prd_path, acs, harness, out_dir, prof),
+                "test-author", f"test-author:{proj}", allowed_tools=["Read", "Write"])
+            log(f"[acceptance] test-author 耗 ${meta['cost']:.4f}｜"
+                f"files={len(payload.get('files') or [])} uncovered={len(payload.get('uncovered') or [])}")
+            if payload.get("refused"):
+                result = {"status": "absent", "reason": "refused", "prd_id": slug,
+                          "detail": str(payload["refused"].get("reason", ""))[:200]}
+            else:
+                files, suite_ids = _collect_authored_files(payload, out_dir)
+                ok, detail = _structural_self_check(files, harness, valid_ids)
+                if not files:
+                    result = {"status": "absent", "reason": "no_files", "prd_id": slug}
+                elif not ok:
+                    result = {"status": "absent", "reason": "self_check_failed",
+                              "prd_id": slug, "detail": detail}
+                else:
+                    ref = acceptance_tests.store_suite(
+                        STATE_DIR / "acceptance_store", files,   # PRD 级常驻 root（supersedes 链跨 iteration 累积）
+                        prd_criteria_ids=sorted(valid_ids),
+                        suite_criteria_ids=sorted(suite_ids), harness=harness)
+                    result = ({"status": "stored", "prd_id": slug, **ref} if ref
+                              else {"status": "absent", "reason": "store_failed", "prd_id": slug})
+        except Exception as e:   # persona 熔断/超时/解析失败 → fail-open 记缺席（同 handoff 契约）
+            result = {"status": "absent", "reason": "author_failed",
+                      "prd_id": slug, "detail": str(e)[:200]}
+    try:
+        reg_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"[acceptance] ⚠ 登记文件写入失败（fail-open）: {e}")
+    return result
+
+
+def _author_acceptance_for_gate(entries: list[dict], profiles: dict, stamp: str) -> None:
+    """gate 出口统一面：对 verdict=pass 的 entries 编验收套件（stage_critic 与 graph 聚合 node 共消费）。
+
+    skip_critic 面**不调**（canary/演练零额外面，对齐 shadow parity 零 LLM 原则）。
+    """
+    for _e in entries:
+        if _e.get("verdict") != "pass" or not _e.get("prd_path"):
+            continue
+        try:
+            _r = _author_acceptance_suite(_e, profiles.get(_e.get("project"), {}), stamp)
+            if _r and _r.get("status") == "stored":
+                log(f"[acceptance] ✓ {_r['prd_id']} → {_r['digest'][:20]}… "
+                    f"({len(_r['files'])} 文件, uncovered={len(_r.get('uncovered') or [])})")
+            elif _r:
+                log(f"[acceptance] ⚠ {_r.get('prd_id')} 缺席: {_r.get('reason')}")
+        except Exception as e:
+            log(f"[acceptance] ⚠ 编写接线异常（fail-open）: {e}")
+
+
 # verify-loop-discipline B4/SHALL4：质量达标维度集按 profile 裁剪（frontend 含 UX/响应式；纯后端省略）。
 _DIM_FRONTEND = ["UX 可用性", "响应式布局", "安全", "性能", "兼容性"]
 _DIM_BACKEND = ["安全", "性能", "兼容性"]
@@ -879,7 +1050,15 @@ def verify_prompt(prd_path: str, branch: str | None, base: str, diff_path: Path,
     仓无 scripts.test）。anchors = 机械行级锚点；bundles = 大 diff 文件打包。两者 None/空/单 bundle = baseline
     （flag 关或小 diff），prompt 行为不变。"""
     test_rc = (verify or {}).get("test_rc")
-    if test_rc == 0:
+    _verdict = (verify or {}).get("verdict")
+    if _verdict == "green":
+        test_state = "绿（verdict=green，test_rc=0，全量测试过）"
+    elif _verdict == "red":
+        test_state = f"红（verdict=red，test_rc={test_rc}，有测试失败）"
+    elif _verdict == "invalid":
+        # 2.7：invalid 不进本闸（dispatch 早已分流 triage）——此行仅防御性（verdict 面异常透传时显式标注）
+        test_state = f"invalid（不可判读：{(verify or {}).get('note')}）——三锚证据见 verify-report"
+    elif test_rc == 0:
         test_state = "绿（test_rc=0，全量测试过）"
     elif test_rc is not None:
         test_state = f"红（test_rc={test_rc}，有测试失败）"
@@ -1368,6 +1547,8 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
         EO.append_event(STATE_DIR, _e.get("project"), stamp,
                         Path(_e.get("prd_path") or "").stem or "unknown", "critic_verdict",
                         verdict=_e.get("verdict"), summary=str(_e.get("summary") or ""))
+    # agent-verify-injection 1.4：critic pass → 验收测试编写（观测面 fail-open，绝不拦 dispatch）
+    _author_acceptance_for_gate(entries, profiles, stamp)
     return entries
 
 
@@ -1938,7 +2119,9 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
              round_n: int = 0,
              expect_handoff: bool = False,
              handoff_artifact: str | None = None,
-             handoff_digest: str | None = None) -> list[str] | None:
+             handoff_digest: str | None = None,
+             acceptance_bundle: str | None = None,
+             acceptance_digest: str | None = None) -> list[str] | None:
     """构造 dev-agent 触发命令（ADR-0006：控制面标准执行器为唯一源）。
 
     始终调用控制面 ``scripts/dev-agent.py``（DEV_AGENT_PY）——执行器贴目标仓跑（cwd=调用方传入的
@@ -1974,6 +2157,11 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
     #   成对（round≥2 / retry 注入，digest 由 dev-agent fail-closed 校验）；baseline 缺省 → cmd 零 handoff 参数。
     if expect_handoff:
         cmd += ["--expect-handoff"]
+    if acceptance_bundle:      # agent-verify-injection 1.9：dev 注入面接线（绝对 path——dev-agent cwd=worktree；
+        #   digest 与 verify 注入同源快照，dispatch 对账「同 iteration 同 digest」；缺省 → 零参数 baseline）
+        cmd += ["--acceptance-tests", acceptance_bundle]
+        if acceptance_digest:
+            cmd += ["--acceptance-digest", acceptance_digest]
     if handoff_artifact:
         cmd += ["--handoff-artifact", handoff_artifact]
         if handoff_digest:
@@ -2621,6 +2809,10 @@ _DISPATCH_STATUS_TO_ENVELOPE_TERMINAL: dict[str, str] = {
     #   merged=已合 main（≈ published，已交付；task 6.1a 引 MERGED 非终态允许 revert 时再调）；triaged=待人工（≈ external_blocked）。
     "merged": "published",
     "triaged": "external_blocked",
+    # agent-verify-injection 2.6：invalid 三态分流 → triage 升人工（UNKNOWN 语义，非代码红非 revise）。
+    #   blocked_infra 同语义（install 基建失败升人工）既有缺口一并补齐。
+    "verify_invalid": "external_blocked",
+    "blocked_infra": "external_blocked",
     # pr_* 系列需配合 verify 双门决定 published/revise（见 _dispatch_status_to_envelope_terminal 函数体）
 }
 
@@ -2729,6 +2921,8 @@ _SJ_TERMINAL_MAP: dict[str, str] = {
     "blocked_evidence": "blocked_evidence",   # task 4.2：green evidence artifact 持久化失败（不当 fresh green evidence）
     "merged": "published",            # single-flight-auto-merge task #5：已合 main → published（for 外 _sj_terminal 统一 emit）
     "triaged": "external_blocked",    # single-flight-auto-merge task #5：进 triage 池待人工 → external_blocked
+    "verify_invalid": "external_blocked",   # agent-verify-injection 2.6：invalid 三态分流升人工（非 revise）
+    "blocked_infra": "external_blocked",    # 同语义既有缺口补齐（install 基建失败升人工）
 }
 
 
@@ -3003,6 +3197,16 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
     cur_fork_session = False
     _parent_fb_digest: str | None = None  # task 3.3：prior feedback artifact digest（next attempt 引用）
     _parent_handoff_ref: dict | None = None  # add-dev-handoff-artifact 组4：prior round handoff artifact ref（round≥2 注入；每轮覆盖，无新 handoff → None 不携带 stale）
+    # agent-verify-injection 1.9：**iteration 考卷快照**（F4 同 iteration 同 digest 不变式）——循环外读一次，
+    #   本 iteration 的 dev 注入（--acceptance-tests/-digest）与 verify 注入（suite_ref）全用此快照；
+    #   mid-iteration triage 重编写（supersedes 新 digest 落登记文件）不换本 iteration 考卷，只对下一次
+    #   dispatch 生效（重跑 verify 仍用 dev 实现所基于的版本）。dev 上报 acceptance_digest ≠ 快照 → 不变式
+    #   破坏 → invalid 分流（考卷身份不明不可判读，同 2.6 语义面）。
+    _suite_snap = _acceptance_ref_for(proj, slug, stamp)
+    if _suite_snap and _sj.enabled:   # 1.9：iteration→考卷 digest 绑定记账（journal 可机械审计 F4 不变式）
+        _sj.emit("acceptance_bound", _iter, _prd, payload={
+            "digest": _suite_snap["digest"], "iteration_snapshot": True,
+            "supersedes": _suite_snap.get("supersedes")})
     for round_n in range(1, VERIFY_MAX_ROUNDS + 1):
         _iter = _coord.next_iteration(round_n)   # task 3.3：每轮 distinct deterministic iteration（seq=round_n；
         #   planned/running 用 run 级 seq0，每 attempt 一个新 iteration；distinct 使 reducer/recovery 可按 attempt 切片）
@@ -3039,14 +3243,20 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
                            expect_handoff=_coord.flags.dev_handoff,
                            handoff_artifact=(str((STATE_DIR / "artifacts" / _run) / _parent_handoff_ref["path"])
                                              if _parent_handoff_ref else None),
-                           handoff_digest=(_parent_handoff_ref["digest"] if _parent_handoff_ref else None))
+                           handoff_digest=(_parent_handoff_ref["digest"] if _parent_handoff_ref else None),
+                           acceptance_bundle=(str(STATE_DIR / "acceptance_store" / _suite_snap["path"])
+                                              if _suite_snap else None),
+                           acceptance_digest=(_suite_snap["digest"] if _suite_snap else None))
         else:
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
                            lessons_artifact=_lessons_artifact, round_n=round_n,
                            expect_handoff=_coord.flags.dev_handoff,
                            handoff_artifact=(str((STATE_DIR / "artifacts" / _run) / _parent_handoff_ref["path"])
                                              if _parent_handoff_ref else None),
-                           handoff_digest=(_parent_handoff_ref["digest"] if _parent_handoff_ref else None))
+                           handoff_digest=(_parent_handoff_ref["digest"] if _parent_handoff_ref else None),
+                           acceptance_bundle=(str(STATE_DIR / "acceptance_store" / _suite_snap["path"])
+                                              if _suite_snap else None),
+                           acceptance_digest=(_suite_snap["digest"] if _suite_snap else None))
         if cmd is None:
             rec.update(status="fail", skip_reason="控制面 dev-agent.py 缺失（控制面安装异常）")
             _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec
@@ -3138,9 +3348,20 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
         has_commits = commits.state is ExtState.FOUND and bool(commits.value)
         if commits.is_unknown:      # fail-safe：commit 态不明 → 跳过独立验证（不臆断有无产出）
             log(f"  ⚠ {slug}: r{round_n} commit 态不明，跳过独立验证: {commits.reason}")
-        if has_commits:
+        # agent-verify-injection 1.9：同 iteration 同 digest 机械对账——dev 上报的注入 digest 必须等于
+        #   考卷快照（dev 实现所基于的考卷 == verify 即将用的考卷）。violation = 控制面接线 bug（快照单源
+        #   下不应发生）→ 考卷身份不明，不可判读 → 构造 invalid _vj 落 2.6 分流（不烧 verify 会话、不进 revise）。
+        _dev_adg = (script_json or {}).get("acceptance_digest")
+        if _suite_snap and _dev_adg and _dev_adg != _suite_snap["digest"]:
+            log(f"  ⚠ {slug}: r{round_n} 考卷不变式破坏（dev 上报 {_dev_adg[:20]}… ≠ 快照 {_suite_snap['digest'][:20]}…）→ invalid 分流")
+            rec["verify"] = {"verdict": "invalid", "pass": False, "test_rc": None, "test_cmd": None,
+                             "install_rc": None, "test_log": None,
+                             "note": f"考卷不变式破坏: dev 上报 digest {_dev_adg} ≠ iteration 快照 "
+                                     f"{_suite_snap['digest']}（控制面接线异常，fail-safe 不判读）"}
+        elif has_commits:
             rec["verify"] = independent_verify(repo, branch, stamp, slug, log_file, prof,
-                                               test_cmd_hint=(script_json.get("test_cmd") if script_json else None))
+                                               test_cmd_hint=(script_json.get("test_cmd") if script_json else None),
+                                               suite_ref=_suite_snap)   # 2.4/1.9：verify 注入面用 iteration 快照（mid-iteration 重编写不换考卷；flag off 不消费）
         else:
             rec["verify"] = None              # 无新增 commit → 无可验证（round≥2 dev 未动已由上方 no_progress 门终止，此处剩 round1 无产出）
         _vj = rec.get("verify") or {}
@@ -3157,6 +3378,23 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
             rec["verify_round"] = round_n
             rec["status"] = "blocked_infra"
             rec["skip_reason"] = f"install_rc={_vj['install_rc']}（{_vj.get('note') or '基建失败'}，非代码红）"
+            break
+        # agent-verify-injection 2.6：invalid 三态分流——不可判读（unresolved / 锚 violation / 会话墙钟
+        # 超时 / 套件 load 失败）不烧 pa-verify 会话、不进 revise 回环（verify-loop-discipline B2 三分管
+        # 方向：UNKNOWN 升人工非代码红）。对账保留 PR；verify-report/stream/test_log 证据在 rec["verify"]
+        # 供 triage；收集级失败签名机械预检 → triage_reason 候选（确认与重编写是 triage 人工面，T2）。
+        if _vj.get("verdict") == "invalid":
+            _suspect = _suite_defective_signature(_vj)
+            log(f"  ⚠️ {slug}: 独立验证 invalid（{_vj.get('note')}）→ triage（不进 revise）")
+            _sj.emit("test", _iter, _prd, payload={
+                "round": round_n, "test_pass": False, "verdict": "invalid",
+                **({"suspected_suite_defective": True} if _suspect else {})})
+            reconcile_pr(repo, owner_repo, rec, base, slug, interrupted=True, fapi=fapi)
+            rec["verify_round"] = round_n
+            rec["status"] = "verify_invalid"
+            rec["skip_reason"] = f"invalid→triage: {_vj.get('note')}"
+            if _suspect:
+                rec["triage_reason"] = "acceptance_suite_defective_candidate"
             break
         # task 4.2 evidence integrity：green test result（机械绿）必须持久化为 content-addressed artifact
         # （valid digest），否则不当 fresh green evidence → blocked_evidence（spec verified-publication-integrity
@@ -3542,14 +3780,179 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
         log(f"  🗑 {slug}: 无 commit 孤儿分支 {branch} 已删")
 
 
+def _acceptance_ref_for(proj: str, slug: str, stamp: str) -> dict | None:
+    """agent-verify-injection 2.4：dispatch 侧取本 PRD 的验收套件引用（verify 注入面）。
+
+    读 critic 段落盘的登记文件（``_author_acceptance_suite`` 幂等面）；status=stored → 整个
+    suite_ref（digest/path/size/files/harness）；absent / 无文件 / 损坏 → None（fail-open，
+    verify 轨自然降级——无考卷只跑全量门或跳过）。"""
+    reg = STATE_DIR / f"acceptance_{stamp}_{dev_slugify(proj)}_{dev_slugify(slug)}.json"
+    try:
+        rec = json.loads(reg.read_text(encoding="utf-8"))
+        return rec if rec.get("status") == "stored" else None
+    except Exception:
+        return None
+
+
+def _resolve_gate_cmd(prof: dict | None, test_cmd_hint: str | None) -> tuple[str | None, str]:
+    """agent-verify-injection 2.4：全量门命令优先序（harden-verify-test-scope 归并 D7）。
+
+    ``profile verify_test_cmd``（项目自治声明）> dev 上报 test_cmd_hint（dev-reported）>
+    None（none——只跑注入验收测试，不编造命令）。返回 (cmd, source)，source 进 note/report
+    机械可查（命令从哪来是 verify 证据链的一环）。"""
+    prof_cmd = str(((prof or {}).get("verify_test_cmd") or "")).strip()
+    if prof_cmd:
+        return prof_cmd, "profile"
+    if test_cmd_hint:
+        return test_cmd_hint, "dev-reported"
+    return None, "none"
+
+
+_SUITE_DEFECT_PATTERNS = (
+    "ERROR collecting",                 # pytest 收集失败（套件自身破损）
+    "no tests ran",                     # pytest 空收集
+    "must contain at least one test",   # jest 空套件
+    "Cannot find module",               # 注入件 import 路径坏（套件缺陷常见签名）
+)
+
+
+def _suite_defective_signature(vj: dict) -> bool:
+    """agent-verify-injection 2.6（T2）：收集级失败签名机械预检——verify 产物 test_log 匹配已知
+    「套件自身破损」模式 → triage_reason 候选 ``acceptance_suite_defective``（确认与重编写是
+    triage 人工动作：supersedes 新 digest → 重跑 verify，不烧 dev revise 预算）。"""
+    log_path = vj.get("test_log")
+    if not log_path:
+        return False
+    try:
+        text = Path(log_path).read_text(encoding="utf-8")[:20000]
+    except Exception:
+        return False
+    return any(p in text for p in _SUITE_DEFECT_PATTERNS)
+
+
+def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file: Path,
+                        prof: dict | None, test_cmd_hint: str | None,
+                        suite_ref: dict | None) -> dict:
+    """agent-verify-injection 2.4：verify agent 轨（``PA_VERIFY_AGENT=on`` 时 independent_verify 分支）。
+
+    与机械轨同入口不同实现：verify worktree 自建（同 ``.worktrees/verify-<stamp>-<slug>`` 模式）；
+    验收套件由**编排器机械拷入**（agent 不自拷——注入件位置/内容是锚③输入，不能交给被验方）；
+    会话 prompt 与锚①判定 declared **同一来源**（``declared_suite_cmds_for`` 一份构造两消费）；
+    三锚（``verify_stream``）→ verdict 三态 → 原始 stream + verify-report 落 ``state/runs``
+    （D13：hub 容器形态 log_file.parent 即挂载卷内）。返回 dict 在机械轨基型上扩
+    ``verdict`` / ``verify_report`` / ``gate_source``（消费方对齐在 2.6/2.7）。"""
+    out: dict = {"test_cmd": None, "pass": False, "install_rc": None, "test_rc": None, "note": None,
+                 "test_log": None, "verdict": None, "verify_report": None, "gate_source": None}
+    gate_cmd, gate_source = _resolve_gate_cmd(prof, test_cmd_hint)
+    out["test_cmd"], out["gate_source"] = gate_cmd, gate_source
+
+    # 注入面：bundle load（digest 校验 fail-closed）+ declared 命令机械构造
+    injected: dict[str, str] = {}
+    digests: dict[str, str] = {}
+    suite_cmds: list[str] = []
+    harness = ""
+    if suite_ref:
+        try:
+            bundle = acceptance_tests.load_suite(STATE_DIR / "acceptance_store", suite_ref)
+            injected = acceptance_tests.inject_from_bundle(bundle)
+            digests = acceptance_tests.file_digests(suite_ref)
+            harness = str(bundle.get("harness") or "")
+            suite_cmds = VA_MOD.declared_suite_cmds_for(harness, sorted(injected))
+        except Exception as e:
+            out["verdict"], out["note"] = "invalid", f"验收套件 load 失败（fail-closed 不跑）: {str(e)[:200]}"
+            return out
+    if not suite_cmds and not gate_cmd:
+        # 无考卷且无全量门 → 无可执行面（与机械轨「测试归项目自治跳过」同构：verdict=None 未判定）
+        out["note"] = "agent 轨无可执行面（无验收套件且无全量门命令）"
+        return out
+
+    _repo_dir = Path(repo).resolve()   # 绝对形态归一（同机械轨 #15/#16）
+    vt = _repo_dir / ".worktrees" / f"verify-{stamp}-{slug}"
+    if vt.exists():
+        subprocess.run(["git", "-C", str(_repo_dir), "worktree", "remove", "--force", str(vt)],
+                       capture_output=True, text=True, timeout=60)
+    try:
+        vrc, _, verr = _run_capture(["git", "-C", str(_repo_dir), "worktree", "add", "--detach", str(vt), branch],
+                                    str(_repo_dir), 120, f"[{slug}:verify-wt]", log_file)
+        if vrc != 0:
+            out["verdict"], out["note"] = "invalid", f"建验证 worktree 失败: git rc={vrc} {verr}".strip()[:200]
+            return out
+        # 机械拷入注入件（编排器自己拷——位置= bundle rel path；dev 侧「摆放位置是语义活」不适用
+        # 于 verify 面：verify worktree 是干净 checkout，考卷位置由控制面定，锚②的注入集白名单同源）
+        for rel, content in injected.items():
+            _p = vt / rel
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            _p.write_text(content, encoding="utf-8")
+        env_spec = " ".join(f"{k}={v}" for k, v in sorted(((prof or {}).get("env") or {}).items()))
+        prompt = VA_MOD.build_verify_prompt(env_spec, suite_cmds, gate_cmd, gate_source)
+        declared = suite_cmds + ([gate_cmd] if gate_cmd else [])
+        try:
+            raw = VA_MOD.ClaudeHeadlessExecutor(log=log).run(
+                vt, prompt, timeout=VA_MOD.resolve_wall_clock())
+        except VA_MOD.VerifySessionTimeout as e:   # 墙钟超时 → invalid（不可判读非失败，T4）
+            out["verdict"], out["note"] = "invalid", str(e)[:200]
+            return out
+        stream_path = log_file.parent / (log_file.stem + ".verify-stream.jsonl")   # ④：原始流 durable（B2）
+        try:
+            stream_path.write_text(raw, encoding="utf-8")
+        except Exception:
+            stream_path = None   # 落盘失败不废判定（report evidence 缺席由 triage 查）
+        execs, meta = VS_MOD.parse_stream(raw)
+        matched = VS_MOD.match_declared(execs, declared)
+        ws_ok, ws_detail = VS_MOD.check_workspace_clean(vt, set(injected))
+        dg_viol = VS_MOD.check_injected_digests(vt, digests)
+        report = VS_MOD.build_verify_report(
+            run_id=stamp, project="", prd_id=slug, iteration_id="", harness=harness,
+            gate_cmd=gate_cmd, gate_source=gate_source, matched=matched,
+            anchor_workspace_ok=ws_ok, anchor_digest_violations=dg_viol,
+            stream_path=str(stream_path) if stream_path else "",
+            session_meta=meta, env_spec=env_spec,
+            env_observed=VS_MOD.observed_env_exports(execs),
+            anchor_workspace_detail=ws_detail)
+        rp = log_file.parent / (log_file.stem + ".verify-report.json")
+        try:
+            rp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            out["verify_report"] = str(rp)
+        except Exception:
+            pass   # 报告落盘失败不废判定（dispatch record 持路径缺席可查）
+        verdict = report["verdict"]
+        out["verdict"], out["pass"] = verdict, verdict == "green"
+        # test_log：采信执行的 output 拼接（runner 原始输出保留——行锚解析输入在新轨不断供，B1）
+        _outs = [ex.output for ex in matched.values() if ex is not None and ex.output]
+        try:
+            _tl = log_file.parent / (log_file.stem + ".testout")
+            _tl.write_text("\n".join(_outs), encoding="utf-8")
+            out["test_log"] = str(_tl)
+        except Exception:
+            out["test_log"] = None
+        _bad = [ex.exit_code for ex in matched.values() if ex is not None and ex.exit_code != 0]
+        out["test_rc"] = _bad[0] if _bad else (0 if verdict == "green" else None)
+        out["note"] = {"green": "绿（agent 轨：全 declared 匹配 exit 0 + 三锚净）",
+                       "red": "红→标 failing，PR 留待 review",
+                       "invalid": "invalid→triage（不进 revise 回环）"}[verdict] \
+            + f"（命令来源 {gate_source}）"   # 2.6：record note 显式记来源（gate_source 键同在 rec["verify"]）
+        log(f"  {'✅' if verdict == 'green' else '🔴' if verdict == 'red' else '⚠️'} "
+            f"{slug}: agent 轨独立验证 {verdict}（gate 来源 {gate_source}）")
+        return out
+    finally:
+        subprocess.run(["git", "-C", str(_repo_dir), "worktree", "remove", "--force", str(vt)],
+                       capture_output=True, text=True, timeout=60)
+
+
 def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: Path,
-                       prof: dict | None = None, test_cmd_hint: str | None = None) -> dict:
+                       prof: dict | None = None, test_cmd_hint: str | None = None,
+                       suite_ref: dict | None = None) -> dict:
     """独立验证闸（SPEC §4.4）：PR 分支全新 checkout worktree 重跑 test（非 dev 热乎树）。
     双轨：Node 仓（package.json）→ npm ci + npm test；Python 仓 → 重放 dev-agent 上报的 test_cmd（conda env PATH 注入）。
     测试归项目自治（ADR-0002）：dispatch 不替项目决定怎么测，只重放 dev-agent 上报的命令；dev-agent 未上报 → 跳过。
-    返回 {test_cmd, pass, install_rc, test_rc, note}。红=标 failing（PR 留着不关）。"""
+    返回 {test_cmd, pass, install_rc, test_rc, note}。红=标 failing（PR 留着不关）。
+    agent-verify-injection 2.4：``PA_VERIFY_AGENT=on`` → agent 轨（``_agent_track_verify``——verify agent
+    执行 + 三机械锚 + verify-report，``suite_ref`` 为验收套件注入面）；off → 下方机械轨原样（byte-identical）。"""
+    if resolve_flags(profile=prof).verify_agent_track:
+        return _agent_track_verify(repo, branch, stamp, slug, log_file, prof, test_cmd_hint, suite_ref)
     out: dict = {"test_cmd": None, "pass": False, "install_rc": None, "test_rc": None, "note": None,
-                 "test_log": None}   # test_log=干净测试 stdout 路径（喂 pa-verify Read，避开 log_file 的 install/wt 噪声）
+                 "test_log": None, "verdict": None}   # verdict 三态（2.7）：机械轨 green/red 派生 + 超时 invalid；
+    #   跳过/install 基建失败留 None（各自有既有消费槽——note 跳过 / install_rc→blocked_infra，不重复语义）
     is_node = (Path(repo) / "package.json").exists()
     if is_node:
         try:
@@ -3609,6 +4012,7 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
             trc, test_out, _ = _run_capture(["bash", "-c", test_cmd_hint], str(vt), VERIFY_TEST_TIMEOUT,
                                      f"[{slug}:py-test]", log_file, env=venv or None)
         out["test_rc"] = trc; out["pass"] = (trc == 0)
+        out["verdict"] = "green" if trc == 0 else "red"   # 2.7：机械轨三态派生（与 agent 轨 verdict 同值域）
         test_log = log_file.parent / (log_file.stem + ".testout")   # 干净测试 stdout（vt 在 finally 里删，test_log 在 state/runs 下留存）
         try:
             test_log.write_text(test_out or "", encoding="utf-8")
@@ -3617,6 +4021,13 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
             out["test_log"] = None
         out["note"] = "绿" if trc == 0 else f"红（test rc={trc}）→ 标 failing，PR 留待 review"
         log(f"  {'✅' if trc == 0 else '🔴'} {slug}: 独立验证 {out['note']}")
+        return out
+    except RuntimeError as e:
+        # 2.7：机械轨墙钟超时（_run_capture TimeoutExpired→RuntimeError）契约化归 invalid——超时是
+        # 不可判读不是失败（T4，对齐 agent 轨 VerifySessionTimeout 映射）；不再上抛中断整个 dispatch。
+        out["verdict"], out["pass"] = "invalid", False
+        out["note"] = f"机械轨超时/执行异常（invalid→triage）: {str(e)[:200]}"
+        log(f"  ⚠️ {slug}: 独立验证 invalid（{out['note']}）")
         return out
     finally:
         subprocess.run(["git", "-C", str(_repo_dir), "worktree", "remove", "--force", str(vt)],

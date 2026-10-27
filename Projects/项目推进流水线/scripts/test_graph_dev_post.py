@@ -272,3 +272,75 @@ def test_dev_post_install_fail_blocked_infra(monkeypatch):
     assert upd["_exit_status"] == "blocked_infra"
     assert "install_rc=2" in upd["_skip_reason"]
     assert "_verify_payload" not in upd                        # 不喂 pa-verify（非代码红）
+
+
+# ── agent-verify-injection 2.6：invalid 三态分流（graph 对齐 dispatch_one）──
+def test_dev_post_verify_invalid_routes_triage(monkeypatch, tmp_path):
+    """invalid（不可判读）→ triage 收尾：不烧 verify 会话、不进 revise；收集级失败签名 → triage_reason 候选。"""
+    import run_daily
+    seen = []
+
+    def fake(repo, owner_repo, rec, base, slug, interrupted=True):
+        seen.append(interrupted); rec["status"] = "interrupted_pr"
+    monkeypatch.setattr(run_daily, "reconcile_pr", fake)
+    _mock_has_commits(monkeypatch, run_daily.found(True))
+    bad_log = tmp_path / "bad.out"; bad_log.write_text("ERROR collecting test/a.py\n", encoding="utf-8")
+    _mock_independent(monkeypatch, {"verdict": "invalid", "pass": False, "test_rc": None,
+                                    "note": "unresolved", "test_log": str(bad_log), "test_cmd": "pytest"})
+    upd = GN.node_dev_post(dict(_BASE))
+    assert seen == [True]                                      # interrupted 对账收尾（分支保留）
+    assert upd["terminal"] == C.STATUS_TRIAGED                 # triage 槽（非红/revise、非 blocked）
+    assert upd["_exit_status"] == "verify_invalid"
+    assert upd["_triage_reason"] == "acceptance_suite_defective_candidate"
+    assert upd["_verify_payload"]["verdict"] == "invalid"      # vj 透传（triage 人工面输入）
+    obs0 = upd["obs_log"][0]                                   # obs 进 obs_log（非摊平）
+    assert obs0["test_pass"] is False and obs0["verdict"] == "invalid"
+    assert obs0["has_commits"] is True                         # 分支保留（非无产出收尾）
+
+
+def test_dev_post_verify_invalid_no_signature_no_triage_reason(monkeypatch, tmp_path):
+    """invalid 但 test_log 无收集失败签名（如纯超时）→ 不设 triage_reason（候选仅机械可查时给）。"""
+    import run_daily
+    monkeypatch.setattr(run_daily, "reconcile_pr",
+                        lambda *a, **kw: None)
+    _mock_has_commits(monkeypatch, run_daily.found(True))
+    log = tmp_path / "t.out"; log.write_text("killed after timeout\n", encoding="utf-8")
+    _mock_independent(monkeypatch, {"verdict": "invalid", "pass": False, "test_rc": None,
+                                    "note": "invalid: 会话超时", "test_log": str(log), "test_cmd": "pytest"})
+    upd = GN.node_dev_post(dict(_BASE))
+    assert upd["terminal"] == C.STATUS_TRIAGED
+    assert "_triage_reason" not in upd
+
+
+# ── agent-verify-injection 1.9：考卷快照 + 同 digest 不变式（graph 对称）──
+def test_dev_post_invariant_violation_invalid(monkeypatch):
+    """graph ③ 前置对账：dev 上报 digest ≠ _suite_snap 快照 → 构造 invalid vj 落 ③a 分流，
+    independent_verify 不被触（考卷身份不明不可判读）。"""
+    import run_daily
+    monkeypatch.setattr(run_daily, "reconcile_pr", lambda *a, **kw: None)
+    _mock_has_commits(monkeypatch, run_daily.found(True))
+    monkeypatch.setattr(run_daily, "independent_verify",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("不变式破坏应在 verify 前分流")))
+    s = dict(_BASE)
+    s["_suite_snap"] = {"digest": "sha256:" + "a" * 64, "path": "sha256/aa/x", "status": "stored"}
+    s["_dev_acceptance_digest"] = "sha256:" + "e" * 64
+    upd = GN.node_dev_post(s)
+    assert upd["terminal"] == C.STATUS_TRIAGED
+    assert upd["_exit_status"] == "verify_invalid"
+    assert "不变式破坏" in upd["_skip_reason"]
+    assert "_triage_reason" not in upd                # 非 suite 缺陷（控制面接线异常），无 triage 候选
+
+
+def test_dev_build_cmd_acceptance_kwargs(tmp_path, monkeypatch):
+    """_dev_build_cmd：state 持 _suite_snap → --acceptance-tests 绝对路径 + --acceptance-digest 快照值；
+    无快照 → 零参数 baseline cmd。"""
+    import run_daily
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path / "state")
+    state = {"_prof": {"conda_env": ""}, "_prd_abs": "/p.md", "_base": "main"}
+    cmd = GN._dev_build_cmd(dict(state))
+    assert "--acceptance-tests" not in cmd and "--acceptance-digest" not in cmd
+    state["_suite_snap"] = {"digest": "sha256:" + "a" * 64, "path": "sha256/aa/x", "status": "stored"}
+    cmd2 = GN._dev_build_cmd(dict(state))
+    _b = tmp_path / "state" / "acceptance_store" / "sha256/aa/x"
+    assert cmd2[cmd2.index("--acceptance-tests") + 1] == str(_b)
+    assert cmd2[cmd2.index("--acceptance-digest") + 1] == "sha256:" + "a" * 64

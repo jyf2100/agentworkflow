@@ -39,9 +39,9 @@ def test_record_schema_matches_dispatch_one():
     entry = {"prd_path": "state/prd/x/p.md", "source_path": "src.md"}
     prof = {"name": "proj", "default_branch": "main"}
     rec = AGG._subgraph_result_to_record(result, entry, prof)
-    assert set(rec.keys()) == _BASE_REC_KEYS       # 基础 21（子图未产条件字段，不写）
+    assert set(rec.keys()) == _BASE_REC_KEYS       # 基础 22（子图未产条件字段，不写）
     assert _CONDITIONAL_KEYS.isdisjoint(rec.keys())  # 条件字段未触发（对齐 legacy skip/正常路径）
-    assert len(rec) == 21
+    assert len(rec) == 22
 
 
 def test_record_conditional_fields_when_subgraph_produces():

@@ -383,6 +383,38 @@ git -C <repo> fetch origin <branch> && git -C <repo> branch <branch> origin/<bra
 判据：dev log 出现 `already exists` 反复失败 / PR diff 突然缩水（新分支只含本轮 commit）→ 查
 `git rev-parse <branch>` vs `origin/<branch>` 是否同 SHA。
 
+### 10.3 verify agent 轨（agent-verify-injection，2026-10）
+
+`PA_VERIFY_AGENT` flag（默认 **off**，`feature_flags.py` `verify_agent_track`；env / profile.loop 可开）——
+verify 双轨：
+
+- **off（baseline）**：机械轨原样（npm ci+test / dev 上报 test_cmd 重放），行为 byte-identical。
+- **on（agent 轨）**：verify worktree 内跑 headless verify agent 会话（`verify_agent.py`
+  `--output-format stream-json`，worktree 内 cwd，`Bash,Read`），验收套件由**编排器机械拷入**
+  （非 agent 自己写），判定靠**三机械锚**（零 LLM 判读）：
+  ① **命令同一性**——transcript 里 Bash 命令链末端段与 declared cmd 全等（declared 由
+  `declared_suite_cmds_for(harness, rels)` 机械构造，与 prompt 指令同一来源；jest/pytest 外
+  harness 显式空 → 只跑全量门）；
+  ② **工作区净**——`git diff`/`--cached` 空 + untracked ⊆ 注入集（注入件是白名单）；
+  ③ **注入件 digest**——逐文件 sha256 复核。
+  三锚全过 + exit 0 → **green**；跑完有非零 exit → **red**（进 revise 回环）；unresolved（无匹配
+  tool_result）/ 锚 violation / 会话墙钟超时 / 套件 load 失败 → **invalid**。
+- **invalid-triage 语义**：invalid 不烧 pa-verify 会话、不进 revise 回环（红=代码问题可 revise，
+  invalid=**不可判读**，revise 修不了）。dispatch record `status=verify_invalid`（terminal 映射
+  `external_blocked`）+ reconcile interrupted 对账收尾（分支保留）+ `triage_reason` 候选
+  `acceptance_suite_defective_candidate`（test_log 匹配收集级失败签名——ERROR collecting /
+  no tests ran 等；确认与重编写是 triage 人工面）。
+- **考卷快照不变式（1.9）**：iteration 开始快照验收套件 digest，dev 注入（`--acceptance-tests/
+  --acceptance-digest`）与 verify 注入同源；dev 上报 digest ≠ 快照 → invalid 分流（控制面接线
+  异常 fail-safe）。mid-iteration triage 重编写（supersedes 新版本）只对**下一次 dispatch** 生效。
+- **证据面**：stream 原始流 `<log>.verify-stream.jsonl` + 完整报告 `<log>.verify-report.json`
+  （含环境奇偶节）+ testout `<log>.testout`（行锚解析输入），全在 `state/runs/` 下，dispatch
+  record 持路径。
+- **回滚**：flag off 即回机械轨（零残留——机械轨从未被改动语义，仅加 `verdict` 派生键）。
+
+canary（tasks 3.3）：同 PRD 双跑对账机械轨 vs agent 轨绿红分布，分歧按象限分解报；shadow parity /
+graph canary 一律 `PA_VERIFY_AGENT=off` 跑（不进双源对照面）。
+
 ## 11. 部署拓扑与路径真相（2026-10 产品化前置 F3）
 
 **双 checkout 拓扑**——vault 有两个 checkout，职责不同：

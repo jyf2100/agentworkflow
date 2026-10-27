@@ -88,6 +88,8 @@ def test_all_env_names_mapped():
         "pa_graph_orchestrator": "PA_GRAPH_ORCHESTRATOR",
         # add-dev-handoff-artifact D2：dev 亲笔交接（dev 会话连续性，loop runtime 域，PA_LOOP_ 前缀）
         "dev_handoff": "PA_LOOP_DEV_HANDOFF",
+        # agent-verify-injection 2.4：verify agent 轨（verify 质量闸域，PA_VERIFY_ 前缀）
+        "verify_agent_track": "PA_VERIFY_AGENT",
     }
 
 

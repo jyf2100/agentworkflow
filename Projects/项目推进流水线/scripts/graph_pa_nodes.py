@@ -284,6 +284,20 @@ def make_devloop_node(*, name: str, stage: str = "dispatch",
     def node(state: dict) -> dict:
         import run_daily
         ni = _ni(state, stage=stage, node_id=name)
+        # agent-verify-injection 1.9：iteration 考卷快照（graph 面，对称 dispatch_one 循环外快照）——
+        #   首轮（state 无键）读登记文件一次，revise 轮（redo→dev 同 state）沿用；mid-iteration triage
+        #   重编写不换本 iteration 考卷（dev 注入与 verify 注入同 digest，F4 不变式）。per-PRD 隔离由
+        #   aggregate 每 PRD 新 shell 天然保证。
+        _snap_upd: dict = {}
+        if "_suite_snap" not in state:
+            state["_suite_snap"] = run_daily._acceptance_ref_for(
+                state.get("_project", ""), state.get("_slug", ""), state.get("stamp", ""))
+            _snap_upd["_suite_snap"] = state["_suite_snap"]
+            _sj0 = state.get("_sj")
+            if state["_suite_snap"] and _sj0 is not None and getattr(_sj0, "enabled", False):
+                _sj0.emit("acceptance_bound", state.get("_iter", ""), state.get("_prd", ""),
+                          payload={"digest": state["_suite_snap"]["digest"], "iteration_snapshot": True,
+                                   "supersedes": state["_suite_snap"].get("supersedes")})
         cmd = build_cmd(state)
         cwd, log_file = resolve_cwd(state)
         base_out: dict = {"artifacts": [], "idempotency_key": _ik(ni, stage)}
@@ -336,6 +350,7 @@ def make_devloop_node(*, name: str, stage: str = "dispatch",
         # dev 字段写入（对齐 dispatch_one L2232-2247）
         extra: dict = {"_dev_rc": rc, "_dev_script": script, "_dev_killed": script is None}
         extra.update(_handoff_upd)   # add-dev-handoff-artifact：_parent_handoff_ref 每轮覆盖进 state（flag off=空 no-op）
+        extra.update(_snap_upd)      # 1.9：考卷快照首轮传播进 state（dev_post verify 注入同源消费）
         if script:
             extra["_dev_cost"] = script.get("cost")
             extra["_dev_turns"] = script.get("turns")
@@ -344,6 +359,7 @@ def make_devloop_node(*, name: str, stage: str = "dispatch",
             extra["_dev_off_track"] = bool(script.get("off_track"))
             extra["_dev_run_log"] = script.get("run_log")
             extra["_dev_test_cmd"] = script.get("test_cmd")
+            extra["_dev_acceptance_digest"] = script.get("acceptance_digest")   # 1.9：dev 注入 digest 上报（dev_post 对账）
         # terminal 映射（机械，对齐 dispatch_one L2216-2259）
         out = dict(base_out)
         if script and script.get("blocked_by_gate"):
@@ -625,6 +641,12 @@ def _dev_build_cmd(state: dict) -> list[str] | None:
         expect_handoff=bool(flags and getattr(flags, "dev_handoff", False)),
         handoff_artifact=(str(_ho_root / _hr["path"]) if _hr else None),
         handoff_digest=(_hr["digest"] if _hr else None))
+    # agent-verify-injection 1.9：dev 注入面接线（iteration 快照同源——node() 首轮快照进 state，
+    #   revise 轮沿用；None=无考卷零参数 baseline cmd）
+    _snap = state.get("_suite_snap")
+    _ac_kw = dict(
+        acceptance_bundle=(str(run_daily.STATE_DIR / "acceptance_store" / _snap["path"]) if _snap else None),
+        acceptance_digest=(_snap["digest"] if _snap else None))
     if flags and getattr(flags, "session_aware_retry", False):
         return run_daily._dev_cmd(
             prof, prd_abs, base, src_abs,
@@ -635,13 +657,13 @@ def _dev_build_cmd(state: dict) -> list[str] | None:
             fork_session=bool(state.get("_cur_fork_session", False)),
             lessons_artifact=state.get("_lessons_artifact"),
             round_n=state.get("verify_round", 1),   # verify-loop-discipline A4：轮次 marker（commit 边界锚）
-            **_ho_kw)
+            **_ho_kw, **_ac_kw)
     return run_daily._dev_cmd(
         prof, prd_abs, base, src_abs,
         feedback_artifact=state.get("_fb_artifact"),
         lessons_artifact=state.get("_lessons_artifact"),
         round_n=state.get("verify_round", 1),   # verify-loop-discipline A4：轮次 marker（commit 边界锚）
-        **_ho_kw)
+        **_ho_kw, **_ac_kw)
 
 
 def _state_log_path(state: dict) -> Any:
@@ -747,10 +769,36 @@ def _dev_post_op(ni: dict, state: dict):
     if commits.is_unknown or not has_commits:
         return _reconcile_terminal()
 
-    # ③ independent_verify（L2271-2273；test_cmd_hint 取 dev 上报）
-    vj = run_daily.independent_verify(
-        repo, branch, stamp, slug, log_file, prof,
-        test_cmd_hint=(script.get("test_cmd") if script else None))
+    # ③ independent_verify（L2271-2273；test_cmd_hint 取 dev 上报；
+    #    agent-verify-injection 2.4 graph 对称：suite_ref 注入面同传——flag on 时 agent 轨消费，
+    #    off 时 independent_verify 不读它，行为 byte-identical。
+    #    1.9：suite_ref 用 iteration 快照（dev node 首轮写 state，revise 轮沿用——mid-iteration
+    #    重编写不换考卷）；dev 上报 digest ≠ 快照 → 不变式破坏 → 构造 invalid vj 落 ③a 分流）
+    _snap = state.get("_suite_snap")
+    _dev_adg = state.get("_dev_acceptance_digest")
+    if _snap and _dev_adg and _dev_adg != _snap.get("digest"):
+        vj = {"verdict": "invalid", "pass": False, "test_rc": None, "test_cmd": None,
+              "install_rc": None, "test_log": None,
+              "note": f"考卷不变式破坏: dev 上报 digest {_dev_adg} ≠ iteration 快照 "
+                      f"{_snap.get('digest')}（控制面接线异常，fail-safe 不判读）"}
+    else:
+        vj = run_daily.independent_verify(
+            repo, branch, stamp, slug, log_file, prof,
+            test_cmd_hint=(script.get("test_cmd") if script else None),
+            suite_ref=_snap)
+
+    # ③a agent-verify-injection 2.6（graph 对齐 dispatch_one）：invalid 三态分流——不可判读不烧
+    #    verify 会话、不进 revise 回环（B2 三分管方向）；对账收尾 → triage；收集级失败签名 →
+    #    triage_reason 候选 acceptance_suite_defective（确认/重编写是 triage 人工面，T2）。
+    if vj.get("verdict") == "invalid":
+        events, extra, obs = _reconcile_terminal()
+        extra = {**extra, "terminal": C.STATUS_TRIAGED, "_exit_status": "verify_invalid",
+                 "_skip_reason": f"invalid→triage: {vj.get('note')}",
+                 "_verify_payload": vj}
+        if run_daily._suite_defective_signature(vj):
+            extra["_triage_reason"] = "acceptance_suite_defective_candidate"
+        return (events, extra, {**obs, "test_pass": False, "verdict": "invalid",
+                                "has_commits": True, "verify_round": round_n})
 
     # ③b verify-loop-discipline B2（graph 同步，对齐 dispatch_one L2364-2377）：install 基建失败
     #    （install_rc≠0，三态 UNKNOWN——系统无法判定代码是否正确）→ blocked_infra 升人工，

@@ -61,7 +61,8 @@ def test_devloop_normal_writes_state(monkeypatch):
     """正常 JSON → 写 dev 字段（_branch/_dev_cost/_dev_turns/...），不 terminal（交 dev_post）。"""
     _mock_devcmd(monkeypatch)
     _mock_capture(monkeypatch, 0, '{"ok":true,"branch":"pa-dev-x","cost":0.5,"turns":12,'
-                                  '"stalled":false,"off_track":false,"run_log":"r.jsonl","test_cmd":"pytest"}')
+                                  '"stalled":false,"off_track":false,"run_log":"r.jsonl","test_cmd":"pytest",'
+                                  '"acceptance_digest":"sha256:aa"}')
     upd = GN.node_dev(dict(_BASE))
     assert upd["_branch"] == "pa-dev-x"
     assert upd["_dev_cost"] == 0.5
@@ -69,8 +70,31 @@ def test_devloop_normal_writes_state(monkeypatch):
     assert upd["_dev_stalled"] is False
     assert upd["_dev_run_log"] == "r.jsonl"
     assert upd["_dev_test_cmd"] == "pytest"
+    assert upd["_dev_acceptance_digest"] == "sha256:aa"   # 1.9：dev 注入 digest 上报进 state
     assert upd["_dev_killed"] is False
     assert not upd.get("terminal")                       # 正常 → 不 terminal
+
+
+def test_devloop_suite_snapshot_first_round_reused(monkeypatch):
+    """1.9 考卷快照（graph 面）：首轮 state 无键 → 读登记文件一次写 _suite_snap；revise 轮 state 已有键
+    → 不再读登记文件（mid-iteration 重编写不换考卷）。"""
+    import run_daily
+    _mock_devcmd(monkeypatch)
+    _mock_capture(monkeypatch, 0, '{"ok":true,"branch":"b","cost":1,"turns":2}')
+    reads = []
+
+    def _fake_ref(proj, slug, stamp):
+        reads.append((proj, slug, stamp))
+        return {"digest": f"sha256:{len(reads)}", "path": "p", "status": "stored"}
+    monkeypatch.setattr(run_daily, "_acceptance_ref_for", _fake_ref)
+    # r1：state 无键 → 快照 + 传播
+    upd1 = GN.node_dev(dict(_BASE))
+    assert reads == [("proj", "x", "s")] and upd1["_suite_snap"]["digest"] == "sha256:1"
+    # r2（revise 轮，langgraph merge 后 state 已含键）→ 不重读登记文件，沿用 r1 快照
+    state2 = dict(_BASE); state2["_suite_snap"] = upd1["_suite_snap"]; state2["verify_round"] = 1
+    upd2 = GN.node_dev(state2)
+    assert reads == [("proj", "x", "s")]                 # 只读过一次（r2 未重读）
+    assert "_suite_snap" not in upd2                     # 已有键 → 不重写不重传播
 
 
 def test_devloop_blocked_by_gate(monkeypatch):
