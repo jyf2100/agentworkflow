@@ -1,5 +1,7 @@
 # harden-verify-test-scope
 
+> **归并说明（2026-10-27）**：本 change 0/9 未实施，其问题域与解法已被 **`agent-verify-injection`** 吸收（该 change design **D7**）：验收测试由控制面 pa-test-author 独立编写并双注入 dev/verify 会话（同一 digest 考卷），从根上消解本案所述「dev 自选测试面同盲裂缝」——独立性的来源从「profile 声明全量命令」升级为「考卷本身独立于 dev」。本案 `verify_test_cmd` profile 字段作为 verify agent 会话内测试命令的来源面保留在 agent-verify-injection tasks 1.5/2.1 中。本目录属**吸收归并**（非完工归档），移入 archive 供决策史追溯。
+
 ## Why
 
 独立验证的测试范围存在**同盲裂缝**：dev 侧发布门（`evidence.py` TestEvidence）保证「最新测试绿 + 之后无写」但**不约束测试命令范围**；编排器侧 `independent_verify`（`run_daily.py` L3308-）双轨中 Node 轨跑 `npm ci + npm test`（package.json `scripts.test` 即项目全量门，独立于 dev），而 **Python 轨只重放 dev-agent 上报的 `test_cmd`**（L3327-3330：dev 未上报则跳过）。若 Python 目标仓的 dev 上报窄命令（如单文件 `pytest scripts/test_foo.py`），两层验证都绿、发布照常，**回归漏过**——两层都绿的「证实」其实共享同一盲区，独立验证失去独立性。

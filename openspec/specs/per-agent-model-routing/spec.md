@@ -25,7 +25,6 @@ AND claude CLI 走 roc 默认（glm-5.2），与 baseline 行为一致。
 WHEN `_build_options` 构造 ClaudeAgentOptions 且 `args["model"]` 为 None 且 `PA_DEV_MODEL` env 未设
 THEN 传入的 `model=None`
 AND dev SDK loop 走 roc 默认 glm-5.2，与 baseline 一致。
-
 ### Requirement: Per-persona model injection via env
 
 persona 子进程的 base_cmd SHALL 在拼装后查 env `PA_PERSONA_MODEL_<AGENT>`，其中 `<AGENT>` = `agent_name.upper().replace('-', '_')`（env 变量名禁连字符）；env 有值时 MUST 追加 `--model=<value>`（equals 单 token 形式，review follow-up D7）。查表 SHALL 在 `persona_call.run_persona_subproc`（变量 `agent_name`）与 `run_daily.run_persona`（变量 `name`）两处 base_cmd 同形镜像（双胞胎契约）。env 设为**空串**（`""`）SHALL 经 log 回调 warn（配错反馈，review follow-up）；env 命中非空值 SHALL 经 log 记审计行「model route → X」（可观测性）。
@@ -60,7 +59,6 @@ AND cmd 不含任何 `--model*`（走 roc 默认 glm-5.2）。
 
 WHEN `PA_PERSONA_MODEL_PA_PROGRESS=haiku` 且调 run_persona_subproc（传 log 回调）
 THEN log 含「model route → haiku（env）」审计行。
-
 ### Requirement: Twin-mirror base_cmd alignment
 
 `persona_call.run_persona_subproc` 与 `run_daily.run_persona` 的 base_cmd 是刻意复制的双胞胎（行为对齐契约：persona_call 模块头注释「与 run_daily.run_persona 行为对齐，行为基线 = test_persona_call」）。env 查表 `--model` 注入 MUST 在两处同形（仅变量名差异：`agent_name` vs `name`），不得只改一处。
@@ -70,7 +68,6 @@ THEN log 含「model route → haiku（env）」审计行。
 WHEN 审查 persona_call.py 与 run_daily.py 的 base_cmd 拼装段
 THEN 两处都有 `os.environ.get(f"PA_PERSONA_MODEL_{<var>.upper().replace('-', '_')}")` → 条件追加 `--model`
 AND `<var>` 在 persona_call 为 `agent_name`、在 run_daily 为 `name`（各自对齐本函数参数）。
-
 ### Requirement: Dev loop dual-channel model routing
 
 dev SDK loop 的 model SHALL 经双通道解析，优先级 flag > env > roc 默认。**flag 精确语义**（review follow-up D4）：`_build_options` 用 `_dev_flag = args.get("model"); _model = _dev_flag if _dev_flag is not None else os.environ.get("PA_DEV_MODEL")`。flag 设了（哪怕空串 `""`）= flag 胜（空→model="" → SDK truthiness 跳过 → roc 默认）；仅 flag 缺省（None）才回退 env。`--model` flag（parse_args）给手动/canary 用；`PA_DEV_MODEL` env 给 cron（经 subprocess `dict(os.environ)` 继承，无需 run_daily 显式透传）。两者都无 → None（roc 默认）。
@@ -98,7 +95,6 @@ AND dev loop 路由到 glm-5.1。
 WHEN run_daily.py 经 subprocess 启动 dev-agent 且父进程 env 含 `PA_DEV_MODEL=sonnet`
 THEN dev-agent subprocess 经 `dict(os.environ)` 继承到 `PA_DEV_MODEL`
 AND `_build_options` 读到 → model="sonnet"，无需 run_daily 在 cmd 里显式传 `--model`。
-
 ### Requirement: Model value is roc-recognized alias (runtime constraint)
 
 `--model` / `PA_DEV_MODEL` 的值 MUST 是 roc 认的 alias（`haiku` / `sonnet` / `opus` / `fable`）或裸 `glm-*`。**裸 Anthropic model id（如 `claude-sonnet-5`）会被 roc 代理拒绝**。本约束是 roc 层运行时校验，代码层 MUST NOT 维护 alias 白名单（避免随 roc 升级腐化）；非法值经 persona_call 现有 `is_error` / 非零退出 raise 路径冒泡。
@@ -114,12 +110,13 @@ AND persona_call `meta["model"]`（= outer `modelUsage`）反映 glm-5.1。
 WHEN `PA_DEV_MODEL=claude-sonnet-5`（裸 Anthropic id）
 THEN roc 代理拒绝该请求
 AND dev-agent 经现有非零退出 / is_error 路径 raise（不静默吞），错误可见。
-
 ### Requirement: Config via independent file (primary) + env override (canary)
 
 per-agent 模型路由的**主配置源** SHALL 是独立文件 `Projects/项目推进流水线/config/model-routing.json`（独立于 `~/.claude/settings.json` 与认证 env，解耦——日常配置不经认证注入函数 `_load_claude_settings_env`）。零依赖模块 `scripts/model_routing.py` SHALL 解析之：`resolve_persona_model(agent_name)` / `resolve_dev_model()`；文件不存在 / 空 / key 缺 / null / 空串 → None（roc 默认，零变更 baseline）。
 
 env `PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL` SHALL 保留作 canary 覆盖（临时覆盖主配置）。persona 优先级 SHALL 为 **env > 文件 > roc**；dev 经 `run_daily._dev_cmd` 解析 `env or resolve_dev_model()` 透传 `--model` flag（dev-agent 是 ADR-0006 纯调度器，不读控制面文件）。`_load_claude_settings_env` 的 `PA_*_MODEL` 注入保留作可选 canary 通道（env 配在 settings.json 时生效），日常用文件则不触发。
+
+**容器形态（execution-hub / pa-executor 镜像）限定**：文件主点 SHALL 视为 vault 本机形态专属配置面——executor 镜像 MUST NOT 含 `config/` 目录（patch.Dockerfile 不 COPY），hub 派发的执行容器内路由 SHALL 仅经 env 点（`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL`，经 hub 进程 env `PA_*` 透传注入容器）。这是有意的部署面选择（裁决 2026-10-27）：路由随 hub.env 差异化、改后即刻生效，烤进镜像会把路由钉死在发布时点。文件主点在容器内缺失 SHALL 走既有 None 降级（零变更 baseline），MUST NOT 告警——镜像内本就不预期存在该文件。
 
 #### Scenario: config 文件配 pa-progress → persona cmd 含 --model
 
@@ -153,6 +150,11 @@ WHEN env `PA_DEV_MODEL=""`（空串）
 THEN run_daily log 含 `⚠ PA_DEV_MODEL 设为空串` warn（配错反馈，对称 persona 空串 warn）
 AND cmd 不含 `--model*`（空串经 `or` 降级文件/roc 默认）。
 
+#### Scenario: 容器形态文件主点缺失 → env-only 降级零告警
+
+WHEN pa-executor 镜像内 `config/model-routing.json` 不存在且 hub.env 配 `PA_PERSONA_MODEL_PA_PROGRESS=haiku`
+THEN 执行容器内 resolve_* 返回 None（零变更 baseline，不告警镜像内文件缺失）
+AND persona cmd 含 `--model=haiku`（env 点经 `PA_*` 透传生效——容器形态唯一配置点）。
 ### Requirement: Degrade-without-raise contract + misconfig feedback (review 2026-08-09)
 
 `model_routing._load` SHALL 对**任意**损坏输入降级到 roc 默认且**不 raise**：缺文件 / IO 错（`OSError`）/ JSON 语法错（`ValueError`）/ 深嵌套（`RecursionError`，实测 `[`×10000 触发，须显式捕——不被 `ValueError` 覆盖）/ 超大文件（> `_MAX_BYTES` 64KB cap，防 `MemoryError`）/ 顶层非 object / value 非字符串。消费点（`run_persona` / `_dev_cmd` / `persona_call`）裸调用无 try/except 兜底，`_load` raise 会穿透致整晚 pipeline abort。
