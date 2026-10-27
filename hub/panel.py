@@ -25,11 +25,20 @@ td,th{border:1px solid #333;padding:.35rem .55rem;text-align:left;font-size:.88r
 textarea,input,select{width:100%;box-sizing:border-box;background:#1c1c1c;color:#e8e8e8;
 border:1px solid #444;border-radius:4px;padding:.45rem;font-family:inherit;font-size:.92rem}
 textarea{min-height:12rem}
+textarea:focus,input:focus,select:focus{border-color:#7ab8ff;outline:1px solid #7ab8ff}
 button{background:#2d5aa8;color:#fff;border:0;border-radius:4px;padding:.55rem 1.4rem;
 font-size:.95rem;cursor:pointer;margin-top:.7rem}
+button:hover{background:#3a6dc0}
+button:focus-visible{outline:2px solid #7ab8ff;outline-offset:2px}
 .error{border-left:3px solid #e66;padding:.5rem .8rem;background:#2a1a1a;margin:.8rem 0}
 pre{background:#1a1a1a;border:1px solid #333;padding:.7rem;overflow-x:auto;font-size:.8rem}
- nav a{margin-right:1rem}
+pre.maxh{max-height:24rem;overflow:auto}
+nav a{margin-right:1rem}
+label{display:block;margin-top:1.1rem;font-weight:600;font-size:.92rem}
+.hint{margin:.15rem 0 .3rem;color:#9a9a9a;font-size:.8rem}
+.sym{font-weight:700;margin-right:.25rem}
+td.err{max-width:16rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tablewrap{overflow-x:auto}
 """
 
 
@@ -56,41 +65,105 @@ def _status_class(status: str) -> str:
     return "ok" if status in ("done", "succeeded") else ("bad" if status in ("failed", "failed_to_start") else "warn")
 
 
-def render_submit(projects: list[str], *, error: str | None = None, success: str | None = None, current_user: str = "") -> str:
-    """提交页。error = 上次提交的拒绝原因（evidence 空等）回显；success = 入队回执。"""
-    opts = "".join(f'<option value="{_esc(p)}">{_esc(p)}</option>' for p in projects) or "<option value=\"\">（无可用 project——先在服务器建必读面）</option>"
+def _status_sym(status: str) -> str:
+    """状态符号通道（fix-hub-panel-ux D4）：与 _status_class 同范畴——✓/✗/… 与色并行，色觉障碍可辨。"""
+    if status in ("done", "succeeded"):
+        return "✓"
+    if status in ("failed", "failed_to_start"):
+        return "✗"
+    return "…"
+
+
+def _status_cell(status: str) -> str:
+    return f'<td class="{_status_class(status)}"><span class="sym">{_status_sym(status)}</span>{_esc(status)}</td>'
+
+
+def render_submit(projects: list[str], *, error: str | None = None, success: str | None = None,
+                  current_user: str = "", values: dict[str, str] | None = None) -> str:
+    """提交页。error = 上次提交的拒绝原因（evidence 空等）回显；success = 入队回执。
+    values = 已提交值（fix-hub-panel-ux：422 回显不丢输入，服务端回填经 _esc）。"""
+    v = values or {}
+    opts = "".join(
+        f'<option value="{_esc(p)}"{" selected" if p == v.get("project") else ""}>{_esc(p)}</option>'
+        for p in projects
+    ) or '<option value="">（无可用 project）</option>'
+    empty_hint = ('<p class="hint">还没有项目？先去<a href="/panel/projects/new">建项目</a>——'
+                  "github / gitlab / gitcode 三形态均可在界面自助建档</p>") if not projects else ""
     err = f'<div class="error">{_esc(error)}</div>' if error else ""
     ok = f'<div class="ok">{_esc(success)}</div>' if success else ""
     body = (
         f"<h1>提交手写 PRD</h1><p>已登录：{_esc(current_user)}</p>{ok}{err}"
         "<form method=\"post\" action=\"/panel/prd\">"
-        "<h2>project</h2>"
-        f"<select name=\"project\" required>{opts}</select>"
-        "<h2>PRD 内容（markdown，粘贴全文）</h2>"
-        "<textarea name=\"prd_content\" required placeholder=\"# 目标…&#10;## 验收标准…\"></textarea>"
-        "<h2>evidence（必填——链接或出处说明，空依据在闸前被拒）</h2>"
-        "<input name=\"evidence\" required placeholder=\"https://… 或 出处说明\">"
-        "<button type=\"submit\">提交入队</button></form>"
+        '<label for="f-project">project</label>'
+        f'<p class="hint">已建档项目的下拉（来自 data_root 必读面扫描）</p>{empty_hint}'
+        f'<select name="project" id="f-project" required>{opts}</select>'
+        '<label for="f-prd">PRD 内容</label>'
+        '<p class="hint">markdown，粘贴全文</p>'
+        f'<textarea name="prd_content" id="f-prd" required placeholder="# 目标…&#10;## 验收标准…">{_esc(v.get("prd_content", ""))}</textarea>'
+        '<label for="f-evidence">evidence</label>'
+        '<p class="hint">必填——链接或出处说明，空依据在闸前被拒</p>'
+        f'<input name="evidence" id="f-evidence" required value="{_esc(v.get("evidence", ""))}" placeholder="https://… 或 出处说明">'
+        '<button type="submit">提交入队</button></form>'
     )
     return _page("提交 PRD", body)
 
 
-def render_project_new(*, error: str | None = None, success: str | None = None, current_user: str = "") -> str:
-    """建项目表单页（add-hub-panel-console D1）。单行 input（D1：只收单行文本）。"""
+# 建项目成功后的下一步引导（fix-hub-panel-ux 收尾：HTML 在渲染层构造，api 只传 forge 形态 key——
+# 动态值不进 success 文本，XSS 防线形态不变）
+_NEXT_HINTS = {
+    "gitlab": '下一步：去<a href="/panel/credentials">凭据页</a>配 GITLAB_TOKEN（PAT，api scope）——缺了派发前会被拒',
+    "gitcode": '下一步：去<a href="/panel/credentials">凭据页</a>配 GITCODE_TOKEN——缺了派发前会被拒',
+    "": '可直接去<a href="/panel">提交 PRD</a>（github 项目另需凭据页配 GH_TOKEN）',
+}
+
+
+def render_project_new(*, error: str | None = None, success: str | None = None,
+                       current_user: str = "", values: dict[str, str] | None = None,
+                       next_forge: str = "") -> str:
+    """建项目表单页（add-hub-panel-console D1；fix-hub-form-parity 补 forge 三形态；
+    fix-hub-panel-ux：label/hint 结构 + values 回填 + forge→gitlab_host 显隐联动 + 成功引导）。"""
+    v = values or {}
     err = f'<div class="error">{_esc(error)}</div>' if error else ""
-    ok = f'<div class="ok">{_esc(success)}</div>' if success else ""
+    if success:
+        ok = f'<div class="ok">{_esc(success)}——{_NEXT_HINTS.get(next_forge, _NEXT_HINTS[""])}</div>'
+    else:
+        ok = ""
+    forge_sel = v.get("forge", "")
+    fsel = lambda val: " selected" if forge_sel == val else ""  # 紧凑三态 selected
     body = (
         f"<h1>建项目</h1><p>已登录：{_esc(current_user)}</p>{ok}{err}"
         "<form method=\"post\" action=\"/panel/projects\">"
-        "<h2>项目名（小写字母/数字/-/_）</h2>"
-        "<input name=\"name\" required placeholder=\"demo\">"
-        "<h2>目标仓（owner/repo 或 GitHub URL——流水线在其中开分支干活）</h2>"
-        "<input name=\"repo\" required placeholder=\"owner/repo\">"
-        "<h2>goal（一句话：这个项目要推进成什么）</h2>"
-        "<input name=\"goal\" required placeholder=\"…\">"
-        "<h2>match_surface（一句话：什么信号归这个项目）</h2>"
-        "<input name=\"surface\" required placeholder=\"…\">"
+        '<label for="f-name">项目名</label>'
+        '<p class="hint">小写字母/数字/-/_（PRD frontmatter 的 project 值须等于它）</p>'
+        f'<input name="name" id="f-name" required value="{_esc(v.get("name", ""))}" placeholder="demo">'
+        '<label for="f-forge">目标仓形态（forge）</label>'
+        '<p class="hint">决定 repo 填法与派发机制：github=本地 clone（缺省）；gitlab/gitcode=打 forge API，仓不须本地 clone</p>'
+        f'<select name="forge" id="f-forge">'
+        f'<option value=""{fsel("")}>github（缺省——repo 填 owner/repo 或 GitHub URL）</option>'
+        f'<option value="gitlab"{fsel("gitlab")}>gitlab（自建实例——须填实例地址，repo 填全路径）</option>'
+        f'<option value="gitcode"{fsel("gitcode")}>gitcode（SaaS——repo 填 owner/repo 两级）</option>'
+        "</select>"
+        '<div id="f-gitlab-host-box">'
+        '<label for="f-gitlab-host">gitlab 实例地址</label>'
+        '<p class="hint">仅 forge=gitlab 必填——带 scheme，可带端口；gitcode 无此键（固定 SaaS）</p>'
+        f'<input name="gitlab_host" id="f-gitlab-host" value="{_esc(v.get("gitlab_host", ""))}" placeholder="http://172.32.153.183:8180">'
+        "</div>"
+        '<label for="f-repo">目标仓</label>'
+        '<p class="hint">流水线在其中开分支干活——github：owner/repo 或 GitHub URL；gitlab：组/子组/仓 全路径（可多级）；gitcode：owner/repo 两级</p>'
+        f'<input name="repo" id="f-repo" required value="{_esc(v.get("repo", ""))}" placeholder="owner/repo 或 组/仓">'
+        '<label for="f-goal">goal</label>'
+        '<p class="hint">一句话：这个项目要推进成什么</p>'
+        f'<input name="goal" id="f-goal" required value="{_esc(v.get("goal", ""))}" placeholder="…">'
+        '<label for="f-surface">match_surface</label>'
+        '<p class="hint">一句话：什么信号归这个项目</p>'
+        f'<input name="surface" id="f-surface" required value="{_esc(v.get("surface", ""))}" placeholder="…">'
         "<button type=\"submit\">建档</button></form>"
+        # forge→gitlab_host 显隐联动（D2：内联原生脚本仅此一处、无外部资源；禁 JS 时框常显，hint 说明 + 服务端校验兜底）
+        "<script>\n"
+        "(function(){var s=document.getElementById('f-forge'),b=document.getElementById('f-gitlab-host-box');\n"
+        "function sync(){b.style.display=s.value==='gitlab'?'':'none'}\n"
+        "s.addEventListener('change',sync);sync();})();\n"
+        "</script>"
     )
     return _page("建项目", body)
 
@@ -98,7 +171,7 @@ def render_project_new(*, error: str | None = None, success: str | None = None, 
 def render_credentials(*, configured_fields: list[str] | None = None,
                        warning: str | None = None,
                        error: str | None = None, success: str | None = None,
-                       current_user: str = "") -> str:
+                       current_user: str = "", values: dict[str, str] | None = None) -> str:
     """凭据录入页（2026-10-23：PUT /auth/credentials 早已有，UI 补齐——值不过对话/不经手）。
 
     configured_fields = 当前 vault 记录的字段名列表（None = 未配置）——只显示键名，
@@ -113,22 +186,27 @@ def render_credentials(*, configured_fields: list[str] | None = None,
     warn = f'<p class="warn">{_esc(warning)}</p>' if warning else ""
     err = f'<div class="error">{_esc(error)}</div>' if error else ""
     ok = f'<div class="ok">{_esc(success)}</div>' if success else ""
+    v = values or {}
     body = (
         f"<h1>凭据</h1><p>已登录：{_esc(current_user)}</p>{status}{warn}{ok}{err}"
         "<form method=\"post\" action=\"/panel/credentials\">"
-        "<h2>ANTHROPIC_BASE_URL（LiteLLM 代理地址，含 http:// 前缀）</h2>"
-        "<input name=\"anthropic_base_url\" required placeholder=\"http://172.32.0.1:9001\">"
-        "<h2>ANTHROPIC_AUTH_TOKEN</h2>"
-        "<input name=\"anthropic_auth_token\" type=\"password\" required placeholder=\"sk-…\">"
-        "<h2>平台 token（按项目 forge 按需——三框至少其一非空，留空 = 保留既有值）</h2>"
-        "<p>GH_TOKEN（GitHub 项目）</p>"
-        "<input name=\"gh_token\" type=\"password\" placeholder=\"ghp_…（github 项目必填）\">"
-        "<p>GITLAB_TOKEN（forge: gitlab 项目）</p>"
-        "<input name=\"gitlab_token\" type=\"password\" placeholder=\"glpat-…（gitlab 项目必填）\">"
-        "<p>GITCODE_TOKEN（forge: gitcode 项目）</p>"
-        "<input name=\"gitcode_token\" type=\"password\" placeholder=\"（gitcode 项目必填）\">"
-        "<h2>模型（可选，默认走代理侧默认模型）</h2>"
-        "<input name=\"model\" placeholder=\"如 qwen3.8-27b-fast（留空 = 保留既有）\">"
+        '<label for="f-base-url">ANTHROPIC_BASE_URL</label>'
+        '<p class="hint">LiteLLM 代理地址，含 http:// 前缀</p>'
+        f'<input name="anthropic_base_url" id="f-base-url" required value="{_esc(v.get("anthropic_base_url", ""))}" placeholder="http://172.32.0.1:9001">'
+        '<label for="f-auth-token">ANTHROPIC_AUTH_TOKEN</label>'
+        '<p class="hint">代理鉴权 token</p>'
+        '<input name="anthropic_auth_token" id="f-auth-token" type="password" required placeholder="sk-…">'
+        "<h2>平台 token（按项目 forge 按需）</h2>"
+        '<p class="hint">三框至少其一非空；留空 = 保留既有值（密码语义，拒绝后不回填）</p>'
+        '<label for="f-gh">GH_TOKEN（GitHub 项目）</label>'
+        '<input name="gh_token" id="f-gh" type="password" placeholder="ghp_…（github 项目必填）">'
+        '<label for="f-gitlab">GITLAB_TOKEN（forge: gitlab 项目）</label>'
+        '<input name="gitlab_token" id="f-gitlab" type="password" placeholder="glpat-…（gitlab 项目必填）">'
+        '<label for="f-gitcode">GITCODE_TOKEN（forge: gitcode 项目）</label>'
+        '<input name="gitcode_token" id="f-gitcode" type="password" placeholder="（gitcode 项目必填）">'
+        '<label for="f-model">模型</label>'
+        '<p class="hint">可选（ANTHROPIC_MODEL 路由），默认走代理侧默认模型</p>'
+        f'<input name="model" id="f-model" value="{_esc(v.get("model", ""))}" placeholder="如 qwen3.8-27b-fast（留空 = 保留既有）">'
         "<button type=\"submit\">保存进保险箱</button></form>"
     )
     return _page("凭据", body)
@@ -145,19 +223,30 @@ def _queue_action(row: dict) -> str:
     return ""
 
 
+def _short_time(iso: str) -> str:
+    """ISO → 「MM-DD HH:MM」机械截短（不改时区不改语义；title 悬停看全文）。"""
+    s = iso or ""
+    return s[5:16].replace("T", " ") if len(s) >= 16 else s
+
+
 def render_queue(rows: list[dict], *, success: str | None = None) -> str:
     trs = "".join(
         f"<tr><td>#{r['id']}</td><td>{_esc(r['project'])}</td>"
-        f"<td class=\"{_status_class(r['status'])}\">{_esc(r['status'])}</td>"
+        f"{_status_cell(r['status'])}"
+        f"<td>{_queue_action(r)}</td>"
         f"<td>{r['attempt']}</td><td>{_esc(r.get('initiator') or r.get('enqueued_by'))}</td>"
-        f"<td>{_esc(r['last_error'] or '')}</td><td>{_queue_action(r)}</td></tr>"
+        # fix-hub-queue-recency：入队/最后状态变化两列（截短显示，title 全文）；
+        # 操作列紧邻 status——时间列加入不得把重跑/放弃按钮挤出首屏可视区
+        f"<td title=\"{_esc(r.get('created_at') or '')}\">{_esc(_short_time(r.get('created_at') or ''))}</td>"
+        f"<td title=\"{_esc(r.get('updated_at') or '')}\">{_esc(_short_time(r.get('updated_at') or ''))}</td>"
+        f"<td class=\"err\" title=\"{_esc(r['last_error'] or '')}\">{_esc(r['last_error'] or '')}</td></tr>"
         for r in rows
     )
     ok = f'<div class="ok">{_esc(success)}</div>' if success else ""
     body = (
         f"<h1>队列（{len(rows)} 项）</h1>{ok}"
-        "<table><tr><th>id</th><th>project</th><th>status</th><th>attempt</th>"
-        f"<th>发起人</th><th>last_error</th><th>操作</th></tr>{trs}</table>"
+        '<div class="tablewrap"><table><tr><th>id</th><th>project</th><th>status</th><th>操作</th><th>attempt</th>'
+        f"<th>发起人</th><th>入队</th><th>更新</th><th>last_error</th></tr>{trs}</table></div>"
     )
     return _page("队列", body)
 
@@ -166,15 +255,15 @@ def render_runs(runs: list[dict]) -> str:
     trs = "".join(
         f"<tr><td><a href=\"/panel/runs/{r['id']}\">#{r['id']}</a></td>"
         f"<td>{_esc(r['project'])}</td>"
-        f"<td class=\"{_status_class(r['status'])}\">{_esc(r['status'])}</td>"
+        f"{_status_cell(r['status'])}"
         f"<td>{'' if r['exit_code'] is None else r['exit_code']}</td>"
         f"<td>{_esc(r['started_at'])}</td><td>{_esc(r['ended_at'] or '')}</td></tr>"
         for r in runs
     )
     body = (
         f"<h1>runs（{len(runs)}）</h1>"
-        "<table><tr><th>run</th><th>project</th><th>status</th><th>exit</th>"
-        f"<th>started</th><th>ended</th></tr>{trs}</table>"
+        '<div class="tablewrap"><table><tr><th>run</th><th>project</th><th>status</th><th>exit</th>'
+        f"<th>started</th><th>ended</th></tr>{trs}</table></div>"
     )
     return _page("runs", body)
 
@@ -192,10 +281,10 @@ def render_run_detail(detail: dict, journal_tail: list[str], report_md: str | No
         )
     )
     tail = "".join(f"{_esc(line)}\n" for line in journal_tail) or "（无 journal）"
-    rep = f"<pre>{_esc(report_md)}</pre>" if report_md is not None else "<p>无报告</p>"
+    rep = f'<pre class="maxh">{_esc(report_md)}</pre>' if report_md is not None else "<p>无报告</p>"
     body = (
-        f"<h1>run #{detail['id']}</h1><table>{rows}</table>"
-        f"<h2>journal 尾部（原样）</h2><pre>{tail}</pre>"
+        f"<h1>run #{detail['id']}</h1><div class=\"tablewrap\"><table>{rows}</table></div>"
+        f"<h2>journal 尾部（原样）</h2><pre class=\"maxh\">{tail}</pre>"
         f"<h2>报告</h2>{rep}"
     )
     return _page(f"run #{detail['id']}", body)

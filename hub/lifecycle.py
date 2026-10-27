@@ -153,11 +153,12 @@ class Lifecycle:
                 bad = vault_store.placeholder_issues(rec)
                 if bad:
                     return None, f"保险箱记录凭据形态非法：{'；'.join(bad)}"
-                # F9 模型路由（非凭据配置键）恒注入：vault payload 只存凭据面，
-                # HUB_USER_MODEL→ANTHROPIC_MODEL 与凭据同 env-file 通道——vault 有记录时
-                # 不 merge 则模型路由仅在「无记录降级 env 直注」分支生效（组5.1 hub 全链
-                # 实证：容器内 claude 落 CLI 内置默认模型，roc 代理 400 拒裸 Anthropic id）。
-                if self.cfg.user_model:
+                # F9 模型路由（非凭据配置键）兜底注入：vault 记录无 ANTHROPIC_MODEL 时
+                # HUB_USER_MODEL→ANTHROPIC_MODEL 与凭据同 env-file 通道——不 merge 则该分支
+                # 无模型路由（组5.1 hub 全链实证：容器内 claude 落 CLI 内置默认模型，roc
+                # 代理 400 拒裸 Anthropic id）。记录里有模型（面板凭据页所存）= 用户显式
+                # 选择，优先于 hub 级缺省（2026-10-27 #56 修复：恒覆盖致面板 model 框失效）。
+                if self.cfg.user_model and not rec.get("ANTHROPIC_MODEL"):
                     rec = {**rec, "ANTHROPIC_MODEL": self.cfg.user_model}
                 return rec, "vault"
             print(
@@ -275,7 +276,10 @@ class Lifecycle:
 
         rid = self._db.create_run(item["id"], project, str(run_dir))
         # 纯参数（镜像 ENTRYPOINT 已收敛 run_daily.py——docker run tag 后 args 附加到 ENTRYPOINT）
-        cmd = ["--from-stage", "inject", "--inject-prd", f"/input/{prd.name}", "--stamp", stamp]
+        # --to-stage report：执行链段范围 inject→report（fix-hub-form-parity，spec: execution-hub
+        # 「执行链段范围」）——report 段双写产物落 state/reports/ 供面板渲染；run_daily 默认值不动。
+        cmd = ["--from-stage", "inject", "--to-stage", "report",
+               "--inject-prd", f"/input/{prd.name}", "--stamp", stamp]
         with env_file(user_env) as ef:
             spec = RunSpec(
                 image_tag=item["image_tag"], command=cmd, state_root=state_root,

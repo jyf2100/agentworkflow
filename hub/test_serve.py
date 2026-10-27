@@ -42,6 +42,27 @@ def test_build_app_with_key_mounts_vault(tmp_path, monkeypatch):
     assert lc._vault is not None  # key 在 = 保险箱装配进 lifecycle
 
 
+def test_build_app_mounts_vault_into_api_layer(tmp_path, monkeypatch):
+    """回归锚（2026-10-27 真机 503）：key 在时 vault 须透传 create_app——凭据面板
+    GET 不再「保险箱未配置 503」（此前 serve 只装进 Lifecycle，API 面独漏）。"""
+    from fastapi.testclient import TestClient
+
+    import auth
+    env = _env(tmp_path)
+    env.update({"HUB_MM_BASE_URL": "https://mm.example.com", "HUB_MM_CLIENT_ID": "cid",
+                "HUB_MM_CLIENT_SECRET": "sec", "HUB_SESSION_SECRET": "S" * 43})
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("HUB_VAULT_MASTER_KEY", Fernet.generate_key().decode())
+    app, lc, cfg = serve.build_app()
+    client = TestClient(app)
+    client.cookies.set(auth.SESSION_COOKIE, auth.sign_token(
+        {"mm_user_id": "probe00112233445566778899aabb", "username": "zhang3"},
+        lc.cfg.session_secret, ttl_s=60))
+    resp = client.get("/panel/credentials")
+    assert resp.status_code == 200 and "保险箱未配置" not in resp.text  # 修复前 503
+
+
 def test_build_app_bad_key_raises_not_silent(tmp_path, monkeypatch):
     for k, v in _env(tmp_path).items():
         monkeypatch.setenv(k, v)

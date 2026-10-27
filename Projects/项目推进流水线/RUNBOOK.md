@@ -520,10 +520,10 @@ grep '"failed"' .project-auto/state/deliver_ledger.jsonl | python3 -c "import sy
 
 hub 观察面三件套：读面会话守卫 + MM 通知 bot + 镜像陈旧检测（spec: `openspec/specs/`（归档后）hub-notifications / execution-hub delta）。全离线可测，真机联调项见下。
 
-**bot 创建（前置）**：MM 管理员在 系统控制台 → 集成 → Bot 帐号 新建 bot（独立于 OAuth 2.0 应用的第二个凭据实体——登录归 OAuth app，推通知归 bot token）。记下 bot token；每个要收通知的用户需把 bot 加为 DM 联系人（否则 DM 推递失败——fail-open 只留 stderr warn，不重试）。
+**bot 创建（前置）**：MM 管理员在 系统控制台 → 集成 → Bot 帐号 新建 bot（独立于 OAuth 2.0 应用的第二个凭据实体——登录归 OAuth app，推通知归 bot token）。记下 bot token；每个要收通知的用户需把 bot 加为 DM 联系人（否则 DM 推递失败——fail-open 只留 stderr warn，不重试）。**PAT 替代（2026-10-27 真机实证可用）**：也可走 系统控制台 → 集成 → 个人访问令牌——推递功能等价，仅凭据身份不同（PAT 绑定创建用户本人而非独立 bot，F14「身份与通道两范畴」语义弱化为二者同身份）。
 
 **env 填值（hub.env）**：
-- `HUB_MM_BOT_TOKEN`：bot token（与 `HUB_MM_BASE_URL` 齐才生效）；
+- `HUB_MM_BOT_TOKEN`：bot token（与 `HUB_MM_BASE_URL` 齐才生效）。**⚠️ PAT 形态坑（2026-10-27 真机实证）**：本 MM 实例的个人访问令牌生效形态是**只填「访问令牌」单段**——令牌 ID 拼接成 `id.secret`（标准 bot token 形态）反而 401 `api.context.session_expired`（首配踩过此坑，check-notify 卡 1/3 即查此处）；改值后须 `docker compose up -d` 重建再自检；
 - `HUB_MM_PROJECT_CHANNELS=proj:chan-id,...`：可选失败广播频道（仅 failed/failed_to_start；chan-id 是频道 id 非名字）；
 - `HUB_IMAGE_TEMPLATE_REPO=owner/repo`：陈旧检测比对源（不配 = 关闭）；`HUB_STALE_CHECK_TICKS` 默认 720（≈5s tick 每小时一查）。
 
@@ -554,6 +554,10 @@ hub 观察面三件套：读面会话守卫 + MM 通知 bot + 镜像陈旧检测
 - hub 读面：reconcile_running 对 running run 每轮读 → `(run_id, seq)` 进程内存去重 → 新行经 4a bot 通道转发（critic drop / verify 红进频道 + 私信，其余仅私信）；`v≠1` **整文件跳过**（不转发半懂的形态）、未知 event 行跳过、坏 JSON 行跳过；run 终态后不读；孤儿 run（item 查无）跳过。
 
 **PA_REPORT_DIR（report 双写）**：hub 派发时给容器注入 `PA_REPORT_DIR=<容器内 state>/reports`（docker `-e` 直传，与凭据 env-file 分离）——pa report 段在该目录**追加**双写一份 `项目推进报告_<stamp>.md`（原落点不变，缺省零变化），落容器内 state 卷即 host `<data_root>/<project>/state/reports/` 可见，面板 run 详情页按 run stamp 对齐读。不注入（如本地 vault 直接跑 run_daily）= 行为与 4b 前完全一致。
+
+**容器形态：执行链段范围与模型路由（fix-hub-form-parity，2026-10，spec: execution-hub「执行链段范围」）**：
+- **段范围**：派发 cmd 已补 `--to-stage report`（此前止于 dispatch 默认——report 段从不跑、`state/reports/` 恒空、面板恒「无报告」）。现在执行链 inject→critic→dispatch→report 跑满，report 双写产物真实落卷。**容器内 report 段 SMTP 必走 fail-open 告警**（SMTP env 不透传容器，只透 `PA_*`）——run 尾恒一条 SMTP 告警日志属预期，勿为此配 SMTP env（hub 形态通知面是 MM bot，见 §16）。
+- **模型路由 env-only**：容器形态**仅 env 点**可配（`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL`）——executor 镜像不含 `config/`，文件主点 `config/model-routing.json` 是 vault 本机形态专属（有意选择：路由随 hub.env 差异化、改后即刻生效，烤进镜像反而钉死在发布时点）。hub.env 示例：`PA_PERSONA_MODEL_PA_PROGRESS=haiku`、`PA_DEV_MODEL=sonnet`；改后 `docker compose up -d` 重建 hub 进程即生效（`PA_*` 经派发透传进 run 容器），**无需重发镜像**。容器内优先级 env > roc（无文件点可降级）。
 
 **无 run 放弃告警**：create_run 前的五类放弃（project 名非法 / PRD 缺失 / 启动必读面缺失 / 凭据缺失 / meta 署名失败）收敛经 `_abandon` → bot 私信管理员（含队列项 id + project + 原因摘要）；通道关闭 = stderr 降级留痕（fail_item 不受影响）。与 run 终态通知（4a notify_run）互补：无 run 的放弃也有可见性。
 

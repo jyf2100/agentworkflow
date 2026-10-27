@@ -39,7 +39,7 @@ def build_app(cfg: config.HubConfig | None = None):
     notifier = notify_mod.build_notifier(cfg)
     lc = lifecycle_mod.Lifecycle(database, engine, runner_mod.DockerRunner(), cfg, vault=vault, notifier=notifier)
     interval = float(os.environ.get("HUB_TICK_INTERVAL") or 5)
-    app = create_app(database, engine, lc, tick_interval=interval)
+    app = create_app(database, engine, lc, vault=vault, tick_interval=interval)
     return app, lc, cfg
 
 

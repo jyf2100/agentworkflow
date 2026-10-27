@@ -211,3 +211,78 @@ def test_panel_submit_error_echo_escaped(tmp_path):
     })
     assert resp.status_code == 422
     assert "<script>" not in resp.text and "&lt;script&gt;" in resp.text
+
+
+# ── fix-hub-panel-ux：表单结构（label/hint/联动）+ 状态符号 + CSS 底线 ──
+
+
+def test_form_labels_paired_with_input_ids():
+    """label for-id 配对（UX 底线）：三表单每个 for= 都指向同 id 控件。"""
+    import re
+
+    for html in (panel.render_submit(["p"]), panel.render_project_new(), panel.render_credentials()):
+        for_ = re.findall(r'<label for="([^"]+)"', html)
+        assert for_, "零 label = 结构缺失"
+        for f in for_:
+            assert f'id="{f}"' in html
+
+
+def test_project_form_forge_toggle_and_hints():
+    """建项目表单：hint 存在 + forge→gitlab_host 联动（包裹 id + change 监听 + 初始 sync）。"""
+    html = panel.render_project_new()
+    assert 'class="hint"' in html
+    assert 'id="f-forge"' in html and 'id="f-gitlab-host-box"' in html
+    assert "addEventListener('change'" in html and "sync()" in html
+
+
+def test_submit_empty_project_list_links_to_new_project():
+    """空 project 清单：提示链接到建项目页（收尾引导——不再引导 ssh 建必读面）。"""
+    html = panel.render_submit([])
+    assert 'href="/panel/projects/new"' in html
+    assert "先在服务器" not in html  # 旧 ssh 引导文案已移除（必读面字样仍见于扫描说明 hint，属合法）
+
+
+def test_project_new_success_hint_by_forge():
+    """成功消息按 forge 形态引导下一步（收尾引导）：gitlab/gitcode→凭据页、缺省→提交页。"""
+    lab = panel.render_project_new(success="已建档：x", next_forge="gitlab")
+    assert 'href="/panel/credentials"' in lab and "GITLAB_TOKEN" in lab
+    assert "GITCODE_TOKEN" in panel.render_project_new(success="已建档：x", next_forge="gitcode")
+    assert 'href="/panel"' in panel.render_project_new(success="已建档：x", next_forge="")
+
+
+def test_repaint_values_escaped():
+    """回填值经 _esc：XSS 防线唯一性不因回填新增入口（载荷精确断言，避开合法联动 script 块）。"""
+    html = panel.render_project_new(values={"name": "<script>alert(1)</script>"})
+    assert "<script>alert(1)" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_status_symbols_in_queue_and_runs():
+    """状态符号双通道（D4）：✓/✗/… 与色 class 并行；last_error 截断 + title 悬停全文。"""
+    rows = [
+        {"id": 1, "project": "p", "status": "done", "attempt": 1, "initiator": "a", "last_error": None,
+         "created_at": "2026-10-27T04:14:08+00:00", "updated_at": "2026-10-27T04:20:31+00:00"},
+        {"id": 2, "project": "p", "status": "failed", "attempt": 2, "initiator": "a", "last_error": "boom",
+         "created_at": "2026-10-27T03:14:08+00:00", "updated_at": "2026-10-27T03:40:00+00:00"},
+        {"id": 3, "project": "p", "status": "running", "attempt": 1, "initiator": "a", "last_error": None,
+         "created_at": "2026-10-27T05:00:00+00:00", "updated_at": "2026-10-27T05:01:00+00:00"},
+    ]
+    html = panel.render_queue(rows)
+    assert '<span class="sym">✓</span>done' in html
+    assert '<span class="sym">✗</span>failed' in html
+    assert '<span class="sym">…</span>running' in html
+    assert 'class="err" title="boom"' in html  # D5：截断列 + title 悬停全文
+    # fix-hub-queue-recency：入队/更新时间列（截短显示 + title 全文）+ 操作列紧邻 status
+    assert "<th>入队</th><th>更新</th>" in html
+    assert '<th>status</th><th>操作</th>' in html  # 按钮不被时间列挤出可视区
+    assert 'title="2026-10-27T04:14:08+00:00"' in html  # ISO 全文进 title
+    assert ">10-27 04:14<" in html and ">10-27 04:20<" in html  # 显示为截短形
+    runs = [{"id": 1, "project": "p", "status": "succeeded", "exit_code": 0,
+             "started_at": "t", "ended_at": "t"}]
+    assert '<span class="sym">✓</span>succeeded' in panel.render_runs(runs)
+
+
+def test_css_baseline_present():
+    """CSS 底线静态锚：focus 可见态 / hover / 长内容截断与滚动 / 表格容器均入 _STYLE。"""
+    for pat in (":focus", "button:hover", "text-overflow:ellipsis", "pre.maxh", ".tablewrap"):
+        assert pat in panel._STYLE

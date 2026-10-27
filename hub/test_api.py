@@ -436,6 +436,57 @@ def test_panel_project_create_422_no_side_effects(tmp_path):
     assert not (lc.cfg.data_root / "demo").exists()  # 零残留（含半写清理路径未触发即拒）
 
 
+# ── fix-hub-form-parity ④：面板建项目 forge 三形态（spec: hub-panel「建项目表单」）──
+
+
+def test_panel_project_create_gitlab_via_form(tmp_path):
+    """gitlab 经界面自助建档（spec scenario）：表单 forge+gitlab_host → 落盘三键 + 提交页可见。"""
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    _login(client, lc)
+    r = client.post("/panel/projects", data={
+        "name": "lab-a", "forge": "gitlab", "gitlab_host": "http://172.32.153.183:8180",
+        "repo": "my-group/sub-team/demo-repo", "goal": "推进 lab 项目", "surface": "lab 信号",
+    })
+    assert r.status_code == 201, r.text
+    prof = (lc.cfg.data_root / "lab-a" / "profiles" / "lab-a.yaml").read_text(encoding="utf-8")
+    assert 'forge: gitlab\n' in prof
+    assert 'gitlab_host: "http://172.32.153.183:8180"\n' in prof
+    assert 'repo: "my-group/sub-team/demo-repo"\n' in prof  # 全路径原样（不走 GitHub 归一）
+    submit = client.get("/panel")
+    assert ">lab-a<" in submit.text  # 提交页下拉命中
+
+
+def test_panel_project_create_gitlab_missing_host_422(tmp_path):
+    """gitlab 缺 host 被 422 拒（spec scenario）：回显错误、零落盘。"""
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    _login(client, lc)
+    r = client.post("/panel/projects", data={
+        "name": "lab-a", "forge": "gitlab", "repo": "grp/repo", "goal": "g", "surface": "s",
+    })
+    assert r.status_code == 422 and "gitlab_host 必填" in r.text
+    assert not (lc.cfg.data_root / "lab-a").exists()
+
+
+def test_panel_project_create_gitcode_and_github_default(tmp_path):
+    """gitcode 两级（spec scenario）+ github 缺省回归（表单不带 forge 键 = 既有行为）。"""
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    _login(client, lc)
+    r = client.post("/panel/projects", data={
+        "name": "code-a", "forge": "gitcode", "repo": "owner/repo", "goal": "g", "surface": "s",
+    })
+    assert r.status_code == 201, r.text
+    prof = (lc.cfg.data_root / "code-a" / "profiles" / "code-a.yaml").read_text(encoding="utf-8")
+    assert 'forge: gitcode\n' in prof and "gitlab_host" not in prof
+    assert 'repo: "owner/repo"\n' in prof
+    # github 缺省：不带 forge 键（老表单/脚本直 POST）——落盘与既有逐字节一致
+    r2 = client.post("/panel/projects", data={
+        "name": "demo", "repo": "owner/repo", "goal": "g", "surface": "s",
+    })
+    assert r2.status_code == 201, r2.text
+    prof2 = (lc.cfg.data_root / "demo" / "profiles" / "demo.yaml").read_text(encoding="utf-8")
+    assert "forge" not in prof2 and 'repo: "https://github.com/owner/repo"' in prof2
+
+
 def test_panel_ops_admin_guard(tmp_path):
     """D4：未登录 401 / 白名单外 403 / 白名单内放行 / 空名单=任何有效会话放行。"""
     client, d, eng, lc = _mk(tmp_path, extra_env={**_MM_ENV, "HUB_PANEL_ADMINS": "li4"})
@@ -470,7 +521,7 @@ def test_panel_ops_admin_guard(tmp_path):
 def test_panel_retry_failed_creates_new_item(tmp_path):
     """重跑 happy（spec scenario）：新项同 project/prd、发起人=操作者；旧行留审计。"""
     client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
-    ident = _login(client, lc)
+    _login(client, lc)  # enqueued_by 断言改走原项后 ident 不再用（F841）
     prd = tmp_path / "p.md"; prd.write_text("# x", encoding="utf-8")
     qid = eng.enqueue("proj-a", str(prd), "roc", initiator="roc")
     eng.fail_item(qid, "跑炸了")
@@ -479,7 +530,8 @@ def test_panel_retry_failed_creates_new_item(tmp_path):
     new = [i for i in d.list_items() if i["id"] != qid][0]
     assert new["status"] == "pending" and new["project"] == "proj-a"
     assert new["prd_path"] == str(prd)
-    assert new["enqueued_by"] == ident["mm_user_id"] and new["initiator"] == "zhang3"
+    # 凭据跟入队人走：admin 代点重跑不换凭据源（2026-10-27 #52 凭据缺失回归锚）
+    assert new["enqueued_by"] == "roc" and new["initiator"] == "zhang3"
     assert d.get_item(qid)["status"] == "failed" and d.get_item(qid)["last_error"] == "跑炸了"  # 旧行原样
     assert f"#{new['id']}" in resp.text  # 回执含新项号
 
@@ -519,4 +571,68 @@ def test_panel_abandon_pending_same_as_rest_delete(tmp_path):
     assert r_ab.status_code == r_del.status_code == 409
     assert r_ab.json()["detail"] == r_del.json()["detail"]
     assert client.post("/panel/queue/999/abandon").status_code == 404
+
+
+# ── fix-hub-panel-ux：422 回显回填（spec: hub-panel「UX 底线」——拒绝不丢输入）──
+
+
+def test_panel_prd_422_repaints_submitted_values(tmp_path):
+    """提交 PRD 422（evidence 空白）：页面回填已选 project（selected）+ 已贴 PRD 正文。"""
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    _login(client, lc)
+    resp = client.post("/panel/prd", data={
+        "project": "proj-a", "prd_content": "# 手写目标\n## 验收\n- [ ] 回填可见", "evidence": "  ",
+    })
+    assert resp.status_code == 422 and "evidence 必填" in resp.text
+    assert "# 手写目标" in resp.text and "回填可见" in resp.text  # textarea 正文回填
+    assert '<option value="proj-a" selected>' in resp.text  # select selected 回填
+
+
+def test_panel_project_create_422_repaints_submitted_values(tmp_path):
+    """建项目 422（重名触发）：六字段回填 + forge=gitlab selected + gitlab_host 值保留。"""
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    _login(client, lc)
+    resp = client.post("/panel/projects", data={  # name=proj-a 与 fixture 重名 → 422；其余字段合法
+        "name": "proj-a", "repo": "g/sub/r", "goal": "推进 lab-x", "surface": "lab 信号",
+        "forge": "gitlab", "gitlab_host": "http://172.32.0.1:8180",
+    })
+    assert resp.status_code == 422 and "已存在" in resp.text
+    assert 'value="g/sub/r"' in resp.text and 'value="推进 lab-x"' in resp.text
+    assert 'value="lab 信号"' in resp.text and 'value="http://172.32.0.1:8180"' in resp.text
+    assert '<option value="gitlab" selected>' in resp.text
+
+
+def test_panel_credentials_422_token_not_repainted(tmp_path):
+    """凭据 422：非密码框回填（base_url/model）；token 框不回填（密码语义例外锚）。"""
+    from cryptography.fernet import Fernet
+
+    import vault_store as vs
+    _, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    vault = vs.CredentialVault(tmp_path / "vault", Fernet.generate_key())
+    client = TestClient(api.create_app(d, eng, lc, vault=vault))
+    _login(client, lc)
+    resp = client.post("/panel/credentials", data={  # 平台 token 全空 → 422（auth 两值已给全）
+        "anthropic_base_url": "http://172.32.0.1:9001",
+        "anthropic_auth_token": "sk-secret-tok-0123456789abcd",
+        "model": "qwen3.8-27b-fast",
+    })
+    assert resp.status_code == 422 and "缺平台 token" in resp.text
+    assert 'value="http://172.32.0.1:9001"' in resp.text  # base_url 回填
+    assert 'value="qwen3.8-27b-fast"' in resp.text  # model 回填
+    assert "sk-secret-tok-0123456789abcd" not in resp.text  # token 框绝不回填（密码例外）
+
+
+# ── fix-hub-queue-recency：队列最新优先（spec: hub-panel「面板只读面」）──
+
+
+def test_queue_listing_recency_order(tmp_path):
+    """GET /queue 同源降序：最新入队在前（与面板同 db.list_items，无分支透传）。"""
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    _login(client, lc)  # REST 读面同会话守卫（与面板同口径）
+    p = tmp_path / "a.md"; p.write_text("# x", encoding="utf-8")
+    q1 = eng.enqueue("proj-a", str(p), "t", "u")
+    q2 = eng.enqueue("proj-a", str(p), "t", "u")
+    resp = client.get("/queue")
+    assert resp.status_code == 200
+    assert [i["id"] for i in resp.json()] == [q2, q1]  # 最新优先
 

@@ -17,7 +17,7 @@ worktree 挂载落点（design D6），hub 绝不挂不碰——两个范畴不�
   `/opt/pa/.project-auto/sources.yaml`（_run_pipeline 顶部无条件 load_sources() 必读）
 - PRD 只读输入卷：host PRD 文件 → 容器 `/input/<prd>.md:ro`（A2：PRD 经只读卷进容器）
 - 容器命令：传给镜像 ENTRYPOINT 的**纯参数**（docker run tag 后 args 附加到 ENTRYPOINT）——
-  `--from-stage inject --inject-prd /input/<prd>.md --stamp <预分配>`
+  `--from-stage inject --to-stage report --inject-prd /input/<prd>.md --stamp <预分配>`
 """
 from __future__ import annotations
 

@@ -149,7 +149,7 @@ class HubDB:
         if status is not None:
             sql += " WHERE status=?"
             args = (status,)
-        return [dict(r) for r in self._conn.execute(sql + " ORDER BY id", args)]
+        return [dict(r) for r in self._conn.execute(sql + " ORDER BY id DESC", args)]  # 最新优先（fix-hub-queue-recency）
 
     @_locked
     def set_item_status(self, item_id: int, status: str) -> None:

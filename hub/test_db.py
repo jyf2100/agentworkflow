@@ -72,6 +72,7 @@ def test_list_items_by_status(tmp_path):
     d.set_item_status(b, "running")
     assert [i["id"] for i in d.list_items(status="pending")] == [a]
     assert len(d.list_items()) == 2
+    assert [i["id"] for i in d.list_items()] == [b, a]  # 最新优先（fix-hub-queue-recency）
 
 
 def test_sqlite_multithread_writes_no_deadlock_no_loss(tmp_path):

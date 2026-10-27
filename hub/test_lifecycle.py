@@ -78,6 +78,23 @@ def test_dispatch_signs_meta_creates_run_starts_container(tmp_path):
     assert spec.sources_file == data / "proj-a" / "sources.yaml"   # 启动必读单文件卷
 
 
+def test_dispatch_cmd_runs_full_second_half_inject_to_report(tmp_path):
+    # 段范围钉死（fix-hub-form-parity，spec: execution-hub「执行链段范围」）：
+    # cmd 必含相邻对 ("--from-stage","inject") 与 ("--to-stage","report")——report 段
+    # 双写产物落 state/reports/ 供面板渲染；--to-stage 缺席则止于 dispatch 默认（回归形态）。
+    lc, d, fake, _ = _mk(tmp_path)
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    assert lc.tick_dispatch() is True
+    spec = fake.containers[d.runs_for_item(qid)[0]["container_ref"]]["spec"]
+    cmd = spec.command
+    for i, tok in enumerate(cmd):
+        if tok == "--from-stage":
+            assert cmd[i + 1] == "inject"
+        if tok == "--to-stage":
+            assert cmd[i + 1] == "report"
+    assert "--to-stage" in cmd and "--from-stage" in cmd  # 两个 flag 都在（防只断相邻不防缺位）
+
+
 def test_dispatch_missing_image_fails_item_records_no_container(tmp_path):
     lc, d, fake, _ = _mk(tmp_path, images=set())
     prd = _prd(tmp_path)
@@ -302,17 +319,29 @@ def test_credentials_vault_wins_over_env(tmp_path):
 
 
 def test_credentials_vault_merges_user_model(tmp_path):
-    """组5.1 hub 全链实证修复：vault 有记录时 HUB_USER_MODEL→ANTHROPIC_MODEL 仍须注入——
-    vault payload 只存凭据面，模型路由（非凭据）不 merge 则容器内 claude 落 CLI 内置
-    默认模型（claude-opus-5），roc 代理 400 拒裸 Anthropic id。"""
+    """组5.1 hub 全链实证修复：vault 有记录（无模型）时 HUB_USER_MODEL→ANTHROPIC_MODEL
+    仍须注入——vault payload 只存凭据面，模型路由（非凭据）不 merge 则容器内 claude 落
+    CLI 内置默认模型（claude-opus-5），roc 代理 400 拒裸 Anthropic id。"""
     lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {"roc": _VAULT_ENV}))
     import dataclasses
 
     lc.cfg = dataclasses.replace(lc.cfg, user_model="glm-5.3")  # HubConfig frozen，整体替换
     env, source = lc._credentials()
     assert source == "vault"
-    assert env["ANTHROPIC_MODEL"] == "glm-5.3"  # 路由键恒注入（F9 同 env-file 通道）
+    assert env["ANTHROPIC_MODEL"] == "glm-5.3"  # 记录无模型 → hub 级缺省兜底注入（F9）
     assert env["GH_TOKEN"] == _VAULT_ENV["GH_TOKEN"]  # 凭据面原样（非替换式 merge）
+
+
+def test_credentials_vault_model_wins_over_user_model(tmp_path):
+    """2026-10-27 #56 回归锚：面板凭据页存的 ANTHROPIC_MODEL（用户显式选择）优先于
+    hub 级 HUB_USER_MODEL 缺省——恒覆盖会让面板 model 框形同虚设。"""
+    lc, d, fake, data = _mk(tmp_path, vault=_vault(tmp_path, {
+        "roc": {**_VAULT_ENV, "ANTHROPIC_MODEL": "qwen3.8-27b"}}))
+    import dataclasses
+
+    lc.cfg = dataclasses.replace(lc.cfg, user_model="glm-5.3")
+    env, source = lc._credentials()
+    assert source == "vault" and env["ANTHROPIC_MODEL"] == "qwen3.8-27b"
 
 
 def test_credentials_fallback_env_with_warn(tmp_path, capsys):

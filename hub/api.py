@@ -364,8 +364,10 @@ def create_app(
         user = ident["username"]
 
         def _reject(msg: str) -> HTMLResponse:
+            # fix-hub-panel-ux：422 回显回填已提交值（不丢输入，经 _esc）
             return HTMLResponse(
-                panel.render_submit(_panel_projects(), error=msg, current_user=user),
+                panel.render_submit(_panel_projects(), error=msg, current_user=user,
+                                    values={"project": project, "prd_content": prd_content, "evidence": evidence}),
                 status_code=422,
             )
 
@@ -424,22 +426,28 @@ def create_app(
         repo = str(form.get("repo") or "").strip()
         goal = str(form.get("goal") or "").strip()
         surface = str(form.get("surface") or "").strip()
+        forge = str(form.get("forge") or "").strip()
+        gitlab_host = str(form.get("gitlab_host") or "").strip()
 
         def _reject(msg: str) -> HTMLResponse:
+            # fix-hub-panel-ux：422 回显回填已提交值（不丢输入，经 _esc）
             return HTMLResponse(
-                panel.render_project_new(error=msg, current_user=ident["username"]),
+                panel.render_project_new(error=msg, current_user=ident["username"],
+                                         values={"name": name, "repo": repo, "goal": goal, "surface": surface,
+                                                 "forge": forge, "gitlab_host": gitlab_host}),
                 status_code=422,
             )
 
         if not name or not repo or not goal or not surface:
             return _reject("四字段（name/repo/goal/match_surface）均必填")
         try:
-            projects.create_project(lc.cfg.data_root, name, repo, goal, surface)
+            projects.create_project(lc.cfg.data_root, name, repo, goal, surface,
+                                    forge=forge, gitlab_host=gitlab_host)
         except projects.ProjectSetupError as e:
             return _reject(str(e))
         return HTMLResponse(
             panel.render_project_new(
-                success=f"已建档：{name}——提交页 project 下拉已可见", current_user=ident["username"]
+                success=f"已建档：{name}", next_forge=forge, current_user=ident["username"]
             ),
             status_code=201,
         )
@@ -447,7 +455,9 @@ def create_app(
     @app.post("/panel/queue/{item_id}/retry")
     def panel_queue_retry(item_id: int, request: Request):
         """重跑（D2）：仅 failed 可重跑（防双跑/防重复投递）——以原 project + 原 PRD
-        新建队列项（发起人 = 当前操作者），旧行留审计。PRD 文件不在则 404。"""
+        新建队列项，旧行留审计。enqueued_by 沿用原项（凭据跟入队人走——admin 代点
+        重跑不换凭据源，2026-10-27 #52 凭据缺失修复），initiator 记当前操作者。
+        PRD 文件不在则 404。"""
         ident = _require_admin(request)
         try:
             item = engine.get_item(item_id)
@@ -460,7 +470,7 @@ def create_app(
             )
         if not Path(item["prd_path"]).is_file():
             raise HTTPException(status_code=404, detail=f"原 PRD 文件已不存在，无法重跑：{item['prd_path']}")
-        new_id = engine.enqueue(item["project"], item["prd_path"], ident["mm_user_id"], initiator=ident["username"])
+        new_id = engine.enqueue(item["project"], item["prd_path"], item["enqueued_by"], initiator=ident["username"])
         return HTMLResponse(
             panel.render_queue(database.list_items(), success=f"已重跑：新队列项 #{new_id}（原 #{item_id} 留审计）"),
             status_code=201,
@@ -529,8 +539,11 @@ def create_app(
         form = await request.form()
 
         def _reject(msg: str, status_code: int = 422) -> HTMLResponse:
+            # fix-hub-panel-ux：422 回显回填非密码框（token/password 框不回填——密码语义）
             return HTMLResponse(panel.render_credentials(
-                error=msg, current_user=ident["username"]), status_code=status_code)
+                error=msg, current_user=ident["username"],
+                values={"anthropic_base_url": str(form.get("anthropic_base_url") or "").strip(),
+                        "model": str(form.get("model") or "").strip()}), status_code=status_code)
 
         # add-forge-adapter 3.3：与 PUT /auth/credentials 同 merge 口径——token 框留空保留既有
         try:
