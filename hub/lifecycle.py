@@ -329,8 +329,8 @@ class Lifecycle:
         reconcile 读伴生 events.jsonl，(run_id, seq) 进程内存去重后新行经 notifier 转发。
 
         寻址不依赖 hub run 目录 slug（_slugify 后与 pa stem 可能不同）——从
-        queue_item.prd_path 拿 PRD stem 机械拼 `{stamp}_{stem}.events.jsonl`
-        （stamp = run 目录名前缀 = 派发预分配，与 pa 侧写点逐字节同源）。孤儿 run
+        queue_item.prd_path 拿 PRD stem 经 events.locate_pa_artifact 定位
+        （精确拼 + 真机 stamp 翻倍 glob 兜底，见其 docstring）。孤儿 run
         （item 查无）无 prd_path 可拼 → 跳过。run 终态后不再进本方法（读取面在
         running 扫描集内）。fail-open：任一异常 stderr 告警不抛（reconcile 同步路径）。
         """
@@ -342,7 +342,9 @@ class Lifecycle:
                 return  # 孤儿归档行无 prd_path 可拼——跳过（终态通知已覆盖该 run）
             stem = Path(item["prd_path"]).stem
             run_dir = Path(run["run_dir"])
-            ev_file = run_dir.parent / f"{run_dir.name.split('_', 1)[0]}_{stem}.events.jsonl"
+            ev_file = events.locate_pa_artifact(run_dir, stem, ".events.jsonl")
+            if ev_file is None:
+                return  # 无伴生事件文件（事件未发生或 pa 未写到本 run 目录族）
             for row in events.read_events(ev_file):
                 key = (run["id"], row.get("seq"))
                 if key in self._event_seen:

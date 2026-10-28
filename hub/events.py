@@ -49,3 +49,22 @@ def read_events(path: Path) -> list[dict]:
             continue
         rows.append(row)
     return rows
+
+
+def locate_pa_artifact(run_dir: Path, stem: str, suffix: str) -> Path | None:
+    """pa 落卷工件寻址（events.jsonl / verify-report.json 共用，三消费点唯一拼法）。
+
+    先按契约精确拼 `{stamp}_{stem}{suffix}`（stamp = run 目录名前缀，hub 写面纪
+    律）；真机实证（2026-10-28，run #73/#74）：pa inject 会给注入文件名再前缀
+    stamp（自增 m/m2 避碰，hub 拿不到 actual），pa 侧 append 以注入后 stem 拼
+    `{actual}_{actual}_{stem}{suffix}`——精确未命中时按 `*_{stem}{suffix}` 后缀
+    glob 兜底。mm 路径 stem content-addressed（同内容 store_prd 拒二次落盘 →
+    同 stem 工件唯一）故后缀可靠；面板路径 pinyin slug 对 hub 不可知，glob 亦
+    不可达（pa 侧契约补 hub_stem 回写另行立项——本兜底先救 mm 路径）。
+    返回 None = 无此工件（调用方按缺失处理）。"""
+    rd = Path(run_dir)
+    exact = rd.parent / f"{rd.name.split('_', 1)[0]}_{stem}{suffix}"
+    if exact.is_file():
+        return exact
+    cands = sorted(rd.parent.glob(f"*_{stem}{suffix}"))
+    return cands[-1] if cands else None

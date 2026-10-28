@@ -25,6 +25,7 @@ from uuid import uuid4
 
 import auth
 import daemon
+import events
 import mm_intake
 import panel
 import prd_store
@@ -633,14 +634,13 @@ def create_app(
         return hits[-1].read_text(encoding="utf-8", errors="replace")
 
     def _run_events_tail(run_dir: str, prd_path: str | None, n: int = 30) -> list[str]:
-        """events.jsonl 尾部行原样读（fix-event-outlet-verify-parity 2.4）——与
-        lifecycle 事件转发同拼法 `{stamp}_{prd stem}.events.jsonl`（prd stem 原样，
-        hub run 目录横线化 slug 与之错位，寻址不得依赖目录名）。"""
+        """events.jsonl 尾部行原样读（fix-event-outlet-verify-parity 2.4）——寻址同
+        lifecycle 事件转发：events.locate_pa_artifact（精确拼 + 真机 stamp 翻倍
+        glob 兜底，hub run 目录横线化 slug 与之错位，寻址不得依赖目录名）。"""
         if not prd_path:
             return []
-        stem = Path(prd_path).stem
-        ev = Path(run_dir).parent / f"{Path(run_dir).name.split('_', 1)[0]}_{stem}.events.jsonl"
-        if not ev.is_file():
+        ev = events.locate_pa_artifact(Path(run_dir), Path(prd_path).stem, ".events.jsonl")
+        if ev is None:
             return []
         with ev.open(encoding="utf-8", errors="replace") as f:
             return [line.rstrip("\n") for line in deque(f, maxlen=n)]
@@ -653,8 +653,8 @@ def create_app(
             return None
         stem = Path(prd_path).stem
         rd = Path(run["run_dir"])
-        vr = rd.parent / f"{rd.name.split('_', 1)[0]}_{stem}.verify-report.json"
-        if not vr.is_file():
+        vr = events.locate_pa_artifact(rd, stem, ".verify-report.json")
+        if vr is None:
             return None
         try:
             data = json.loads(vr.read_text(encoding="utf-8", errors="replace"))

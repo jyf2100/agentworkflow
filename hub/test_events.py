@@ -130,6 +130,29 @@ def test_forward_events_dedup_and_text(tmp_path):
     pass
 
 
+def test_forward_events_real_machine_doubled_stamp_naming(tmp_path):
+    """真机实证回归锁（2026-10-28，run #73/#74）：pa inject 给注入文件名再前缀
+    stamp（自增 m 避碰，hub 拿不到 actual），pa 侧 append 以注入后 stem 拼事件
+    文件 = {actual}_{actual}_{stem}.events.jsonl——hub 精确拼不中，
+    locate_pa_artifact 按 content-addressed stem 后缀 glob 兜底（本 bug 曾致
+    语义事件转发在生产从未生效——面板时代 20261027_20261027_* 文件同为铁证）。"""
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
+    lc, d, fake, data = _mk(tmp_path, mm=mm)
+    prd = tmp_path / "mm-5d554c15.md"  # content-addressed 形态（同 stem 工件唯一）
+    prd.write_text("# PRD\n", encoding="utf-8")
+    qid = lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is True
+    run = d.runs_for_item(qid)[0]
+    rd = Path(run["run_dir"])
+    stamp = rd.name.split("_", 1)[0]
+    (rd.parent / f"{stamp}_{stamp}_mm-5d554c15.events.jsonl").write_text(
+        json.dumps(_line(0, "critic_verdict", verdict="drop", summary="无验收标准")) + "\n",
+        encoding="utf-8")
+    lc.reconcile_running()
+    assert len(mm.channels) == 1 and mm.dms == []
+    assert "critic 判定 → drop" in mm.channels[0][1] and "无验收标准" in mm.channels[0][1]
+
+
 def test_forward_new_seq_only_after_growth(tmp_path):
     mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
     lc, d, fake, data = _mk(tmp_path, mm=mm)
