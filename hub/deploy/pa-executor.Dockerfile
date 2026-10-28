@@ -48,7 +48,7 @@ RUN useradd -m -s /bin/bash pa \
     && mkdir -p /home/pa/.claude/skills \
     && cp -r /opt/pa/hub/deploy/executor-skills/. /home/pa/.claude/skills/ \
     && mkdir -p /workspace \
-    && chown -R pa:pa /home/pa /workspace /opt/pa/Projects/项目推进流水线
+    && chown -R pa:pa /home/pa /workspace /opt/pa
 
 USER pa
 ENV HOME=/home/pa

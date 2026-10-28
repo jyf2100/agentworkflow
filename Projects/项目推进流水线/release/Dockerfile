@@ -53,13 +53,14 @@ ENV PATH="/opt/venv/bin:$PATH"
 # ── 非 root 用户（design D6）+ persona 到用户级 ─────────────────────────────
 # WORKDIR /workspace 是目标仓 worktree 落点（F6：目标面在执行环境中的投影）——
 # 项目级 .claude/agents 不存在于目标仓，persona 必须装到用户级 ~/.claude/agents/。
-# pa 投影树归运行用户：自检（compileall/pytest 缓存）需在源码树落地 pyc——即弃容器
-# 内合法（隔离边界在容器，不在文件属主；/workspace 之外的可写性无安全含义）。
+# /opt/pa 全树归运行用户（对齐真机 v0.1.18 事实）：dispatch 段在 VAULT_ROOT 下建
+# workspace/、report 段建报告目录——投影根可写是编排器写面前提（即弃容器内合法，
+# 隔离边界在容器不在文件属主；/workspace 之外的可写性无安全含义）。
 RUN useradd -m -s /bin/bash pa \
     && mkdir -p /home/pa/.claude/agents \
     && cp /opt/pa/.claude/agents/*.md /home/pa/.claude/agents/ \
     && mkdir -p /workspace \
-    && chown -R pa:pa /home/pa /workspace /opt/pa/Projects/项目推进流水线
+    && chown -R pa:pa /home/pa /workspace /opt/pa
 
 # ── 首跑状态预置（design D5，spec 验收项）───────────────────────────────────
 # 以运行用户预初始化 CLI 状态：headless -p 不被 onboarding/trust 交互卡住；
