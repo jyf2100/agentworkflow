@@ -188,9 +188,9 @@ def test_report_renders_integrity_blocked_separately_from_failing(tmp_path, monk
     rp = run_daily.stage_report(SimpleNamespace(dry_run=True, no_notify=False), {}, STAMP)
     txt = rp.read_text(encoding="utf-8")
 
-    # 完整性阻断节渲染两类（带 block 类别 + 脱敏原因）
-    assert "## 🚫 证据/日志完整性阻断" in txt
-    integ = txt.split("## 🚫 证据/日志完整性阻断", 1)[1]
+    # 完整性阻断节渲染两类（带 block 类别 + 脱敏原因）；审核⑤F5 后节标题扩为四态措辞
+    assert "## 🚫 完整性/可判读性阻断" in txt
+    integ = txt.split("## 🚫 完整性/可判读性阻断", 1)[1]
     assert "slug-b" in integ and "evidence" in integ.lower()
     assert "slug-c" in integ and "journal" in integ.lower()
 
@@ -278,3 +278,29 @@ def test_triage_reason_drift_logs_warning_not_crash(tmp_path, monkeypatch):
     assert "x-slug" in txt
     assert "totally_new_reason_not_in_enum" in txt
     assert "triage：1" in txt
+
+
+def test_report_verify_invalid_and_blocked_infra_not_coerced_into_failing(tmp_path, monkeypatch):
+    """本体论审核⑤F5（agent-verify-injection 收尾修）：verify_invalid（考卷/环境不可判读→升人工）+
+    blocked_infra（install 基建失败→升人工）虽 verify.pass=False，语义非「dev 产出红」——计入 failing
+    等于把 invalid 强折成红，违反 verified-dev-execution「invalid never coerced into pass=false」
+    的 report 消费面条款（hub 事件面已三态，vault 日报面曾退化回二值）。两态与
+    blocked_evidence/state_corrupt 同族（完整性/可判读性阻断，运维 triage）→ integrity 桶扩四态。"""
+    disp = [
+        {"project": "o/r1", "status": "pr_open", "pr_url": "https://github.com/o/r1/pull/1",
+         "branch": "auto/a", "slug": "slug-a", "verify": {"pass": False, "test_cmd": "pytest"}},  # 真 failing
+        {"project": "o/r2", "status": "verify_invalid", "branch": "auto/b", "slug": "slug-b",
+         "verify": {"pass": False, "verdict": "invalid"}, "skip_reason": "invalid→triage: 考卷不可判读"},
+        {"project": "o/r3", "status": "blocked_infra", "branch": "auto/c", "slug": "slug-c",
+         "verify": {"pass": False}, "skip_reason": "独立验证基建失败"},
+    ]
+    _setup_report(tmp_path, monkeypatch, disp)
+    rp = run_daily.stage_report(SimpleNamespace(dry_run=True, no_notify=False), {}, STAMP)
+    txt = rp.read_text(encoding="utf-8")
+    # failing 只算真红那 1 条（invalid/infra 不被强折成红）
+    assert "验证 failing：1" in txt
+    # 两态进完整性/可判读性阻断节（概览计数 2 = verify_invalid 1 + blocked_infra 1）
+    assert "完整性阻断：2" in txt
+    integ = txt.split("## 🚫", 1)[1]
+    assert "slug-b" in integ and "slug-c" in integ
+    assert "不可判读" in integ and "基建" in integ

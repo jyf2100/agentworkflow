@@ -3432,7 +3432,8 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
         elif has_commits:
             rec["verify"] = independent_verify(repo, branch, stamp, slug, log_file, prof,
                                                test_cmd_hint=(script_json.get("test_cmd") if script_json else None),
-                                               suite_ref=_suite_snap)   # 2.4/1.9：verify 注入面用 iteration 快照（mid-iteration 重编写不换考卷；flag off 不消费）
+                                               suite_ref=_suite_snap,   # 2.4/1.9：verify 注入面用 iteration 快照（mid-iteration 重编写不换考卷；flag off 不消费）
+                                               project=proj, iteration=_iter)   # 审核⑤F7：verify-report run 身份（dispatch 手头的 proj/iteration 透传）
         else:
             rec["verify"] = None              # 无新增 commit → 无可验证（round≥2 dev 未动已由上方 no_progress 门终止，此处剩 round1 无产出）
         _vj = rec.get("verify") or {}
@@ -3926,7 +3927,7 @@ def _suite_defective_signature(vj: dict) -> bool:
 
 def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file: Path,
                         prof: dict | None, test_cmd_hint: str | None,
-                        suite_ref: dict | None) -> dict:
+                        suite_ref: dict | None, project: str = "", iteration: str = "") -> dict:
     """agent-verify-injection 2.4：verify agent 轨（``PA_VERIFY_AGENT=on`` 时 independent_verify 分支）。
 
     与机械轨同入口不同实现：verify worktree 自建（同 ``.worktrees/verify-<stamp>-<slug>`` 模式）；
@@ -3999,7 +4000,7 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
         ws_ok, ws_detail = VS_MOD.check_workspace_clean(vt, set(injected))
         dg_viol = VS_MOD.check_injected_digests(vt, digests)
         report = VS_MOD.build_verify_report(
-            run_id=stamp, project="", prd_id=slug, iteration_id="", harness=harness,
+            run_id=stamp, project=project, prd_id=slug, iteration_id=iteration, harness=harness,
             gate_cmd=gate_cmd, gate_source=gate_source, matched=matched,
             anchor_workspace_ok=ws_ok, anchor_digest_violations=dg_viol,
             stream_path=str(stream_path) if stream_path else "",
@@ -4041,15 +4042,19 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
 
 def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: Path,
                        prof: dict | None = None, test_cmd_hint: str | None = None,
-                       suite_ref: dict | None = None) -> dict:
+                       suite_ref: dict | None = None,
+                       project: str = "", iteration: str = "") -> dict:
     """独立验证闸（SPEC §4.4）：PR 分支全新 checkout worktree 重跑 test（非 dev 热乎树）。
     双轨：Node 仓（package.json）→ npm ci + npm test；Python 仓 → 重放 dev-agent 上报的 test_cmd（conda env PATH 注入）。
     测试归项目自治（ADR-0002）：dispatch 不替项目决定怎么测，只重放 dev-agent 上报的命令；dev-agent 未上报 → 跳过。
     返回 {test_cmd, pass, install_rc, test_rc, note}。红=标 failing（PR 留着不关）。
     agent-verify-injection 2.4：``PA_VERIFY_AGENT=on`` → agent 轨（``_agent_track_verify``——verify agent
-    执行 + 三机械锚 + verify-report，``suite_ref`` 为验收套件注入面）；off → 下方机械轨原样（byte-identical）。"""
+    执行 + 三机械锚 + verify-report，``suite_ref`` 为验收套件注入面）；off → 下方机械轨原样（byte-identical）。
+    ``project``/``iteration``（审核⑤F7）：verify-report run 身份——triage 按报告定位 iteration 时
+    身份面不可为空串；缺省空串 = 旧调用面回退形态（机械轨不消费）。"""
     if resolve_flags(profile=prof).verify_agent_track:
-        return _agent_track_verify(repo, branch, stamp, slug, log_file, prof, test_cmd_hint, suite_ref)
+        return _agent_track_verify(repo, branch, stamp, slug, log_file, prof, test_cmd_hint, suite_ref,
+                                   project=project, iteration=iteration)
     out: dict = {"test_cmd": None, "pass": False, "install_rc": None, "test_rc": None, "note": None,
                  "test_log": None, "verdict": None}   # verdict 三态（2.7）：机械轨 green/red 派生 + 超时 invalid；
     #   跳过/install 基建失败留 None（各自有既有消费槽——note 跳过 / install_rc→blocked_infra，不重复语义）
@@ -4518,16 +4523,19 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
     failing = [d for d in disp
                if d.get("verify") and not d["verify"].get("pass")
                and d.get("status") not in ("blocked_external_state", "blocked_test_gate",
-                                           "blocked_evidence")]   # 5.2 正交：阻断桶不计 failing；task 4.3：blocked_evidence 虽 verify.pass=False 但语义是「绿灯证据无法持久化」（非自报绿但独立红），独立成完整性节
+                                           "blocked_evidence", "verify_invalid", "blocked_infra")]   # 5.2 正交：阻断桶不计 failing；task 4.3：blocked_evidence 虽 verify.pass=False 但语义是「绿灯证据无法持久化」（非自报绿但独立红）；审核⑤F5：verify_invalid/blocked_infra 同理——不可判读/基建失败升人工，非 dev 产出红（invalid never coerced into pass=false 的 report 消费面）
     abnormal = [d for d in disp if d.get("status") in ("skip", "planned", "fail")]   # interrupted_pr 必带 verify（reconcile 仅在有 commit 时补开）→ 已落 review/failing，不混入 abnormal（5.2 桶正交，与概览行一致）
     # 5.2 阻断（fail-safe-dispatch / verified-dev-execution）：远程态不明 / 测试发布门未过——未投递，
     # 既不计入「产出 PR」也不计入「verify 绿/红」。独立成节促运维 triage（auth/远程服务/flaky test）。
     blocked_external = [d for d in disp if d.get("status") == "blocked_external_state"]
     blocked_gate = [d for d in disp if d.get("status") == "blocked_test_gate"]
     # task 4.3：证据/日志完整性阻断——green test evidence 无法持久化（blocked_evidence）或 journal
-    # 损坏 fail-closed（state_corrupt）。独立桶：既非测试红（不进 failing）、也非未投递（不在
-    # blocked_external/gate）——运维须 triage artifact 存储 / journal 恢复，不能混进 verify 绿红。
-    integrity_blocked = [d for d in disp if d.get("status") in ("blocked_evidence", "state_corrupt")]
+    # 损坏 fail-closed（state_corrupt）。审核⑤F5 扩四态：verify_invalid（考卷/环境不可判读→升人工）+
+    # blocked_infra（install 基建失败→升人工）同族入桶。独立桶：既非测试红（不进 failing）、也非
+    # 未投递（不在 blocked_external/gate）——运维须 triage artifact 存储 / journal 恢复 / 考卷判读，
+    # 不能混进 verify 绿红。
+    integrity_blocked = [d for d in disp if d.get("status") in
+                         ("blocked_evidence", "state_corrupt", "verify_invalid", "blocked_infra")]
     # task 5.3：single-flight-auto-merge 闭环三态——merged（已合 main）/ triaged（出队进池不阻塞）/ halted
     # （整仓暂停须人工）。新闭环语义，不进 baseline 的 review/failing/abnormal/blocked/integrity 桶（防混计）。
     merged = [d for d in disp if d.get("status") == "merged"]
@@ -4684,15 +4692,18 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
         L.append("（无）")
     L.append("")
 
-    # 🚫 证据/日志完整性阻断（task 4.3）——green test evidence 无法持久化（evidence）或 journal
-    # 损坏 fail-closed（journal）。非测试红、非未投递：独立成节促运维 triage（artifact 存储 / journal
-    # 恢复），不计 verify 绿红（spec verified-publication「Test artifact write fails」integrity-block reason）。
-    L += ["## 🚫 证据/日志完整性阻断"]
+    # 🚫 完整性/可判读性阻断（task 4.3 + 审核⑤F5 扩四态）——green test evidence 无法持久化（evidence）、
+    # journal 损坏 fail-closed（journal）、考卷/环境不可判读（invalid→triage）、install 基建失败（infra）。
+    # 非测试红、非未投递：独立成节促运维 triage，不计 verify 绿红（spec verified-publication
+    # 「Test artifact write fails」integrity-block reason + verified-dev-execution invalid 三态消费面）。
+    L += ["## 🚫 完整性/可判读性阻断"]
     if integrity_blocked:
         L += ["| 目标仓 | PRD | 分支 | 完整性类别 | 原因（已脱敏） |", "|---|---|---|---|---|"]
         for d in integrity_blocked:
-            kind = "证据完整性（evidence）" if d.get("status") == "blocked_evidence" \
-                else "日志完整性（journal）"
+            kind = {"blocked_evidence": "证据完整性（evidence）",
+                    "state_corrupt": "日志完整性（journal）",
+                    "verify_invalid": "考卷/环境不可判读（invalid）",
+                    "blocked_infra": "验证基建（infra）"}[d.get("status", "")]
             L.append(f"| {repo_of(d)} | {d.get('slug', '')} | `{d.get('branch') or '—'}` | "
                      f"{kind} | {d.get('skip_reason') or ''} |")
     else:

@@ -420,3 +420,24 @@ def test_dispatch_invariant_violation_invalid(tmp_path, monkeypatch):
     assert rec["status"] == "verify_invalid"
     assert "不变式破坏" in (rec.get("skip_reason") or "")
     assert _c == [True] and rec.get("verify_verdict") is None
+
+
+def test_agent_track_report_run_identity(tmp_path, agent_env):
+    """本体论审核⑤F7（agent-verify-injection 收尾修）：verify-report run 身份非空壳——
+    independent_verify 透传 project/iteration 进 build_verify_report（spec「报告覆盖 run
+    identity」；triage 按 report 定位 iteration 时身份面不可为空串）。"""
+    _t, runs = agent_env
+    suite = _store_jest_suite(tmp_path / "acceptance_store")
+    FakeExecutor.stream = _raw([_ev_use("t1", DEC_JEST), _ev_res("t1", "1 passing"), _ev_meta()])
+    repo = _repo_with_branch(tmp_path)
+    out = run_daily.independent_verify(str(repo), "feat/x", "st", "slug", runs / "st_slug.log",
+                                       prof=None, test_cmd_hint=None, suite_ref=suite,
+                                       project="cc-web-control", iteration="st:prd-x:2")
+    assert out["verdict"] == "green"
+    rep = json.loads((runs / "st_slug.verify-report.json").read_text(encoding="utf-8"))
+    assert rep["run"]["project"] == "cc-web-control"
+    assert rep["run"]["iteration_id"] == "st:prd-x:2"
+    # 缺省形态（旧调用面）零崩溃——空串回退保持
+    out2 = run_daily.independent_verify(str(repo), "feat/x", "st", "slug", runs / "st_slug.log",
+                                        prof=None, test_cmd_hint=None, suite_ref=suite)
+    assert out2["verdict"] == "green"

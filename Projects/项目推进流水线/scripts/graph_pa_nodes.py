@@ -786,7 +786,8 @@ def _dev_post_op(ni: dict, state: dict):
         vj = run_daily.independent_verify(
             repo, branch, stamp, slug, log_file, prof,
             test_cmd_hint=(script.get("test_cmd") if script else None),
-            suite_ref=_snap)
+            suite_ref=_snap,
+            project=ni.get("_project", ""))   # 审核⑤F7：verify-report run 身份（graph 影子无 coordinator iteration，iteration 留空回退）
 
     # ③a agent-verify-injection 2.6（graph 对齐 dispatch_one）：invalid 三态分流——不可判读不烧
     #    verify 会话、不进 revise 回环（B2 三分管方向）；对账收尾 → triage；收集级失败签名 →
