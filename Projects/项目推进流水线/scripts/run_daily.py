@@ -2178,6 +2178,29 @@ def _run_capture(cmd: list[str], cwd: str, timeout: int, label: str,
     return proc.returncode, proc.stdout, (proc.stderr or "")[-800:]
 
 
+def _clone_workspace_repo(repo: str, clone_url: str, slug: str,
+                          log_file: Path | None) -> tuple[bool, str]:
+    """dispatch 仓准备 clone（第六修，run #83/#84 真机）：HTTP/1.1 强制 + rc≠0 间歇抽重试 1 次。
+
+    hub 出口代理对 github git smart HTTP 的 HTTP/2 流分钟级间歇断（m14 ``expected flush
+    after ref listing`` / m15 ``HTTP/2 stream not closed cleanly``，宿主 ls-remote 三连测
+    亦见 503；强制 HTTP/1.1 双通道实测绕过，2026-10-28）。``_run_capture`` rc≠0 不抛——
+    曾致 clone fatal 被静默吞、后续 worktree 段才以裸 ``Errno 2`` 炸出（细节被吞排障
+    绕圈）。重试前清半拉子目标目录（git clone 失败残留会 ``destination path already
+    exists``）。两次皆败 → (False, 显式原因含 stderr 尾)；成功 → (True, "")。
+    """
+    argv = ["git", "-c", "http.version=HTTP/1.1", "clone", clone_url, Path(repo).name]
+    parent = str(Path(repo).parent)
+    rc, _, err = _run_capture(argv, parent, 600, f"[{slug}:clone]", log_file)
+    if rc != 0:
+        if Path(repo).exists():
+            shutil.rmtree(repo, ignore_errors=True)
+        rc, _, err = _run_capture(argv, parent, 600, f"[{slug}:clone-retry]", log_file)
+    if rc != 0:
+        return False, f"clone 目标仓失败（含重试 1 次，HTTP/1.1）: {err[-300:]}"
+    return True, ""
+
+
 # ─── verify 闭环辅助（dev→独立验证→pa-verify，docs/verify-commit-loop-design.md §3/§5）──
 def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
              feedback_artifact: str | None = None, *,
@@ -3217,8 +3240,12 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
             Path(repo).parent.mkdir(parents=True, exist_ok=True)
             # 目标用 name（相对 cwd=parent 解析）——argv 若写全相对路径 repo，git 会相对 parent 再拼
             # 一次 → 双重嵌套 pa-qa/sub/pa-qa/sub/proj，后续 worktree 的 cwd=repo 随即 Errno 2。
-            _run_capture(["git", "clone", _clone_url, Path(repo).name], str(Path(repo).parent),
-                         600, f"[{slug}:clone]", log_file)
+            # clone 细节（HTTP/1.1 强制 / rc≠0 检查 / 间歇抽重试 1 次——第六修 run #83/#84 真机）
+            # 见 _clone_workspace_repo。
+            _ok, _why = _clone_workspace_repo(repo, _clone_url, slug, log_file)
+            if not _ok:
+                rec.update(status="fail", skip_reason=_why)
+                _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {_why}"); return rec
         except RuntimeError as e:
             rec.update(status="fail", skip_reason=f"clone 目标仓失败: {e}")
             _sj_terminal(_sj, rec, _iter, _prd); log(f"  ✗ {slug}: {rec['skip_reason']}"); return rec

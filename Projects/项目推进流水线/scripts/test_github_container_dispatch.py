@@ -187,3 +187,50 @@ def test_repo_local_path_mapping():
     assert p2.endswith("workspace/r")
     assert run_daily._repo_local_path("/abs/repo") == "/abs/repo"
     assert run_daily._repo_local_path("pa-qa/sub/proj") == "pa-qa/sub/proj"
+
+
+# ─── 第六修（run #83/#84 真机）：clone HTTP/1.1 + rc 检查 + 间歇抽重试 ──────────
+def test_clone_workspace_repo_http11_and_retry(monkeypatch, tmp_path):
+    """clone argv 强制 HTTP/1.1（代理对 git smart HTTP 的 HTTP/2 流间歇断）；rc≠0 重试 1 次后成功。"""
+    calls = []
+
+    def fake_run(cmd, cwd, timeout, label, log_file=None, env=None):
+        calls.append(list(cmd))
+        return (128 if len(calls) == 1 else 0), "", "fatal: HTTP/2 stream not closed"
+
+    monkeypatch.setattr(run_daily, "_run_capture", fake_run)
+    repo = str(tmp_path / "ws" / "proj")
+    ok, why = run_daily._clone_workspace_repo(repo, "https://github.com/o/p.git", "slug", None)
+    assert ok and why == ""
+    assert calls[0][:5] == ["git", "-c", "http.version=HTTP/1.1", "clone", "https://github.com/o/p.git"]
+    assert calls[0][5] == "proj"                      # 目标用 name（防双重嵌套注释的既有语义）
+    assert len(calls) == 2                            # 间歇抽重试恰好 1 次
+
+
+def test_clone_workspace_repo_double_fail_explicit_reason(monkeypatch, tmp_path):
+    """两次皆败 → (False, 显式原因含 stderr 尾)——不再静默吞 rc 让 worktree 段裸 Errno 2。"""
+
+    def fake_run(cmd, cwd, timeout, label, log_file=None, env=None):
+        return 128, "", "fatal: expected flush after ref listing"
+
+    monkeypatch.setattr(run_daily, "_run_capture", fake_run)
+    ok, why = run_daily._clone_workspace_repo(str(tmp_path / "ws" / "p"), "https://x.git", "slug", None)
+    assert not ok and "clone 目标仓失败" in why and "expected flush" in why
+
+
+def test_clone_workspace_repo_cleans_partial_dir_before_retry(monkeypatch, tmp_path):
+    """首次失败残留的半拉子目录在重试前被清（否则 git 报 destination path already exists）。"""
+    target = tmp_path / "ws" / "proj"
+    seen = []
+
+    def fake_run(cmd, cwd, timeout, label, log_file=None, env=None):
+        seen.append(target.exists())
+        if len(seen) == 1:                            # 首败模拟 git 留半拉子
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "HEAD").write_text("partial")
+            return 128, "", "fatal: stream broken"
+        return 0, "", ""
+
+    monkeypatch.setattr(run_daily, "_run_capture", fake_run)
+    ok, _ = run_daily._clone_workspace_repo(str(target), "https://github.com/o/p.git", "slug", None)
+    assert ok and seen == [False, False]              # 重试时残留已被清（exists=False）
