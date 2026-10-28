@@ -117,7 +117,9 @@ def test_playwright_declared_full_track_to_store(tmp_path, monkeypatch):
     # 稳定 id 前缀 = dev_slugify(slug)——slug 是 PRD 文件名 stem「demo_prd」→「demo-prd」
     spec = _GOOD_SPEC.replace("demo:ac1", "demo-prd:ac1")
     (out_dir / "e2e_theme.spec.ts").write_text(spec, encoding="utf-8")
-    (out_dir / "playwright.config.ts").write_text(_GOOD_CONFIG, encoding="utf-8")
+    (out_dir / "playwright.config.ts").write_text(
+        _GOOD_CONFIG.replace("port: 4180", f"port: {run_daily._e2e_port_for(str(prd))}"),
+        encoding="utf-8")
 
     def fake_persona(name, prompt, tag, label, allowed_tools=None):
         assert name == "pa-test-author" and "playwright" in prompt
@@ -137,8 +139,9 @@ def test_prompt_playwright_branch_rules():
     prof = {"tech_stack": "node", "e2e_dev_cmd": "npm run dev"}
     prompt = run_daily._test_author_prompt("p/x.md", acs, "playwright", Path("/tmp/o"), prof)
     assert "playwright.config.ts" in prompt                     # config 是 authored file 之一
-    assert "npm run dev" in prompt                              # webServer command 来自 profile
+    assert "npm run dev" in prompt                              # webServer command 基于 profile
     assert str(run_daily._e2e_port_for("p/x.md")) in prompt     # 机械分配端口写进 prompt
+    assert "实际监听" in prompt                                  # command 端口对齐指令（真跑实证缺口）
     assert "reuseExistingServer" in prompt and "retries: 1" in prompt
     assert "chromium" in prompt and "@playwright/test" in prompt
     assert "page.waitForTimeout" in prompt                      # 禁令显式出现
@@ -187,6 +190,22 @@ def test_self_check_playwright_config_no_webserver():
              "playwright.config.ts": "export default defineConfig({ retries: 1 });\n"}
     ok, detail = run_daily._structural_self_check(files, "playwright", {"demo:ac1"})
     assert not ok and "webServer" in detail
+
+
+def test_self_check_config_port_mismatch_rejected():
+    # 全链真跑实证缺口：command 照抄 e2e_dev_cmd（自带 4180）而 port 写机械分配 → webServer 死等
+    ok, detail = run_daily._structural_self_check(
+        {"e2e_theme.spec.ts": _GOOD_SPEC, "playwright.config.ts": _GOOD_CONFIG},
+        "playwright", {"demo:ac1"}, expected_port=4174)
+    assert not ok and "4174" in detail
+
+
+def test_self_check_config_port_match_passes():
+    cfg = _GOOD_CONFIG.replace("port: 4180", "port: 4174")
+    ok, detail = run_daily._structural_self_check(
+        {"e2e_theme.spec.ts": _GOOD_SPEC, "playwright.config.ts": cfg},
+        "playwright", {"demo:ac1"}, expected_port=4174)
+    assert ok, detail
 
 
 def test_self_check_jest_regression_unchanged():

@@ -872,10 +872,14 @@ def _test_author_prompt(prd_path: str, acs: list[dict], harness: str,
     ac_lines = "\n".join(f"- {a['id']}: {a['text']}" for a in acs)
     if harness == "playwright":
         shape = ("e2e_*.spec.ts + playwright.config.ts（config 也要写——随套件注入目标仓）")
+        e2e_port = _e2e_port_for(prd_path)
         e2e_rules = f"""
 E2E 专则（硬性，违反 = 结构自检拒收）：
 - 条件等待：禁 page.waitForTimeout/固定 sleep，一律 toBeVisible/waitForSelector 等条件断言。
-- playwright.config.ts 必含：webServer（command: `{prof.get('e2e_dev_cmd', '')}`、port: {_e2e_port_for(prd_path)}、
+- playwright.config.ts 必含：webServer（command 必须使 dev server **实际监听 {e2e_port} 端口**——
+  profile e2e_dev_cmd 为 `{prof.get('e2e_dev_cmd', '')}`，其默认端口非 {e2e_port} 时改写命令
+  （如 `PORT={e2e_port} <e2e_dev_cmd>` / `--port {e2e_port}` / 命令内端口参数改 {e2e_port}），
+  port: {e2e_port}（编排器机械分配，自检强校验一致）、
   reuseExistingServer: true——dev server 起停全归 webServer 管，测试内不起停服务、零外网依赖）、
   retries: 1、projects 仅 chromium（单浏览器）。
 - 只 `import '@playwright/test'`——镜像全局已装（NODE_PATH resolve），勿在仓内装依赖/引新 devDependency。
@@ -928,10 +932,13 @@ def _collect_authored_files(payload: dict, out_dir: Path) -> tuple[dict[str, str
 
 
 def _structural_self_check(files: dict[str, str], harness: str,
-                           valid_ids: set[str]) -> tuple[bool, str]:
+                           valid_ids: set[str],
+                           expected_port: int | None = None) -> tuple[bool, str]:
     """控制面可跑的结构自检（T2 第一层）：文件形态 + criterion 标注可解析且 ⊆ PRD id 集。
 
     收集级自检（pytest --collect-only 类）需要目标仓依赖环境，留注入面在 worktree 内跑（第二层）。
+    expected_port（playwright 专用）：PRD 机械分配端口——config webServer.port 与之不符即拒收
+    （command 照抄 e2e_dev_cmd 而端口错位 = webServer 死等超时，全链真跑实证的缺口）。
     """
     ann: set[str] = set()
     for rel, content in files.items():
@@ -945,6 +952,11 @@ def _structural_self_check(files: dict[str, str], harness: str,
             if Path(rel).name == "playwright.config.ts":
                 if "webServer" not in content:
                     return False, f"playwright.config 无 webServer 节（dev server 生命周期失管）: {rel}"
+                if expected_port is not None:
+                    _pm = re.search(r"port:\s*(\d+)", content)
+                    if not _pm or int(_pm.group(1)) != expected_port:
+                        return False, (f"playwright.config webServer.port 非机械分配端口 {expected_port}"
+                                       f"（command/e2e_dev_cmd 端口错位 = webServer 死等超时）: {rel}")
                 continue
             if not _E2E_FILE_RE.match(Path(rel).name):
                 return False, f"playwright 套件含非 e2e_*.spec.ts 文件: {rel}"
@@ -1010,7 +1022,8 @@ def _author_acceptance_suite(entry: dict, prof: dict, stamp: str) -> dict | None
                           "detail": str(payload["refused"].get("reason", ""))[:200]}
             else:
                 files, suite_ids = _collect_authored_files(payload, out_dir)
-                ok, detail = _structural_self_check(files, harness, valid_ids)
+                ok, detail = _structural_self_check(files, harness, valid_ids,
+                                                    expected_port=_e2e_port_for(prd_path) if harness == "playwright" else None)
                 if not files:
                     result = {"status": "absent", "reason": "no_files", "prd_id": slug}
                 elif not ok:

@@ -22,7 +22,7 @@ pa 编排器 SHALL 接受 profile `harness: playwright` 声明并与 jest/pytest
 
 ### Requirement: E2E 确定性纪律
 
-pa-test-author 对 playwright 形态 SHALL 强制：条件等待（禁固定 sleep）、playwright.config 声明 webServer（command 来自 profile `e2e_dev_cmd`、127.0.0.1 固定端口段、`reuseExistingServer`）、`retries=1`、单 chromium。结构自检对违反前两条的产出 SHALL 拒收（同 jest/pytest 形态不匹配拒收的现行纪律）。
+pa-test-author 对 playwright 形态 SHALL 强制：条件等待（禁固定 sleep）、playwright.config 声明 webServer（command 基于profile `e2e_dev_cmd` 改写至**实际监听**机械分配端口、127.0.0.1 固定端口段、`reuseExistingServer`）、`retries=1`、单 chromium。结构自检对违反前两条的产出 SHALL 拒收，且对 config `webServer.port` 与该 PRD 机械分配端口不符的产出 SHALL 拒收（command 照抄 e2e_dev_cmd 而端口错位 = webServer 死等超时；command 实际监听端口的运行时对齐由 prompt 纪律 + verify 面真跑兜底，机械面只单侧校验 port 字段）。
 
 #### Scenario: sleep 写法被拒
 
@@ -32,6 +32,11 @@ pa-test-author 对 playwright 形态 SHALL 强制：条件等待（禁固定 sle
 #### Scenario: 无 webServer 声明被拒
 
 - **WHEN** 产出套件的 playwright.config 无 `webServer` 节
+- **THEN** 结构自检失败，套件拒收并回执原因
+
+#### Scenario: config port 与机械分配端口错位被拒
+
+- **WHEN** 产出套件的 playwright.config `webServer.port` 非 PRD 机械分配端口（如 command 照抄 e2e_dev_cmd 自带异端口）
 - **THEN** 结构自检失败，套件拒收并回执原因
 
 ### Requirement: executor 镜像浏览器环境（template 发版路径）
