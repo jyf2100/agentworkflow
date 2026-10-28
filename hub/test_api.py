@@ -17,11 +17,12 @@ from runner import FakeRunner
 
 import api
 import lifecycle as lc_mod
+import mm_intake
 
 _CLOCK = datetime(2026, 10, 21, 3, 0, 0, tzinfo=timezone.utc)
 
 
-def _mk(tmp_path: Path, extra_env: dict | None = None):
+def _mk(tmp_path: Path, extra_env: dict | None = None, mm_client=None):
     env = {
         "HUB_USER_ID": "roc",
         # 长值：_credentials 派发前占位符判据（vault_store.placeholder_issues，2026-10-23）
@@ -33,6 +34,7 @@ def _mk(tmp_path: Path, extra_env: dict | None = None):
     }
     if extra_env:
         env.update(extra_env)
+    tmp_path.mkdir(parents=True, exist_ok=True)  # mm 系列测试传未预建子目录（tmp_path/"mm" 等）
     d = hub_db.HubDB(tmp_path / "h.sqlite3")
     eng = qe.QueueEngine(d, max_containers=2, max_retries=2, image_tag_default="pa-executor:v0.1.3")
     cfg = config.load_config(env)
@@ -42,7 +44,7 @@ def _mk(tmp_path: Path, extra_env: dict | None = None):
     profs.mkdir(parents=True, exist_ok=True)
     (profs / "proj-a.yaml").write_text("name: proj-a\nadmission: true\n", encoding="utf-8")
     (tmp_path / "data" / "proj-a" / "sources.yaml").write_text("sources: []\n", encoding="utf-8")
-    return TestClient(api.create_app(d, eng, lc)), d, eng, lc
+    return TestClient(api.create_app(d, eng, lc, mm_client=mm_client)), d, eng, lc
 
 
 def test_post_queue_enqueues_and_pins_default_tag(tmp_path):
@@ -636,3 +638,231 @@ def test_queue_listing_recency_order(tmp_path):
     assert resp.status_code == 200
     assert [i["id"] for i in resp.json()] == [q2, q1]  # 最新优先
 
+
+
+# ── add-mm-channel-intake：POST /mm/intake 入站端点全路径（2.2/4.5/5.2）──
+# 全离线：FakeMMClient 可编程成员面；slash token 走 env；绑定直插 db（bind 面
+# 另测）。form 字段对齐 MM slash command POST（x-www-form-urlencoded）。
+
+_SLASH_TOK = "slash-secret-token"
+_U1 = "a1b2c3d4e5f6a1b2c3d4e5f6a1"  # 发起人 user_id（26-hex 直发形态）
+_BOT = "f" * 26                     # FakeMMClient.me_id（bot 探活判据）
+_C1 = "c1b2c3d4e5f6a1b2c3d4e5f6a1"  # 频道 id（26 字符形态）
+_C2 = "d1b2c3d4e5f6a1b2c3d4e5f6a1"
+
+
+def _mk_mm(tmp_path, mm, extra_env=None, **mk_kw):
+    env = {"HUB_MM_SLASH_TOKEN": _SLASH_TOK}
+    if extra_env:
+        env.update(extra_env)
+    return _mk(tmp_path / "mm", extra_env=env, mm_client=mm, **mk_kw)
+
+
+def _slash(client, *, token=_SLASH_TOK, channel_id=_C1, user_id=_U1, user_name="zhang3", text=""):
+    return client.post("/mm/intake", data={
+        "token": token, "channel_id": channel_id, "user_id": user_id,
+        "user_name": user_name, "command": "/pa", "text": text,
+    })
+
+
+def _mm_bound(members=None, **kw):
+    import notify
+    return notify.FakeMMClient(channel_members={_C1: members if members is not None else [_U1, _BOT]}, **kw)
+
+
+def test_mm_intake_token_gate_two_states(tmp_path):
+    """2.2 契约：未配 slash token = 503（入站关闭零行为）；配了不匹配 = 401；匹配放行。"""
+    client0, _, _, _ = _mk(tmp_path / "off")  # 未配
+    assert client0.post("/mm/intake", data={"token": "x"}).status_code == 503
+    mm = _mm_bound()
+    client, _, _, _ = _mk_mm(tmp_path, mm)
+    assert _slash(client, token="wrong").status_code == 401  # 恒时校验的形态（非时序断言）
+    assert _slash(client, text="随便").status_code == 200  # 对 token → 分流（用法清单也是 200）
+
+
+def test_mm_intake_unknown_subcommand_usage(tmp_path):
+    client, _, _, _ = _mk_mm(tmp_path, _mm_bound())
+    resp = _slash(client, text="跳舞")
+    assert resp.status_code == 200 and resp.json()["response_type"] == "ephemeral"
+    assert "/pa run" in resp.json()["text"] and "/pa bind" in resp.json()["text"]
+
+
+def test_mm_intake_unbound_channel_educates_bind(tmp_path):
+    client, d, _, _ = _mk_mm(tmp_path, _mm_bound())
+    resp = _slash(client, text="run 修 bug 出处: https://x/1")
+    assert resp.status_code == 200
+    assert "未绑定" in resp.json()["text"] and "/pa bind" in resp.json()["text"]
+    assert d.list_items() == []  # 拒绝即不入队
+
+
+def test_mm_intake_non_member_denied_no_channel_post(tmp_path):
+    mm = _mm_bound(members=["b" * 26, _BOT])  # 发起人不在集
+    client, d, _, _ = _mk_mm(tmp_path, mm)
+    d.upsert_bind("proj-a", _C1, "rocju")
+    resp = _slash(client, text="run 修 bug 出处: https://x/1")
+    assert "不是本频道成员" in resp.json()["text"]
+    assert d.list_items() == [] and mm.channels == []  # 拒绝不广播
+
+
+def test_mm_intake_unknown_fail_closed(tmp_path):
+    """UNKNOWN（网络错/403/无 bot）fail-closed 拒——绝不旁路、绝不回执「非成员」。"""
+    d_side = tmp_path / "d1"; mm1 = _mm_bound(crash_on_members=RuntimeError("net"))
+    client1, d1, _, _ = _mk_mm(d_side, mm1); d1.upsert_bind("proj-a", _C1, "rocju")
+    t1 = _slash(client1, text="run 修 bug 出处: https://x/1").json()["text"]
+    assert "校验暂不可用" in t1 and "非成员" not in t1
+    d_side2 = tmp_path / "d2"; mm2 = _mm_bound(members_forbidden={_C1})
+    client2, d2, _, _ = _mk_mm(d_side2, mm2); d2.upsert_bind("proj-a", _C1, "rocju")
+    assert "校验暂不可用" in _slash(client2, text="run x 出处: y").json()["text"]
+    d_side3 = tmp_path / "d3"  # mm_client=None：判据不可得恒 UNKNOWN
+    client3, d3, _, _ = _mk_mm(d_side3, None); d3.upsert_bind("proj-a", _C1, "rocju")
+    assert "校验暂不可用" in _slash(client3, text="run x 出处: y").json()["text"]
+    assert d1.list_items() == [] and d2.list_items() == [] and d3.list_items() == []
+
+
+def test_mm_intake_channel_missing_check_binding_receipt(tmp_path):
+    mm = _mm_bound(members_not_found={_C1})
+    client, d, _, _ = _mk_mm(tmp_path, mm)
+    d.upsert_bind("proj-a", _C1, "rocju")
+    resp = _slash(client, text="run 修 bug 出处: https://x/1")
+    assert "频道不存在" in resp.json()["text"] and "检查绑定" in resp.json()["text"]
+    assert d.list_items() == []
+
+
+def test_mm_intake_evidence_gate_fullwidth_colon_accepted(tmp_path):
+    mm = _mm_bound()
+    client, d, _, _ = _mk_mm(tmp_path, mm)
+    d.upsert_bind("proj-a", _C1, "rocju")
+    # 全角冒号（中文输入法高频）必须通过
+    r = _slash(client, text="run 修登录超时 出处：https://issues/1")
+    assert "已入队" in r.json()["text"]
+    # 缺标记 / 标记在但值空
+    (tmp_path / "mm" / "e2").mkdir(parents=True)
+    client2, d2, _, _ = _mk_mm(tmp_path / "e2", _mm_bound()); d2.upsert_bind("proj-a", _C1, "rocju")
+    assert "缺出处" in _slash(client2, text="run 修登录超时").json()["text"]
+    r2 = _slash(client2, text="run 修登录超时 出处：")
+    assert "缺出处" in r2.json()["text"] and d2.list_items() == []
+
+
+def test_mm_intake_too_long_rejected(tmp_path):
+    mm = _mm_bound()
+    client, d, _, _ = _mk_mm(tmp_path, mm)
+    d.upsert_bind("proj-a", _C1, "rocju")
+    huge = "字" * (mm_intake.MAX_TEXT_BYTES // 3 + 1)  # >1MB utf-8
+    resp = _slash(client, text=f"run {huge} 出处: x")
+    assert "超长" in resp.json()["text"] and "面板" in resp.json()["text"]
+    assert d.list_items() == []  # 拒绝不截断不入队
+
+
+def test_mm_intake_success_dual_receipt_and_direct_route(tmp_path):
+    """成功全链：enqueued_by=user_id 直发、确定性文件名、deliver_key 形态、双回执。"""
+    import prd_store
+    mm = _mm_bound()
+    client, d, _, _ = _mk_mm(tmp_path, mm)
+    d.upsert_bind("proj-a", _C1, "rocju")
+    resp = _slash(client, text="run 修登录超时 出处: https://issues/1")
+    body = resp.json()
+    assert body["response_type"] == "ephemeral" and "已入队 #" in body["text"]
+    items = d.list_items()
+    assert len(items) == 1
+    it = items[0]
+    assert it["enqueued_by"] == _U1  # 26-hex 直发路由（入站身份即 user_id）
+    assert it["project"] == "proj-a" and it["status"] == "pending"
+    assert it["deliver_key"].startswith(f"mm:proj-a:{_U1}:") and it["deliver_key"].endswith(tuple("0123456789"))
+    # 确定性文件名 mm-<sha8>.md；wrap frontmatter 可审计
+    files = sorted((tmp_path / "mm" / "data" / "proj-a" / "prd").glob("mm-*.md"))
+    assert len(files) == 1 and len(files[0].stem) == len("mm-") + 8
+    content = files[0].read_text(encoding="utf-8")
+    assert "source: mm-channel" in content and 'evidence: "https://issues/1"' in content
+    assert prd_store.sha256_text(content)  # 落盘完整（sha 同源）
+    # 双回执：频道时间线 1 条含 @发起人 + #id；无 DM
+    assert len(mm.channels) == 1 and f"<@{_U1}>" in mm.channels[0][1] and "#" in mm.channels[0][1]
+    assert mm.dms == []
+
+
+def test_mm_intake_same_content_retry_idempotent(tmp_path):
+    """同 (user, text) 重发（MM webhook 重试）——同小时窗撞 deliver_key 幂等回执 #id。"""
+    mm = _mm_bound()
+    client, d, _, _ = _mk_mm(tmp_path, mm)
+    d.upsert_bind("proj-a", _C1, "rocju")
+    r1 = _slash(client, text="run 修登录超时 出处: https://issues/1")
+    r2 = _slash(client, text="run 修登录超时 出处: https://issues/1")
+    assert "已入队" in r1.json()["text"]
+    assert "已入队" in r2.json()["text"] and "幂等" in r2.json()["text"]
+    assert len(d.list_items()) == 1  # 不重复入队
+    assert len(mm.channels) == 1  # 重试不再进频道时间线
+
+
+def test_mm_intake_channel_post_failure_fail_open(tmp_path):
+    """频道时间线 post 崩（bot 被踢等）——ephemeral 回执照回、入队不受影响（fail-open）。"""
+    mm = _mm_bound(crash_on_channel=RuntimeError("chan down"))
+    client, d, _, _ = _mk_mm(tmp_path, mm)
+    d.upsert_bind("proj-a", _C1, "rocju")
+    resp = _slash(client, text="run 修登录超时 出处: https://issues/1")
+    assert resp.status_code == 200 and "已入队" in resp.json()["text"]
+    assert len(d.list_items()) == 1
+
+
+# ── bind/unbind 管理命令（5.2）────────────────────────────────────
+
+def test_bind_requires_admin_whitelist(tmp_path):
+    mm = _mm_bound()
+    client, d, _, _ = _mk_mm(tmp_path, mm, extra_env={"HUB_PANEL_ADMINS": "rocju"})
+    resp = _slash(client, user_name="zhang3", text="bind proj-a")
+    assert "管理员" in resp.json()["text"]
+    assert d.get_channel_binding_by_channel(_C1) is None  # 拒绝不落库
+
+
+def test_bind_empty_admins_fail_closed_on_slash_channel(tmp_path):
+    """空白名单语义分立（F2 裁决）：面板空 = OAuth 会话回退放行；slash 空 = 全拒。"""
+    mm = _mm_bound()  # 不配 HUB_PANEL_ADMINS
+    client, d, _, _ = _mk_mm(tmp_path, mm)
+    resp = _slash(client, user_name="rocju", text="bind proj-a")
+    assert "未开放" in resp.json()["text"] and "HUB_PANEL_ADMINS" in resp.json()["text"]
+    assert d.get_channel_binding_by_channel(_C1) is None
+
+
+def test_bind_project_not_readable_rejected(tmp_path):
+    mm = _mm_bound()
+    client, d, _, _ = _mk_mm(tmp_path, mm, extra_env={"HUB_PANEL_ADMINS": "rocju"})
+    resp = _slash(client, user_name="rocju", text="bind proj-nope")
+    assert "不在可绑定清单" in resp.json()["text"] and "proj-a" in resp.json()["text"]  # 回执带可用清单
+
+
+def test_bind_success_and_rebind_shows_replacement(tmp_path):
+    mm = _mm_bound()
+    mm.channel_members[_C2] = [_U1, _BOT]
+    client, d, _, _ = _mk_mm(tmp_path, mm, extra_env={"HUB_PANEL_ADMINS": "rocju"})
+    r1 = _slash(client, user_name="rocju", text="bind proj-a")
+    assert "已绑定：proj-a" in r1.json()["text"] and "by rocju" in r1.json()["text"]
+    assert mm.channels == []  # bind 管理动作不进频道时间线
+    r2 = _slash(client, user_name="rocju", channel_id=_C2, text="bind proj-a")  # project 换频道
+    assert "替换旧绑定" in r2.json()["text"] and _C1 in r2.json()["text"]
+    assert d.get_channel_binding_by_channel(_C1) is None  # 旧绑定必清
+    assert d.get_channel_binding_by_project("proj-a")["channel_id"] == _C2
+
+
+def test_bind_bot_not_in_channel_rejected(tmp_path):
+    mm = _mm_bound(members=[_U1])  # bot 不在成员集
+    client, d, _, _ = _mk_mm(tmp_path, mm, extra_env={"HUB_PANEL_ADMINS": "rocju"})
+    resp = _slash(client, user_name="rocju", text="bind proj-a")
+    assert "bot 不在本频道" in resp.json()["text"] and "拉进" in resp.json()["text"]
+    assert d.get_channel_binding_by_channel(_C1) is None
+
+
+def test_bind_requires_mm_client(tmp_path):
+    client, d, _, _ = _mk_mm(tmp_path, None, extra_env={"HUB_PANEL_ADMINS": "rocju"})
+    resp = _slash(client, user_name="rocju", text="bind proj-a")
+    assert "bot 未配置" in resp.json()["text"]
+    assert d.get_channel_binding_by_channel(_C1) is None
+
+
+def test_unbind_then_intake_denied_and_education(tmp_path):
+    mm = _mm_bound()
+    client, d, _, _ = _mk_mm(tmp_path, mm, extra_env={"HUB_PANEL_ADMINS": "rocju"})
+    d.upsert_bind("proj-a", _C1, "rocju")
+    r1 = _slash(client, user_name="rocju", text="unbind")
+    assert "已解绑：proj-a" in r1.json()["text"]
+    r2 = _slash(client, user_name="rocju", text="unbind")  # 再解绑：教育回执
+    assert "未绑定" in r2.json()["text"]
+    r3 = _slash(client, text="run 修 bug 出处: https://x/1")  # 入站回落未绑定拒绝
+    assert "未绑定" in r3.json()["text"] and d.list_items() == []

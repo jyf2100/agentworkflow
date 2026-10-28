@@ -19,7 +19,11 @@ from lifecycle import PROJECT_RE
 # stamp 形态与 meta_sign 同源（8 位日期 + 可选 mN 避碰后缀）；可选 -<sha8> 落盘避碰后缀
 STAMP_RE = r"\d{8}(m\d*)?"
 SLUG_RE = r"[a-z0-9-]+"
-PRD_NAME_RE = rf"{STAMP_RE}_{SLUG_RE}(-[a-f0-9]{{8}})?\.md"
+# mm-<sha8>（可选 -<sha8> 避碰后缀）= MM 入站确定性文件名（add-mm-channel-intake D5：
+# 零时间戳零随机成分——同输入 byte-identical 是 deliver_key 幂等的前提；与面板 stamp
+# 前缀形态有意偏离，勿「顺手统一」加回日期/uuid）
+MM_NAME_RE = r"mm-[a-f0-9]{8}(-[a-f0-9]{8})?\.md"
+PRD_NAME_RE = rf"{STAMP_RE}_{SLUG_RE}(-[a-f0-9]{{8}})?\.md|{MM_NAME_RE}"
 SHA256_RE = r"[a-f0-9]{64}"
 _PRD_DIR = "prd"
 

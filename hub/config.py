@@ -47,6 +47,11 @@ MM_BOT_TOKEN_ENV = "HUB_MM_BOT_TOKEN"
 MM_PROJECT_CHANNELS_ENV = "HUB_MM_PROJECT_CHANNELS"
 IMAGE_TEMPLATE_REPO_ENV = "HUB_IMAGE_TEMPLATE_REPO"
 STALE_CHECK_TICKS_ENV = "HUB_STALE_CHECK_TICKS"
+
+# 可选 MM 入站 slash command token（add-mm-channel-intake D6）：不配 = 入站关闭
+# （POST /mm/intake 503，零行为）。凭据第三实体：OAuth app（登录）/ bot token（出站
+# 推递）/ slash token（入站校验）三者独立分职。
+MM_SLASH_TOKEN_ENV = "HUB_MM_SLASH_TOKEN"
 DEFAULT_STALE_CHECK_TICKS = 720  # ≈ 5s tick 下每小时一次
 
 
@@ -96,7 +101,8 @@ class HubConfig:
     panel_admins: frozenset[str] = frozenset()  # 空 = 面板改行为操作对任何有效会话放行（单用户回退态）
     # 通知面（4a，spec: hub-notifications）：None/空 = 对应能力关闭零行为
     mm_bot_token: str | None = None          # 独立 bot 凭据实体（F14，与 OAuth app 分离）
-    project_channels: dict[str, str] = field(default_factory=dict)  # 空 = 仅私信（无频道广播）
+    project_channels: dict[str, str] = field(default_factory=dict)  # 仅 seed 迁移消费（add-mm-channel-intake D2：启动 seed 进 project_channels 表后此 env 键废止；通知路由读绑定表）
+    mm_slash_token: str | None = None        # 入站 slash command 校验 token（None = 入站关闭零行为）
     image_template_repo: str | None = None   # 陈旧检测比对源 owner/repo（None = 检测关闭）
     stale_check_ticks: int = DEFAULT_STALE_CHECK_TICKS  # 检测周期（N tick 一次）
 
@@ -168,6 +174,7 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         panel_admins=frozenset(u.strip() for u in (e.get(PANEL_ADMINS_ENV) or "").split(",") if u.strip()),
         mm_bot_token=e.get(MM_BOT_TOKEN_ENV) or None,
         project_channels=parse_project_channels(e.get(MM_PROJECT_CHANNELS_ENV)),
+        mm_slash_token=e.get(MM_SLASH_TOKEN_ENV) or None,
         image_template_repo=e.get(IMAGE_TEMPLATE_REPO_ENV) or None,
         stale_check_ticks=stale_check_ticks,
     )

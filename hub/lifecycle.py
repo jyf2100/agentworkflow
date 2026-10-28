@@ -55,19 +55,6 @@ def _profile_forges(profiles_root: Path) -> set[str] | None:
     return forges or None
 
 
-def _event_broadcast(row: dict) -> bool:
-    """频道广播判据（4b spec：critic drop / verify 红进频道 + 私信，其余仅私信）——
-    hub 只做机械枚举比对，零语义解读。"""
-    ev = row.get("event")
-    if ev == "critic_verdict":
-        return row.get("verdict") == "drop"
-    if ev == "verify_verdict":
-        return row.get("verdict") != "pass"  # 红 = 非 pass（revise / invalid 均频道可见）
-    if ev == "acceptance_suite":
-        return row.get("status") == "absent"  # absent 是推进阻断（团队可见）；stored 正常产出仅私信
-    return False  # pr_opened / critic pass / acceptance stored 仅私信
-
-
 def _event_text(run: dict, row: dict) -> str:
     """事件通知文本 = 事实字段机械拼接（hub 零语义加工），头部带 run 标识可回查。"""
     head = f"[pa-hub] {row.get('project') or run['project']} run #{run['id']}（{Path(run['run_dir']).name}）"
@@ -227,15 +214,16 @@ class Lifecycle:
     # ── 派发（7.1）───────────────────────────────────────────────
 
     def _abandon(self, item: dict, project: str, reason: str) -> None:
-        """无 run 的队列放弃收敛点（4b 任务 4.1，spec: hub-notifications「无 run 放弃告警」）：
-        create_run 前五处 fail_item 的唯一包装——落放弃 + notify_admin（含 project + 原因摘要）。
+        """无 run 的队列放弃收敛点（4b 任务 4.1 + 6.2 归属路由，spec: hub-notifications
+        「无 run 放弃告警」）：create_run 前五处 fail_item 的唯一包装——落放弃 +
+        notify_abandon（绑定频道进频道，未绑定 admin DM；含 project + 原因摘要）。
         通道关闭（notifier None）stderr 降级留痕；通知异常 fail-open 绝不阻断 fail_item。"""
         self.engine.fail_item(item["id"], reason)
         if self.notifier is None:
             print(f"[notify][warn] 队列放弃（通道关闭，仅 stderr）：item#{item['id']} {project}：{reason}", file=sys.stderr)
             return
         try:
-            self.notifier.notify_admin(f"[pa-hub] 队列项 #{item['id']}（{project}）放弃，无 run 产生：\n{reason}")
+            self.notifier.notify_abandon(project, f"[pa-hub] 队列项 #{item['id']}（{project}）放弃，无 run 产生：\n{reason}")
         except Exception as e:  # noqa: BLE001——观察面绝不阻断执行面
             print(f"[notify][warn] 放弃告警推递异常（fail-open）: {type(e).__name__}", file=sys.stderr)
 
@@ -362,7 +350,7 @@ class Lifecycle:
                 self._event_seen.add(key)
                 self.notifier.notify_event(
                     text=_event_text(run, row), enqueued_by=item.get("enqueued_by"),
-                    project=run["project"], broadcast=_event_broadcast(row),
+                    project=run["project"],  # 归属路由（6.2）：绑定频道全量进，per-event 判定废止
                 )
         except Exception as e:  # 观察面 fail-open——绝不炸 reconcile 主路径
             print(f"[events][warn] run#{run['id']} 事件转发失败（fail-open）: {type(e).__name__}", file=sys.stderr)

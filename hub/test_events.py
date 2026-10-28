@@ -55,10 +55,10 @@ def _mk(tmp_path: Path, mm=None, boot_inputs=True):
     eng = qe.QueueEngine(d, max_containers=2, max_retries=2, image_tag_default="pa-executor:v0.1.3")
     fake = FakeRunner(images={"pa-executor:v0.1.3"})
     cfg = config.load_config(_env(tmp_path / "data"))
-    cfg.project_channels["proj-a"] = "chan-1"  # 频道广播判据可断言
+    d.upsert_bind("proj-a", "chan-1", "test")  # 6.x 归属路由判据 = 绑定表（env 映射废止）
     if boot_inputs:
         _boot_inputs(tmp_path / "data", "proj-a")
-    notifier = notify.Notifier(cfg, mm=mm) if mm is not None else None
+    notifier = notify.Notifier(cfg, mm=mm, database=d) if mm is not None else None
     lc = lifecycle.Lifecycle(d, eng, fake, cfg, clock=_CLOCK, notifier=notifier)
     return lc, d, fake, tmp_path / "data"
 
@@ -117,15 +117,15 @@ def test_forward_events_dedup_and_text(tmp_path):
         _line(0, "critic_verdict", verdict="revise", summary="证据不足回炉"),
         _line(1, "verify_verdict", verdict="pass", round=1, summary=""),
     ])
-    lc.reconcile_running()  # running → 转发新行
-    assert len(mm.dms) == 2
-    t0, t1 = mm.dms[0][1], mm.dms[1][1]
+    lc.reconcile_running()  # running → 转发新行（绑定 proj-a → 全量进频道）
+    assert len(mm.channels) == 2 and mm.dms == []  # 全事件进频道 + 不重复私信
+    t0, t1 = mm.channels[0][1], mm.channels[1][1]
+    assert t0.startswith("<@")  # @发起人提及（roc 解析 mm id）
     assert "critic 判定 → revise" in t0 and "证据不足回炉" in t0 and f"run #{run['id']}" in t0
-    assert "verify 判定 → pass" in t1 and "round 1" in t1
-    assert mm.channels == []   # 审核补：verify pass 仅私信不进频道（fail-safe：非 pass 才广播）
+    assert "verify 判定 → pass" in t1 and "round 1" in t1  # pass 也进（新口径全事件）
     # 去重：同 (run, seq) 二跑不重发
     lc.reconcile_running()
-    assert len(mm.dms) == 2
+    assert len(mm.channels) == 2
     # 新 seq 出现 → 只转发新行
     pass
 
@@ -136,15 +136,16 @@ def test_forward_new_seq_only_after_growth(tmp_path):
     run, ev = _running_run_with_events(lc, d, fake, tmp_path, [
         _line(0, "critic_verdict", verdict="pass", summary="")])
     lc.reconcile_running()
-    assert len(mm.dms) == 1
+    assert len(mm.channels) == 1
     with ev.open("a", encoding="utf-8") as f:  # 容器追加 pr_opened（seq=1）
         f.write(json.dumps(_line(1, "pr_opened", pr_url="https://github.com/o/r/pull/9", repo="o/r")) + "\n")
     lc.reconcile_running()
-    assert len(mm.dms) == 2 and "PR 开出（o/r）" in mm.dms[1][1] and mm.dms[1][1].endswith("/pull/9")
+    assert len(mm.channels) == 2 and "PR 开出（o/r）" in mm.channels[1][1] and mm.channels[1][1].endswith("/pull/9")
 
 
 def test_forward_channel_rules(tmp_path):
-    """频道规则：critic drop / verify 红（非 pass）进频道 + 私信；critic pass / pr_opened 仅私信。"""
+    """绑定频道四类全量进（6.2 新口径：per-event 广播判定废止——pass/pr_opened 也进，
+    全事件时间线语义）；发起人零重复私信。"""
     mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
     lc, d, fake, data = _mk(tmp_path, mm=mm)
     _running_run_with_events(lc, d, fake, tmp_path, [
@@ -154,10 +155,13 @@ def test_forward_channel_rules(tmp_path):
         _line(3, "verify_verdict", verdict="revise", round=1, summary="测试未过"),
     ])
     lc.reconcile_running()
-    assert len(mm.dms) == 4          # 全部私信
-    assert len(mm.channels) == 2     # 仅 drop + verify 红
+    assert mm.dms == []              # 绑定频道已覆盖个人触达（@提及）
+    assert len(mm.channels) == 4     # 四类全量（旧「仅警示类」口径废止）
     assert "critic 判定 → drop" in mm.channels[0][1]
-    assert "verify 判定 → revise" in mm.channels[1][1]
+    assert "critic 判定 → pass" in mm.channels[1][1]  # pass 也进（新口径锚）
+    assert "PR 开出（o/r）" in mm.channels[2][1]       # pr_opened 也进
+    assert "verify 判定 → revise" in mm.channels[3][1]
+    assert d.get_channel_binding_by_project("proj-a")["channel_id"] == "chan-1"  # 路由判据 = 绑定表
 
 
 def test_forward_skips_v_mismatch_file_end_to_end(tmp_path, capsys):
@@ -194,13 +198,13 @@ def test_forward_stops_after_terminal(tmp_path):
     run, ev = _running_run_with_events(lc, d, fake, tmp_path, [])
     ref = run["container_ref"]
     fake.finish(ref, 0)
-    lc.reconcile_running()  # exited → succeeded 收敛（+ 终态通知）
-    assert any("succeeded" in t for _, t in mm.dms)
-    n_before = len(mm.dms)
+    lc.reconcile_running()  # exited → succeeded 收敛（+ 终态通知进绑定频道）
+    assert any("succeeded" in t for _, t in mm.channels)
+    n_before = len(mm.channels)
     with ev.open("a", encoding="utf-8") as f:  # 终态后事件文件再长
         f.write(json.dumps(_line(0, "critic_verdict", verdict="drop", summary="late")) + "\n")
     lc.reconcile_running()
-    assert len(mm.dms) == n_before  # 不再读（run 已不在 running 扫描集）
+    assert len(mm.channels) == n_before  # 不再读（run 已不在 running 扫描集）
 
 
 def test_notifier_none_channel_off_zero_behavior(tmp_path, capsys):
@@ -256,7 +260,8 @@ def test_container_env_passes_pa_flags(tmp_path, monkeypatch):
 # ── 4.1/4.2 无 run 放弃告警 ──────────────────────────────────────
 
 
-def test_abandon_notifies_admin_on_missing_prereqs(tmp_path):
+def test_abandon_bound_routes_to_channel(tmp_path):
+    """6.2 归属路由：proj-a 绑定 chan-1 → 无 run 放弃进频道（团队可见），无 DM。"""
     mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
     lc, d, fake, data = _mk(tmp_path, mm=mm, boot_inputs=False)  # 必读面缺失
     prd = tmp_path / _PRD_NAME
@@ -265,8 +270,22 @@ def test_abandon_notifies_admin_on_missing_prereqs(tmp_path):
     assert lc.tick_dispatch() is False
     item = d.list_items()[0]
     assert item["status"] == "failed"  # 放弃仍落账
-    assert len(mm.dms) == 1 and "放弃" in mm.dms[0][1]
-    assert "proj-a" in mm.dms[0][1] and "必读面缺失" in mm.dms[0][1]  # project + 原因摘要
+    assert mm.dms == [] and len(mm.channels) == 1 and mm.channels[0][0] == "chan-1"
+    t = mm.channels[0][1]
+    assert "放弃" in t and "proj-a" in t and "必读面缺失" in t  # project + 原因摘要
+
+
+def test_abandon_unbound_falls_back_admin_dm(tmp_path):
+    """未绑定 → admin DM 不变（notify_abandon 回落 cfg.user_id 路径）。"""
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
+    lc, d, fake, data = _mk(tmp_path, mm=mm, boot_inputs=False)
+    d.unbind_by_channel("chan-1")  # 摘掉绑定 → 未绑定形态
+    prd = tmp_path / _PRD_NAME
+    prd.write_text("# PRD\n", encoding="utf-8")
+    lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is False
+    assert mm.channels == [] and len(mm.dms) == 1
+    assert "放弃" in mm.dms[0][1] and "proj-a" in mm.dms[0][1] and "必读面缺失" in mm.dms[0][1]
 
 
 def test_abandon_stderr_when_channel_off(tmp_path, capsys):
@@ -290,7 +309,7 @@ def test_forward_verify_invalid_reason_to_channel(tmp_path):
     _running_run_with_events(lc, d, fake, tmp_path, [
         _line(0, "verify_verdict", verdict="invalid", round=1, reason="wallclock_timeout", summary="")])
     lc.reconcile_running()
-    assert len(mm.dms) == 1 and len(mm.channels) == 1
+    assert mm.dms == [] and len(mm.channels) == 1        # 绑定 → 频道不私信
     assert "verify 判定 → invalid" in mm.channels[0][1]
     assert "wallclock_timeout" in mm.channels[0][1]      # reason 机械拼接可见（triage 入口）
 
@@ -302,7 +321,8 @@ def test_forward_verify_revise_text_unchanged(tmp_path):
     _running_run_with_events(lc, d, fake, tmp_path, [
         _line(0, "verify_verdict", verdict="revise", round=2, summary="测试未过")])
     lc.reconcile_running()
-    t = mm.channels[0][1]                                # revise ≠ pass → 频道（既有规则不变）
+    assert mm.dms == []                                  # 绑定 → 频道不私信
+    t = mm.channels[0][1]                                # 绑定全量进频道（revise 同）
     assert "verify 判定 → revise（round 2）" in t and "测试未过" in t
     assert "reason" not in t and "原因" not in t          # 无 reason 行 → 不拼 reason 节
 
@@ -315,14 +335,15 @@ def test_forward_acceptance_absent_to_channel(tmp_path):
         _line(0, "acceptance_suite", status="absent", reason="no_harness",
               detail="profile 未声明 harness")])
     lc.reconcile_running()
-    assert len(mm.dms) == 1 and len(mm.channels) == 1
+    assert mm.dms == [] and len(mm.channels) == 1        # 绑定 → 频道不私信
     t = mm.channels[0][1]
     assert "acceptance" in t and "absent" in t and "no_harness" in t
     assert "profile 未声明 harness" in t
 
 
-def test_forward_acceptance_stored_dm_only_with_supersedes_chain(tmp_path):
-    """acceptance stored：正常产出仅私信；换版（supersedes 非 null）文本附换版链。"""
+def test_forward_acceptance_stored_also_channel_with_supersedes_chain(tmp_path):
+    """acceptance stored 也进频道（6.2 新口径：四类全量——stored 是正常产出也是项目
+    状态）；换版（supersedes 非 null）文本附换版链（拼接契约零变化继承）。"""
     mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
     lc, d, fake, data = _mk(tmp_path, mm=mm)
     _running_run_with_events(lc, d, fake, tmp_path, [
@@ -331,8 +352,8 @@ def test_forward_acceptance_stored_dm_only_with_supersedes_chain(tmp_path):
         _line(1, "acceptance_suite", status="stored", digest="b" * 64,
               criteria_ids=["c1"], supersedes="a" * 64)])
     lc.reconcile_running()
-    assert len(mm.dms) == 2 and mm.channels == []         # stored 永不进频道
-    t0, t1 = mm.dms[0][1], mm.dms[1][1]
+    assert mm.dms == [] and len(mm.channels) == 2         # stored 全量进频道（旧「仅私信」口径废止）
+    t0, t1 = mm.channels[0][1], mm.channels[1][1]
     assert "stored" in t0 and "a" * 64 in t0
     assert "supersedes" not in t0.lower()                  # 首版（null）无换版链
     assert "supersedes" in t1.lower() and "a" * 64 in t1   # 换版行附链（旧 digest 可回查）

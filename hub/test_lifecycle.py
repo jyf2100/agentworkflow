@@ -528,19 +528,19 @@ def test_reconcile_exit_zero_notifies_succeeded(tmp_path):
 
 
 def test_reconcile_exit_nonzero_notifies_failed_with_channel(tmp_path):
-    # exited 非零 → failed 私信 + 频道广播（失败类才广播）——与私信并行互不依赖
-    import dataclasses
-
+    # 6.x 归属路由：exited 非零 → 绑定频道含提及（不重复私信）；未绑定 → 私信
     mm = notify.FakeMMClient(user_ids={"roc": _MM_ID_A})
     lc, d, fake, _ = _mk(tmp_path, mm=mm)
-    lc.cfg = dataclasses.replace(lc.cfg, project_channels={"proj-a": "chan-1"})
-    lc.notifier = notify.Notifier(lc.cfg, mm=mm)  # 换新 cfg 后重建（频道映射进通知面）
+    lc.notifier = notify.Notifier(lc.cfg, mm=mm, database=d)  # 绑定表路由（env 映射废止）
+    d.upsert_bind("proj-a", "chan-1", "test")
     qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
     lc.tick_dispatch()
     fake.finish(d.runs_for_item(qid)[0]["container_ref"], exit_code=1)
     lc.reconcile_running()
-    assert len(mm.dms) == 1 and "failed" in mm.dms[0][1] and "exit 1" in mm.dms[0][1]
-    assert mm.channels == [("chan-1", mm.dms[0][1])]  # 同文广播到项目频道
+    assert mm.dms == []                                   # 绑定 → 不重复私信
+    assert len(mm.channels) == 1 and mm.channels[0][0] == "chan-1"
+    t = mm.channels[0][1]
+    assert t.startswith("<@") and "failed" in t and "exit 1" in t  # 提及 + 失败事实
 
 
 def test_image_missing_notifies_failed_to_start(tmp_path):

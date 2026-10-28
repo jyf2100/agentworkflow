@@ -36,7 +36,8 @@ def main(argv: list[str] | None = None, *, runner=None, mm=None) -> int:
     vi.add_argument("--from-env", action="store_true", help="从 hub 进程 env 导入（当前唯一来源；交互录入归切片 2b）")
     cn = sub.add_parser("check-notify", help="通知通道自检（RUNBOOK §16 联调一键化）")
     cn.add_argument("--to", default=None, help="测试收件人（26-hex mm_user_id 或 username；缺省 HUB_USER_ID 走解析路径）")
-    cn.add_argument("--channel", default=None, help="附加频道 id 连通性测试（对应 HUB_MM_PROJECT_CHANNELS 值）")
+    cn.add_argument("--channel", default=None, help="附加频道 id 连通性测试（对应绑定表 channel_id）")
+    sub.add_parser("check-intake", help="MM 入站 /pa 自检（RUNBOOK §19：slash token / 绑定表 / bot 可达各绑定频道）")
     args = ap.parse_args(argv)
 
     cfg = config.load_config()
@@ -46,6 +47,10 @@ def main(argv: list[str] | None = None, *, runner=None, mm=None) -> int:
 
     if args.cmd == "check-notify":
         return _check_notify(cfg, mm=mm, to=args.to, channel=args.channel)
+
+    if args.cmd == "check-intake":
+        database = db.HubDB(Path(args.db) if args.db else cfg.data_root / "hub.sqlite3")
+        return _check_intake(cfg, mm=mm, database=database)
 
     database = db.HubDB(Path(args.db) if args.db else cfg.data_root / "hub.sqlite3")
     engine = queue_engine.QueueEngine(
@@ -126,6 +131,64 @@ def _check_notify(cfg: config.HubConfig, *, mm, to: str | None, channel: str | N
             return 1
     print("✓ 通知通道自检通过")
     return 0
+
+
+def _check_intake(cfg: config.HubConfig, *, mm, database) -> int:
+    """MM 入站 /pa 自检（add-mm-channel-intake 7.1，RUNBOOK §19）。
+
+    三步：① slash token 配置态（HUB_MM_SLASH_TOKEN——未配 = 入站关闭，跑本自检的
+    意图即启用，报 ✗）；② bot 通道前提 + token 有效性（缺 bot 凭据 = 成员判据恒
+    UNKNOWN fail-closed，入站必拒）；③ 绑定表内容 + 逐绑定频道 bot 可达
+    （channel_member_ids 含 bot 自身——不含则 /pa bind 会被拒，须先把 bot 拉进
+    频道）。空绑定表 = ⚠ 不 fail（bind 是管理员在 MM 里做的运营动作，非配置错）。
+    凭据绝不进输出；失败非零退出。
+    """
+    if not cfg.mm_slash_token:
+        print("✗ 1/3 HUB_MM_SLASH_TOKEN 未配置——入站关闭（MM 管理台建 /pa slash command 拿 token 后配进 hub.env，见 RUNBOOK §19）", file=sys.stderr)
+        return 1
+    print("✓ 1/3 slash token 已配置（入站开放；值不回显）")
+    missing = [name for name, v in (("HUB_MM_BOT_TOKEN", cfg.mm_bot_token),
+                                    ("HUB_MM_BASE_URL", cfg.mm_base_url)) if not v]
+    if missing:
+        print(f"✗ 2/3 bot 通道关闭（缺 {', '.join(missing)}）——入站成员判据恒 UNKNOWN fail-closed，/pa 必拒", file=sys.stderr)
+        return 1
+    client = mm or notify.HttpMMClient(cfg)
+    try:
+        me = client.me_id()
+        print(f"✓ 2/3 bot token 有效（bot id {me}）")
+    except Exception as e:  # noqa: BLE001——自检面：报类型不报响应体（防凭据泄漏进日志）
+        print(f"✗ 2/3 bot token 无效或 MM base_url 错（{type(e).__name__}；token 不回显）", file=sys.stderr)
+        return 1
+    bindings = database.list_channel_bindings()
+    if not bindings:
+        print("⚠ 3/3 绑定表空——/pa run 将回教育回执；admin 在项目频道发 `/pa bind <project>` 绑定（须先把 bot 拉进频道）")
+        return 0
+    ok = True
+    for row in bindings:
+        chan = row["channel_id"]
+        try:
+            ids = client.channel_member_ids(chan)
+        except notify.MMChannelNotFound:
+            print(f"✗ 3/3 {row['project']} ↔ {chan}：频道不存在（已删频道）——admin `/pa unbind` 后重 bind", file=sys.stderr)
+            ok = False
+            continue
+        except Exception as e:  # noqa: BLE001
+            print(f"✗ 3/3 {row['project']} ↔ {chan}：成员查询异常（{type(e).__name__}——UNKNOWN，/pa run 会 fail-closed 拒）", file=sys.stderr)
+            ok = False
+            continue
+        if ids is None:
+            print(f"✗ 3/3 {row['project']} ↔ {chan}：bot 无权限/不可达（成员判据 UNKNOWN，/pa run 会 fail-closed 拒——查 bot 权限）", file=sys.stderr)
+            ok = False
+        elif me not in ids:
+            print(f"✗ 3/3 {row['project']} ↔ {chan}：bot 不在频道——先把 bot 拉进该频道（成员查询与频道 post 都需要）", file=sys.stderr)
+            ok = False
+        else:
+            print(f"✓ 3/3 {row['project']} ↔ {chan} 可达（成员 {len(ids)} 人，含 bot）")
+    if ok:
+        print("✓ 入站自检通过")
+    else:
+        print("✗ 入站自检未过（见上）", file=sys.stderr)
+    return 0 if ok else 1
 
 
 def _vault_import(cfg: config.HubConfig, *, from_env: bool) -> int:

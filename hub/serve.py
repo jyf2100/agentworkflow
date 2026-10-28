@@ -30,16 +30,24 @@ def build_app(cfg: config.HubConfig | None = None):
     """
     cfg = cfg or config.load_config()
     database = db.HubDB(cfg.data_root / "hub.sqlite3")
+    # env 一次性 seed 迁移（add-mm-channel-intake D2）：表空才灌（幂等），此后
+    # HUB_MM_PROJECT_CHANNELS env 键废止——绑定表是唯一真相。
+    database.seed_project_channels(cfg.project_channels)
     engine = queue_engine.QueueEngine(database, cfg.max_containers, cfg.max_retries, cfg.image_tag_default)
     try:
         key = vault_store.load_key()
     except vault_store.VaultKeyMissing:
         key = None
     vault = vault_store.CredentialVault(cfg.data_root, key) if key is not None else None
-    notifier = notify_mod.build_notifier(cfg)
+    # MM 客户端单实例共享（add-mm-channel-intake）：Notifier 出站推递与 /mm/intake
+    # 成员查询/频道 post 同一 bot 身份；bot token 或 base_url 缺 = None（出站通道
+    # 关闭 + 入站成员判据恒 UNKNOWN fail-closed 拒绝——判据不可得绝不旁路）。
+    mm_client = notify_mod.HttpMMClient(cfg) if (cfg.mm_bot_token and cfg.mm_base_url) else None
+    # database = 归属路由判据（6.x）：Notifier 按绑定表路由 run 终态/语义事件/放弃告警
+    notifier = notify_mod.build_notifier(cfg, mm=mm_client, database=database)
     lc = lifecycle_mod.Lifecycle(database, engine, runner_mod.DockerRunner(), cfg, vault=vault, notifier=notifier)
     interval = float(os.environ.get("HUB_TICK_INTERVAL") or 5)
-    app = create_app(database, engine, lc, vault=vault, tick_interval=interval)
+    app = create_app(database, engine, lc, vault=vault, tick_interval=interval, mm_client=mm_client)
     return app, lc, cfg
 
 

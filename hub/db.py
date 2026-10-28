@@ -8,7 +8,9 @@ runs 表是索引不是真相（F10：卷上 meta 可重建）。sqlite3 标准�
 from __future__ import annotations
 
 import functools
+import re
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,11 +46,24 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_queue_items_status ON queue_items(status);
 CREATE INDEX IF NOT EXISTS idx_runs_item ON runs(queue_item_id);
+CREATE TABLE IF NOT EXISTS project_channels (
+    project     TEXT NOT NULL UNIQUE,
+    channel_id  TEXT NOT NULL UNIQUE,
+    bound_by    TEXT NOT NULL,
+    bound_at    TEXT NOT NULL
+);
 """  # deliver_key UNIQUE 索引不在此——旧表存在时 executescript 先于 _migrate 跑，索引引用新列会炸；统一在 _migrate 建
+# project_channels 是全新表（add-mm-channel-intake D2）：旧库 executescript 直接建出含 UNIQUE
+# 的完整表，无补列问题——UNIQUE 内联声明安全，不走 _migrate。
 
 
 class DBError(Exception):
     """非法状态/约束违规——不静默吞。"""
+
+
+# MM 频道 id 公开事实：26 字符小写字母数字（与 user_id 同形态族；落库与 seed 迁移的
+# 机械判据，防频道名/URL 误填——add-mm-channel-intake D2）
+MM_CHANNEL_ID_RE = re.compile(r"[0-9a-z]{26}")
 
 
 def _now() -> str:
@@ -261,3 +276,78 @@ class HubDB:
             (status, _now(), exit_code, run_id),
         )
         self._conn.commit()
+
+    # ── project_channels（add-mm-channel-intake D2：频道↔项目绑定唯一真相）──
+
+    @_locked
+    def get_channel_binding_by_channel(self, channel_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM project_channels WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    @_locked
+    def get_channel_binding_by_project(self, project: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM project_channels WHERE project=?", (project,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_channel_bindings(self) -> list[dict]:
+        """全表（自检面消费：cli check-intake 逐绑定验 bot 可达）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM project_channels ORDER BY project"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @_locked
+    def upsert_bind(self, project: str, channel_id: str, bound_by: str) -> list[dict]:
+        """双向换绑对称覆盖（1:1 双 UNIQUE）：清 project 旧绑定与 channel_id 既有绑定
+        （各 0/1 条）后插新行——DELETE+INSERT 同事务单 commit，原子（旧绑定必清，
+        不留双绑/暗绑）。返回被替换旧绑定列表（调用方回执明示，0-2 条）。"""
+        ts = _now()
+        old = self._conn.execute(
+            "SELECT * FROM project_channels WHERE project=? OR channel_id=?", (project, channel_id)
+        ).fetchall()
+        replaced = [dict(r) for r in old]
+        self._conn.execute("DELETE FROM project_channels WHERE project=? OR channel_id=?", (project, channel_id))
+        self._conn.execute(
+            "INSERT INTO project_channels (project, channel_id, bound_by, bound_at) VALUES (?,?,?,?)",
+            (project, channel_id, bound_by, ts),
+        )
+        self._conn.commit()
+        return replaced
+
+    @_locked
+    def unbind_by_channel(self, channel_id: str) -> dict | None:
+        """按频道解绑；返回被删行（None = 本频道未绑定——调用方教育回执）。"""
+        row = self._conn.execute(
+            "SELECT * FROM project_channels WHERE channel_id=?", (channel_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        self._conn.execute("DELETE FROM project_channels WHERE channel_id=?", (channel_id,))
+        self._conn.commit()
+        return dict(row)
+
+    @_locked
+    def seed_project_channels(self, pairs: dict[str, str]) -> int:
+        """HUB_MM_PROJECT_CHANNELS env 一次性 seed 迁移（D2）：表空才整批 seed
+        （bound_by=seed-migration、bound_at=seed 时刻）；表非空跳过（幂等——env 再改
+        也不重灌，绑定表是唯一真相）。channel_id 形态校验不过的条目拒入并 stderr
+        可见（无静默失败）。返回实际入库行数。"""
+        if self._conn.execute("SELECT 1 FROM project_channels LIMIT 1").fetchone():
+            return 0
+        ts = _now()
+        count = 0
+        for project, channel_id in pairs.items():
+            if not MM_CHANNEL_ID_RE.fullmatch(channel_id):
+                print(f"[db][warn] seed 拒入（channel_id 非 26 字符 id 形态）：{project}", file=sys.stderr)
+                continue
+            self._conn.execute(
+                "INSERT INTO project_channels (project, channel_id, bound_by, bound_at) VALUES (?,?,?,?)",
+                (project, channel_id, "seed-migration", ts),
+            )
+            count += 1
+        self._conn.commit()
+        return count

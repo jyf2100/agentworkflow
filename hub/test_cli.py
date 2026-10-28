@@ -172,6 +172,80 @@ def test_check_notify_direct_mm_id_skips_lookup(tmp_path, capsys, monkeypatch):
     assert "直发" in capsys.readouterr().out
 
 
+# ── 入站自检（check-intake，add-mm-channel-intake 7.1；Fake 注入全离线）──
+
+_C = "c1b2c3d4e5f6a1b2c3d4e5f6a1"  # 26 字符频道 id
+_BOT = "f" * 26
+
+
+def _intake_env(tmp_path: Path) -> dict:
+    return {**_notify_env(tmp_path), "HUB_MM_SLASH_TOKEN": "slash-tok"}
+
+
+def _bound_db(tmp_path: Path, *pairs) -> None:
+    import db as hub_db
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    d = hub_db.HubDB(tmp_path / "data" / "hub.sqlite3")
+    for project, chan in pairs:
+        d.upsert_bind(project, chan, "test")
+
+
+def test_check_intake_missing_slash_token_exit_1(tmp_path, capsys, monkeypatch):
+    for k, v in _notify_env(tmp_path).items():  # 有 bot 凭据、无 slash token
+        monkeypatch.setenv(k, v)
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    rc = cli.main(["check-intake"], mm=notify.FakeMMClient())
+    assert rc == 1 and "HUB_MM_SLASH_TOKEN" in capsys.readouterr().err
+
+
+def test_check_intake_bot_channel_off_exit_1(tmp_path, capsys, monkeypatch):
+    for k, v in {**_env(tmp_path), "HUB_MM_SLASH_TOKEN": "slash-tok"}.items():
+        monkeypatch.setenv(k, v)  # slash 配了但 bot 凭据缺
+    monkeypatch.delenv("HUB_MM_BOT_TOKEN", raising=False)
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    rc = cli.main(["check-intake"], mm=notify.FakeMMClient())
+    assert rc == 1 and "fail-closed" in capsys.readouterr().err
+
+
+def test_check_intake_empty_bindings_warns_but_pass(tmp_path, capsys, monkeypatch):
+    for k, v in _intake_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    rc = cli.main(["check-intake"], mm=notify.FakeMMClient())
+    out = capsys.readouterr().out
+    assert rc == 0 and "绑定表空" in out and "/pa bind" in out
+
+
+def test_check_intake_all_bindings_reachable_pass(tmp_path, capsys, monkeypatch):
+    for k, v in _intake_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    _bound_db(tmp_path, ("proj-a", _C))
+    mm = notify.FakeMMClient(channel_members={_C: [_MM_ID, _BOT]})
+    rc = cli.main(["check-intake"], mm=mm)
+    out = capsys.readouterr().out
+    assert rc == 0 and "proj-a" in out and "含 bot" in out and "自检通过" in out
+
+
+def test_check_intake_bot_not_in_channel_exit_1(tmp_path, capsys, monkeypatch):
+    for k, v in _intake_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    _bound_db(tmp_path, ("proj-a", _C))
+    mm = notify.FakeMMClient(channel_members={_C: [_MM_ID]})  # 无 bot
+    rc = cli.main(["check-intake"], mm=mm)
+    err = capsys.readouterr().err
+    assert rc == 1 and "bot 不在频道" in err
+
+
+def test_check_intake_channel_missing_exit_1(tmp_path, capsys, monkeypatch):
+    for k, v in _intake_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    _bound_db(tmp_path, ("proj-a", _C))
+    mm = notify.FakeMMClient(members_not_found={_C})  # 404
+    rc = cli.main(["check-intake"], mm=mm)
+    err = capsys.readouterr().err
+    assert rc == 1 and "频道不存在" in err and "unbind" in err
+
+
 def test_check_notify_bad_token_stops_at_step1(tmp_path, capsys, monkeypatch):
     # token 无效（me_id 抛）= 1/3 ✗ 即停：不走解析不发 DM（后续步骤依赖前步）
     for k, v in _notify_env(tmp_path).items():

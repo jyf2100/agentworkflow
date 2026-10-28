@@ -570,7 +570,7 @@ hub 观察面三件套：读面会话守卫 + MM 通知 bot + 镜像陈旧检测
 
 **env 填值（hub.env）**：
 - `HUB_MM_BOT_TOKEN`：bot token（与 `HUB_MM_BASE_URL` 齐才生效）。**⚠️ PAT 形态坑（2026-10-27 真机实证）**：本 MM 实例的个人访问令牌生效形态是**只填「访问令牌」单段**——令牌 ID 拼接成 `id.secret`（标准 bot token 形态）反而 401 `api.context.session_expired`（首配踩过此坑，check-notify 卡 1/3 即查此处）；改值后须 `docker compose up -d` 重建再自检；
-- `HUB_MM_PROJECT_CHANNELS=proj:chan-id,...`：可选失败广播频道（仅 failed/failed_to_start；chan-id 是频道 id 非名字）；
+- `HUB_MM_PROJECT_CHANNELS`：**已废止（add-mm-channel-intake，2026-10）**——首次启动 seed 迁移进 hub DB `project_channels` 绑定表后不再读取，继续配置静默无效；频道关系唯一真相 = 绑定表（`/pa bind` 管理，见 §19）。通知路由改为归属路由：绑定频道全终态+全事件进频道，未绑定私信；
 - `HUB_IMAGE_TEMPLATE_REPO=owner/repo`：陈旧检测比对源（不配 = 关闭）；`HUB_STALE_CHECK_TICKS` 默认 720（≈5s tick 每小时一查）。
 
 **两级回退**：只 unset `HUB_MM_BOT_TOKEN` = 通知静默（读面守卫不变——bot 通道与 auth 独立）；连 MM 四项（BASE_URL/CLIENT_ID/CLIENT_SECRET/SESSION_SECRET）也 unset = 整体回 2a 回退态（读面守卫同退、auth 群 503）。读面守卫强度跟随 auth 配置面，无独立开关。
@@ -597,7 +597,7 @@ hub 观察面三件套：读面会话守卫 + MM 通知 bot + 镜像陈旧检测
 - 路径：`<state>/runs/<project>/<stamp>_<PRD stem>.events.jsonl`（与 journal 平铺伴生同拼法；**stem 原样含下划线**——hub 侧从 queue_item.prd_path 拼寻址，不用 run 目录名，因 hub `_slugify` 把下划线转横线会使目录名与文件名错位）；
 - 行：`{"v":1,"event":"critic_verdict"|"pr_opened"|"verify_verdict","seq":<run 内单调 int>,"stamp":...,"project":...,...事实字段}`；critic 带 verdict+summary，pr_opened 带 pr_url+repo，verify 带 verdict+round+summary；
 - 写纪律：O_APPEND + fsync 对齐 journal.py；写失败 fail-open（stderr warn 不阻断流水线）；
-- hub 读面：reconcile_running 对 running run 每轮读 → `(run_id, seq)` 进程内存去重 → 新行经 4a bot 通道转发（critic drop / verify 红进频道 + 私信，其余仅私信）；`v≠1` **整文件跳过**（不转发半懂的形态）、未知 event 行跳过、坏 JSON 行跳过；run 终态后不读；孤儿 run（item 查无）跳过。
+- hub 读面：reconcile_running 对 running run 每轮读 → `(run_id, seq)` 进程内存去重 → 新行经 4a bot 通道转发（**归属路由（§19）：绑定频道四类全量进频道 + @提及不私信，未绑定私信发起人**——per-event 广播判定已废止）；`v≠1` **整文件跳过**（不转发半懂的形态）、未知 event 行跳过、坏 JSON 行跳过；run 终态后不读；孤儿 run（item 查无）跳过。
 
 **PA_REPORT_DIR（report 双写）**：hub 派发时给容器注入 `PA_REPORT_DIR=<容器内 state>/reports`（docker `-e` 直传，与凭据 env-file 分离）——pa report 段在该目录**追加**双写一份 `项目推进报告_<stamp>.md`（原落点不变，缺省零变化），落容器内 state 卷即 host `<data_root>/<project>/state/reports/` 可见，面板 run 详情页按 run stamp 对齐读。不注入（如本地 vault 直接跑 run_daily）= 行为与 4b 前完全一致。
 
@@ -621,3 +621,27 @@ dev 亲笔交接工件：断点后新 dev 会话拿到上一 iteration 的结构
 - 观测层 fail-open：store/emit 失败只 log `⚠ iteration_handoff store 失败`，不拖垮 dispatch；handoff 永不进 verdict/gate/retry 决策（RetryPolicy 输入不含它）；
 - 排查：journal grep `iteration_handoff` 看每轮归档（含 adopted 标记）；artifact 在 `state/artifacts/<run>/handoff/`；dev 侧中途快照在 worktree `state/runs/handoff-latest.json`（roc cron 形态盘上幸存可收养；hub 容器形态 worktree 是容器可写层，容器死后 in-flight 快照随容器丢 = 诚实缺失回退，已归档的 journal/artifact 在 state 卷幸存——见 design.md Open Question 2 结案）；
 - 回退：`PA_LOOP_DEV_HANDOFF=false` 一键关回 baseline（env 压过 profile）。
+
+## 19. MM 频道入站 /pa 与出站归属路由（add-mm-channel-intake，2026-10）
+
+「频道即项目」双向入口：MM 频道里 `/pa` slash command 提交需求（入站），run 终态/语义事件按绑定表回流同一频道（出站）。spec: `openspec/specs/hub-mm-intake`（归档后）+ hub-notifications 归属路由 delta。
+
+**三凭据实体（勿混）**：OAuth app（登录身份，§16）／bot token（出站推递 + 入站成员查询，§16）／**slash token（入站验签，新）**。三个独立凭据，缺一只是对应面关闭，不互相兜底。
+
+**启用入站五步**：
+1. bot 侧就绪：bot（或 PAT，§16 单段形态坑）已建、已拉进目标项目频道（成员查询 + 频道 post 都要求 bot 在频道内）；
+2. MM 管理台建 slash command：系统控制台 → 集成 → Slash Commands → 新建——Command `/pa`、Request URL `https://<hub-host>:<port>/mm/intake`（hub 与 MM 网络互通）、复制生成的 **Token**；
+3. hub.env 配 `HUB_MM_SLASH_TOKEN=<token>` → `docker compose up -d` 重建（不配 = 入站关闭，`POST /mm/intake` 恒 503 零行为）；
+4. admin 在项目频道发 `/pa bind <project>`（project = data_root 下有必读面的项目名；HUB_PANEL_ADMINS 白名单判据，空白名单全拒）；
+5. 自检 `python3 hub/cli.py check-intake`（hub 进程 env 下）：①slash token 配置态 ②bot 有效性 ③逐绑定频道 bot 可达，任一 ✗ 非零退出。
+
+**入站回执语义（D3/D7）**：
+- 三态授权 fail-closed：频道成员即授权；MM 不可达/403 = UNKNOWN → 回执「校验暂不可用」**绝不旁路也绝不回执非成员**（判据不可用 ≠ 授权结论）；404 = 绑定指向已删频道 → 回执检查绑定。判定缓存 60s 仅 FOUND 可缓存（踢人 60s 内生效）。
+- evidence 必填：正文须含 `出处:` / `出处：`（半/全角冒号）且行内值非空——空依据闸前拒。
+- 双回执：HTTP 响应 = ephemeral（仅发起人可见）；入队成功后 bot 另 post 进频道（`<@发起人> 已入队 #id：首行摘要`）；拒绝不进频道（个人错误不公开）。
+- 幂等：同发起人同内容同小时窗（UTC）重试 → 回既有 #id 不重复入队；跨窗/改措辞 = 有意重发不拦。
+- bind/unbind 仅 admin 白名单；run 仅频道成员判据——双轨分立不串联。换绑双向对称覆盖（project 换频道 / 频道顶绑旧 project 自动解除，回执明示）。
+
+**出站归属路由（6.x）**：频道关系唯一真相 = hub DB `project_channels` 绑定表（`HUB_MM_PROJECT_CHANNELS` env 已废止——首次启动 seed 迁移一次，此后不读）。绑定项目：run 终态（成败皆进）+ 四类语义事件（critic/verify/PR/acceptance，pass/stored 也进——全事件时间线）+ 无 run 放弃告警全量进频道，消息带 `<@发起人>` 提及（26-hex 直拼；username 解析失败降级纯文本），**不重复私信**；频道 post 失败 fail-open 不回退 DM。未绑定项目：私信三代分流不变（§16）。
+
+**真机联调项（离线测试覆盖不了，7.2 留待真机）**：① MM 管理台 slash command 的 Request URL 签名校验行为（hmac.compare_digest 对真 form token）；② slash 转发的 form 字段形态（channel_id/user_id/user_name/text——不同 MM 版本可能带 `team_id` 等多余字段，hub 侧只取已知键应无碍）；③ `/pa run` 全链（bind → 成员发需求 → ephemeral 回执 → 频道时间线 → run 终态回频道含 @）；④ unbind 后出站回落 DM 复核。

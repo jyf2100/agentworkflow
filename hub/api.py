@@ -15,6 +15,7 @@ import hmac
 import json
 import secrets
 import sqlite3
+import sys
 import threading
 from collections import deque
 from contextlib import asynccontextmanager
@@ -24,6 +25,7 @@ from uuid import uuid4
 
 import auth
 import daemon
+import mm_intake
 import panel
 import prd_store
 import projects
@@ -142,11 +144,15 @@ def create_app(
     *,
     tick_interval: float | None = None,
     vault: vault_store.CredentialVault | None = None,
+    mm_client=None,
 ) -> FastAPI:
     """tick_interval=None = 被动 API（切片 1 形态零变化）；非 None = startup 挂排度常驻线程。
 
     vault（2b）：凭据录入端点的写入通道（None = 未配 master key，录入端点 503）。
     auth 配置从 lc.cfg 读（可选面：未配置 = auth 群 503，其余端点零影响）。
+    mm_client（add-mm-channel-intake）：MM 客户端（bot token + base_url 齐时
+    serve 传入，与 Notifier 共享实例）；None = 成员判据恒 UNKNOWN（入站 fail-closed
+    拒绝——判据不可得绝不旁路）+ bind 探活不可用回执。
     """
 
     @asynccontextmanager
@@ -320,15 +326,9 @@ def create_app(
 
     def _panel_projects() -> list[str]:
         """project 清单 = data_root 下有启动必读面的子目录（与派发 fail fast 同判据，
-        lifecycle.py 启动必读面检查）——hub 不维护独立 project 注册表。"""
-        root = lc.cfg.data_root
-        if not root.is_dir():
-            return []
-        return sorted(
-            sub.name for sub in root.iterdir()
-            if sub.is_dir() and PROJECT_RE.fullmatch(sub.name)
-            and (sub / "profiles").is_dir() and (sub / "sources.yaml").is_file()
-        )
+        lifecycle.py 启动必读面检查）——hub 不维护独立 project 注册表。判据本体在
+        mm_intake.readable_projects（与 /pa bind 必读面校验两皮一芯）。"""
+        return mm_intake.readable_projects(lc.cfg.data_root)
 
     def _panel_get(request: Request) -> HTMLResponse | RedirectResponse | None:
         """GET 面守卫：未配置 503（HTML）/ 未登录 302；已登录返回 None 由端点续渲染。"""
@@ -661,6 +661,37 @@ def create_app(
         except (json.JSONDecodeError, OSError, ValueError):
             return None
         return data if isinstance(data, dict) else None
+
+    # ── MM 入站端点（add-mm-channel-intake D1/D6/D7，spec: hub-mm-intake）─────
+    # 薄壳：token 恒时校验（未配 503 对齐 auth 群未配置回退态 / 不匹配 401）→
+    # form 解析 → mm_intake.handle_command（全部语义面）→ ephemeral JSON 响应 +
+    # 后置频道 post（fail-open——MM 对 slash 响应秒级超时，频道 post 拉长处理链
+    # 会放大超时→重试面）。
+
+    _member_cache = mm_intake.MemberCache()
+
+    @app.post("/mm/intake")
+    async def mm_intake_endpoint(request: Request) -> JSONResponse:
+        tok = lc.cfg.mm_slash_token  # D6：不配 = 入站关闭零行为
+        if tok is None:
+            raise HTTPException(status_code=503, detail="入站未配置（HUB_MM_SLASH_TOKEN）——/pa slash command 关闭")
+        form = await request.form()  # x-www-form-urlencoded 由 Starlette 原生解析
+        req_token = str(form.get("token") or "")
+        if not hmac.compare_digest(req_token, tok):
+            raise HTTPException(status_code=401, detail="slash token 校验失败")
+        result = mm_intake.handle_command(
+            database=database, engine=engine, cfg=lc.cfg, mm=mm_client,
+            form={k: str(v) for k, v in form.items()},
+            member_cache=_member_cache,
+        )
+        channel_post = result.get("channel_post")
+        if channel_post is not None:
+            channel_id = str(form.get("channel_id") or "")
+            try:
+                mm_client.post_channel(channel_id, channel_post)  # 后置于响应构造前但 fail-open
+            except Exception as e:  # noqa: BLE001——时间线 post 绝不拖垮 ephemeral 回执
+                print(f"[mm-intake][warn] 频道时间线 post 异常（fail-open）: {type(e).__name__}", file=sys.stderr)
+        return JSONResponse({"response_type": "ephemeral", "text": result["ephemeral"]})
 
     # ── 投递端点（slice-3 D1/D2/D6/D7，spec: prd-delivery「hub 幂等交接端点」）──
 

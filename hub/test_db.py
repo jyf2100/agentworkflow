@@ -202,3 +202,115 @@ def test_enqueue_without_deliver_key_allows_multiple_nulls(tmp_path):
     d = _open(tmp_path)
     d.enqueue("a", "/p1", "t", "u"); d.enqueue("b", "/p2", "t", "u")  # 既有 CLI/API 入队路径零破坏
     assert len(d.list_items()) == 2  # UNIQUE 索引对 NULL 不约束——非投递入队无幂等键语义
+
+
+# ── add-mm-channel-intake 1.x：project_channels 绑定表（D2 频道↔项目 1:1 唯一真相）──
+
+_C1 = "c" * 26
+_C2 = "d" * 26
+
+
+def test_bind_crud_roundtrip(tmp_path):
+    d = _open(tmp_path)
+    assert d.get_channel_binding_by_channel(_C1) is None and d.get_channel_binding_by_project("proj-a") is None
+    d.upsert_bind("proj-a", _C1, "roc")
+    row = d.get_channel_binding_by_channel(_C1)
+    assert row is not None and row["project"] == "proj-a" and row["bound_by"] == "roc"
+    assert d.get_channel_binding_by_project("proj-a")["channel_id"] == _C1
+    # 重开连接持久（绑定是 db 实体非内存态）
+    d2 = db.HubDB(tmp_path / "hub.sqlite3")
+    assert d2.get_channel_binding_by_channel(_C1)["project"] == "proj-a"
+
+
+def test_bind_unique_constraints_both_directions(tmp_path):
+    d = _open(tmp_path)
+    d.upsert_bind("proj-a", _C1, "roc"); d.upsert_bind("proj-b", _C2, "roc")
+    conn = sqlite3.connect(tmp_path / "hub.sqlite3")
+    # 同 project 二频道 / 同频道二 project 双向撞 UNIQUE（1:1 两方向都唯一）
+    try:
+        conn.execute("INSERT INTO project_channels VALUES ('proj-a',?, 'x','t')", (_C2,)); raised = False
+    except sqlite3.IntegrityError:
+        raised = True
+    assert raised
+    try:
+        conn.execute("INSERT INTO project_channels VALUES ('proj-c',?, 'x','t')", (_C1,)); raised = False
+    except sqlite3.IntegrityError:
+        raised = True
+    assert raised
+    conn.close()
+
+
+def test_rebind_project_switches_channel_clears_old(tmp_path):
+    d = _open(tmp_path)
+    d.upsert_bind("proj-a", _C1, "roc")
+    replaced = d.upsert_bind("proj-a", _C2, "roc")  # project 换频道
+    assert [r["channel_id"] for r in replaced] == [_C1]
+    assert d.get_channel_binding_by_channel(_C1) is None  # 旧绑定必清
+    assert d.get_channel_binding_by_project("proj-a")["channel_id"] == _C2
+    assert d.get_channel_binding_by_channel(_C2)["project"] == "proj-a"
+
+
+def test_rebind_channel_takes_over_project(tmp_path):
+    d = _open(tmp_path)
+    d.upsert_bind("proj-a", _C1, "roc"); d.upsert_bind("proj-b", _C2, "roc")
+    replaced = d.upsert_bind("proj-a", _C2, "roc")  # 频道顶绑：proj-a←C2 顶掉 proj-b←C2
+    assert {(r["project"], r["channel_id"]) for r in replaced} == {("proj-a", _C1), ("proj-b", _C2)}
+    assert d.get_channel_binding_by_project("proj-b") is None  # C2 原 project 绑定被顶清
+    assert d.get_channel_binding_by_channel(_C1) is None  # proj-a 原频道绑定被清
+    assert d.get_channel_binding_by_channel(_C2)["project"] == "proj-a"  # 唯一幸存：新绑定
+
+
+def test_rebind_same_pair_returns_own_old_row(tmp_path):
+    d = _open(tmp_path)
+    d.upsert_bind("proj-a", _C1, "roc")
+    replaced = d.upsert_bind("proj-a", _C1, "jyf")  # 重复 bind 同对 = 换绑覆盖自身（bound_by 更新）
+    assert len(replaced) == 1 and replaced[0]["bound_by"] == "roc"
+    assert d.get_channel_binding_by_channel(_C1)["bound_by"] == "jyf"
+
+
+def test_unbind_by_channel(tmp_path):
+    d = _open(tmp_path)
+    assert d.unbind_by_channel(_C1) is None  # 未绑定 → None（教育回执判据）
+    d.upsert_bind("proj-a", _C1, "roc")
+    row = d.unbind_by_channel(_C1)
+    assert row is not None and row["project"] == "proj-a"
+    assert d.get_channel_binding_by_project("proj-a") is None
+
+
+def test_seed_empty_table_seeds_with_migration_audit(capsys, tmp_path):
+    d = _open(tmp_path)
+    n = d.seed_project_channels({"proj-a": _C1, "proj-b": _C2})
+    assert n == 2
+    row = d.get_channel_binding_by_channel(_C1)
+    assert row["bound_by"] == "seed-migration" and row["bound_at"]  # 审计列：seed 来源 + 时刻
+    assert "warn" not in capsys.readouterr().err
+
+
+def test_seed_skips_when_table_nonempty(tmp_path):
+    d = _open(tmp_path)
+    d.upsert_bind("proj-a", _C1, "roc")  # 表非空（哪怕只有一行手工绑定）
+    assert d.seed_project_channels({"proj-b": _C2}) == 0  # 跳过——env 再改也不重灌
+    assert d.get_channel_binding_by_project("proj-b") is None
+    assert d.get_channel_binding_by_channel(_C1)["bound_by"] == "roc"  # 既有绑定不被覆盖
+
+
+def test_seed_empty_pairs_and_rerun_idempotent(tmp_path):
+    d = _open(tmp_path)
+    assert d.seed_project_channels({}) == 0  # env 缺失/空 → 零行为零行
+    assert d.get_channel_binding_by_channel(_C1) is None
+    assert d.seed_project_channels({"proj-a": _C1}) == 1
+    assert d.seed_project_channels({"proj-a": _C1, "proj-b": _C2}) == 0  # 二次启动：表非空跳过
+
+
+def test_seed_rejects_malformed_channel_id(capsys, tmp_path):
+    d = _open(tmp_path)
+    n = d.seed_project_channels({
+        "proj-a": "not-a-channel-url",       # 频道名/URL 误填形态
+        "proj-b": "abc123",                  # 短 id
+        "proj-c": _C1,
+    })
+    assert n == 1  # 只有合法形态入库
+    assert d.get_channel_binding_by_project("proj-a") is None
+    assert d.get_channel_binding_by_project("proj-c")["channel_id"] == _C1
+    err = capsys.readouterr().err
+    assert "proj-a" in err and "proj-b" in err  # 拒入 stderr 可见（无静默失败）
