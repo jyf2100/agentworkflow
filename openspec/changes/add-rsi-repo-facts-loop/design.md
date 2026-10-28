@@ -29,18 +29,19 @@ cross-prd-learning-memory 已落地：终态后 curated evidence bundle → 结�
 
 ## Decision: D3 人审环 + facts sidecar 写面
 
-- hub 收 `repo_fact_proposed` 事件 → 频道 post @admin（HUB_PANEL_ADMINS——仓事实是项目级知识，admin 拍板）→ `/pa fact ok|no|merge|del #<id>`（del 亦用于陈旧清理）。
-- **facts sidecar 文件**（评审 R4）：确认后写 `profiles/<name>.facts.yaml` **独立文件**，不动 profile 主文件——hub 侧唯一既有 profile 写面是建档一次性字符串模板（projects.py），运行期改写主文件是开无先例新写面且 `yaml.dump` 回写会重排键序/丢注释、毁「落盘键集逐字节一致」回归基线。sidecar 写面：读-改-走 tmp 文件 + `os.replace` 原子换名，追加式块写入；pa 读面按需合并。条数上限 12/项目（FIFO 满则回执提示先清）。条目带 `confirmed_by/confirmed_at/evidence_run` 溯源（该三字段 schema 契约在 tasks 1.2 定稿，hub 写侧引用同一契约）。
-- **拦截审计回流**（评审 B1/B2）：fact 条目带 `blocked_count/last_blocked_run`；同一 fact_key 连续拦截达 2 次 → 频道自动 post @admin 复审（附计数与最近拦截 run 链）；check-intake 展示。这是错误事实的自然退出信号——否则事实拦掉的 PRD 永不跑，永无反驳证据（环自密封）。
-- 状态机与 B 环共享：fact_requests 表结构 requested/confirmed/rejected/expired + 72h 过期 + 幂等与 confirmation_requests 同构；B 环先落地则复用其 `request_decide` helper 与 expire_sweep（合并为一 sweep 扫两表），避免双表双状态机 DRY 漂移。
+- hub 收 `repo_fact_proposed` 事件 → 频道 post @admin（HUB_PANEL_ADMINS——仓事实是项目级知识，admin 拍板；判据复用既有 `_require_bind_admin` helper）→ `/pa fact ok|no|merge|del #<id>`（del 亦用于陈旧清理）。
+- **facts sidecar 文件**（评审 R4）：确认后写 `profiles/<name>.facts.yaml` **独立文件**，不动 profile 主文件——hub 侧唯一既有 profile 写面是建档一次性字符串模板（projects.py），运行期改写主文件是开无先例新写面且 `yaml.dump` 回写会重排键序/丢注释、毁「落盘键集逐字节一致」回归基线。sidecar 写面：读-改-走 tmp 文件 + `os.replace` 原子换名，追加式块写入；pa 读面按需合并，**`load_profiles` 的 `*.yaml` glob 显式排除 `*.facts.yaml`**（否则顶层 list 的 sidecar 撞 `prof.get()` 直接炸 inject 段）；lifecycle `_profile_forges` 同规则。条数上限 12/项目（FIFO 满则回执提示先清）。条目带 `confirmed_by/confirmed_at/evidence_run` 溯源（该三字段 schema 契约在 tasks 1.2 定稿，hub 写侧引用同一契约）。**幂等判据按 fact_key 先行**：`ok` 重放时 sidecar 已有同 key 条目 → 直接回执「已生效」不再写（防半程崩溃重放双条目，尤其 merge 改写后 key 重派生场景）；sidecar 写入与 fact_requests 建行均按 fact_key 幂等去重（第二候选命中已确认键 → 回执「已生效」）。
+- **拦截审计回流**（评审 B1/B2）：`blocked_count/last_blocked_run` 确认前在 fact_requests 表行、**确认时迁入 sidecar 条目**（表行 confirmed 是状态机终态不可再累计；confirm 后累计/展示/回流均以 sidecar 为准，check-intake 读 sidecar）。**计数语义**：「连续」= 同一 fact_key 的拦截事件序列中无 `fact ok/no/merge/del` 决策介入（任何 decide 转移清零）；同一 run 内多轮 revise 计 1 次（按 run 去重）；累计口径 = critic 事件结构化 `fact_keys` 字段（B 契约同名字段，非文本解析；无字段不计数）。达 2 次 → 频道自动 post @admin 复审。
+- **拦截回流回执分叉**（正确事实 vs 错误事实都有出路）：fact 可疑 → 复审 fact（evidence 链）；fact 可信 → 复审**需求与基建**（「该类需求连续 2 次被事实拦截——是事实错了，还是该给仓上基建/立项 v2 harness（如 Python E2E）？」）——软出口不制造「正确事实 × 合法需求」的永久死锁，基建升级是环内显式出路（RUNBOOK SOP 对应处置项）。
+- 状态机与 B 环共享（**无条件复用**，实施顺序已锁 A→B→RSI，B 恒先落地）：fact_requests 表结构 requested/confirmed/rejected/expired + 72h 过期 + 幂等与 confirmation_requests 同构，复用 B 落地的 decide helper（以其落地名为准）与 expire_sweep（合并为一 sweep 扫两表）。
 
 ## Decision: D4 上游注入点（pa 侧三处 + B 后一处，机械拼接零 LLM）
 
 - **radar-PRD prompt**（`run_daily.py` prd prompt 构建）：尾部追加「## 仓事实（验收指标须贴此现实）」节。
-- **critic prompt**：附 repo_facts 节；判据增软出口理由——PRD 验收指标与 repo_facts 直接冲突 → **revise 打回**（反馈附冲突 fact key 与仓事实原文；B 环落地后为 needs_metrics），**SHALL NOT 终局 drop**。PRD 打回重写后会再来，环不密封；人从 revise 反馈可见冲突，可改写指标或 `/pa fact no` 推翻事实。
+- **critic prompt**：附 repo_facts 节；判据增软出口理由——PRD 验收指标与 repo_facts 直接冲突 → **revise 打回**（反馈附冲突 fact key 与仓事实原文；B 环落地后为 needs_metrics，reason=fact_conflict + fact_keys 结构化字段），**SHALL NOT 因事实冲突无声终局 drop**。**额度条款**：事实冲突 revise 消耗既有 revise 1 次额度（复用回环机制）；额度耗尽 round-2 仍冲突 → 终局 drop（summary 引 fact key + 冲突原文，事件 fact_keys 照发）——终局非无声（反馈可见 + 拦截计数照累计 + 回流兜底），环不密封。**人确认不豁免软拦截**：confirmed PRD 与已确认仓事实冲突仍被软拦（事实覆盖唯二出口 = `/pa fact no|del` 或仓基建升级后 del）。**回执指向声明面**：冲突 fact 属 `fact_class=test_infra`/`dep_reality` 且指标隐含超出已声明 harness 能力时，反馈文案显式指向 profile 声明动作（「本仓未声明可执行该指标的 harness：请补 `harness: playwright` + `e2e_dev_cmd` 声明（并装依赖），或改写指标」）——「事实→声明→指标」三角在本 change 与 B 环 requires 标注处闭合，不自动改 profile。
 - **test-author prompt**：附同节（纯 append，不碰 harness 声明段——A 环先行定型的面）。
-- **spec-author prompt**：B 环落地后扩展（blocked-by: add-acceptance-spec-confirmation；v1 不对不存在 persona 建 SHALL 面）。
-- **不注入**：MM wrap（`hub/mm_intake.py wrap_mm_prd`）与 panel wrap（`hub/api.py _wrap_panel_prd`）保持纯机械零注入——wrap 是 deliver_key sha 的输入，注入 = hub 对人写 PRD 正文的语义增写，污染 provenance 审计面，且与 critic prompt 注入双源冗余、事实冻结在入队时刻；**dev** 不注入（它自己读仓，事实冗余）。
+- **spec-author prompt**：B 环落地后扩展（blocked-by: add-acceptance-spec-confirmation；v1 不对不存在 persona 建 SHALL 面）；注入时输出契约增 `conflicts: [fact_key...]`——拟指标与 sidecar 现行事实冲突时显式报出，hub 建 confirmation_requests 行时频道 post 附「与已确认仓事实 #N 冲突，可 /pa fact no 推翻或改需求」（把改指标 vs 推翻事实两条人出口在状态空间显式连通，第二波）。
+- **不注入**：MM wrap（`hub/mm_intake.py wrap_mm_prd`）与 panel wrap（`hub/api.py _wrap_panel_prd`）保持纯机械零注入——wrap 是 deliver_key sha 的输入，注入 = hub 对人写 PRD 正文的语义增写，污染 provenance 审计面，且与 critic prompt 注入双源冗余、事实冻结在入队时刻；**dev** 不注入（它自己读仓，事实冗余）。**身份连续性**：wrap 零注入 ⇒ fact 生效不改变已排队项的 deliver_key / 不触发重投——pending 项下一 run 起 critic prompt 构建时新鲜读 sidecar（3.x 单测锁死此语义）。
 
 ## Decision: D5 fail-open 边界（软出口版）
 

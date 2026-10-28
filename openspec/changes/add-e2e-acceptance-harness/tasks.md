@@ -2,9 +2,9 @@
 
 ## 1. pa 编排器 harness 面
 
-- [ ] 1.1 `run_daily.py`：harness 拦截面（:950）集扩 `("playwright",)`；profile 读面增 `e2e_dev_cmd` 键（声明 playwright 时必填，缺失 = test-author 调用前置拦截、回执指引补声明）；`_test_author_prompt` 增 playwright 分支（文件形态 `e2e_*.spec.ts` + D3 纪律专则：条件等待/webServer（command=profile e2e_dev_cmd、端口段 4173-4199 sha 取模、reuseExistingServer）/retries=1/单 chromium）
-- [ ] 1.2 `run_daily.py`：`_structural_self_check` 增 `_E2E_FILE_RE` 分支（`e2e_[\w\-]+\.spec\.ts` 形态不匹配拒收 + `page.waitForTimeout(` 出现即拒收 + playwright.config 无 `webServer` 节拒收——纪律 1/2 机械面）
-- [ ] 1.3 `verify_agent.py`：`declared_suite_cmds_for` 增 `playwright test <rel>` 分支（全局 bin 直调非 npx，docstring 支持集同步 v2 + NODE_PATH 全局 resolve 依据）；`verify_anchors.parse_failing_anchors` 增 playwright runner 分支（`Error:` + `at e2e_x.spec.ts:LINE:COL` 形态；flaky retries 后绿 exit 0 计绿注记）
+- [ ] 1.1 `run_daily.py`：harness 拦截面（:950）集扩 `("playwright",)`；profile 读面增 `e2e_dev_cmd` 键（声明 playwright 时必填，缺失 = test-author 调用前置拦截、回执指引补声明）；`_test_author_prompt` 增 playwright 分支（文件形态 `e2e_*.spec.ts` + **playwright.config 为 authored file 之一**（随 bundle content-addressed 注入 worktree，覆盖目标仓既有 config）+ D3 纪律专则：条件等待/webServer（command=profile e2e_dev_cmd、端口段 4173-4199 sha 取模、reuseExistingServer）/retries=1/单 chromium）
+- [ ] 1.2 `run_daily.py`：`_structural_self_check` 增 `_E2E_FILE_RE` 分支（`e2e_[\w\-]+\.spec\.ts` 形态不匹配拒收 + `page.waitForTimeout(` 出现即拒收 + playwright.config（authored file，自检可见）无 `webServer` 节拒收——纪律 1/2 机械面）
+- [ ] 1.3 `verify_agent.py`：`declared_suite_cmds_for` 增 `playwright test <rel>` 分支（全局 bin 直调非 npx，docstring 支持集同步 v2 + NODE_PATH 全局 resolve 依据）；`verify_anchors.detect_runner` 增 playwright 映射（`"playwright" in cmd → "playwright"`——**入口不改则 parse 分支永不被调用**，现状 `playwright test` 命中 `return "unknown"`）；`verify_anchors.parse_failing_anchors` 增 playwright runner 分支（锚定主形态 = 失败头行 `[chromium] › path/e2e_x.spec.ts:LINE:COL › test name`，`at file:line:col` 栈帧行仅佐证——fixture 以镜像锁版实测输出为准；flaky retries 后绿 exit 0 计绿注记）
 
 ## 2. test-author persona
 
@@ -17,6 +17,6 @@
 
 ## 4. 测试与回归
 
-- [ ] 4.1 单测：harness=playwright 全链（声明放行/缺 e2e_dev_cmd 前置拦/file 形态自检/sleep 与无 webServer 拒收/命令映射 `playwright test` 非 npx/flaky 计绿/未声明项目零变化）——离线 fixture
+- [ ] 4.1 单测：harness=playwright 全链（声明放行/缺 e2e_dev_cmd 前置拦/file 形态自检/sleep 与无 webServer 拒收/命令映射 `playwright test` 非 npx/detect_runner 映射与 playwright 失败输出锚解析（锁版实测 fixture）/flaky 计绿/未声明项目零变化）——离线 fixture
 - [ ] 4.2 `bash scripts/quality.sh` + `bash hub/quality.sh` 双绿
 - [ ] 4.3 真机坐实（发版后）：cc-web-control profile 临时声明 `harness: playwright` + `e2e_dev_cmd`，发一条 E2E 可测需求（如「主题切换按钮点击后 body data-theme 变更」），全链入队→test-author 产 e2e 套件（webServer 起停自动）→dev→verify 机械锚→终态回流频道；坐实后 profile 还原与否听用户
