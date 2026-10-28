@@ -20,6 +20,7 @@
 
 ## Out of Scope
 
-- 多 harness 混合声明（一 profile 同时 jest + playwright）——v2 再议。
+- **Python 项目的 Web E2E**（pytest-playwright 形态）——v1 playwright 声明钉死 Node 工具链（`e2e_*.spec.ts` + node/playwright CLI），Python 项目（aigw 类）的 E2E 需求 v1 覆盖不到，v2 另议。
+- 多 harness 混合声明（一 profile 同时 jest + playwright）——v2 再议；混合验收点场景语义见 design D6。
 - 视觉快照对比（screenshot diff）专项——playwright `toHaveScreenshot` 属确定性坑（字体/AA 渲染差），本 change 只开 `toBeVisible`/属性/DOM 断言面，快照对比另行立项。
 - B 环（验收指标预确认，见 `add-acceptance-spec-confirmation`）——正交，可独立交付。
