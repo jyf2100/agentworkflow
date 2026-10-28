@@ -6,7 +6,7 @@
 
 **项目 (Project)**:
 roc 自有的代码仓库（github.com/jyf2100/ 或 okwinds/ 下），位于 /Users/roc/workspace/，有 GitHub remote，经白名单准入。是 [[开发 agent]] 唯一会改动、开 PR 的对象。
-profile 可选字段（agent-verify-injection 1.5 扩展，均缺省 = 无验收套件）：`harness`（验收测试载体，v1 支持集 jest/pytest，集外显式降级 no_harness 不猜测）、`verify_test_cmd`（verify agent 会话内跑测试的命令）、`env`（工具链级环境声明，v1 记录不阻断）。
+profile 可选字段（agent-verify-injection 1.5 扩展，均缺省 = 无验收套件）：`harness`（验收测试载体，v1 支持集 jest/pytest/playwright——playwright 为 Node 工具链项目 E2E 专属且须并声明 `e2e_dev_cmd`，add-e2e-acceptance-harness；集外显式降级 no_harness 不猜测）、`verify_test_cmd`（verify agent 会话内跑测试的命令）、`env`（工具链级环境声明，v1 记录不阻断）。
 _Avoid_: 仓/代码库（太泛）、vault 子目录（那些不是项目）、上游 fork 作为目标。
 
 **大脑 (Brain)**:
@@ -122,7 +122,7 @@ _Avoid_: 把 dev loop 内部循环拆成 graph 边（违 ADR-0006 + claude runti
 _Avoid_: 用 node 内循环表达跨语义角色的回环（掩埋拓扑、损 graph 可读性）。
 
 **drop**:
-[[PRD 质量闸]] / verify 闭环中，**对抗 persona 独占**的语义排除判决（PRD 不进 dispatch / dev 产出判死）。编排器（graph node/edge）**从不产生 drop**——遇 persona 输出残缺只产 [[triaged]]（升人工，不替判死）。守「机械层不替语义层判结论」。
+[[PRD 质量闸]]中，**对抗 persona 独占**的语义排除判决（PRD 不进 dispatch）。verify 闭环**无 drop**——pa-verify verdict 仅 pass/revise，机会用尽走 [[triaged]]（verify_exhausted 升人工），dev 产出只回炉或升人工、永不被判死。编排器（graph node/edge）**从不产生 drop**——遇 persona 输出残缺只产 [[triaged]]（升人工，不替判死）。守「机械层不替语义层判结论」。
 **现状标注（2026-10）**：「编排器从不产 drop」是 langgraph 重构目标态，task 4.2（3 处编排器 drop 改 triaged）**未完成**——现行 `run_daily.py` stage_critic 三边界仍产 drop（缺 path / 漏吐 verdict / revise 异常；熔断终态 raise 穿透除外），`graph_pa_aggregate.py` 聚合层全镜像同语义。file:line 证据见 change `productize-pa-template` 验证笔记。
 _Avoid_: 编排器硬判 drop（边界滑落，见 `orchestrator-boundary-audit-2026-08-11.md` 层 2）。
 
@@ -211,7 +211,7 @@ hub 观察面的 run 终态事件出口（add-hub-slice-4a，F14）——事件�
 _Avoid_: 与 SMTP 简讯混称（那是 vault 侧 report 段动作；hub 通知只认 run 终态行）；「通知失败阻断执行」的直觉（观察面永不阻断执行面——fail-open 是钉死语义）。
 
 **bot 通道 (notify bot)**:
-与 OAuth 2.0 应用（登录身份）分离的**第二个 MM 凭据实体**（F14）——bot token 只司推递，不做登录；未配（或 MM base_url 缺）= 通道关闭零行为。收件人值形态三代分流：enqueued_by 为 26-hex mm_user_id（2b 会话入队）直发 / username（2a env 兜底）经 `users/username/{name}` 解析后发（内存缓存，解析失败可见丢）/ `vault-deliver`（机机字面量）回落 cfg.user_id 走 username 路径。频道广播仅失败类（噪音控制）。
+与 OAuth 2.0 应用（登录身份）分离的**第二个 MM 凭据实体**（F14）——bot token 只司推递，不做登录；未配（或 MM base_url 缺）= 通道关闭零行为。收件人值形态三代分流：enqueued_by 为 26-hex mm_user_id（2b 会话入队）直发 / username（2a env 兜底）经 `users/username/{name}` 解析后发（内存缓存，解析失败可见丢）/ `vault-deliver`（机机字面量）回落 cfg.user_id 走 username 路径。频道广播为全事件时间线（add-mm-channel-intake：绑定频道的项目全事件进频道、成功也进；未绑定项目走私信三代分流——旧「仅失败类」口径已废止）。
 _Avoid_: bot token 与 OAuth client_secret 混用（两实体两用途，spec 钉死分离）；把 username 解析失败当 bug（是「可见的丢」——stderr 留痕，修法是 MM 侧加 bot 联系人/核对 username）。
 
 **陈旧检测 (stale check)**:
@@ -223,5 +223,5 @@ hub 的手写 PRD 提交入口 + 只读观察页（add-hub-slice-4b，`/panel` �
 _Avoid_: 把面板当管理面（无取消/重试/改态操作——hub 操纵面钉死在 CLI）；期待文件上传（粘贴 only，multipart 会破零新依赖面）。
 
 **事件出口 (event outlet)**:
-pa → hub 的**唯一语义事件接缝**（add-hub-slice-4b）——pa 侧 `event_outlet.py` 在 critic/PR/verify 落点机械追加 `runs/<project>/<stamp>_<PRD stem>.events.jsonl`（O_APPEND+fsync 对齐 journal 写纪律，fail-open 绝不炸流水线）；hub 侧 reconcile_running 读新行经 bot 通道转发（critic drop/verify 红进频道 + 私信，其余仅私信），`(run_id, seq)` 进程内存去重、终态即清。**hub 绝不解析 pa journal 内部格式**（4a D2 边界不动）；`v≠1` 整文件跳过（不转发半懂的形态）。寻址从 queue_item.prd_path 拼stem（不用 run 目录名——hub `_slugify` 下划线→横线与 pa stem 原样天然错位）。
+pa → hub 的**唯一语义事件接缝**（add-hub-slice-4b）——pa 侧 `event_outlet.py` 在 critic/PR/verify 落点机械追加 `runs/<project>/<stamp>_<PRD stem>.events.jsonl`（O_APPEND+fsync 对齐 journal 写纪律，fail-open 绝不炸流水线）；hub 侧 reconcile_running 读新行经 bot 通道转发（绑定频道项目 = 全事件时间线进频道，未绑定走私信三代分流——add-mm-channel-intake 升级，旧「仅失败类进频道」口径废止），`(run_id, seq)` 进程内存去重、终态即清。**hub 绝不解析 pa journal 内部格式**（4a D2 边界不动）；`v≠1` 整文件跳过（不转发半懂的形态）。寻址从 queue_item.prd_path 拼stem（不用 run 目录名——hub `_slugify` 下划线→横线与 pa stem 原样天然错位）。
 _Avoid_: 期待事件通知「至多一次」（进程内存去重 + hub 重启重发一轮是接受的语义——文本幂等）；把 events.jsonl 当 pa 内部状态（是单向观察面输出，容器即弃后文件留卷）。

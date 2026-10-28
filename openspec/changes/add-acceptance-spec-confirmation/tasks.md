@@ -19,3 +19,4 @@
 
 - [ ] 3.1 真机坐实：重放 #74 模糊原文 → 频道收指标清单 → rocju `/pa confirm` → 新 run critic 直接 pass → dispatch；另一轮 `/pa reject` 与超时形态抽查；radar 源模糊信号抽查（仍三态、零 metrics_proposed 事件）
 - [ ] 3.2 RUNBOOK 新节：确认环生命周期（needs_metrics→清单→confirm/reject/metrics→超时）+ 三子命令用法 + 故障形态（spec-author 失败降级 drop 的回执语义 / 事件未注册死链的排查 / 重入队上界回执）；`bash scripts/quality.sh` + `bash hub/quality.sh` 双绿
+- [ ] 3.3 落地同步挂靠（本体论审核 ④ INFO）：本 change 落地日将同时击穿 CLAUDE.md 两处声明——persona 计数（10→11，pa-spec-author 入列）与 critic 三态表述（pass/drop/revise → 四态，且按来源分叉）——实施 1.3 时同 commit 更新 CLAUDE.md 对应行，勿留 will-break 窗口
