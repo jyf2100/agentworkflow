@@ -39,5 +39,6 @@
 
 - [x] 7.1 `hub/cli.py` check-notify 扩步入或新子命令 `check-intake`：slash token 配置态 / 绑定表内容 / bot 可达各绑定频道（成员查询连通）一键自检；RUNBOOK §16/新节补：MM 管理台建 slash command 步骤、bind 操作流程、入站回执语义、PAT 单段形态事实引用（§16 已记）
 - [ ] 7.2 真机联调：MM 管理台建 `/pa` slash command → env 配 token 重建 → bot 拉进项目频道 → admin bind → 成员发 `/pa run <需求+出处>` 全链坐实（ephemeral 回执 / 频道时间线 / run 终态回频道含 @）；未配项回落形态复核（出站迁移前后行为对齐）
-  - 2026-10-28 真机进度：token 两态（401/503）/ 未知子命令用法 / 未绑定教育回执 / 非成员真 MM 成员查询拒绝 / 成员缺出处 evidence 拒 / bind 非管理员白名单拒 / admin bind-unbind-绑回 / bot 频道 post 201 全部真机绿（cc-web-control ↔ txnt3p8iejb1p8ix6qw1wwe87c 经 seed 迁移落表后 bind 复验）；剩：MM 管理台正式注册 slash command 换真 token + 首个真 `/pa run` 全链（含 run 终态回频道 @）
+  - 2026-10-28 真机进度：token 两态（401/503）/ 未知子命令用法 / 未绑定教育回执 / 非成员真 MM 成员查询拒绝 / 成员缺出处 evidence 拒 / bind 非管理员白名单拒 / admin bind-unbind-绑回 / bot 频道 post 201 全部真机绿（cc-web-control ↔ txnt3p8iejb1p8ix6qw1wwe87c 经 seed 迁移落表后 bind 复验）
+  - 2026-10-28 全链坐实：rocju 真身发 `/pa run`（curl 模拟 slash 转发，token 恒时校验后同链路）→ 入队 #73 → ephemeral 回执 + 频道时间线 `<@发起人> 已入队` → 容器调度 → inject ✓ → critic PASS → dispatch（dev 40 turns）→ 同内容重试幂等回执 ✓ → run 终态 succeeded 回流频道含 `<@发起人>` ✓。README 任务本体被测试发布门以 test_stale 阻断（无新绿不 PR——fail-safe 不变量按设计工作；docs-only 任务无测试可跑是已知产品缝隙，另行立项）。剩唯一人工步：MM 管理台正式注册 /pa slash command 拿真 token 换 hub.env 测试值
 - [x] 7.3 `bash hub/quality.sh` 全绿 + 全量测试回归（既有 hub-notifications 语义被 MODIFIED 的四 requirement 场景全部翻绿新口径）
