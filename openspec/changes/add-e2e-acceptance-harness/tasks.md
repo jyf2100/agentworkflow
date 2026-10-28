@@ -12,8 +12,10 @@
 
 ## 3. executor 镜像（template 发版路径——MUST NOT 改 hub/deploy/Dockerfile）
 
-- [ ] 3.1 template repo 投影 Dockerfile 增层：`npm i -g playwright@<锁区间>` + `playwright install chromium --with-deps` + `ENV NODE_PATH=/usr/local/lib/node_modules`；template tag 发版（release note 注记体积影响 +~400MB 与 playwright 锁版区间），`pa-executor` tag 随发版咬合
-- [ ] 3.2 发版镜像容器内冒烟：`playwright --version` + 最小 `e2e_smoke.spec.ts`（`import '@playwright/test'` 从全局 resolve + data URL 断言标题）就地跑绿——**目标仓 node_modules 无 playwright 前提下**零外网零仓内依赖
+- [x] 3.1 template repo 投影 Dockerfile 增层：`npm i -g playwright@<锁区间>` + `playwright install chromium --with-deps` + `ENV NODE_PATH=/usr/local/lib/node_modules`；template tag 发版（release note 注记体积影响 +~400MB 与 playwright 锁版区间），`pa-executor` tag 随发版咬合
+      （实证 2026-10-28：release/Dockerfile 与 hub/deploy/pa-executor.Dockerfile 双投影层落地（锁 1.64.1）；镜像 pa-executor:v0.1.19 三轮 build 迭代真机 hub 派发跑通（#77 model-routing 污染、#78 /opt/pa 属主两缺陷修复后 build3 定版，commit 2433009 chown /opt/pa 整树））
+- [x] 3.2 发版镜像容器内冒烟：`playwright --version` + 最小 `e2e_smoke.spec.ts`（`import '@playwright/test'` 从全局 resolve + data URL 断言标题）就地跑绿——**目标仓 node_modules 无 playwright 前提下**零外网零仓内依赖
+      （实证 2026-10-28 超额：非最小冒烟——本机 v0.1.19 容器内空 node_modules 目标仓注入套件真跑 2 passed EXIT=0（webServer 自动起 4174 + 故意红锚解析全过）；真机 #79 容器内 test-author 产套件注入 dev 会话）
 
 ## 4. 测试与回归
 

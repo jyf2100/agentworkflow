@@ -87,6 +87,33 @@ def test_injection_renders_suite(tmp_path, monkeypatch):
     p = _prompt(tmp_path, monkeypatch, [])
     assert "验收测试套件" in p
     assert "test/prd_ac1.test.js" in p
+
+
+def test_injection_e2e_suite_config_docking_hint(tmp_path, monkeypatch):
+    """e2e bundle（files 含 playwright.config.*）→ 注入 config 环境对接纪律段。
+
+    真机 #79 实证（add-e2e 4.3）：test-author 猜错端口 env 名（PORT≠CC_WEB_PORT），
+    而「不要改写或删除」指令把 config 一并锁死 → dev 只能绕路折腾 → off_track 止损。
+    config 是环境对接面非测试本体，dev 侧须有修正通道（spec：command 运行时对齐
+    靠 prompt 纪律 + verify 真跑兜底）。
+    """
+    files = {"e2e/e2e_login.spec.ts": "// criterion: p:ac1\ntest('ac1', () => {});",
+             "playwright.config.ts": "export default defineConfig({ webServer: {} });"}
+    ref = AT.store_suite(tmp_path, files, prd_criteria_ids=["p:ac1"],
+                         suite_criteria_ids=["p:ac1"], harness="playwright")
+    args = DA.parse_args(["--prd", "x.md", "--acceptance-tests", str(tmp_path / ref["path"]),
+                          "--acceptance-digest", ref["digest"]])
+    monkeypatch.chdir(tmp_path)
+    p = DA.build_prompt(args, "# PRD", "pa-dev-x")
+    assert "playwright.config" in p and "环境对接" in p      # 对接纪律段出现
+    assert "实际监听" in p                                    # 修正目标 = server 实际监听 config.port
+    assert "e2e_login.spec.ts" in p                            # 套件文件本体照常注入
+
+
+def test_injection_jest_suite_no_e2e_hint(tmp_path, monkeypatch):
+    """jest bundle → 无 e2e 对接纪律段（零污染回归）。"""
+    p = _prompt(tmp_path, monkeypatch, [])
+    assert "环境对接" not in p
     assert "criterion: proj-x:ac1" in p          # 标注原样透传（traceability 锚）
     assert p.endswith(_BASELINE_TAIL)            # 只插入不改尾
 

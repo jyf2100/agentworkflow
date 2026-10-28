@@ -705,11 +705,23 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
         except Exception as e:
             raise AcceptanceIntegrityError(f"acceptance bundle 畸形: {e}") from e
         _files_md = "\n\n".join(f"### `{p}`\n```\n{c}\n```" for p, c in _suite)
+        # add-e2e 4.3 真机 #79 实证：e2e 套件的 playwright.config 是环境对接面非测试本体——
+        # test-author 侧端口改写可能猜错 env 变量名（PORT≠CC_WEB_PORT），「不要改写」若把
+        # config 一并锁死，dev 只能绕路折腾（off_track 止损）。config 修正通道 = spec 的
+        # 「command 运行时对齐靠 prompt 纪律 + verify 真跑兜底」在 dev 侧的落点。
+        _e2e_rules = ""
+        if any(Path(p).name.startswith("playwright.config.") for p, _ in _suite):
+            _e2e_rules = (
+                "- playwright.config 是**环境对接面**而非测试本体：其 webServer command 若与本仓 server\n"
+                "  启动机制错位（端口 env 变量名不同，如本仓读专用变量而非通用 PORT / 启动参数形态不同），\n"
+                "  修正 command 使 server **实际监听** config.port（读本仓 server 入口/config loader 确认）。\n"
+                "  这是对接修正不是改写测试；`e2e_*.spec.ts` 测试文件本身仍不可改。\n")
         acceptance_injection = (
             "\n\n## 验收测试套件（控制面独立编写；红→绿是完成判据）\n"
             "以下是本 PRD 验收标准的可执行测试（控制面 pa-test-author 编写，非你写，**不要改写或删除**）。\n"
             "- 把每个文件放到本仓 harness 惯例位置（读 CLAUDE.md 定测试目录；`criterion:` 标注原样保留——它是控制面 traceability 锚）。\n"
             "- 实现功能使这些测试全绿（连同你自写的测试）；跑它们时用**纯净测试命令**（见下方守则 2，退出码才是发布证据）。\n"
+            + _e2e_rules +
             "- 它们还红 = 没做完；删改它们不会让验证通过（发布门要求绿后无任何再写）。\n"
             f"{_files_md}")
     # add-cross-prd-learning-memory Section 5 接线：lesson block（控制面检索的 prior-PRD 经验）经

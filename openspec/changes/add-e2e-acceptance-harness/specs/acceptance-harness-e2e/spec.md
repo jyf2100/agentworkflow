@@ -57,6 +57,11 @@ E2E 套件执行期的 dev server 起停 SHALL 由 playwright.config `webServer`
 - **WHEN** verify agent 在未预起 dev server 的容器内执行 declared 命令 `playwright test <file>`
 - **THEN** playwright 按 config webServer 自动起 server（固定端口）跑套件，结束自动杀进程
 
+#### Scenario: dev 会话对 config 环境对接错位的修正通道
+
+- **WHEN** 注入套件的 playwright.config webServer command 与目标仓 server 启动机制错位（如端口 env 变量名非通用 `PORT`——test-author 侧信息不足猜错，真机 #79 实证 dev 因此绕路被 off_track 止损）
+- **THEN** dev 注入面（bundle 含 `playwright.config.*` 时机械追加的纪律段）指引 dev 修正 command 使 server **实际监听** config.port（读目标仓启动入口确认 env 变量名）——config 是环境对接面非测试本体；`e2e_*.spec.ts` 测试文件不可改的约束不变
+
 ### Requirement: 测试门同权
 
 发布门 SHALL 将 playwright 新绿与 jest/pytest 新绿同权计为「新的绿色测试证据」。flaky（retries=1 后绿，exit 0）SHALL 计绿；连续两红 SHALL 计真红。
