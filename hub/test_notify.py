@@ -55,6 +55,19 @@ def test_dm_to_mm_user_id_direct_no_lookup(tmp_path):
     assert mm.dms == [(_MM_ID, mm.dms[0][1])] and mm.lookups == []
 
 
+def test_real_machine_nonhex_id_form_is_direct_not_username(tmp_path):
+    # 真机值域锁（2026-10-28）：实例 user id 含 g-z 非纯 hex（bi79e3rknjncfj9mfaz9gebzmo）。
+    # _MM_ID_RE 钉 [0-9a-f] 时这类 id 被误判当 username 走 lookup 解析 → 丢通知。
+    real = "bi79e3rknjncfj9mfaz9gebzmo"  # 26 位小写字母数字（真机实证形态）
+    mm = notify.FakeMMClient()
+    n = notify.Notifier(_cfg(tmp_path), mm=mm)
+    n.notify_run(**_notify(enqueued_by=real))  # 未绑定 → 私信路径
+    assert mm.dms == [(real, mm.dms[0][1])] and mm.lookups == []  # 直发不解析
+    n2 = notify.Notifier(_cfg(tmp_path), mm=mm, database=_db_bound(tmp_path, ("proj-a", "chan-1")))
+    n2.notify_run(**_notify(enqueued_by=real))  # 绑定 → 频道提及直拼
+    assert mm.channels[-1][1].startswith(f"<@{real}> ") and not mm.lookups
+
+
 def test_dm_username_resolved_and_cached(tmp_path):
     # 值形态第二代：username 经 users/username/{name} 解析后发；解析成功进内存缓存（一次 lookup 多次复用）
     mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})

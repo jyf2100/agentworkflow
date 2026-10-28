@@ -8,7 +8,7 @@ F14 身份与通道分离：OAuth app（登录身份）与 bot token（推通知
 绑定表（旧 HUB_MM_PROJECT_CHANNELS env 映射已废止——仅 serve 启动 seed 迁移消费）。
 project 已绑定 → 推频道（含 `<@发起人>` 提及——MM 提及通知强度替代私信，且协作
 可见）且不再重复私信；未绑定 → 既有 per-user 私信（D4 值形态三代分流不变）：
-enqueued_by = mm_user_id（2b 会话入队，26 字符十六进制）直发；username（2a env
+enqueued_by = mm_user_id（2b 会话入队，26 字符小写字母数字）直发；username（2a env
 兜底 = cfg.user_id）经 users/username/{name} 解析 mm id 后发（内存缓存，解析失败
 记日志放弃——可见的丢非静默吞）；`vault-deliver`（slice-3 机机字面量）回落
 cfg.user_id 走 username 路径。绑定频道提及目标同源解析（26-hex 直拼；非 26-hex
@@ -26,8 +26,10 @@ from typing import Protocol
 
 import httpx
 
-# Mattermost user id 公开事实：26 字符十六进制（分流判据用途，非拒收校验）
-_MM_ID_RE = re.compile(r"[0-9a-f]{26}")
+# Mattermost user id 公开事实：26 字符小写字母数字（真机实证 2026-10-28：id 值域含
+# g-z 非纯 hex——钉 [0-9a-f] 会把真实 id 误判走 username 解析分流；与 db.MM_CHANNEL_ID_RE
+# 同形态族。分流判据用途，非拒收校验）
+_MM_ID_RE = re.compile(r"[0-9a-z]{26}")
 
 # 与 api._DELIVER_ENQUEUED_BY 同值（机机通道来源字面量）——测试锁相等防漂移
 VAULT_DELIVER_LITERAL = "vault-deliver"
@@ -222,7 +224,7 @@ class Notifier:
         return binding["channel_id"] if binding else None
 
     def _mention(self, enqueued_by: str | None) -> str:
-        """频道提及前缀（add-mm-channel-intake 6.1）：26-hex 直拼 `<@id>`；非 26-hex
+        """频道提及前缀（add-mm-channel-intake 6.1）：26 位 id 直拼 `<@id>`；非 id 形态
         （含 None / 机机字面量 → cfg.user_id）经 username 解析（同 _uid_cache 同
         fail-open）；解析失败降级空串——纯文本消息照发（提及是增强非送达前提）。"""
         recipient = enqueued_by if (enqueued_by and enqueued_by != VAULT_DELIVER_LITERAL) else self._cfg.user_id

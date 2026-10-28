@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None, *, runner=None, mm=None) -> int:
     vi = sub.add_parser("vault-import", help="把 hub 进程 env 凭据导入保险箱（单用户 bootstrap）")
     vi.add_argument("--from-env", action="store_true", help="从 hub 进程 env 导入（当前唯一来源；交互录入归切片 2b）")
     cn = sub.add_parser("check-notify", help="通知通道自检（RUNBOOK §16 联调一键化）")
-    cn.add_argument("--to", default=None, help="测试收件人（26-hex mm_user_id 或 username；缺省 HUB_USER_ID 走解析路径）")
+    cn.add_argument("--to", default=None, help="测试收件人（26 位 mm_user_id 或 username；缺省 HUB_USER_ID 走解析路径）")
     cn.add_argument("--channel", default=None, help="附加频道 id 连通性测试（对应绑定表 channel_id）")
     sub.add_parser("check-intake", help="MM 入站 /pa 自检（RUNBOOK §19：slash token / 绑定表 / bot 可达各绑定频道）")
     args = ap.parse_args(argv)
@@ -103,7 +103,7 @@ def _check_notify(cfg: config.HubConfig, *, mm, to: str | None, channel: str | N
         return 1
     recipient = to or cfg.user_id
     import re as _re
-    if _re.fullmatch(r"[0-9a-f]{26}", recipient):
+    if _re.fullmatch(r"[0-9a-z]{26}", recipient):  # 同 notify._MM_ID_RE（真机 id 含 g-z 非纯 hex）
         uid = recipient
         print("✓ 2/3 收件人为 mm_user_id 形态，直发（不走 username 解析）")
     else:
