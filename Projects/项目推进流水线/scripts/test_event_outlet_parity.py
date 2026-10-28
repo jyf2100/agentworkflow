@@ -149,7 +149,9 @@ def _read_events(state_dir, proj, stamp, slug) -> list[dict]:
     return [json.loads(ln) for ln in f.read_text(encoding="utf-8").splitlines()]
 
 
-def test_dispatch_invalid_emits_verify_verdict_with_reason(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reason", SIX_REASONS)
+def test_dispatch_invalid_emits_verify_verdict_with_reason(tmp_path, monkeypatch, reason):
+    """审核补（r2）：六成因值全参数化钉分流点透传——事件行 reason 必 ∈ INVALID_REASONS。"""
     import test_verify_loop as VL
     VL._setup(tmp_path, monkeypatch)
     VL._admit(monkeypatch)
@@ -159,8 +161,8 @@ def test_dispatch_invalid_emits_verify_verdict_with_reason(tmp_path, monkeypatch
     monkeypatch.setattr(run_daily, "_has_commits", lambda *a, **k: VL.found(True))
     monkeypatch.setattr(run_daily, "independent_verify",
                         lambda *a, **k: {"verdict": "invalid", "pass": False, "test_rc": None,
-                                         "invalid_reason": "wallclock_timeout",
-                                         "test_log": None, "note": "机械轨超时"})
+                                         "invalid_reason": reason,
+                                         "test_log": None, "note": "构造点集成"})
     monkeypatch.setattr(run_daily, "run_persona",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("invalid 不应烧语义审")))
     _c, fake_rec = VL._recon_recorder()
@@ -170,7 +172,7 @@ def test_dispatch_invalid_emits_verify_verdict_with_reason(tmp_path, monkeypatch
     lines = _read_events(run_daily.STATE_DIR, PROJ, "20260718", "20260718_test")
     assert len(lines) == 1   # invalid 分流在 pr_opened/语义审之前 → 事件文件只此一行
     assert lines[0]["event"] == "verify_verdict" and lines[0]["verdict"] == "invalid"
-    assert lines[0]["reason"] == "wallclock_timeout" and lines[0]["round"] == 1
+    assert lines[0]["reason"] == reason and lines[0]["round"] == 1
 
 
 def _snap_ref(digest: str) -> dict:
@@ -274,11 +276,31 @@ def test_acceptance_absent_event_reason_domain(tmp_path, monkeypatch, reason):
     assert line["reason"] == reason and line["detail"] == "d"
 
 
-def test_graph_track_has_no_independent_emit_point():
-    """graph 轨无独立 emit 点（包装直调共享函数 → 分流点 emit 双轨同点）——inspect 源防回归。"""
+def test_acceptance_gate_wiring_exception_still_emits(tmp_path, monkeypatch):
+    """审核补（r2）：编写接线异常 fail-open 吞异常不得吞事件——absent/author_failed 行必落卷。"""
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path / "state")
+
+    def _boom(*a, **k):
+        raise RuntimeError("wiring exploded")
+
+    monkeypatch.setattr(run_daily, "_author_acceptance_suite", _boom)
+    run_daily._author_acceptance_for_gate([_gate_entry()], {}, STAMP)
+    line = _read_events(tmp_path / "state", PROJ, STAMP, f"{STAMP}_a")[0]
+    assert line["event"] == "acceptance_suite" and line["status"] == "absent"
+    assert line["reason"] == "author_failed" and "wiring exploded" in line["detail"]
+
+
+def test_graph_track_dispatch_emit_parity():
+    """graph 轨 dispatch 段是子图独立分流（非包装直调 dispatch_one）——invalid 分流点须自持
+    emit 且 facts 形态与 legacy 一致；组装层 graph_pa_dispatch 保持零业务 emit。
+    （审核修正：旧断言只查组装文件 = 假保证——真分流逻辑在 graph_pa_nodes._dev_post_op。）"""
     import graph_pa_dispatch
-    src = inspect.getsource(graph_pa_dispatch)
-    assert "append_event" not in src and "event_outlet" not in src
+    import graph_pa_nodes
+    assert "append_event" not in inspect.getsource(graph_pa_dispatch)  # 组装层零业务 emit
+    src = inspect.getsource(graph_pa_nodes._dev_post_op)
+    assert 'EO.append_event' in src and '"verify_verdict"' in src      # invalid 分流点自持 emit
+    assert "verdict=\"invalid\"" in src and "reason=vj.get(\"invalid_reason\")" in src
+    assert "REASON_EXAM_SNAPSHOT_MISMATCH" in src                      # 考卷分支 vj 带 invalid_reason
 
 
 # ── E. verify-report 双写（_double_write_report + agent 轨落卷链路）─
@@ -336,3 +358,31 @@ def test_agent_track_report_double_write_integration(tmp_path, monkeypatch):
     assert out["verdict"] == "green" and "invalid_reason" not in out   # 非 invalid 不携带
     assert out["verify_report"] and Path(out["verify_report"]).is_file()
     assert (extra / Path(out["verify_report"]).name).is_file()   # 双写落卷
+
+
+@pytest.mark.parametrize("matched,clean,expect", [
+    ({"c": None}, (True, "ok"), "unresolved"),                       # 有声明未匹配 → unresolved
+    ({"c": _exec()}, (False, "工作区不净"), "anchor_violation"),       # 锚违规（工作区不净）
+])
+def test_agent_track_report_reason_propagation(tmp_path, monkeypatch, matched, clean, expect):
+    """审核补（r2）：report.invalid_reason → out.invalid_reason 传播行贯通——unresolved/
+    anchor_violation 两成因经 _agent_track_verify 全链直调钉住（此前仅构造点常量单测）。"""
+    ref = _store_a_suite(tmp_path, monkeypatch)
+    monkeypatch.setattr(run_daily, "_run_capture", lambda *a, **k: (0, "", ""))
+
+    class _FakeExec:
+        def __init__(self, log=None):
+            pass
+
+        def run(self, *a, **k):
+            return ""
+
+    monkeypatch.setattr(run_daily.VA_MOD, "ClaudeHeadlessExecutor", _FakeExec)
+    monkeypatch.setattr(run_daily.VS_MOD, "parse_stream", lambda raw: ([], {}))
+    monkeypatch.setattr(run_daily.VS_MOD, "match_declared", lambda execs, declared: matched)
+    monkeypatch.setattr(run_daily.VS_MOD, "check_workspace_clean", lambda vt, inj: clean)
+    monkeypatch.setattr(run_daily.VS_MOD, "check_injected_digests", lambda vt, dg: [])
+    monkeypatch.setattr(run_daily.VS_MOD, "observed_env_exports", lambda execs: {})
+    out = run_daily._agent_track_verify(str(tmp_path), "b1", STAMP, "s",
+                                        tmp_path / "run.log", {}, None, ref)
+    assert out["verdict"] == "invalid" and out["invalid_reason"] == expect

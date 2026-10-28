@@ -419,7 +419,7 @@ verify 双轨：
   |---|---|---|
   | `unresolved` | 命令匹配面——declared cmd 在 transcript 无全等末端段匹配（变体/未执行） | commands.results[] 的 `unresolved: true` 行 + evidence.stream_path 原始流比对 |
   | `anchor_violation` | 锚②③——工作区不净或注入件 digest 不符 | anchors.workspace_clean.detail / anchors.injected_digests.violations |
-  | `wallclock_timeout` | 环境奇偶节与墙钟上限——`PA_VERIFY_WALL_CLOCK` 覆盖 > hub 3600s > 本机 1200s（`VERIFY_INSTALL/TEST_TIMEOUT` 量级合并）；agent 轨会话超时与机械轨执行超时同归此值 | env_parity（declared spec vs transcript 观测装配）+ session 时长 |
+  | `wallclock_timeout` | 环境奇偶节与墙钟上限——`PA_VERIFY_WALL_CLOCK` 覆盖 > hub 3600s > 本机 1200s（`VERIFY_INSTALL/TEST_TIMEOUT` 量级合并）；agent 轨会话超时与机械轨执行超时同归此值 | env_parity（declared spec vs transcript 观测装配）+ session 时长——**agent 轨 verify-report**；机械轨超时不产 verify-report（逐命令受 `VERIFY_INSTALL/TEST_TIMEOUT` 控制，超时即结论，排障走 hub run 日志） |
   | `suite_load_failed` | acceptance store 完整性——digest 校验 fail-closed（load_suite 失败） | commands.source/gate_cmd（套件来源）+ state/acceptance store 落盘核对 |
   | `worktree_setup_failed` | git worktree / 磁盘 / 并发残留——`git worktree add` 失败（agent 轨专用成因；机械轨同因走跳过语义不进 invalid 分流） | （此成因 verify-report 未产出——查 hub run 日志与目标仓 `.worktrees/` 残留） |
   | `exam_snapshot_mismatch` | **控制面双注入链路**（dispatch 考卷不变式）——dev 注入 digest ≠ 快照，非目标仓问题 | （此成因在 dispatch 构造分支——查 dispatch record `verify` 节 + 控制面 journal） |

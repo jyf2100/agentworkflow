@@ -122,6 +122,7 @@ def test_forward_events_dedup_and_text(tmp_path):
     t0, t1 = mm.dms[0][1], mm.dms[1][1]
     assert "critic 判定 → revise" in t0 and "证据不足回炉" in t0 and f"run #{run['id']}" in t0
     assert "verify 判定 → pass" in t1 and "round 1" in t1
+    assert mm.channels == []   # 审核补：verify pass 仅私信不进频道（fail-safe：非 pass 才广播）
     # 去重：同 (run, seq) 二跑不重发
     lc.reconcile_running()
     assert len(mm.dms) == 2

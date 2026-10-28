@@ -78,6 +78,28 @@ def test_self_check_withheld(tmp_path, monkeypatch):
     assert not list((root / "acceptance_store").rglob("*")) if (root / "acceptance_store").exists() else True
 
 
+def test_absent_no_files_registered(tmp_path, monkeypatch):
+    """审核补（r2）：persona 正常返回但零文件 → absent（no_files）登记。"""
+    root, calls, fp = _setup(tmp_path, monkeypatch)
+    fp.ret = ({"files": [], "uncovered": [], "refused": None}, {"cost": 0.01})
+    r = run_daily._author_acceptance_suite(_gate_entry(root), {"harness": "jest"}, "20261027")
+    assert r["status"] == "absent" and r["reason"] == "no_files" and len(calls) == 1
+
+
+def test_absent_store_failed_registered(tmp_path, monkeypatch):
+    """审核补（r2）：store_suite 返回 falsy（store 层失败不抛）→ absent（store_failed）登记。"""
+    root, calls, fp = _setup(tmp_path, monkeypatch)
+    out_dir = root / "acceptance" / "20261027" / "demo-proj_20261027_demo"
+    out_dir.mkdir(parents=True)
+    tf = out_dir / "test_ac1.test.js"
+    tf.write_text("// criterion: 20261027-demo:ac1\ntest('ac1', () => {});", encoding="utf-8")
+    fp.ret = ({"files": [{"path": str(tf), "criteria_ids": ["20261027-demo:ac1"]}],
+               "uncovered": [], "refused": None}, {"cost": 0.01})
+    monkeypatch.setattr(run_daily.acceptance_tests, "store_suite", lambda *a, **k: None)
+    r = run_daily._author_acceptance_suite(_gate_entry(root), {"harness": "jest"}, "20261027")
+    assert r["status"] == "absent" and r["reason"] == "store_failed"
+
+
 def test_persona_failure_fail_open(tmp_path, monkeypatch):
     """persona 抛异常 → absent（author_failed）不穿透（fail-open，全量门兜底）。"""
     root, calls, fp = _setup(tmp_path, monkeypatch)

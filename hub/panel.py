@@ -270,42 +270,53 @@ def render_runs(runs: list[dict]) -> str:
 
 def _verify_report_html(vr: dict) -> str:
     """verify-report 机械表格渲染（fix-event-outlet-verify-parity 2.4）——字段原样进表，
-    零语义：判词（verdict/reason/invalid_reason）只来自文件本身，hub 不产结论。"""
-    run, cmds, anc = vr.get("run") or {}, vr.get("commands") or {}, vr.get("anchors") or {}
-    ws, dg, envp = anc.get("workspace_clean") or {}, anc.get("injected_digests") or {}, vr.get("env_parity") or {}
-    facts = "".join(
-        f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
-        for k, v in (
-            ("verdict", vr.get("verdict")),
-            ("invalid_reason", vr.get("invalid_reason")),
-            ("reason", vr.get("reason")),
-            ("commands.source", cmds.get("source")),
-            ("gate_cmd", cmds.get("gate_cmd")),
-            ("harness", run.get("harness")),
-            ("stream_path", (vr.get("evidence") or {}).get("stream_path")),
-        ))
-    cmd_rows = "".join(
-        f"<tr><td>{_esc(r.get('declared'))}</td>"
-        f"<td>{_esc(r.get('matched_command') or ('unresolved' if r.get('unresolved') else ''))}</td>"
-        f"<td>{'' if r.get('exit_code') is None else r.get('exit_code')}</td></tr>"
-        for r in cmds.get("results") or [])
-    anchor_rows = "".join(
-        f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
-        for k, v in (
-            ("workspace_clean.ok", ws.get("ok")),
-            ("workspace_clean.detail", ws.get("detail")),
-            ("injected_digests.ok", dg.get("ok")),
-            ("injected_digests.violations", "；".join(dg.get("violations") or [])),
-            ("env_parity.declared", envp.get("declared")),
-            ("env_parity.observed_exports", envp.get("observed_exports")),
-            ("env_parity.note", envp.get("note")),
-        ))
-    return (
-        f'<div class="tablewrap"><table><tr><th>判定</th><th>值</th></tr>{facts}</table></div>'
-        '<div class="tablewrap"><table><tr><th>declared cmd</th><th>matched</th><th>exit</th></tr>'
-        f"{cmd_rows}</table></div>"
-        f'<div class="tablewrap"><table><tr><th>锚/环境</th><th>值</th></tr>{anchor_rows}</table></div>'
-    )
+    零语义：判词（verdict/reason/invalid_reason）只来自文件本身，hub 不产结论。
+
+    内层结构防御：该文件在 state 卷上、目标仓代码可写（dev 循环对目标仓零信任），
+    坏内层形态（evidence 非 dict / violations 非 str 元素等）不打废整个 run 详情页——
+    降级为原样转义全文展示（可见非静默），且一切插值必经 _esc（XSS 防线唯一入口）。"""
+    try:
+        run, cmds, anc = vr.get("run") or {}, vr.get("commands") or {}, vr.get("anchors") or {}
+        ws, dg = anc.get("workspace_clean") or {}, anc.get("injected_digests") or {}
+        envp = vr.get("env_parity") or {}
+        evd = vr.get("evidence")
+        evd = evd if isinstance(evd, dict) else {}
+        facts = "".join(
+            f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
+            for k, v in (
+                ("verdict", vr.get("verdict")),
+                ("invalid_reason", vr.get("invalid_reason")),
+                ("reason", vr.get("reason")),
+                ("commands.source", cmds.get("source")),
+                ("gate_cmd", cmds.get("gate_cmd")),
+                ("harness", run.get("harness")),
+                ("stream_path", evd.get("stream_path")),
+            ))
+        cmd_rows = "".join(
+            f"<tr><td>{_esc(r.get('declared'))}</td>"
+            f"<td>{_esc(r.get('matched_command') or ('unresolved' if r.get('unresolved') else ''))}</td>"
+            f"<td>{_esc(r.get('exit_code'))}</td></tr>"
+            for r in cmds.get("results") or [])
+        anchor_rows = "".join(
+            f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
+            for k, v in (
+                ("workspace_clean.ok", ws.get("ok")),
+                ("workspace_clean.detail", ws.get("detail")),
+                ("injected_digests.ok", dg.get("ok")),
+                ("injected_digests.violations",
+                 "；".join(str(x) for x in (dg.get("violations") or []))),
+                ("env_parity.declared", envp.get("declared")),
+                ("env_parity.observed_exports", envp.get("observed_exports")),
+                ("env_parity.note", envp.get("note")),
+            ))
+        return (
+            f'<div class="tablewrap"><table><tr><th>判定</th><th>值</th></tr>{facts}</table></div>'
+            '<div class="tablewrap"><table><tr><th>declared cmd</th><th>matched</th><th>exit</th></tr>'
+            f"{cmd_rows}</table></div>"
+            f'<div class="tablewrap"><table><tr><th>锚/环境</th><th>值</th></tr>{anchor_rows}</table></div>'
+        )
+    except Exception:  # 坏内层结构：降级原样转义全文（可见非静默），不打废整页
+        return f'<pre class="maxh">{_esc(vr)}</pre>'
 
 
 def render_run_detail(detail: dict, journal_tail: list[str], report_md: str | None,

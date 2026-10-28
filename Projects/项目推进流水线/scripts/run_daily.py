@@ -1022,6 +1022,11 @@ def _author_acceptance_for_gate(entries: list[dict], profiles: dict, stamp: str)
                 log(f"[acceptance] ⚠ {_r.get('prd_id')} 缺席: {_r.get('reason')}")
         except Exception as e:
             log(f"[acceptance] ⚠ 编写接线异常（fail-open）: {e}")
+            # 审核修复（fix-event-outlet-verify-parity r2）：fail-open 吞异常不得吞事件——
+            # gate-pass 后 acceptance 行必落卷（absent/author_failed），否则 hub 观测面静默缺行。
+            EO.append_event(STATE_DIR, _e.get("project") or "unknown", stamp,
+                            Path(_e["prd_path"]).stem, "acceptance_suite",
+                            status="absent", reason="author_failed", detail=str(e)[:300])
 
 
 # verify-loop-discipline B4/SHALL4：质量达标维度集按 profile 裁剪（frontend 含 UX/响应式；纯后端省略）。

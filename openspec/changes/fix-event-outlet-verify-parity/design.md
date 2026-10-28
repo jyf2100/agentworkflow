@@ -44,7 +44,7 @@ run 详情两处扩展（零语义铁律内）：① 若 run state 卷存在双�
 ### D5 hub 通知：invalid 归警示类 + acceptance absent 进频道
 `KNOWN_EVENTS` 加 `acceptance_suite`；`_event_broadcast` 扩：acceptance_suite 的 `absent` 进频道（无验收保护 dispatch 是团队该看见的警示），`stored` 仅私信（正常落账非警示；换版事实经 supersedes 字段机械附带）；`_event_text` 扩：verify invalid 行拼 `reason`，acceptance_suite 行拼 `status` + reason/digest/supersedes。机械拼接不变式不动（hub 零语义生成）。
 
-### D6 RUNBOOK invalid playbook：按 reason 五分流
+### D6 RUNBOOK invalid playbook：按 reason 六分流
 「invalid 第一步做什么」：`unresolved` → 查 verify-report 命令清单与 declared cmd 匹配面（末端段匹配语义）；`anchor_violation` → 查锚检查 rc（worktree 净/注入件 digest 哪个 violated）；`wallclock_timeout` → 查环境奇偶节（容器冷缓存/命令挂起），必要时调 `VERIFY_*_TIMEOUT`；`suite_load_failed` → 查 acceptance store 完整性（digest 校验失败=篡改/半写）；`exam_snapshot_mismatch` → 控制面接线异常（dev 上报 digest ≠ iteration 快照），查双注入链路不查目标仓。每条链到 verify-report 对应节。
 
 ## Risks / Trade-offs

@@ -9,7 +9,7 @@ agent-verify-injection 落地后，控制面内部的 verify 三态语义（gree
 - **verify-report 纳入 report 双写**：`<stamp>.verify-report.json`（`pa.verify-report.v1`）随 report 双写机制拷入 `PA_REPORT_DIR`，hub 侧消费面（面板 run 详情）可读，无需 SSH state 卷。
 - **hub 面板消费三态**：run 详情的 verify 结果展示从二值（pass/revise）扩含 invalid + invalid 原因 + acceptance suite 状态行 + verify-report 关键节（判定/命令清单/锚检查）渲染。
 - **hub 通知 invalid 语义**：invalid 事件的通知分类为 triage（升人工），不按 red/revise 处理——「升人工」必须有可送达的出口，否则 triage 无消费者。
-- **RUNBOOK invalid 排障 playbook**：补「invalid 第一步做什么」操作面（按五原因分流：unresolved 查命令匹配面、anchor_violation 查 worktree/注入件、wallclock_timeout 查环境奇偶、suite_load_failed 查 store 完整性、exam_snapshot_mismatch 查控制面双注入链路）。
+- **RUNBOOK invalid 排障 playbook**：补「invalid 第一步做什么」操作面（按六原因分流：unresolved 查命令匹配面、anchor_violation 查 worktree/注入件、wallclock_timeout 查环境奇偶、suite_load_failed 查 store 完整性、worktree_setup_failed 查 git worktree/磁盘/并发残留、exam_snapshot_mismatch 查控制面双注入链路）。
 
 ## Capabilities
 

@@ -16,7 +16,7 @@ hub SHALL 提供面板只读页：队列状态列表、run 列表（含终态与
 - **THEN** run 详情页渲染判定（含 invalid reason）、逐命令 cmd/source/exit 表格、锚检查结果、环境奇偶字段（原样展示）；文件缺失时显示「无 verify-report」占位
 
 #### Scenario: 语义事件尾部行可见
-- **WHEN** 某 run 的 events.jsonl 含 `acceptance_suite`（absent/defective）或 `verify_verdict`（invalid + reason）事件行
+- **WHEN** 某 run 的 events.jsonl 含 `acceptance_suite`（absent——工件状态二值无 defective，缺陷可见性经 invalid reason + supersedes 链承载）或 `verify_verdict`（invalid + reason）事件行
 - **THEN** run 详情页 events 尾部行区原样展示该行文本（无 hub 侧解读）
 
 #### Scenario: 只读面不产生语义判定

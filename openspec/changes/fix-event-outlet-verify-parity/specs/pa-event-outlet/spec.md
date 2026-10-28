@@ -35,6 +35,7 @@ pa 容器内流水线 SHALL 在 critic / dispatch / verify 段产生语义事件
 #### Scenario: 套件换版经 supersedes 链可见
 - **WHEN** triage 确认套件缺陷后重编写，新套件入 store（journal 落新 stored 事件）
 - **THEN** `events.jsonl` 追加新 `acceptance_suite` stored 行，`supersedes` 指向被换版本 digest（非 null）——消费方无需独立「defective」事件即见换版事实
+- **NOTE**（r2 审核修正）：换版**字段契约**钉于此；当前生产写方 `store_suite` 生产调用不传 supersedes、恒 null——supersedes 非 null 属 triage 重编写流程接线后的形态（投射面已就绪，非超诺「生产任一 run 可见」）
 
 ### Requirement: report 双写（T2a 裁决落地）
 pa report 段 SHALL 支持经 env `PA_REPORT_DIR` 指定额外落盘目录（服务器容器形态 hub 挂 state 卷出口路径）：设置时报告文件**双写**（原 vault 落点不变 + `PA_REPORT_DIR` 落点追加）；未设置时行为与现状完全一致（缺省零变化）。**verify-report 双写**：dispatch 段落 `verify-report.json`（`pa.verify-report.v1`，`independent_verify` 共享落盘点）SHALL 在 `PA_REPORT_DIR` 设置时同名拷入该目录——挂点在 verify-report 落盘即时处（非 report 段统一拷：invalid→triage 路径不走完整 report 段，而 invalid 的报告恰是最需人看的证据）；拷贝失败 SHALL fail-open（stderr 告警不阻断 dispatch）。hub 面板读卷渲染见 spec: hub-panel。
@@ -47,8 +48,8 @@ pa report 段 SHALL 支持经 env `PA_REPORT_DIR` 指定额外落盘目录（服
 - **WHEN** 未设 `PA_REPORT_DIR`（vault 本机形态）
 - **THEN** 报告只落原落点，与现状一致
 
-#### Scenario: verify-report 落卷可达
-- **WHEN** 某 run verify 完成（绿/红/invalid 任一态）且 `PA_REPORT_DIR` 已设置
+#### Scenario: verify-report 落卷可达（agent 轨）
+- **WHEN** 某 run verify 完成（绿/红/invalid 任一态）且 `PA_REPORT_DIR` 已设置——**agent 轨**（`PA_VERIFY_AGENT=1`）；机械轨执行超时（wallclock_timeout）不产 verify-report——超时本身即结论，排障走 hub run 日志 / dispatch record
 - **THEN** `<stamp>.verify-report.json` 同名出现在 `PA_REPORT_DIR`，hub 无需 SSH state 卷即可读
 
 #### Scenario: verify-report 拷贝失败不阻断

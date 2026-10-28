@@ -292,8 +292,12 @@ def test_css_baseline_present():
 
 
 def _dispatched_run(tmp_path, client, d, eng, lc):
-    """派发一个 run → 返回 (rid, runs_dir, stamp, prd_stem)——事件/verify-report 寻址三要素。"""
-    prd = tmp_path / "p.md"
+    """派发一个 run → 返回 (rid, runs_dir, stamp, prd_stem)——事件/verify-report 寻址三要素。
+
+    PRD stem 含下划线：hub run 目录名经 _slugify 下划线→横线（错位），pa 侧文件名
+    stem 原样——用它锁死面板寻址从 prd_path stem 拼（若实现回归成从 run 目录名拼，
+    本 fixture 下事件/verify-report 全找不到 → 下方断言必红）。"""
+    prd = tmp_path / "20261020_hand-a1b2c3d4.md"
     prd.write_text("# x", encoding="utf-8")
     qid = eng.enqueue("proj-a", str(prd), "roc")
     lc.tick_dispatch()
@@ -360,3 +364,20 @@ def test_panel_verify_report_render_zero_semantics(tmp_path):
     assert "verify-report" in html and "全净" in html                 # 文件字段原样
     for hub_verdict_word in ("hub 判定", "结论：", "不合格", "建议"):  # hub 不产结论
         assert hub_verdict_word not in html
+
+
+def test_panel_verify_report_malformed_inner_shapes_degrade_not_500(tmp_path):
+    """坏内层结构降级非 500：evidence 非 dict / violations 非 str / exit_code 可注字符串——
+    全经 _esc 原样展示，run 详情页不炸（该文件在 state 卷上、目标仓代码可写）。"""
+    detail = {"id": 1, "project": "p", "status": "succeeded", "exit_code": 0,
+              "run_dir": "/x", "started_at": "t", "ended_at": "t"}
+    html = panel.render_run_detail(
+        detail, [], None, events_tail=[],
+        verify_report={"verdict": "red", "evidence": "not-a-dict",          # evidence 非 dict
+                       "anchors": {"injected_digests":
+                                   {"violations": [123, None]}},            # 非 str 元素
+                       "commands": {"results": [{"declared": "x",
+                                                 "exit_code": "<img src=x onerror=alert(1)>"}]}})
+    assert "<img src=x" not in html and "&lt;img src=x" in html      # 注入面全经 _esc
+    html2 = panel.render_run_detail(detail, [], None, events_tail=[], verify_report="junk-shape")
+    assert "verify-report" in html2                                  # 顶层怪形也不打废整页（降级原样）

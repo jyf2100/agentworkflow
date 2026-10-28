@@ -779,6 +779,7 @@ def _dev_post_op(ni: dict, state: dict):
     if _snap and _dev_adg and _dev_adg != _snap.get("digest"):
         vj = {"verdict": "invalid", "pass": False, "test_rc": None, "test_cmd": None,
               "install_rc": None, "test_log": None,
+              "invalid_reason": run_daily.VS_MOD.REASON_EXAM_SNAPSHOT_MISMATCH,
               "note": f"考卷不变式破坏: dev 上报 digest {_dev_adg} ≠ iteration 快照 "
                       f"{_snap.get('digest')}（控制面接线异常，fail-safe 不判读）"}
     else:
@@ -792,6 +793,13 @@ def _dev_post_op(ni: dict, state: dict):
     #    triage_reason 候选 acceptance_suite_defective（确认/重编写是 triage 人工面，T2）。
     if vj.get("verdict") == "invalid":
         events, extra, obs = _reconcile_terminal()
+        # fix-event-outlet-verify-parity 1.2 graph 对称：invalid 行事件出口——graph 的 dispatch
+        # 段是子图独立分流（非包装直调 dispatch_one），须自持 emit；facts 形态与 legacy 分流点
+        # 逐字段一致（verdict/round/reason），hub 消费面单契约。independent_verify 返回的成因
+        # 已带 invalid_reason（六成因在共享函数内归一），此处 reason 直读。
+        run_daily.EO.append_event(run_daily.STATE_DIR, project, stamp, slug,
+                                  "verify_verdict", verdict="invalid",
+                                  round=round_n, reason=vj.get("invalid_reason"))
         extra = {**extra, "terminal": C.STATUS_TRIAGED, "_exit_status": "verify_invalid",
                  "_skip_reason": f"invalid→triage: {vj.get('note')}",
                  "_verify_payload": vj}
