@@ -14,7 +14,7 @@
 - [x] 6. `bash hub/quality.sh` 全绿
 - [x] 7. 部署：compose 重建 + hub.env 补 `HUB_PANEL_ADMINS=rocju` + 真机实测
       （面板建 demo 项目 → 提交页清单出现）
-- [ ] 8. spec sync + 归档（hub-panel ADDED 2 requirements）
+- [x] 8. spec sync + 归档（hub-panel ADDED 2 requirements）
 - [x] 9. 面板 PRD 落盘即包装 frontmatter（2026-10-23 首跑 #4 实证修复：裸 md 被容器内
       pa inject 确定性拒绝；evidence 落 frontmatter.evidence 键可审计，不伪造
       source_path；deliver/REST 通道不包装）+ #4 已落盘文件一次性补插运维

@@ -6,24 +6,39 @@ hub 面板能力：浏览器提交入口（会话强制 + evidence 机械必填�
 
 ## Requirements
 
-### Requirement: 面板提交入口（会话强制 + evidence 机械必填）
-hub SHALL 提供浏览器面板的 PRD 提交页：PRD 内容（文本粘贴）+ project 选择 + evidence 字段，提交即落盘入队走既有队列。面板 SHALL 强制有效会话（复用 2b OAuth 会话；auth 未配置态面板整体 503 对齐 auth 群）。**evidence 机械必填（F12）**：入口 SHALL 拒绝空 evidence 的提交（422 + 明确提示）——把空依据挡在 critic 闸外，省一轮 critic；hub 不判定 evidence 内容质量（机械非空检查 only）。发起人身份 SHALL 取会话用户（enqueued_by = mm_user_id 形态，通知走直发路径）；无会话提交不可达（面板强制会话，无 env 兜底形态）。project 清单 SHALL 机械扫描 data_root 下具备启动必读面（profiles 目录 + sources.yaml）的子目录生成——hub 不维护独立 project 注册表。
+### Requirement: 面板提交入口（会话强制 + evidence 机械必填 + 包装态落盘）
+hub 面板提交入口在原有守卫与 evidence 必填之上，落盘契约修订为**包装态**：
+面板通道落盘的 PRD 一律带 hub 机械生成的 YAML frontmatter（`project`（白名单值）、
+`source_path: ''`（手写注入无源是 pa 预期态，不伪造路径——source_path 在 pa 侧被
+critic/dispatch 当路径消费）、`evidence`（面板依据落盘可审计，单行化 + 转义，上限
+2048 字节）），sha256 与入队均以包装后全文为对象。原因（2026-10-23 首跑 #4 实证）：
+裸 markdown 会被容器内 pa `stage_inject` 的 `frontmatter.project` 校验确定性拒绝
+（exit 1），且 evidence「收了又扔」不可审计。deliver 机机通道（pa-prd 产物自带
+frontmatter）与 REST 直入队通道不包装。
 
 #### Scenario: 会话提交闭环
 - **WHEN** 已登录同事在提交页填 PRD 内容、选 project、填 evidence 链接并提交
-- **THEN** PRD 落盘 `data_root/<project>/prd/`、队列项入队（enqueued_by = 该会话 mm_user_id），页面显示队列项标识
+- **THEN** PRD 以包装态落盘 `data_root/<project>/prd/`（frontmatter 含
+  project / source_path 空串 / evidence 转义值 + 原文正文）、sha256 按包装后全文、
+  队列项入队（enqueued_by = 该会话 mm_user_id），页面显示队列项标识
+- **AND** 该文件被派发重试时原样复用（retry 幂等——包装发生在落盘点一次成型）
 
 #### Scenario: evidence 空被拒
 - **WHEN** 提交时 evidence 为空或纯空白
 - **THEN** 422 拒绝入队，提示「evidence 必填（链接或出处说明）」；不产生队列项、不落盘
+
+#### Scenario: evidence 超限被拒
+- **WHEN** evidence 压缩单行后超 2048 字节
+- **THEN** 422 拒绝，提示上限；不产生队列项、不落盘
 
 #### Scenario: 未登录不可提交
 - **WHEN** 无有效会话 cookie 访问面板提交端点
 - **THEN** 401/302 到登录；auth 未配置态面板端点 503（对齐 auth 群行为）
 
 #### Scenario: project 清单来自必读面扫描
-- **WHEN** 渲染提交页 project 选择器
-- **THEN** 候选 = data_root 下有 profiles 目录与 sources.yaml 的子目录（与派发 fail fast 同判据）；空清单时提示并**链接到建项目页**（`/panel/projects/new`——面板自助建档入口，不再引导 ssh 后端）
+- **WHEN** 渲染提交页 project 下拉
+- **THEN** 清单 = data_root 下有启动必读面（profiles/ + sources.yaml）的子目录扫描，
+  与派发 fail fast 同判据；面板建档成功后当次渲染即可见
 ### Requirement: 面板只读面（队列 / run / 报告，零语义渲染）
 hub SHALL 提供面板只读页：队列状态列表、run 列表（含终态与 exit code）、run 详情（终态事实 + journal 尾部行机械展示）。run 报告 SHALL 在报告落卷存在时只读渲染（T2a 裁决：pa 侧 report 双写 state 卷，见 spec: pa-event-outlet；roc 侧报告可见性 = 面板渲染 + bot 摘要）。run 详情 SHALL 在 events.jsonl（伴生事件文件）存在时机械展示其尾部若干行（原样文本——acceptance_suite / verify invalid 等语义事件从此面板可见，展示非判定）；SHALL 在 verify-report.json 落卷（pa 侧 verify-report 双写，见 spec: pa-event-outlet）存在时机械表格渲染其关键节：判定（verdict + invalid 时 reason）、命令清单（cmd / source / exit code 逐行）、锚检查（名称 + 通过/违反 rc）、环境奇偶节原样字段——缺失时显示「无 verify-report」占位（非错误，旧 run / flag off 形态无此文件）。面板渲染 MUST 限于机械展示 hub DB 自有行与 state 卷落盘文件——不解析 pa journal 内部结构做语义判定（journal/events 尾部行原样展示除外——展示非判定）、不聚合统计语义结论。只读面同样强制会话（与提交页同守卫口径）。队列状态列表 SHALL 最新优先（id 降序）并展示每行 `created_at`（入队时间）与 `updated_at`（最后状态变化时间）两列（原样展示，不做语义格式化）。
 
@@ -88,3 +103,47 @@ hub SHALL 提供面板只读页：队列状态列表、run 列表（含终态与
 #### Scenario: gitcode 两级路径
 - **WHEN** 选 forge=gitcode、填两级 owner/repo（无 host 字段）提交
 - **THEN** 落盘 profile 含 `forge: gitcode`（无 host 键）+ repo 两级全路径
+
+### Requirement: 面板项目建档
+hub 面板应提供项目建档入口：已登录的 admin 会话经表单提交项目档案
+（name / repo / goal / match_surface one_liner），hub 以机械落盘在
+`HUB_DATA_ROOT/<name>/` 下创建启动必读面（`profiles/<name>.yaml` + `sources.yaml`），
+建档后项目立即进入提交页 project 清单。项目档案定性为运行时配置（真相源 =
+`HUB_DATA_ROOT`），面板写它不构成控制面越界。
+
+#### Scenario: 建档 happy path 落两文件且立即可提交
+- **WHEN** admin 会话 POST `/panel/projects`（name=demo、repo=owner/repo、goal 与
+  surface 非空单行）
+- **THEN** `<data_root>/demo/profiles/demo.yaml`（含 name/admission: true/repo 规范化
+  为 `https://github.com/owner/repo`/goal/match_surface.one_liner）与
+  `<data_root>/demo/sources.yaml`（`sources: []`）落盘
+- **AND** 提交页 project 下拉出现 demo（必读面扫描当次命中）
+
+#### Scenario: 非法输入 422 回显不落盘
+- **WHEN** 提交 name 含非法字符（不匹配 PROJECT_RE）、或 name 与既有项目重名、
+  或 repo/goal/surface 空、或任一字段含换行
+- **THEN** 422 + 表单页错误回显，data_root 无新目录（半写目录已清理）
+
+#### Scenario: 非 admin 会话 403
+- **WHEN** `HUB_PANEL_ADMINS` 已配置且会话 username 不在名单
+- **THEN** 403 明确报错（admins 未配置时空缺省=任何有效会话放行）
+
+### Requirement: 面板 run 操作（重跑 / 放弃）
+hub 面板应在队列页提供人工操作：对 `failed` 队列项**重跑**（以原 PRD 与原 project
+新建队列项，发起人=当前操作者；旧行留审计），对 `pending` 队列项**放弃**（转终态
+failed + last_error 记因，行保留审计——与 REST `DELETE /queue/{id}` 同一语义同一实现）。
+两操作均须 admin 会话。
+
+#### Scenario: 重跑 failed 项
+- **WHEN** admin 会话 POST `/panel/queue/{id}/retry` 且该项 status=failed、PRD 文件仍在
+- **THEN** 新队列项入队（同 project/prd_path，enqueued_by=操作者 mm_user_id）
+- **AND** 旧行状态与审计字段原样保留
+
+#### Scenario: 重跑非 failed 项 409
+- **WHEN** 目标项 status 为 pending/running/done
+- **THEN** 409 明确报错（防双跑/防重复投递），不入队
+
+#### Scenario: 放弃 pending 项与 REST 同源
+- **WHEN** admin 会话 POST `/panel/queue/{id}/abandon` 且该项 status=pending
+- **THEN** 转终态 failed、last_error 记人工放弃因；行为与 `DELETE /queue/{id}` 完全一致
+  （共享实现）；running/done/failed 项 409 文案同源
