@@ -35,8 +35,8 @@ import run_daily  # noqa: E402
 
 STAMP = "20261028"
 PROJ = "cc-web-control"
-SIX_REASONS = ("unresolved", "anchor_violation", "wallclock_timeout",
-               "suite_load_failed", "worktree_setup_failed", "exam_snapshot_mismatch")
+SEVEN_REASONS = ("unresolved", "anchor_violation", "wallclock_timeout", "session_failed",
+                 "suite_load_failed", "worktree_setup_failed", "exam_snapshot_mismatch")
 
 
 # ── A. reason 枚举单元（verify_stream）──────────────────────────────
@@ -45,10 +45,11 @@ def test_invalid_reason_constants_and_enum():
     assert VS.REASON_UNRESOLVED == "unresolved"
     assert VS.REASON_ANCHOR_VIOLATION == "anchor_violation"
     assert VS.REASON_WALLCLOCK_TIMEOUT == "wallclock_timeout"
+    assert VS.REASON_SESSION_FAILED == "session_failed"   # run 92 真机：claude 非零退出（max-turns/API 断）
     assert VS.REASON_SUITE_LOAD_FAILED == "suite_load_failed"
     assert VS.REASON_WORKTREE_SETUP_FAILED == "worktree_setup_failed"
     assert VS.REASON_EXAM_SNAPSHOT_MISMATCH == "exam_snapshot_mismatch"
-    assert VS.INVALID_REASONS == frozenset(SIX_REASONS)
+    assert VS.INVALID_REASONS == frozenset(SEVEN_REASONS)
 
 
 def _exec(cmd: str = "npm test", rc: int = 0):
@@ -149,7 +150,7 @@ def _read_events(state_dir, proj, stamp, slug) -> list[dict]:
     return [json.loads(ln) for ln in f.read_text(encoding="utf-8").splitlines()]
 
 
-@pytest.mark.parametrize("reason", SIX_REASONS)
+@pytest.mark.parametrize("reason", SEVEN_REASONS)
 def test_dispatch_invalid_emits_verify_verdict_with_reason(tmp_path, monkeypatch, reason):
     """审核补（r2）：六成因值全参数化钉分流点透传——事件行 reason 必 ∈ INVALID_REASONS。"""
     import test_verify_loop as VL

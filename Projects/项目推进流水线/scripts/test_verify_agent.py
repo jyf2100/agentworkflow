@@ -106,6 +106,43 @@ def test_wall_clock_local_tier(monkeypatch):
     assert VA.resolve_wall_clock() == VA.LOCAL_WALL_CLOCK
 
 
+# ─── 会话级失败异常（run 92 真机：max-turns 撞墙 claude 退出 1）────────
+def test_session_failure_raises_dedicated_exception(monkeypatch):
+    """claude 非零退出 → VerifySessionFailed（编排层映射 invalid，非 dispatch 异常 fail）。"""
+    class _FailProc:
+        returncode = 1
+        stdout = '{"type":"system","subtype":"init"}'
+        stderr = ""
+    monkeypatch.delenv("PA_PERSONA_MODEL_PA_VERIFY_AGENT", raising=False)
+    monkeypatch.setattr(VA.persona_call.model_routing, "resolve_persona_model", lambda n: None)
+
+    def fake_run(cmd, **kw):
+        return _FailProc()
+    monkeypatch.setattr(VA.subprocess, "run", fake_run)
+    ex = VA.ClaudeHeadlessExecutor(claude_bin="/bin/claude-fake")
+    with pytest.raises(VA.VerifySessionFailed) as ei:
+        ex.run(Path("/tmp/wt"), "p", timeout=60)
+    assert "claude 退出 1" in str(ei.value)          # exit_diag 诊断面保留
+
+
+# ─── maxTurns 分档（run 92 真机：hub 容器 30 turn 全花在装环境）────────
+def test_max_turns_env_override(monkeypatch):
+    monkeypatch.setenv("PA_VERIFY_MAX_TURNS", "77")
+    assert VA.resolve_max_turns() == 77
+
+
+def test_max_turns_hub_tier(monkeypatch):
+    monkeypatch.delenv("PA_VERIFY_MAX_TURNS", raising=False)
+    monkeypatch.setattr(VA, "_is_hub_env", lambda: True)
+    assert VA.resolve_max_turns() == VA.HUB_MAX_TURNS == 150   # 对齐 dev 会话 max_turns
+
+
+def test_max_turns_local_tier(monkeypatch):
+    monkeypatch.delenv("PA_VERIFY_MAX_TURNS", raising=False)
+    monkeypatch.setattr(VA, "_is_hub_env", lambda: False)
+    assert VA.resolve_max_turns() == VA.LOCAL_MAX_TURNS == 30
+
+
 # ─── prompt 结构（design：env spec + 验收测试命令 + 全量门命令 + 围栏）──
 def test_prompt_builder_sections():
     p = VA.build_verify_prompt(env_spec="NODE_ENV=test",
@@ -123,6 +160,15 @@ def test_prompt_builder_no_gate_cmd():
     p = VA.build_verify_prompt(env_spec="", suite_cmds=["python3 -m pytest t/x.py"],
                                gate_cmd=None, gate_source="none")
     assert "只跑" in p and "python3 -m pytest t/x.py" in p
+
+
+def test_prompt_builder_env_discipline():
+    """环境纪律段（run 92 真机：30 turn 里 28 turn 被目标仓 hook 拒/装环境）——预告知
+    scope-bash 允许面 + 依赖装配捷径，省环境探查 turn。"""
+    p = VA.build_verify_prompt(env_spec="", suite_cmds=["npx jest test/a.test.js"],
+                               gate_cmd=None, gate_source="none")
+    assert "scope-bash" in p                       # hook 存在预告知（被拒不重试同形态）
+    assert "npm ci" in p and "--no-save" in p      # 依赖装配捷径（gitignore 内不算弄脏）
 
 
 # ─── declared 命令机械构造（2.4：prompt 指令与锚①判定同一来源）────────

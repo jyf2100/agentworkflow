@@ -120,6 +120,27 @@ def test_workspace_stray_untracked_rejected(tmp_path):
     assert not ok
 
 
+def test_workspace_clean_allows_test_artifact_dirs(tmp_path):
+    """测试运行副产物目录（playwright test-results/ 等）豁免锚②——run 真机预判：
+    runner 产物非注入 untracked 不应判脏（否则红绿皆不可判=invalid，F1）。"""
+    repo = _git_repo(tmp_path)
+    for d, f in (("test-results", ".last-run.json"), ("playwright-report", "index.html"),
+                 ("blob-report", "report.zip"), (".playwright", "lock")):
+        (repo / d).mkdir()
+        (repo / d / f).write_text("x", encoding="utf-8")
+    ok, detail = VS.check_workspace_clean(repo, set())
+    assert ok, detail
+    assert "豁免" in detail and "test-results" in detail   # 豁免可观测（detail 记录）
+
+
+def test_workspace_test_artifact_whitelist_only_dirs(tmp_path):
+    """白名单只豁免副产物**目录**——同名单 tracked 修改/白名单外 untracked 仍判脏。"""
+    repo = _git_repo(tmp_path)
+    (repo / "stray.py").write_text("x", encoding="utf-8")   # 白名单外 untracked
+    ok, _ = VS.check_workspace_clean(repo, set())
+    assert not ok
+
+
 # ─── 锚③：注入件 digest 复核 ─────────────────────────────────────────
 def test_digest_ok(tmp_path):
     import acceptance_tests as AT

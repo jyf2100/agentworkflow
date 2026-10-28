@@ -50,12 +50,24 @@ VERDICT_INVALID = "invalid"
 REASON_UNRESOLVED = "unresolved"                  # declared 命令未被执行/变体不可判读（锚①）
 REASON_ANCHOR_VIOLATION = "anchor_violation"      # 锚②③ violation（工作区不净/注入件 digest 不符）
 REASON_WALLCLOCK_TIMEOUT = "wallclock_timeout"    # agent 轨会话墙钟超时 / 机械轨执行超时
+REASON_SESSION_FAILED = "session_failed"          # agent 轨会话级失败（claude 非零退出：max-turns/API 断，run 92 真机）
 REASON_SUITE_LOAD_FAILED = "suite_load_failed"    # 验收套件 load 失败（digest 校验 fail-closed）
 REASON_WORKTREE_SETUP_FAILED = "worktree_setup_failed"    # 验证 worktree 建立失败（agent 轨）
 REASON_EXAM_SNAPSHOT_MISMATCH = "exam_snapshot_mismatch"  # 考卷不变式破坏（dispatch 构造分支）
 INVALID_REASONS = frozenset({
-    REASON_UNRESOLVED, REASON_ANCHOR_VIOLATION, REASON_WALLCLOCK_TIMEOUT,
+    REASON_UNRESOLVED, REASON_ANCHOR_VIOLATION, REASON_WALLCLOCK_TIMEOUT, REASON_SESSION_FAILED,
     REASON_SUITE_LOAD_FAILED, REASON_WORKTREE_SETUP_FAILED, REASON_EXAM_SNAPSHOT_MISMATCH})
+
+# 测试运行副产物目录（run 真机预判 F1）：runner 跑完落的目录非注入 untracked，判脏会让
+# 红绿皆不可判（invalid）——豁免（仅限 untracked 新增目录；tracked 修改仍判脏）。
+TEST_ARTIFACT_DIRS = frozenset({
+    "test-results",        # playwright 默认 outputDir
+    "playwright-report",   # playwright HTML report
+    "blob-report",         # playwright mergeable report
+    ".playwright",         # playwright 运行时锁/缓存
+    ".pytest_cache",       # pytest
+    "coverage",            # jest/nyc coverage
+})
 
 
 @dataclass
@@ -148,9 +160,11 @@ def match_declared(executions: list[BashExecution],
 
 # ─── 锚②：workspace 干净（tracked 零变更 + 非 ignored untracked ⊆ 注入集） ──
 def check_workspace_clean(cwd: Path, injected_rel: set[str]) -> tuple[bool, str]:
-    """git status --porcelain 判定：无 tracked 变更（M/A/D/R）；?? untracked ⊆ 注入集。
+    """git status --porcelain 判定：无 tracked 变更（M/A/D/R）；?? untracked ⊆ 注入集 ∪ 副产物目录。
 
     porcelain 默认不列 ignored（!! 只在 --ignored 下出现）——天然满足「非 ignored」限定。
+    副产物目录（``TEST_ARTIFACT_DIRS``，F1）豁免：untracked 新增的 runner 产物目录不算脏
+    （--untracked-files=all 展开为 ``<dir>/<file>`` 形态——首段命中白名单即豁免）。
     git 不可用 / 非仓 → fail-closed 拒（锚②不可判读 = invalid 语义）。
     """
     try:
@@ -161,15 +175,23 @@ def check_workspace_clean(cwd: Path, injected_rel: set[str]) -> tuple[bool, str]
     if proc.returncode != 0:
         return False, f"git status 非零退出: {proc.stderr.strip()[:200]}"
     injected = {str(p).strip() for p in injected_rel}
+    waived: list[str] = []
     for line in proc.stdout.splitlines():
         if not line.strip():
             continue
         code, path = line[:2], line[3:].strip().strip('"')
         if code == "??":
-            if path not in injected:
-                return False, f"非注入 untracked 文件: {path}"
+            if path in injected:
+                continue
+            head = path.split("/", 1)[0]
+            if head in TEST_ARTIFACT_DIRS:
+                waived.append(head)
+                continue
+            return False, f"非注入 untracked 文件: {path}"
         else:
             return False, f"tracked 变更（{code.strip()}）: {path}"
+    if waived:
+        return True, f"ok（豁免测试副产物目录: {', '.join(sorted(set(waived)))}）"
     return True, "ok"
 
 

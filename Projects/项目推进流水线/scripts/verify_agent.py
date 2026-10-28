@@ -36,9 +36,29 @@ HUB_WALL_CLOCK = 3600.0     # 容器形态对齐 dev 会话语义（m14 教训�
 LOCAL_WALL_CLOCK = 1200.0   # 本机形态 = VERIFY_INSTALL/TEST_TIMEOUT 量级合并
 HUB_MARK = "/data/pa"       # hub 容器挂载卷标记（run 容器内必挂）
 
+# maxTurns 分档（run 92 真机，2026-10-28）：hub 容器 30 turn 全花在环境装配（npm ci + 绕
+# scope-bash 探查），考卷一条没跑就 max_turns_reached → claude 退出 1。D13 只给墙钟分了档，
+# max-turns 漏跟——hub 档对齐 dev 会话 ``max_turns=150``（dev-agent.py:1227）。
+HUB_MAX_TURNS = 150
+LOCAL_MAX_TURNS = 30
+
+# harness config 换版形态（F2，本体论审核 T2）：这些注入件是「环境对接工件」非考卷本体——
+# dev 分支已有同名文件（dev 对目标环境的对接修正）时 verify 不覆盖（store 原件对照记录）。
+CONFIG_SWAP_RELS = frozenset({
+    "playwright.config.ts", "playwright.config.js", "playwright.config.mjs", "playwright.config.cjs",
+    "jest.config.ts", "jest.config.js", "jest.config.mjs", "jest.config.cjs", "jest.config.json",
+    "pytest.ini", "vitest.config.ts", "vitest.config.js",
+})
+
 
 class VerifySessionTimeout(Exception):
     """verify agent 会话墙钟超时——不可判读非失败（编排层映射 invalid，T4）。"""
+
+
+class VerifySessionFailed(RuntimeError):
+    """verify agent 会话级失败（claude 非零退出：max-turns 撞墙 / API 断流）——不可判读非
+    失败（编排层映射 invalid）。run 92 真机：此形态曾冒泡成「dispatch 异常 status=fail」+
+    report 静默全绿（T1 活标本），故立专用异常与 RuntimeError 语义分开。"""
 
 
 class VerifyExecutor(Protocol):
@@ -65,6 +85,18 @@ def resolve_wall_clock() -> float:
         except ValueError:
             pass   # 配错回落分档（对齐空串语义：不废整个机制）
     return HUB_WALL_CLOCK if _is_hub_env() else LOCAL_WALL_CLOCK
+
+
+def resolve_max_turns() -> int:
+    """会话 turn 上限分档（run 92 真机补 D13 漏跟）：PA_VERIFY_MAX_TURNS 覆盖 >
+    hub 150（对齐 dev 会话）> 本机 30。"""
+    env = os.environ.get("PA_VERIFY_MAX_TURNS")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    return HUB_MAX_TURNS if _is_hub_env() else LOCAL_MAX_TURNS
 
 
 def declared_suite_cmds_for(harness: str, rels: list[str]) -> list[str]:
@@ -115,6 +147,15 @@ def build_verify_prompt(env_spec: str, suite_cmds: list[str],
         "  任何写都会让本次验证作废（invalid）。",
         "- 装依赖 / 工具链（如 `npm ci` / `pip install`）**可以**——这属于环境装配非内容修改。",
         "",
+        "## 环境纪律（省 turn，一次到位）",
+        "- 本仓有 **scope-bash hook**：Bash 只放行白名单前缀（npm/npx/node/git 等只读与包管理面）；",
+        "  组合命令（`&&` / `;`）、管道 / 重定向、`VAR=x cmd` env 前缀**会被拒**。被拒不重试同形态，",
+        "  直接改单条纯净命令。",
+        "- 依赖未预装是常态（worktree 新建无 node_modules）：直接 `npm ci`（或 `pip install -r",
+        "  requirements.txt`）——node_modules / venv 是 gitignore 的，**不算弄脏工作区**。",
+        "- 全局 CLI 报 `Cannot find package 'xxx'`（ESM 不走 NODE_PATH）时：`npm install --no-save",
+        "  xxx` 装进 gitignore 的 node_modules 即可，不改 package.json。",
+        "",
         "## 执行步骤",
         "1. 装配环境后跑下列**验收测试**（控制面注入的 PRD 验收点考卷，逐个跑；命令请按给出的",
         "   原样执行——可加前置链段如 `cd` / 装依赖，但末段命令须与上面逐字一致）：",
@@ -151,5 +192,5 @@ class ClaudeHeadlessExecutor:
             raise VerifySessionTimeout(
                 f"verify agent 会话墙钟超时（{timeout}s），已 kill（不可判读→invalid）") from e
         if proc.returncode != 0:
-            raise RuntimeError(persona_call.exit_diag(VERIFY_AGENT_NAME, proc))
+            raise VerifySessionFailed(persona_call.exit_diag(VERIFY_AGENT_NAME, proc))
         return proc.stdout or ""

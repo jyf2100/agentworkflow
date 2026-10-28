@@ -248,6 +248,56 @@ def test_agent_track_suite_load_failure_fail_closed(tmp_path, agent_env):
     assert out["verdict"] == "invalid" and "load 失败" in out["note"]
 
 
+def test_agent_track_session_failure_maps_invalid(tmp_path, agent_env, monkeypatch):
+    """会话级失败（claude 非零退出：max-turns 撞墙/API 断）→ invalid 非 dispatch 异常
+    （run 92 真机：退出 1 冒泡成「dispatch 异常 status=fail」+ report 静默全绿——T1 活标本）。"""
+    _t, runs = agent_env
+    suite = _store_jest_suite(tmp_path / "acceptance_store")
+
+    class SessionFailExecutor(FakeExecutor):
+        def run(self, cwd, prompt, *, timeout, **k):
+            raise VA.VerifySessionFailed("[pa-verify-agent] claude 退出 1: max_turns_reached")
+
+    monkeypatch.setattr(VA, "ClaudeHeadlessExecutor", SessionFailExecutor)
+    repo = _repo_with_branch(tmp_path)
+    out = run_daily.independent_verify(str(repo), "feat/x", "st", "slug", runs / "st_slug.log",
+                                       prof=None, test_cmd_hint=None, suite_ref=suite)
+    assert out["verdict"] == "invalid" and out["pass"] is False
+    assert out.get("invalid_reason") == "session_failed"
+    assert "claude 退出 1" in (out["note"] or "")
+
+
+def test_agent_track_config_swap_dev_version_wins(tmp_path, agent_env):
+    """F2（config 覆盖）：harness config 换版——dev 分支已有同名 config 时 store 原件
+    不覆盖（dev 环境对接修正是 run 真实形态），out 记两版 sha 对照、锚③豁免换版件。"""
+    _t, runs = agent_env
+    store_cfg = "// store original config\nexport default {};\n"
+    dev_cfg = "// DEV-adapted config (PORT→CC_WEB_PORT)\nexport default {port: 4194};\n"
+    suite = AT.store_suite(tmp_path / "acceptance_store",
+                           {"test/a.spec.ts": "test('ac1', () => {});",
+                            "playwright.config.ts": store_cfg},
+                           prd_criteria_ids=["x:ac1"], suite_criteria_ids=["x:ac1"],
+                           harness="playwright")
+    repo = _repo_with_branch(tmp_path)
+    (repo / "playwright.config.ts").write_text(dev_cfg, encoding="utf-8")   # dev 分支已有修正版
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "dev config adapt"],
+                   check=True, capture_output=True)
+    FakeExecutor.injected_rel = "test/a.spec.ts"
+    FakeExecutor.stream = _raw([
+        _ev_use("t1", "cd wt && playwright test test/a.spec.ts"),
+        _ev_res("t1", "3 passed"), _ev_meta()])
+    out = run_daily.independent_verify(str(repo), "feat/x", "st", "slug", runs / "st_slug.log",
+                                       prof=None, test_cmd_hint=None, suite_ref=suite)
+    swaps = out.get("config_swaps") or []
+    assert swaps and swaps[0]["rel"] == "playwright.config.ts"
+    assert swaps[0]["dev_sha"] != swaps[0]["store_sha"]          # 两版对照可观测
+    # worktree 已被 finally 移除——由 verdict 间接证不覆盖：若 store 件仍注入，锚③对 dev 版
+    # config 必 digest-mismatch → invalid；绿 + 换版 note = dev 版生效且豁免路径命中。
+    assert out["verdict"] == "green", out["note"]
+    assert "config 换版" in (out["note"] or "")
+
+
 def test_agent_track_gate_only_when_no_suite(tmp_path, agent_env):
     """无验收套件但有全量门（dev-reported hint）→ 只 declared gate_cmd 一条。"""
     _t, runs = agent_env

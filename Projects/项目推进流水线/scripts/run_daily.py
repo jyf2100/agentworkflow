@@ -3952,7 +3952,11 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
             injected = acceptance_tests.inject_from_bundle(bundle)
             digests = acceptance_tests.file_digests(suite_ref)
             harness = str(bundle.get("harness") or "")
-            suite_cmds = VA_MOD.declared_suite_cmds_for(harness, sorted(injected))
+            # declared 只对考卷本体（spec）构造——config 件是环境对接工件非测试文件
+            # （run 92 真机暴露：套件带 playwright.config.ts 时曾生成「playwright test
+            # playwright.config.ts」必 unresolved → invalid）
+            _spec_rels = [r for r in sorted(injected) if r not in VA_MOD.CONFIG_SWAP_RELS]
+            suite_cmds = VA_MOD.declared_suite_cmds_for(harness, _spec_rels)
         except Exception as e:
             out["verdict"], out["note"] = "invalid", f"验收套件 load 失败（fail-closed 不跑）: {str(e)[:200]}"
             out["invalid_reason"] = VS_MOD.REASON_SUITE_LOAD_FAILED
@@ -3975,20 +3979,37 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
             out["invalid_reason"] = VS_MOD.REASON_WORKTREE_SETUP_FAILED
             return out
         # 机械拷入注入件（编排器自己拷——位置= bundle rel path；dev 侧「摆放位置是语义活」不适用
-        # 于 verify 面：verify worktree 是干净 checkout，考卷位置由控制面定，锚②的注入集白名单同源）
+        # 于 verify 面：verify worktree 是干净 checkout，考卷位置由控制面定，锚②的注入集白名单同源）。
+        # config 换版（F2，审核 T2）：harness config 是「环境对接工件」非考卷本体——dev 分支已有
+        # 同名文件（dev 对目标环境的对接修正，如 PORT→CC_WEB_PORT）时 store 原件**不覆盖**，
+        # 两版 sha 对照记录（dev 侧偷改风险由测试真实 exit code 兜底：config 改坏测试必非零）。
+        config_swaps: list[dict] = []
         for rel, content in injected.items():
             _p = vt / rel
+            if rel in VA_MOD.CONFIG_SWAP_RELS and _p.exists():
+                dev_sha = artifact_store.compute_digest(_p.read_bytes())
+                store_sha = artifact_store.compute_digest(content.encode("utf-8"))
+                if dev_sha != store_sha:
+                    config_swaps.append({"rel": rel, "dev_sha": dev_sha, "store_sha": store_sha})
+                    continue   # 保留 dev 分支版本，不写 store 原件
             _p.parent.mkdir(parents=True, exist_ok=True)
             _p.write_text(content, encoding="utf-8")
+        if config_swaps:
+            out["config_swaps"] = config_swaps
         env_spec = " ".join(f"{k}={v}" for k, v in sorted(((prof or {}).get("env") or {}).items()))
         prompt = VA_MOD.build_verify_prompt(env_spec, suite_cmds, gate_cmd, gate_source)
         declared = suite_cmds + ([gate_cmd] if gate_cmd else [])
         try:
             raw = VA_MOD.ClaudeHeadlessExecutor(log=log).run(
-                vt, prompt, timeout=VA_MOD.resolve_wall_clock())
+                vt, prompt, timeout=VA_MOD.resolve_wall_clock(),
+                max_turns=VA_MOD.resolve_max_turns())   # run 92 真机：hub 30 turn 全花装环境 → 分档
         except VA_MOD.VerifySessionTimeout as e:   # 墙钟超时 → invalid（不可判读非失败，T4）
             out["verdict"], out["note"] = "invalid", str(e)[:200]
             out["invalid_reason"] = VS_MOD.REASON_WALLCLOCK_TIMEOUT
+            return out
+        except VA_MOD.VerifySessionFailed as e:    # 会话级失败（max-turns 撞墙/API 断）→ invalid
+            out["verdict"], out["note"] = "invalid", str(e)[:200]   # 非 dispatch 异常 fail（run 92 教训）
+            out["invalid_reason"] = VS_MOD.REASON_SESSION_FAILED
             return out
         stream_path = log_file.parent / (log_file.stem + ".verify-stream.jsonl")   # ④：原始流 durable（B2）
         try:
@@ -3998,7 +4019,9 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
         execs, meta = VS_MOD.parse_stream(raw)
         matched = VS_MOD.match_declared(execs, declared)
         ws_ok, ws_detail = VS_MOD.check_workspace_clean(vt, set(injected))
-        dg_viol = VS_MOD.check_injected_digests(vt, digests)
+        _swapped = {s["rel"] for s in config_swaps}
+        # 锚③豁免换版 config（有意保留 dev 版 ≠ 被篡改；两版 sha 已在 config_swaps 对照）
+        dg_viol = VS_MOD.check_injected_digests(vt, {r: d for r, d in digests.items() if r not in _swapped})
         report = VS_MOD.build_verify_report(
             run_id=stamp, project=project, prd_id=slug, iteration_id=iteration, harness=harness,
             gate_cmd=gate_cmd, gate_source=gate_source, matched=matched,
@@ -4032,6 +4055,9 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
                        "red": "红→标 failing，PR 留待 review",
                        "invalid": "invalid→triage（不进 revise 回环）"}[verdict] \
             + f"（命令来源 {gate_source}）"   # 2.6：record note 显式记来源（gate_source 键同在 rec["verify"]）
+        if config_swaps:
+            out["note"] += f"；config 换版 ×{len(config_swaps)}（dev 分支版优先: " \
+                           + ", ".join(s["rel"] for s in config_swaps) + "，sha 对照见 config_swaps）"
         log(f"  {'✅' if verdict == 'green' else '🔴' if verdict == 'red' else '⚠️'} "
             f"{slug}: agent 轨独立验证 {verdict}（gate 来源 {gate_source}）")
         return out
