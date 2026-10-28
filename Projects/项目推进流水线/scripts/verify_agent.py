@@ -73,12 +73,18 @@ def declared_suite_cmds_for(harness: str, rels: list[str]) -> list[str]:
     判定依据必须与给 agent 的指令一字不差——若 prompt 只给文件清单让 agent 自选命令，
     末端段全等匹配（match_declared）的命中率不稳 → invalid 率不可控。故命令在此构造，
     同时喂 build_verify_prompt（指令面）与 match_declared（判定面）。harness 集外（v1
-    支持 jest/pytest，1.5 T5 收窄）→ 空（套件本不会 stored，defensive）。
+    支持 jest/pytest，1.5 T5 收窄；add-e2e-acceptance-harness 扩 playwright）→ 空（套件
+    本不会 stored，defensive）。
+    playwright 走**全局 bin 直调**（非 npx）：执行镜像全局装 playwright@钉版 + NODE_PATH=
+    /usr/local/lib/node_modules，运行时 clone 的目标仓 node_modules 无 @playwright/test，
+    npx 会走 cache 下载（外网）或交互卡死（headless 无 stdin）——全局 resolve 零仓内依赖零网络。
     """
     if harness == "jest":
         return [f"npx jest {r}" for r in rels]
     if harness == "pytest":
         return [f"python3 -m pytest {r}" for r in rels]
+    if harness == "playwright":
+        return [f"playwright test {r}" for r in rels]
     return []
 
 

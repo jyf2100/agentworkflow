@@ -32,6 +32,20 @@ RUN python3 -m venv /opt/venv \
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
 
+# ── E2E harness（add-e2e-acceptance-harness）：playwright 全局 + chromium ──────
+# profile 声明 harness: playwright 的验收套件在容器内执行 `playwright test`（全局 bin
+# 直调非 npx）+ `import '@playwright/test'` 经 NODE_PATH 全局 resolve——零仓内依赖零
+# 网络（D2 两层环境解耦：镜像全局装 ≠ 仓内可 resolve，NODE_PATH 是桥）。
+# 浏览器装全局路径 PLAYWRIGHT_BROWSERS_PATH（默认 /root/.cache 运行用户 pa 不可见）。
+# 钉版 1.64.1：verify_anchors 失败汇总块锚形态锁本版实测输出（升级 = 显式改 ARG +
+# 重实测校准 fixture，镜像 +~400MB）。
+ARG PLAYWRIGHT_VERSION=1.64.1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    NODE_PATH=/usr/local/lib/node_modules
+RUN npm install -g "playwright@${PLAYWRIGHT_VERSION}" "@playwright/test@${PLAYWRIGHT_VERSION}" \
+    && playwright install chromium --with-deps \
+    && npm cache clean --force
+
 # ── pa 投影全量 + venv 入 PATH ──────────────────────────────────────────────
 COPY . /opt/pa
 ENV PATH="/opt/venv/bin:$PATH"

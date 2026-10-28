@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -855,14 +856,34 @@ def _extract_acceptance_ids(prd_path: Path | str, slug: str) -> list[dict]:
 # 机械载体 = 登记文件 acceptance_<stamp>_<proj>_<slug>.json（gate_file 模式：同 stamp 幂等复用不重复烧 LLM）。
 _CRIT_TAG_RE = re.compile(r"criterion:\s*([A-Za-z0-9_:\-]+)")
 _JEST_FILE_RE = re.compile(r"\.test\.[jt]sx?$")
+_E2E_FILE_RE = re.compile(r"e2e_[\w\-]+\.spec\.ts$")
+# playwright webServer 固定端口段（add-e2e-acceptance-harness D3：4173-4199，按 PRD 取模分配）
+_E2E_PORT_BASE, _E2E_PORT_SPAN = 4173, 27
+
+
+def _e2e_port_for(prd_path: str) -> int:
+    """PRD → webServer 固定端口（4173-4199 sha 取模）——机械分配，零冲突协调。"""
+    return _E2E_PORT_BASE + int(hashlib.sha1(prd_path.encode("utf-8")).hexdigest()[:8], 16) % _E2E_PORT_SPAN
 
 
 def _test_author_prompt(prd_path: str, acs: list[dict], harness: str,
                         out_dir: Path, prof: dict) -> str:
     """pa-test-author 输入面：PRD 路径 + 验收点稳定 id 清单 + harness + 输出目录。"""
     ac_lines = "\n".join(f"- {a['id']}: {a['text']}" for a in acs)
-    shape = ("*.test.js / *.test.ts（只 import 仓内已有依赖面，不引新 devDependency）"
-             if harness == "jest" else "test_*.py（纯标准库 + 仓内已有 fixtures，不引新第三方）")
+    if harness == "playwright":
+        shape = ("e2e_*.spec.ts + playwright.config.ts（config 也要写——随套件注入目标仓）")
+        e2e_rules = f"""
+E2E 专则（硬性，违反 = 结构自检拒收）：
+- 条件等待：禁 page.waitForTimeout/固定 sleep，一律 toBeVisible/waitForSelector 等条件断言。
+- playwright.config.ts 必含：webServer（command: `{prof.get('e2e_dev_cmd', '')}`、port: {_e2e_port_for(prd_path)}、
+  reuseExistingServer: true——dev server 起停全归 webServer 管，测试内不起停服务、零外网依赖）、
+  retries: 1、projects 仅 chromium（单浏览器）。
+- 只 `import '@playwright/test'`——镜像全局已装（NODE_PATH resolve），勿在仓内装依赖/引新 devDependency。
+"""
+    else:
+        shape = ("*.test.js / *.test.ts（只 import 仓内已有依赖面，不引新 devDependency）"
+                 if harness == "jest" else "test_*.py（纯标准库 + 仓内已有 fixtures，不引新第三方）")
+        e2e_rules = ""
     return f"""为过闸 PRD 编写验收测试（harness={harness}）。
 
 PRD（先 Read 它了解上下文）：{prd_path}
@@ -875,7 +896,7 @@ PRD（先 Read 它了解上下文）：{prd_path}
 硬性要求：
 - 每个测试的 describe/test 名或文件头注释必须带 criterion id 标注（如 `// criterion: {acs[0]['id']}` 或 `# criterion: {acs[0]['id']}`）——编排器机械解析此标注做覆盖闭合。
 - 测行为不测实现；确定性纪律：禁 sleep/墙钟断言/网络依赖/随机不钉种子（不确定测试是废考卷）。
-- harness 文件形态：{shape}。
+- harness 文件形态：{shape}。{e2e_rules}
 - 无法编写可执行测试的点放 uncovered 带原因，绝不静默漏。
 
 输出契约：只输出一行 JSON（无多余文字）：
@@ -918,6 +939,17 @@ def _structural_self_check(files: dict[str, str], harness: str,
             return False, f"jest 套件含非 *.test.* 文件: {rel}"
         if harness == "pytest" and not re.match(r"test_.*\.py$", Path(rel).name):
             return False, f"pytest 套件文件名不符 test_*.py: {rel}"
+        if harness == "playwright":
+            # authored 面 = e2e_*.spec.ts 套件 + playwright.config.ts（D1/D3）——
+            # config 是 authored file 随套件注入 worktree，只查 webServer 节，不参与 criterion 闭合。
+            if Path(rel).name == "playwright.config.ts":
+                if "webServer" not in content:
+                    return False, f"playwright.config 无 webServer 节（dev server 生命周期失管）: {rel}"
+                continue
+            if not _E2E_FILE_RE.match(Path(rel).name):
+                return False, f"playwright 套件含非 e2e_*.spec.ts 文件: {rel}"
+            if "page.waitForTimeout(" in content:
+                return False, f"禁固定等待 page.waitForTimeout（E2E 条件等待纪律）: {rel}"
         ann |= _parse_criterion_annotations(content)
     if not ann:
         return False, "零 criterion 标注（覆盖闭合不可机械审计）"
@@ -945,9 +977,10 @@ def _author_acceptance_suite(entry: dict, prof: dict, stamp: str) -> dict | None
             pass   # 登记损坏 → 重编（fail-open）
 
     harness_raw = str(prof.get("harness") or "").strip()
-    # tasks 1.5（T5）：harness 声明面 v1 收窄到行锚解析器支持集（jest/pytest）——集外显式降级
-    # 按未声明处理（不猜测测试面），detail 记原值供运维改 profile。
-    harness_invalid = harness_raw not in ("", "jest", "pytest")
+    # harness 声明面 v1 收窄到行锚解析器支持集（jest/pytest；add-e2e-acceptance-harness 扩
+    # playwright——Node 工具链 E2E 专属）——集外显式降级按未声明处理（不猜测测试面），
+    # detail 记原值供运维改 profile。
+    harness_invalid = harness_raw not in ("", "jest", "pytest", "playwright")
     harness = "" if harness_invalid else harness_raw
     acs = _extract_acceptance_ids(prd_path, slug) if prd_path else []
     valid_ids = {a["id"] for a in acs}
@@ -956,8 +989,14 @@ def _author_acceptance_suite(entry: dict, prof: dict, stamp: str) -> dict | None
         result = {"status": "absent", "reason": "no_criteria", "prd_id": slug}
     elif not harness:
         result = {"status": "absent", "reason": "no_harness", "prd_id": slug,
-                  **({"detail": f"harness={harness_raw} 不在 v1 支持集（jest/pytest），显式降级"}
+                  **({"detail": f"harness={harness_raw} 不在 v1 支持集（jest/pytest/playwright），显式降级"}
                      if harness_invalid else {})}
+    elif harness == "playwright" and not str(prof.get("e2e_dev_cmd") or "").strip():
+        # spec「缺 e2e_dev_cmd 声明拒收」：dev server 启动命令只能 profile 声明（test-author
+        # Read-only 不读仓）——前置拦截等价 refused，不烧 persona 额度、不产出半套件。
+        result = {"status": "absent", "reason": "refused", "prd_id": slug,
+                  "detail": "缺 e2e_dev_cmd 声明（playwright harness 必填：dev server 启动命令，"
+                            "如 npm run dev）——补 profile 声明后重跑"}
     else:
         out_dir = STATE_DIR / "acceptance" / stamp / f"{dev_slugify(proj)}_{dev_slugify(slug)}"
         try:

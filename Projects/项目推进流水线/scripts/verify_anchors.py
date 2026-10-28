@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """verify_anchors.py — pa-verify 反馈的机械行级锚点（harden-pa-verify-determinism task 1.1）。
 
-把 independent_verify 落的 .testout（jest / pytest / node-test 红输出）机械解析成结构化锚点
+把 independent_verify 落的 .testout（jest / pytest / node-test / playwright 红输出）机械解析成结构化锚点
 ``(test_name, failing_file, failing_line)``。解析不上 → ``unresolved``（fail-open，不伪造——同
 fail-safe-dispatch 的三态 ``UNKNOWN`` 姿态，design D2）。
 
@@ -27,6 +27,14 @@ _JEST_AT = re.compile(r"at\s+\S.*?\((\S+?):(\d+):\d+\)")
 _NODETEST_NOTOK = re.compile(r"^not ok\s+\d+\s+-\s+(.+?)\s*$", re.M)
 _NODETEST_FILE = re.compile(r"^\s*file:\s+(\S+)\s*$", re.M)
 _NODETEST_LINE = re.compile(r"^\s*line:\s+(\d+)\s*$", re.M)
+# playwright（1.64 锁版实测）：锚面 = 尾汇总 ``N failed`` 块内行（flaky/skipped 各自成块，
+# 天然不混入——flaky 计绿；详情块 ``N) ...`` flaky 首跑红也进，不能当失败锚）。
+# 行形态（project 声明时多 ``[browser] › `` 前缀段，行尾 `` ───`` 长划线剥除）：
+#   ``    [chromium] › e2e_x.spec.ts:12:5 › test name ─────``
+#   ``    e2e_x.spec.ts:12:5 › test name ─────``
+_PLAYWRIGHT_SUMMARY = re.compile(
+    r"^\s+(?:\[[^\]]+\] › )?(?P<file>\S+?\.spec\.ts):(?P<line>\d+):\d+ › (?P<name>.+?)\s*─*\s*$")
+_PLAYWRIGHT_FAILED_HDR = re.compile(r"^\s*\d+ failed\b")
 
 
 @dataclass(frozen=True)
@@ -50,11 +58,13 @@ class Anchor:
 def detect_runner(test_cmd: str | None, testout: str = "") -> str:
     """按 ``test_cmd`` 推断 runner；``npm test``（launcher）/未知时从 testout 内容兜底推。
 
-    返回 ``"pytest" | "jest" | "node-test" | "unknown"``。
+    返回 ``"pytest" | "jest" | "node-test" | "playwright" | "unknown"``。
     """
     cmd = (test_cmd or "").strip().lower()
     if "pytest" in cmd:
         return "pytest"
+    if "playwright" in cmd:
+        return "playwright"
     if "jest" in cmd:
         return "jest"
     if "node --test" in cmd or "node:test" in cmd:
@@ -63,6 +73,8 @@ def detect_runner(test_cmd: str | None, testout: str = "") -> str:
         t = testout or ""
         if "TAP version" in t or re.search(r"^not ok", t, re.M):
             return "node-test"
+        if re.search(r"\S+\.spec\.ts:\d+:\d+ › ", t):
+            return "playwright"
         if "FAIL ./" in t or re.search(r"^●", t, re.M):
             return "jest"
         if re.search(r"FAILED|::.*AssertionError|\.py:\d+:", t):
@@ -84,6 +96,8 @@ def parse_failing_anchors(testout: str, runner: str) -> list[Anchor]:
         return _parse_jest(testout)
     if runner == "node-test":
         return _parse_nodetest(testout)
+    if runner == "playwright":
+        return _parse_playwright(testout)
     return [Anchor(test_name="(unknown-runner)", status="unresolved",
                    reason=f"unsupported runner: {runner}")]
 
@@ -127,6 +141,33 @@ def _parse_jest(testout: str) -> list[Anchor]:
         return [Anchor(test_name=f, status="ok", file=f, line=int(ln)) for f, ln in locs]
     return [Anchor(test_name="(unparseable-jest)", status="unresolved",
                    reason="jest 输出无 ● test / at (file:line:col)")]
+
+
+def _parse_playwright(testout: str) -> list[Anchor]:
+    """尾汇总 ``N failed`` 块内逐行取锚（1.64 实测形态，见 ``_PLAYWRIGHT_SUMMARY`` 注）。
+
+    块界定：``N failed`` 计数行起，锚行 4 空格缩进；下一非 4 空格缩进的汇总块
+    （flaky/skipped/passed）即块尾——flaky 计绿不混入（其详情块与 failed 同构，
+    不能当失败锚）。无 failed 块锚行 → unresolved（fail-open）。
+    """
+    anchors: list[Anchor] = []
+    in_failed = False
+    for ln in testout.splitlines():
+        if _PLAYWRIGHT_FAILED_HDR.match(ln):
+            in_failed = True
+            continue
+        if not in_failed:
+            continue
+        m = _PLAYWRIGHT_SUMMARY.match(ln)
+        if m:
+            anchors.append(Anchor(test_name=m.group("name"), status="ok",
+                                  file=m.group("file"), line=int(m.group("line"))))
+        elif ln.strip() and not ln.startswith("    "):
+            in_failed = False   # 下一汇总块（flaky/skipped/passed）——failed 块结束
+    if anchors:
+        return anchors
+    return [Anchor(test_name="(unparseable-playwright)", status="unresolved",
+                   reason="playwright 输出尾汇总无 failed 块锚行")]
 
 
 def _parse_nodetest(testout: str) -> list[Anchor]:

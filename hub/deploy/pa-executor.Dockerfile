@@ -27,6 +27,15 @@ RUN python3 -m venv /opt/venv \
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
 
+# E2E harness（add-e2e-acceptance-harness，与 release/Dockerfile 投影同步维护）：
+# playwright 全局钉版 + chromium 全局路径（运行用户 pa 可见）+ NODE_PATH 桥全局 resolve。
+ARG PLAYWRIGHT_VERSION=1.64.1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    NODE_PATH=/usr/local/lib/node_modules
+RUN npm install -g "playwright@${PLAYWRIGHT_VERSION}" "@playwright/test@${PLAYWRIGHT_VERSION}" \
+    && playwright install chromium --with-deps \
+    && npm cache clean --force
+
 COPY . /opt/pa
 
 ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
