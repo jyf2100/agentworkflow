@@ -1004,6 +1004,17 @@ def _author_acceptance_for_gate(entries: list[dict], profiles: dict, stamp: str)
             continue
         try:
             _r = _author_acceptance_suite(_e, profiles.get(_e.get("project"), {}), stamp)
+            if _r:
+                # 1.3：acceptance 工件状态投射事件出口（stored/absent 二值；facts 与落账 result 同源
+                # 零翻译——defective 是 triage 判定非工件状态不设第三状态，spec pa-event-outlet D2）。
+                _f: dict = {"status": _r.get("status")}
+                if _r.get("status") == "stored":
+                    _f.update(digest=_r.get("digest"), criteria_ids=_r.get("criteria_ids"),
+                              supersedes=_r.get("supersedes"))
+                else:
+                    _f.update(reason=_r.get("reason"), detail=_r.get("detail"))
+                EO.append_event(STATE_DIR, _e.get("project") or "unknown", stamp,
+                                Path(_e["prd_path"]).stem, "acceptance_suite", **_f)
             if _r and _r.get("status") == "stored":
                 log(f"[acceptance] ✓ {_r['prd_id']} → {_r['digest'][:20]}… "
                     f"({len(_r['files'])} 文件, uncovered={len(_r.get('uncovered') or [])})")
@@ -3358,6 +3369,7 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
             log(f"  ⚠ {slug}: r{round_n} 考卷不变式破坏（dev 上报 {_dev_adg[:20]}… ≠ 快照 {_suite_snap['digest'][:20]}…）→ invalid 分流")
             rec["verify"] = {"verdict": "invalid", "pass": False, "test_rc": None, "test_cmd": None,
                              "install_rc": None, "test_log": None,
+                             "invalid_reason": VS_MOD.REASON_EXAM_SNAPSHOT_MISMATCH,   # 1.1：成因归一（六枚举单一定义点）
                              "note": f"考卷不变式破坏: dev 上报 digest {_dev_adg} ≠ iteration 快照 "
                                      f"{_suite_snap['digest']}（控制面接线异常，fail-safe 不判读）"}
         elif has_commits:
@@ -3388,6 +3400,10 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
         if _vj.get("verdict") == "invalid":
             _suspect = _suite_defective_signature(_vj)
             log(f"  ⚠️ {slug}: 独立验证 invalid（{_vj.get('note')}）→ triage（不进 revise）")
+            # 1.2：invalid 分流点 emit——invalid 绕过语义审（下方 L3441 emit 永远拿 pass/revise），此处是
+            # invalid 唯一事件出口；reason 六枚举由构造点归一赋值（verify_stream.INVALID_REASONS 单一定义点）。
+            EO.append_event(STATE_DIR, proj, stamp, slug, "verify_verdict",
+                            verdict="invalid", round=round_n, reason=_vj.get("invalid_reason"))
             _sj.emit("test", _iter, _prd, payload={
                 "round": round_n, "test_pass": False, "verdict": "invalid",
                 **({"suspected_suite_defective": True} if _suspect else {})})
@@ -3819,6 +3835,24 @@ _SUITE_DEFECT_PATTERNS = (
 )
 
 
+def _double_write_report(rp: Path) -> None:
+    """fix-event-outlet-verify-parity D3：verify-report 双写 PA_REPORT_DIR（fail-open）。
+
+    挂 verify-report 落盘即时处而非 report 段统一拷——invalid→triage 路径可能不走完整 report 段，
+    而 invalid 的报告恰是最需人看的证据；本函数在 ``_agent_track_verify``（legacy/graph 双轨共享）
+    内调用，一处改双轨生效。vault 形态（env 未设）零行为。"""
+    _extra = os.environ.get("PA_REPORT_DIR", "").strip()
+    if not _extra:
+        return
+    try:
+        _dir = Path(_extra)
+        _dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(rp, _dir / rp.name)
+        log(f"[verify-report] 双写 → {_dir / rp.name}（PA_REPORT_DIR）")
+    except Exception as e:
+        print(f"[verify-report] ⚠ PA_REPORT_DIR 双写失败（fail-open 不阻断）: {e}", file=sys.stderr)
+
+
 def _suite_defective_signature(vj: dict) -> bool:
     """agent-verify-injection 2.6（T2）：收集级失败签名机械预检——verify 产物 test_log 匹配已知
     「套件自身破损」模式 → triage_reason 候选 ``acceptance_suite_defective``（确认与重编写是
@@ -3863,6 +3897,7 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
             suite_cmds = VA_MOD.declared_suite_cmds_for(harness, sorted(injected))
         except Exception as e:
             out["verdict"], out["note"] = "invalid", f"验收套件 load 失败（fail-closed 不跑）: {str(e)[:200]}"
+            out["invalid_reason"] = VS_MOD.REASON_SUITE_LOAD_FAILED
             return out
     if not suite_cmds and not gate_cmd:
         # 无考卷且无全量门 → 无可执行面（与机械轨「测试归项目自治跳过」同构：verdict=None 未判定）
@@ -3879,6 +3914,7 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
                                     str(_repo_dir), 120, f"[{slug}:verify-wt]", log_file)
         if vrc != 0:
             out["verdict"], out["note"] = "invalid", f"建验证 worktree 失败: git rc={vrc} {verr}".strip()[:200]
+            out["invalid_reason"] = VS_MOD.REASON_WORKTREE_SETUP_FAILED
             return out
         # 机械拷入注入件（编排器自己拷——位置= bundle rel path；dev 侧「摆放位置是语义活」不适用
         # 于 verify 面：verify worktree 是干净 checkout，考卷位置由控制面定，锚②的注入集白名单同源）
@@ -3894,6 +3930,7 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
                 vt, prompt, timeout=VA_MOD.resolve_wall_clock())
         except VA_MOD.VerifySessionTimeout as e:   # 墙钟超时 → invalid（不可判读非失败，T4）
             out["verdict"], out["note"] = "invalid", str(e)[:200]
+            out["invalid_reason"] = VS_MOD.REASON_WALLCLOCK_TIMEOUT
             return out
         stream_path = log_file.parent / (log_file.stem + ".verify-stream.jsonl")   # ④：原始流 durable（B2）
         try:
@@ -3918,8 +3955,11 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
             out["verify_report"] = str(rp)
         except Exception:
             pass   # 报告落盘失败不废判定（dispatch record 持路径缺席可查）
+        _double_write_report(rp)   # D3：PA_REPORT_DIR 双写（fail-open；invalid→triage 可能不走 report 段）
         verdict = report["verdict"]
         out["verdict"], out["pass"] = verdict, verdict == "green"
+        if verdict == VS_MOD.VERDICT_INVALID:
+            out["invalid_reason"] = report["invalid_reason"]   # 1.1：unresolved/anchor_violation 自判定分支带出
         # test_log：采信执行的 output 拼接（runner 原始输出保留——行锚解析输入在新轨不断供，B1）
         _outs = [ex.output for ex in matched.values() if ex is not None and ex.output]
         try:
@@ -4029,6 +4069,7 @@ def independent_verify(repo: str, branch: str, stamp: str, slug: str, log_file: 
         # 2.7：机械轨墙钟超时（_run_capture TimeoutExpired→RuntimeError）契约化归 invalid——超时是
         # 不可判读不是失败（T4，对齐 agent 轨 VerifySessionTimeout 映射）；不再上抛中断整个 dispatch。
         out["verdict"], out["pass"] = "invalid", False
+        out["invalid_reason"] = VS_MOD.REASON_WALLCLOCK_TIMEOUT
         out["note"] = f"机械轨超时/执行异常（invalid→triage）: {str(e)[:200]}"
         log(f"  ⚠️ {slug}: 独立验证 invalid（{out['note']}）")
         return out

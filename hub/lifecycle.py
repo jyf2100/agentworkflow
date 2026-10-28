@@ -62,8 +62,10 @@ def _event_broadcast(row: dict) -> bool:
     if ev == "critic_verdict":
         return row.get("verdict") == "drop"
     if ev == "verify_verdict":
-        return row.get("verdict") != "pass"  # 红 = 非 pass（revise 等均频道可见）
-    return False  # pr_opened / critic pass 仅私信
+        return row.get("verdict") != "pass"  # 红 = 非 pass（revise / invalid 均频道可见）
+    if ev == "acceptance_suite":
+        return row.get("status") == "absent"  # absent 是推进阻断（团队可见）；stored 正常产出仅私信
+    return False  # pr_opened / critic pass / acceptance stored 仅私信
 
 
 def _event_text(run: dict, row: dict) -> str:
@@ -75,9 +77,27 @@ def _event_text(run: dict, row: dict) -> str:
     if ev == "pr_opened":
         repo = row.get("repo")
         return f"{head} PR 开出{f'（{repo}）' if repo else ''}：{row.get('pr_url')}"
-    rnd = row.get("round")
+    if ev == "acceptance_suite":
+        st = row.get("status")
+        parts = [f"{head} acceptance 套件 → {st}"]
+        if st == "stored":
+            dg = row.get("digest")
+            if dg:
+                parts.append(f"digest {dg}")
+            sup = row.get("supersedes")
+            if sup:
+                parts.append(f"supersedes {sup}（换版链）")  # 旧 digest 可回查换版轨迹
+        else:
+            rs, dt = row.get("reason"), row.get("detail")
+            if rs:
+                parts.append(f"原因 {rs}")
+            if dt:
+                parts.append(str(dt))
+        return "\n".join(parts)
+    rnd, rsn = row.get("round"), row.get("reason")
     return (f"{head} verify 判定 → {row.get('verdict')}"
-            f"{'（round ' + str(rnd) + '）' if rnd is not None else ''}\n{row.get('summary') or ''}").rstrip()
+            f"{'（round ' + str(rnd) + '）' if rnd is not None else ''}"
+            f"{'（reason ' + str(rsn) + '）' if rsn else ''}\n{row.get('summary') or ''}").rstrip()
 
 
 def _journal_exists(run_dir: str) -> bool:

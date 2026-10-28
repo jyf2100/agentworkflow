@@ -268,8 +268,50 @@ def render_runs(runs: list[dict]) -> str:
     return _page("runs", body)
 
 
-def render_run_detail(detail: dict, journal_tail: list[str], report_md: str | None) -> str:
-    """run 详情：终态事实表 + journal 尾部原样 + 报告原文（均机械展示）。"""
+def _verify_report_html(vr: dict) -> str:
+    """verify-report 机械表格渲染（fix-event-outlet-verify-parity 2.4）——字段原样进表，
+    零语义：判词（verdict/reason/invalid_reason）只来自文件本身，hub 不产结论。"""
+    run, cmds, anc = vr.get("run") or {}, vr.get("commands") or {}, vr.get("anchors") or {}
+    ws, dg, envp = anc.get("workspace_clean") or {}, anc.get("injected_digests") or {}, vr.get("env_parity") or {}
+    facts = "".join(
+        f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
+        for k, v in (
+            ("verdict", vr.get("verdict")),
+            ("invalid_reason", vr.get("invalid_reason")),
+            ("reason", vr.get("reason")),
+            ("commands.source", cmds.get("source")),
+            ("gate_cmd", cmds.get("gate_cmd")),
+            ("harness", run.get("harness")),
+            ("stream_path", (vr.get("evidence") or {}).get("stream_path")),
+        ))
+    cmd_rows = "".join(
+        f"<tr><td>{_esc(r.get('declared'))}</td>"
+        f"<td>{_esc(r.get('matched_command') or ('unresolved' if r.get('unresolved') else ''))}</td>"
+        f"<td>{'' if r.get('exit_code') is None else r.get('exit_code')}</td></tr>"
+        for r in cmds.get("results") or [])
+    anchor_rows = "".join(
+        f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
+        for k, v in (
+            ("workspace_clean.ok", ws.get("ok")),
+            ("workspace_clean.detail", ws.get("detail")),
+            ("injected_digests.ok", dg.get("ok")),
+            ("injected_digests.violations", "；".join(dg.get("violations") or [])),
+            ("env_parity.declared", envp.get("declared")),
+            ("env_parity.observed_exports", envp.get("observed_exports")),
+            ("env_parity.note", envp.get("note")),
+        ))
+    return (
+        f'<div class="tablewrap"><table><tr><th>判定</th><th>值</th></tr>{facts}</table></div>'
+        '<div class="tablewrap"><table><tr><th>declared cmd</th><th>matched</th><th>exit</th></tr>'
+        f"{cmd_rows}</table></div>"
+        f'<div class="tablewrap"><table><tr><th>锚/环境</th><th>值</th></tr>{anchor_rows}</table></div>'
+    )
+
+
+def render_run_detail(detail: dict, journal_tail: list[str], report_md: str | None,
+                      events_tail: list[str] | None = None,
+                      verify_report: dict | None = None) -> str:
+    """run 详情：终态事实表 + journal/events 尾部原样 + verify-report 机械表格 + 报告原文。"""
     ec = "" if detail["exit_code"] is None else detail["exit_code"]
     rows = "".join(
         f"<tr><td>{_esc(k)}</td><td>{_esc(v if v is not None else '')}</td></tr>"
@@ -281,10 +323,14 @@ def render_run_detail(detail: dict, journal_tail: list[str], report_md: str | No
         )
     )
     tail = "".join(f"{_esc(line)}\n" for line in journal_tail) or "（无 journal）"
+    ev_tail = "".join(f"{_esc(line)}\n" for line in events_tail or []) or "（无 events）"
+    vr_html = _verify_report_html(verify_report) if verify_report is not None else "<p>无 verify-report</p>"
     rep = f'<pre class="maxh">{_esc(report_md)}</pre>' if report_md is not None else "<p>无报告</p>"
     body = (
         f"<h1>run #{detail['id']}</h1><div class=\"tablewrap\"><table>{rows}</table></div>"
         f"<h2>journal 尾部（原样）</h2><pre class=\"maxh\">{tail}</pre>"
+        f"<h2>events 尾部（原样）</h2><pre class=\"maxh\">{ev_tail}</pre>"
+        f"<h2>verify-report</h2>{vr_html}"
         f"<h2>报告</h2>{rep}"
     )
     return _page(f"run #{detail['id']}", body)

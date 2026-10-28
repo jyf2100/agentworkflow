@@ -12,6 +12,7 @@ stop_event + join 线程，保证「完成当前迭代后退出」（daemon=True
 from __future__ import annotations
 
 import hmac
+import json
 import secrets
 import sqlite3
 import threading
@@ -605,7 +606,11 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"run 不存在：{run_id}")
         qi = detail.pop("queue_item") or {}
         flat = {**detail, "last_error": qi.get("last_error")}  # last_error 在 queue_item 上不在 runs 表
-        return HTMLResponse(panel.render_run_detail(flat, _run_journal_tail(detail["run_dir"]), _run_report_md(detail)))
+        prd_path = qi.get("prd_path")
+        return HTMLResponse(panel.render_run_detail(
+            flat, _run_journal_tail(detail["run_dir"]), _run_report_md(detail),
+            events_tail=_run_events_tail(detail["run_dir"], prd_path),
+            verify_report=_run_verify_report(detail, prd_path)))
 
     def _run_journal_tail(run_dir: str, n: int = 30) -> list[str]:
         """journal 平铺伴生（lifecycle._journal_exists 同拼法）尾部 n 行原样读。"""
@@ -626,6 +631,36 @@ def create_app(
         if not hits:
             return None
         return hits[-1].read_text(encoding="utf-8", errors="replace")
+
+    def _run_events_tail(run_dir: str, prd_path: str | None, n: int = 30) -> list[str]:
+        """events.jsonl 尾部行原样读（fix-event-outlet-verify-parity 2.4）——与
+        lifecycle 事件转发同拼法 `{stamp}_{prd stem}.events.jsonl`（prd stem 原样，
+        hub run 目录横线化 slug 与之错位，寻址不得依赖目录名）。"""
+        if not prd_path:
+            return []
+        stem = Path(prd_path).stem
+        ev = Path(run_dir).parent / f"{Path(run_dir).name.split('_', 1)[0]}_{stem}.events.jsonl"
+        if not ev.is_file():
+            return []
+        with ev.open(encoding="utf-8", errors="replace") as f:
+            return [line.rstrip("\n") for line in deque(f, maxlen=n)]
+
+    def _run_verify_report(run: dict, prd_path: str | None) -> dict | None:
+        """verify-report 落卷读取（2.4）：pa 落点 state/runs/<proj>/<stamp>_<prd stem>
+        .verify-report.json（与 events.jsonl 同拼法同 stem）。缺失/坏 JSON = None →
+        面板显「无 verify-report」（非错误）。"""
+        if not prd_path:
+            return None
+        stem = Path(prd_path).stem
+        rd = Path(run["run_dir"])
+        vr = rd.parent / f"{rd.name.split('_', 1)[0]}_{stem}.verify-report.json"
+        if not vr.is_file():
+            return None
+        try:
+            data = json.loads(vr.read_text(encoding="utf-8", errors="replace"))
+        except (json.JSONDecodeError, OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     # ── 投递端点（slice-3 D1/D2/D6/D7，spec: prd-delivery「hub 幂等交接端点」）──
 

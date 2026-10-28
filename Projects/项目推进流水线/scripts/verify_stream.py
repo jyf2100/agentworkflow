@@ -43,6 +43,20 @@ VERDICT_GREEN = "green"
 VERDICT_RED = "red"
 VERDICT_INVALID = "invalid"
 
+# invalid 细分成因（fix-event-outlet-verify-parity D1：单一定义点常量——代码现状成因编码在判定分支
+# 与人读 note 字符串；事件出口 verify_verdict invalid 行必附 reason ∈ 本枚举，一一对齐 invalid 分流
+# 实现成因，防枚举与实现漂移）。人读描述仍在 build_verify_report 的 reason 字段（两者并存：结构化
+# 枚举给机器消费，人读串给 triage）。
+REASON_UNRESOLVED = "unresolved"                  # declared 命令未被执行/变体不可判读（锚①）
+REASON_ANCHOR_VIOLATION = "anchor_violation"      # 锚②③ violation（工作区不净/注入件 digest 不符）
+REASON_WALLCLOCK_TIMEOUT = "wallclock_timeout"    # agent 轨会话墙钟超时 / 机械轨执行超时
+REASON_SUITE_LOAD_FAILED = "suite_load_failed"    # 验收套件 load 失败（digest 校验 fail-closed）
+REASON_WORKTREE_SETUP_FAILED = "worktree_setup_failed"    # 验证 worktree 建立失败（agent 轨）
+REASON_EXAM_SNAPSHOT_MISMATCH = "exam_snapshot_mismatch"  # 考卷不变式破坏（dispatch 构造分支）
+INVALID_REASONS = frozenset({
+    REASON_UNRESOLVED, REASON_ANCHOR_VIOLATION, REASON_WALLCLOCK_TIMEOUT,
+    REASON_SUITE_LOAD_FAILED, REASON_WORKTREE_SETUP_FAILED, REASON_EXAM_SNAPSHOT_MISMATCH})
+
 
 @dataclass
 class BashExecution:
@@ -202,6 +216,20 @@ def derive_verdict(matched: dict[str, BashExecution | None],
     return VERDICT_RED if any(ex.exit_code != 0 for ex in matched.values()) else VERDICT_GREEN
 
 
+def derive_invalid_reason(matched: dict[str, BashExecution | None],
+                          anchor_workspace_ok: bool,
+                          anchor_digest_violations: list[str]) -> str | None:
+    """invalid 时细分成因（REASON_* 枚举）；非 invalid（green/red）返回 None。
+
+    分支序与 build_verify_report 人读 reason 一致：unresolved（锚①不可判读）优先于
+    anchor_violation——两者并存时报 unresolved（与既有判定分支同判，不引入新语义）。"""
+    if any(ex is None for ex in matched.values()):
+        return REASON_UNRESOLVED
+    if not anchor_workspace_ok or anchor_digest_violations:
+        return REASON_ANCHOR_VIOLATION
+    return None
+
+
 def build_verify_report(*, run_id: str, project: str, prd_id: str, iteration_id: str,
                         harness: str, gate_cmd: str | None, gate_source: str,
                         matched: dict[str, BashExecution | None],
@@ -238,6 +266,7 @@ def build_verify_report(*, run_id: str, project: str, prd_id: str, iteration_id:
                                          "violations": anchor_digest_violations}},
         "verdict": verdict,
         "reason": reason,
+        "invalid_reason": derive_invalid_reason(matched, anchor_workspace_ok, anchor_digest_violations),
         "evidence": {"stream_path": stream_path},
         "session": session_meta,
         "env_parity": {"declared": env_spec, "observed_exports": env_observed,

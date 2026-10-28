@@ -286,3 +286,77 @@ def test_css_baseline_present():
     """CSS 底线静态锚：focus 可见态 / hover / 长内容截断与滚动 / 表格容器均入 _STYLE。"""
     for pat in (":focus", "button:hover", "text-overflow:ellipsis", "pre.maxh", ".tablewrap"):
         assert pat in panel._STYLE
+
+
+# ── fix-event-outlet-verify-parity：events 尾部 + verify-report run 详情扩容 ──
+
+
+def _dispatched_run(tmp_path, client, d, eng, lc):
+    """派发一个 run → 返回 (rid, runs_dir, stamp, prd_stem)——事件/verify-report 寻址三要素。"""
+    prd = tmp_path / "p.md"
+    prd.write_text("# x", encoding="utf-8")
+    qid = eng.enqueue("proj-a", str(prd), "roc")
+    lc.tick_dispatch()
+    run = d.runs_for_item(qid)[0]
+    run_dir = Path(run["run_dir"])
+    return run["id"], run_dir.parent, run_dir.name.split("_", 1)[0], Path(prd).stem
+
+
+def test_panel_run_detail_events_tail_and_verify_report(tmp_path):
+    """events 尾部行原样（acceptance_suite / invalid reason 可见）+ verify-report 关键节渲染。"""
+    import json as _json
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    rid, runs_dir, stamp, stem = _dispatched_run(tmp_path, client, d, eng, lc)
+
+    (runs_dir / f"{stamp}_{stem}.events.jsonl").write_text(
+        '{"v":1,"event":"verify_verdict","verdict":"invalid","reason":"wallclock_timeout"}\n'
+        '{"v":1,"event":"acceptance_suite","status":"absent","reason":"no_harness"}\n',
+        encoding="utf-8")
+    vr = {
+        "schema_version": "pa.verify-report.v1",
+        "run": {"run_id": stamp, "prd_id": stem, "harness": "pytest"},
+        "commands": {"source": "profile", "gate_cmd": None,
+                     "results": [{"declared": "npm test", "unresolved": False,
+                                  "matched_command": "cd wt && npm test", "exit_code": 1}]},
+        "anchors": {"workspace_clean": {"ok": True, "detail": "ok"},
+                    "injected_digests": {"ok": False, "violations": ["digest-mismatch:t.py"]}},
+        "verdict": "invalid", "reason": "unresolved（declared 未被执行/变体不可判读）",
+        "invalid_reason": "unresolved",
+        "evidence": {"stream_path": "/x/y.verify-stream.jsonl"},
+        "env_parity": {"declared": "", "observed_exports": {"FOO": ["1"]}, "note": "v1 记录不阻断"},
+    }
+    (runs_dir / f"{stamp}_{stem}.verify-report.json").write_text(
+        _json.dumps(vr, ensure_ascii=False), encoding="utf-8")
+
+    html = client.get(f"/panel/runs/{rid}").text
+    assert "events 尾部" in html                                   # 新展示区标题
+    assert "acceptance_suite" in html and "no_harness" in html      # 事件行原样可见
+    assert "wallclock_timeout" in html                              # invalid reason 原样可见
+    # verify-report 机械表格：判定节（verdict + invalid_reason + 人读 reason）+ 逐命令 + 锚
+    assert "verify-report" in html
+    assert "unresolved（declared 未被执行/变体不可判读）" in html    # 人读 reason 原样
+    assert "invalid_reason" in html and "npm test" in html
+    assert "cd wt &amp;&amp; npm test" in html                      # 命令经 _esc
+    assert "digest-mismatch:t.py" in html                           # 锚 violation 原样
+    assert "v1 记录不阻断" in html                                  # 环境奇偶 note 原样
+
+
+def test_panel_run_detail_missing_events_and_verify_report_placeholder(tmp_path):
+    """缺失显式占位非错误态（与「无 journal」「无报告」同模式）。"""
+    client, d, eng, lc = _mk(tmp_path, _AUTH_ENV)
+    _login(client, lc)
+    rid, *_ = _dispatched_run(tmp_path, client, d, eng, lc)
+    html = client.get(f"/panel/runs/{rid}").text
+    assert "无 verify-report" in html and "（无 events）" in html
+
+
+def test_panel_verify_report_render_zero_semantics(tmp_path):
+    """零语义渲染铁律：verify-report 节只透传字段，无 hub 侧结论性文本（判词只来自文件）。"""
+    html = panel.render_run_detail(
+        {"id": 1, "project": "p", "status": "succeeded", "exit_code": 0,
+         "run_dir": "/x", "started_at": "t", "ended_at": "t"},
+        [], None, events_tail=[], verify_report={"verdict": "green", "reason": "全净"})
+    assert "verify-report" in html and "全净" in html                 # 文件字段原样
+    for hub_verdict_word in ("hub 判定", "结论：", "不合格", "建议"):  # hub 不产结论
+        assert hub_verdict_word not in html

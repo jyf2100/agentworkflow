@@ -81,11 +81,16 @@ def test_stage_critic_emits_verdict_events(tmp_path, monkeypatch):
                         lambda path, src, prof: {"verdict": next(verdicts), "prd_path": path,
                                                  "project": proj_of[path], "summary": "s1"})
     run_daily.stage_critic(_args(), manifest, {}, STAMP)
-    # Assert：两 project 各自事件文件（slug = PRD stem），verdict 机械转发
+    # Assert：两 project 各自事件文件（slug = PRD stem），verdict 机械转发。
+    # fix-event-outlet-verify-parity 1.3 起 pass 项随后编套件再产 acceptance_suite 行
+    # （PRD 文件不在 → absent no_criteria）——pass 项双事件、drop 项单行。
     e1 = tmp_path / "runs" / "p1" / f"{STAMP}_{STAMP}_a.events.jsonl"
     e2 = tmp_path / "runs" / "p2" / f"{STAMP}_{STAMP}_b.events.jsonl"
-    assert json.loads(e1.read_text(encoding="utf-8"))["verdict"] == "pass"
-    assert json.loads(e2.read_text(encoding="utf-8"))["verdict"] == "drop"
+    l1 = [json.loads(ln) for ln in e1.read_text(encoding="utf-8").splitlines()]
+    l2 = [json.loads(ln) for ln in e2.read_text(encoding="utf-8").splitlines()]
+    assert [ln for ln in l1 if ln["event"] == "critic_verdict"][0]["verdict"] == "pass"
+    assert [ln for ln in l1 if ln["event"] == "acceptance_suite"][0]["status"] == "absent"
+    assert l2[0]["verdict"] == "drop" and len(l2) == 1   # drop 不编套件 → 无 acceptance 行
 
 
 def test_stage_critic_reuse_gate_does_not_reemit(tmp_path, monkeypatch):

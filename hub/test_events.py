@@ -277,3 +277,61 @@ def test_abandon_stderr_when_channel_off(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "通道关闭" in err and "proj-a" in err        # 降级留痕可见
     assert d.list_items()[0]["status"] == "failed"       # fail_item 不受通知面影响
+
+
+# ── fix-event-outlet-verify-parity：invalid reason / acceptance_suite 判读 ──
+
+
+def test_forward_verify_invalid_reason_to_channel(tmp_path):
+    """verify invalid ≠ pass → 进频道（既有规则钉死防回归）+ 文本机械拼 reason（六成因枚举值）。"""
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
+    lc, d, fake, data = _mk(tmp_path, mm=mm)
+    _running_run_with_events(lc, d, fake, tmp_path, [
+        _line(0, "verify_verdict", verdict="invalid", round=1, reason="wallclock_timeout", summary="")])
+    lc.reconcile_running()
+    assert len(mm.dms) == 1 and len(mm.channels) == 1
+    assert "verify 判定 → invalid" in mm.channels[0][1]
+    assert "wallclock_timeout" in mm.channels[0][1]      # reason 机械拼接可见（triage 入口）
+
+
+def test_forward_verify_revise_text_unchanged(tmp_path):
+    """旧版回归锚：语义审轨 pass/revise 行无 reason 字段 → 文本零变化（round 拼接位置不动）。"""
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
+    lc, d, fake, data = _mk(tmp_path, mm=mm)
+    _running_run_with_events(lc, d, fake, tmp_path, [
+        _line(0, "verify_verdict", verdict="revise", round=2, summary="测试未过")])
+    lc.reconcile_running()
+    t = mm.channels[0][1]                                # revise ≠ pass → 频道（既有规则不变）
+    assert "verify 判定 → revise（round 2）" in t and "测试未过" in t
+    assert "reason" not in t and "原因" not in t          # 无 reason 行 → 不拼 reason 节
+
+
+def test_forward_acceptance_absent_to_channel(tmp_path):
+    """acceptance absent：进频道（套件缺位是推进阻断，团队可见）；reason/detail 机械拼接。"""
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
+    lc, d, fake, data = _mk(tmp_path, mm=mm)
+    _running_run_with_events(lc, d, fake, tmp_path, [
+        _line(0, "acceptance_suite", status="absent", reason="no_harness",
+              detail="profile 未声明 harness")])
+    lc.reconcile_running()
+    assert len(mm.dms) == 1 and len(mm.channels) == 1
+    t = mm.channels[0][1]
+    assert "acceptance" in t and "absent" in t and "no_harness" in t
+    assert "profile 未声明 harness" in t
+
+
+def test_forward_acceptance_stored_dm_only_with_supersedes_chain(tmp_path):
+    """acceptance stored：正常产出仅私信；换版（supersedes 非 null）文本附换版链。"""
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID})
+    lc, d, fake, data = _mk(tmp_path, mm=mm)
+    _running_run_with_events(lc, d, fake, tmp_path, [
+        _line(0, "acceptance_suite", status="stored", digest="a" * 64,
+              criteria_ids=["c1"], supersedes=None),
+        _line(1, "acceptance_suite", status="stored", digest="b" * 64,
+              criteria_ids=["c1"], supersedes="a" * 64)])
+    lc.reconcile_running()
+    assert len(mm.dms) == 2 and mm.channels == []         # stored 永不进频道
+    t0, t1 = mm.dms[0][1], mm.dms[1][1]
+    assert "stored" in t0 and "a" * 64 in t0
+    assert "supersedes" not in t0.lower()                  # 首版（null）无换版链
+    assert "supersedes" in t1.lower() and "a" * 64 in t1   # 换版行附链（旧 digest 可回查）

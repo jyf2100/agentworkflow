@@ -410,6 +410,20 @@ verify 双轨：
 - **证据面**：stream 原始流 `<log>.verify-stream.jsonl` + 完整报告 `<log>.verify-report.json`
   （含环境奇偶节）+ testout `<log>.testout`（行锚解析输入），全在 `state/runs/` 下，dispatch
   record 持路径。
+- **invalid 排障 playbook（fix-event-outlet-verify-parity 3.1）**：invalid 行必附结构化
+  `reason` ∈ 六值枚举（事件出口 `verify_verdict` 行 + verify-report `invalid_reason` 字段
+  同值——单一定义点 `verify_stream.INVALID_REASONS`）。hub 面板 run 详情页有 events 尾部行
+  + verify-report 机械表格（判定/逐命令/锚/环境奇偶原样），六分流各查对应节：
+
+  | reason | 查什么 | verify-report 对应节 |
+  |---|---|---|
+  | `unresolved` | 命令匹配面——declared cmd 在 transcript 无全等末端段匹配（变体/未执行） | commands.results[] 的 `unresolved: true` 行 + evidence.stream_path 原始流比对 |
+  | `anchor_violation` | 锚②③——工作区不净或注入件 digest 不符 | anchors.workspace_clean.detail / anchors.injected_digests.violations |
+  | `wallclock_timeout` | 环境奇偶节与墙钟上限——`PA_VERIFY_WALL_CLOCK` 覆盖 > hub 3600s > 本机 1200s（`VERIFY_INSTALL/TEST_TIMEOUT` 量级合并）；agent 轨会话超时与机械轨执行超时同归此值 | env_parity（declared spec vs transcript 观测装配）+ session 时长 |
+  | `suite_load_failed` | acceptance store 完整性——digest 校验 fail-closed（load_suite 失败） | commands.source/gate_cmd（套件来源）+ state/acceptance store 落盘核对 |
+  | `worktree_setup_failed` | git worktree / 磁盘 / 并发残留——`git worktree add` 失败（agent 轨专用成因；机械轨同因走跳过语义不进 invalid 分流） | （此成因 verify-report 未产出——查 hub run 日志与目标仓 `.worktrees/` 残留） |
+  | `exam_snapshot_mismatch` | **控制面双注入链路**（dispatch 考卷不变式）——dev 注入 digest ≠ 快照，非目标仓问题 | （此成因在 dispatch 构造分支——查 dispatch record `verify` 节 + 控制面 journal） |
+
 - **回滚**：flag off 即回机械轨（零残留——机械轨从未被改动语义，仅加 `verdict` 派生键）。
 
 canary（tasks 3.3）：同 PRD 双跑对账机械轨 vs agent 轨绿红分布，分歧按象限分解报；shadow parity /

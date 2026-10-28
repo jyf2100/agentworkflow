@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 EVENT_VERSION = 1  # 与 pa event_outlet.EVENT_VERSION 同值——两文件一处契约
-KNOWN_EVENTS = frozenset({"critic_verdict", "pr_opened", "verify_verdict"})
+KNOWN_EVENTS = frozenset({"critic_verdict", "pr_opened", "verify_verdict", "acceptance_suite"})
 
 
 def read_events(path: Path) -> list[dict]:
