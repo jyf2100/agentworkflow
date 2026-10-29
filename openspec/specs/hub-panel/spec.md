@@ -7,7 +7,7 @@ hub 面板能力：浏览器提交入口（会话强制 + evidence 机械必填�
 ## Requirements
 
 ### Requirement: 面板提交入口（会话强制 + evidence 机械必填 + 包装态落盘）
-hub 面板提交入口在原有守卫与 evidence 必填之上，落盘契约修订为**包装态**：
+hub 面板提交入口在原有守卫与 evidence 必填之上，落盘契约 SHALL 修订为**包装态**：
 面板通道落盘的 PRD 一律带 hub 机械生成的 YAML frontmatter（`project`（白名单值）、
 `source_path: ''`（手写注入无源是 pa 预期态，不伪造路径——source_path 在 pa 侧被
 critic/dispatch 当路径消费）、`evidence`（面板依据落盘可审计，单行化 + 转义，上限
@@ -105,7 +105,7 @@ hub SHALL 提供面板只读页：队列状态列表、run 列表（含终态与
 - **THEN** 落盘 profile 含 `forge: gitcode`（无 host 键）+ repo 两级全路径
 
 ### Requirement: 面板项目建档
-hub 面板应提供项目建档入口：已登录的 admin 会话经表单提交项目档案
+hub 面板 SHALL 提供项目建档入口：已登录的 admin 会话经表单提交项目档案
 （name / repo / goal / match_surface one_liner），hub 以机械落盘在
 `HUB_DATA_ROOT/<name>/` 下创建启动必读面（`profiles/<name>.yaml` + `sources.yaml`），
 建档后项目立即进入提交页 project 清单。项目档案定性为运行时配置（真相源 =
@@ -129,7 +129,7 @@ hub 面板应提供项目建档入口：已登录的 admin 会话经表单提交
 - **THEN** 403 明确报错（admins 未配置时空缺省=任何有效会话放行）
 
 ### Requirement: 面板 run 操作（重跑 / 放弃）
-hub 面板应在队列页提供人工操作：对 `failed` 队列项**重跑**（以原 PRD 与原 project
+hub 面板 SHALL 在队列页提供人工操作：对 `failed` 队列项**重跑**（以原 PRD 与原 project
 新建队列项，发起人=当前操作者；旧行留审计），对 `pending` 队列项**放弃**（转终态
 failed + last_error 记因，行保留审计——与 REST `DELETE /queue/{id}` 同一语义同一实现）。
 两操作均须 admin 会话。
