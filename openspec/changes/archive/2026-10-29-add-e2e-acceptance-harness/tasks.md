@@ -21,4 +21,5 @@
 
 - [x] 4.1 单测：harness=playwright 全链（声明放行/缺 e2e_dev_cmd 前置拦/file 形态自检/sleep 与无 webServer 拒收/命令映射 `playwright test` 非 npx/detect_runner 映射与 playwright 失败输出锚解析（锁版实测 fixture）/flaky 计绿/未声明项目零变化）——离线 fixture
 - [x] 4.2 `bash scripts/quality.sh` + `bash hub/quality.sh` 双绿
-- [ ] 4.3 真机坐实（发版后）：cc-web-control profile 临时声明 `harness: playwright` + `e2e_dev_cmd`，发一条 E2E 可测需求（如「主题切换按钮点击后 body data-theme 变更」），全链入队→test-author 产 e2e 套件（webServer 起停自动）→dev→verify 机械锚→终态回流频道；坐实后 profile 还原与否听用户
+- [x] 4.3 真机坐实（发版后）：cc-web-control profile 临时声明 `harness: playwright` + `e2e_dev_cmd`，发一条 E2E 可测需求（如「主题切换按钮点击后 body data-theme 变更」），全链入队→test-author 产 e2e 套件（webServer 起停自动）→dev→verify 机械锚→终态回流频道；坐实后 profile 还原与否听用户
+  - **坐实（2026-10-28，hub run #85 / 容器 m16 / 镜像 v0.1.24，PRD = e2e-login-version-footer）**：全链一次过——入队 → critic PASS → test-author 在 playwright harness 产 e2e 套件（2 文件，3 criteria 全覆盖 uncovered=0，digest 33a261c9…）→ dev 双注入落地（e2e spec 原样落盘一字未改 + playwright.config.ts 环境对接修正：CC_WEB_PORT/webServer command 重写/chromium-1248 对 /opt/ms-playwright）→ verify agent 轨执行（注入件 sha256 复核过，e2e declared 命令 exit 1 → 红，见 agent-verify-injection 3.3 注记）→ PR #60 开、红标 failing 留 review、report 段正确分类（failing 1 + 🔴标注，非静默全绿）。终态已回流（run 容器日志 + 项目推进报告_20261028m16.md）。profile 还原与否听用户（备份在 /tmp/cc-web-control.yaml.bak-e2e）。
