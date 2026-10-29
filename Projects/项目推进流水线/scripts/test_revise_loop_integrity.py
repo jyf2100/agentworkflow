@@ -83,6 +83,7 @@ def test_round2_gets_round1_revisions_not_blind(tmp_path, monkeypatch):
     prd = tmp_path / f"{STAMP}_f.md"; prd.write_text(_PRD, encoding="utf-8")
     manifest = {"prds": [{"project": "p1", "path": str(prd), "source_path": ""}]}
     seen = []
+    prd_tools = []
     def _fake_critic(path, src, prof, mm_src=None, revisions=None):
         seen.append(revisions)
         if revisions is None:                                    # round1
@@ -91,12 +92,14 @@ def test_round2_gets_round1_revisions_not_blind(tmp_path, monkeypatch):
     monkeypatch.setattr(run_daily, "_critic_one", _fake_critic)
     # 顺序：_critic_one(r1) → pa-prd r2 改文件 → sha 门过 → _critic_one(r2 带 revisions)
     def _fake_prd(*a, **k):
+        prd_tools.append(k.get("allowed_tools"))
         prd.write_text(_PRD + "\n背景色 #f6f1e7。", encoding="utf-8")
         return ({"prds": [{"path": str(prd)}]}, {"cost": 0.01})
     monkeypatch.setattr(run_daily, "run_persona_with_backoff", _fake_prd)
     gate = run_daily.stage_critic(_args(), manifest, {"p1": {"name": "p1"}}, STAMP)
 
     assert seen[0] is None and seen[1] == _REVISE_EXTRA["revisions_needed"]  # r1 盲/r2 带反馈
+    assert prd_tools == [["Read", "Write"]]      # headless Write 预批准（run #98 容器实证漏挂必拒）
     assert gate[1]["verdict"] == "pass"
 
 

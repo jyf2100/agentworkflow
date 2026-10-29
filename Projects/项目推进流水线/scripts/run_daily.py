@@ -1710,7 +1710,8 @@ def stage_prd(args, candidates_payload, profiles, stamp) -> dict:
         return empty
 
     log(f"[prd] 翻译 {len(candidates)} 条候选 → PRD")
-    payload, meta = run_persona_with_backoff("pa-prd", prd_prompt(candidates, profiles, stamp), "prd", "prd")
+    payload, meta = run_persona_with_backoff("pa-prd", prd_prompt(candidates, profiles, stamp), "prd", "prd",
+                                              allowed_tools=["Read", "Write"])   # 同 revise 面：headless Write 需预批准（run #98 容器实证）
     log(f"[prd] ✅ PRD={len(payload.get('prds',[]))} skipped={len(payload.get('skipped',[]))}｜cost=${meta['cost']:.4f} turns={meta['turns']}")
     for prd in payload.get("prds", []):
         log(f"        - {prd.get('path')}")
@@ -1784,7 +1785,10 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
             _sha_before = _file_sha(Path(path))
             try:
                 rev_payload, _ = run_persona_with_backoff(
-                    "pa-prd", prd_prompt([], profiles, stamp, revise=rev), "prd", f"prd-revise:{proj}")
+                    "pa-prd", prd_prompt([], profiles, stamp, revise=rev), "prd", f"prd-revise:{proj}",
+                    allowed_tools=["Read", "Write"])   # 2026-10-29 run #109/#98 实证：不带
+                    # --allowedTools 的 headless Write 无批准链必拒（容器无权限记忆）——修订
+                    # 永不落盘，sha 防御按 drop。对齐 test-author 面预批准 pa-prd 声明的工具。
                 rev_prd = (rev_payload.get("prds") or [{}])[0]
                 rev_path = rev_prd.get("path", path)
                 # 假通防御（2026-10-29 run #109 实证）：pa-prd 声称重写但原文件未变（frontmatter
