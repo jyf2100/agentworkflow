@@ -33,6 +33,13 @@ AND 不产生 judge run_log 条目。
 方向评判 SHALL 由独立于 dev 实现的 persona（`pa-progress`）承担，判据是"当前 diff 是否在解决 PRD 验收标准"，MUST NOT 依赖测试绿/红、MUST NOT 要求测试产物。输出 payload MUST 含受控 `verdict ∈ {on_track, off_track}`，并附 `covered`（已覆盖的验收点）/ `off_topic`（跑偏项）/ `redirect_hint`（可执行纠偏指引）/ `summary`。judger SHALL NOT 修改任何项目文件（只 Read + 判 + 写 JSON）。
 
 - rubric 由 judger 自抽：PRD 全文整段喂入，judger 自行定位验收标准节（零接线，不动 pa-prd / build_prompt / parse_args）。
+- 验收基建豁免：为让验收测试可跑的前置基建（装测试框架/依赖、配 harness/测试环境对接）是到达验收标准的必经路径，判据 SHALL 视其为在轨，不判 off_track。
+
+#### Scenario: 验收基建期不判 off_track
+
+WHEN PRD 验收形态依赖某测试基建（如 e2e 验收需 playwright 入位），而当前 diff 仅为让验收测试可跑的前置基建改动（装框架依赖、配 harness/测试环境对接），尚未直接实现验收点
+THEN 评判判 `on_track`（`covered` 标注为验收基建）
+AND MUST NOT 判 off_track——基建是到达验收点的必经路径，不构成跑偏（run 20261029 #89 标本：dev 搭 playwright 验收基建被窄判据误判 off_track ×2 止损）。
 
 #### Scenario: 评判返回受控方向判定
 

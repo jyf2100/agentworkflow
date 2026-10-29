@@ -143,6 +143,16 @@ def test_build_progress_prompt_contains_prd_diff_and_contract():
     assert "redirect_hint" in p
 
 
+def test_build_progress_prompt_includes_infra_exemption():
+    """验收基建期豁免（RUNBOOK §20.1 立案①，run 20261029 #89 标本）：dev 搭 playwright
+    验收测试基建（装依赖/配 harness）属 PRD 范围，但 diff 形态不直接实现验收点 → 窄判据
+    「diff 是否在解决验收标准」误判 off_track ×2 止损。prompt 判据须明示基建豁免——
+    基建是到达验收点的必经路径，算在轨不判跑偏。"""
+    p = sg.build_progress_prompt("MY_PRD_TEXT", "MY_DIFF_TEXT")
+    assert "验收基建" in p and "必经" in p
+    assert "不判 off_track" in p or "不判off_track" in p
+
+
 def test_build_redirect_prompt_appends_hint_to_base():
     p = sg.build_redirect_prompt("BASE_PROMPT", "转向验收标准 A1")
     assert p.startswith("BASE_PROMPT")
