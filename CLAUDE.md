@@ -106,7 +106,7 @@ persona 调用**默认省略 model 参数** → 走 roc LiteLLM 代理默认（`
 **per-agent 模型路由**（spec: `openspec/specs/per-agent-model-routing/`，默认零变更）：每个 agent 可经 env 单独配模型，不设 = 走 roc 默认（baseline 不变）。
 - **persona**（9 个）：env `PA_PERSONA_MODEL_<AGENT>` → CLI `--model=<值>`（equals 单 token）。`<AGENT>` = `agent_name.upper().replace('-', '_')`（如 pa-progress → `PA_PERSONA_MODEL_PA_PROGRESS`、pa-fetch-github-repo → `PA_PERSONA_MODEL_PA_FETCH_GITHUB_REPO`、pa-test-author → `PA_PERSONA_MODEL_PA_TEST_AUTHOR`）。两处 base_cmd 镜像（`scripts/persona_call.py` + `scripts/run_daily.py`）；空串 env warn、命中记 route 审计 log。
 - **dev loop**：`PA_DEV_MODEL` env（cron 经 subprocess 继承）或 `dev-agent.py --model`（手动/canary）；优先级 flag > env > roc 默认（flag 精确语义 `is not None`：空 flag 胜出不回退 env）。
-- **值约束**：roc fast alias（`haiku` / `sonnet` / `opus` / `fable`）或裸 `glm-*`。`haiku` = glm-5.1（更轻），其余 = glm-5.2[1M]。裸 Anthropic id 被 roc 拒（运行时）。详见 `openspec/specs/per-agent-model-routing/`。
+- **值约束**：roc fast alias（`haiku` / `sonnet` / `opus` / `fable`）或裸 `glm-*`。`haiku` = glm-5.1（更轻），其余 = glm-5.2[1M]。裸 Anthropic id 被 roc 拒（运行时）。**alias 仅本机 CLI 直调形态合法**（CLI 侧 env 映射翻译；hub 容器 CLI 会把 alias 本地解析成裸 Anthropic id → roc 400，容器内须裸模型名，run 93 实证）。详见 `openspec/specs/per-agent-model-routing/`。
 - **配置点（主）**：`Projects/项目推进流水线/config/model-routing.json`（独立文件，纯 JSON）——`model_routing.py` 解析，3 消费点（`persona_call`/`run_persona`/`_dev_cmd`）读它。例：`{"pa-progress": "haiku", "dev": "sonnet"}`。不设 = 默认 glm-5.2。
 - **配置点（canary 覆盖）**：env `PA_*_MODEL` 优先于文件（临时覆盖，仍可经 `~/.claude/settings.json` env block 配，`_load_claude_settings_env` 注入）。优先级 **env > 文件 > roc**。
 

@@ -95,15 +95,28 @@ AND dev loop 路由到 glm-5.1。
 WHEN run_daily.py 经 subprocess 启动 dev-agent 且父进程 env 含 `PA_DEV_MODEL=sonnet`
 THEN dev-agent subprocess 经 `dict(os.environ)` 继承到 `PA_DEV_MODEL`
 AND `_build_options` 读到 → model="sonnet"，无需 run_daily 在 cmd 里显式传 `--model`。
-### Requirement: Model value is roc-recognized alias (runtime constraint)
+### Requirement: Model value is roc-recognized (runtime constraint, form-dependent)
 
-`--model` / `PA_DEV_MODEL` 的值 MUST 是 roc 认的 alias（`haiku` / `sonnet` / `opus` / `fable`）或裸 `glm-*`。**裸 Anthropic model id（如 `claude-sonnet-5`）会被 roc 代理拒绝**。本约束是 roc 层运行时校验，代码层 MUST NOT 维护 alias 白名单（避免随 roc 升级腐化）；非法值经 persona_call 现有 `is_error` / 非零退出 raise 路径冒泡。
+`--model` / `PA_DEV_MODEL` 的值 MUST 是 roc 代理认的模型值，且**合法性依赖调用形态**（run 93 真机实证，2026-10-28）：
 
-#### Scenario: 合法 alias 路由到对应 glm 模型
+- **本机 CLI 直调形态**（roc mac cron / 手动）：alias（`haiku` / `sonnet` / `opus` / `fable`）合法——CLI 侧经 `ANTHROPIC_DEFAULT_*_MODEL` env 映射把 alias 翻译成 glm 后发 roc。
+- **hub 容器形态**（pa-executor 镜像，CLI 2.1.220 实证）：alias **不合法**——容器 CLI 无该 env 映射，把 alias 本地解析成**裸 Anthropic model id**（`sonnet` → `claude-sonnet-5`）发出 → roc 代理 400 拒绝。容器内 MUST 用裸模型名（`glm-*` 及 roc 部署的其他裸模型名）。
+- 两种形态下**裸 Anthropic model id（如 `claude-sonnet-5`）都会被 roc 拒绝**。
 
-WHEN `PA_PERSONA_MODEL_PA_PROGRESS=haiku` 且 pa-progress 跑通
-THEN roc 把 `--model haiku` 路由到 `glm-5.1`（`ANTHROPIC_DEFAULT_HAIKU_MODEL`）
+本约束是 roc/CLI 层运行时事实，代码层 MUST NOT 维护 alias 白名单（避免随 roc 升级腐化）；非法值经 persona_call 现有 `is_error` / 非零退出 raise 路径冒泡。
+
+#### Scenario: 本机形态合法 alias 路由到对应 glm 模型
+
+WHEN 本机 CLI 直调形态下 `PA_PERSONA_MODEL_PA_PROGRESS=haiku` 且 pa-progress 跑通
+THEN CLI 经 env 映射把 `--model haiku` 翻译后发 roc，路由到 `glm-5.1`
 AND persona_call `meta["model"]`（= outer `modelUsage`）反映 glm-5.1。
+
+#### Scenario: 容器形态 alias 被 CLI 解析成裸 id 遭 roc 拒（run 93 标本）
+
+WHEN hub 容器形态下 env 注入 `PA_PERSONA_MODEL_PA_PRD=sonnet`
+THEN 容器 CLI 把 `sonnet` 本地解析成 `claude-sonnet-5` 发出
+AND roc 代理 400 拒绝该请求
+AND persona_call 经现有 is_error / 非零退出路径 raise（不静默吞），错误可见。
 
 #### Scenario: 非法裸 Anthropic id 被 roc 拒并冒泡
 
@@ -116,7 +129,7 @@ per-agent 模型路由的**主配置源** SHALL 是独立文件 `Projects/项目
 
 env `PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL` SHALL 保留作 canary 覆盖（临时覆盖主配置）。persona 优先级 SHALL 为 **env > 文件 > roc**；dev 经 `run_daily._dev_cmd` 解析 `env or resolve_dev_model()` 透传 `--model` flag（dev-agent 是 ADR-0006 纯调度器，不读控制面文件）。`_load_claude_settings_env` 的 `PA_*_MODEL` 注入保留作可选 canary 通道（env 配在 settings.json 时生效），日常用文件则不触发。
 
-**容器形态（execution-hub / pa-executor 镜像）限定**：文件主点 SHALL 视为 vault 本机形态专属配置面——executor 镜像 MUST NOT 含 `config/` 目录（patch.Dockerfile 不 COPY），hub 派发的执行容器内路由 SHALL 仅经 env 点（`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL`，经 hub 进程 env `PA_*` 透传注入容器）。这是有意的部署面选择（裁决 2026-10-27）：路由随 hub.env 差异化、改后即刻生效，烤进镜像会把路由钉死在发布时点。文件主点在容器内缺失 SHALL 走既有 None 降级（零变更 baseline），MUST NOT 告警——镜像内本就不预期存在该文件。
+**容器形态（execution-hub / pa-executor 镜像）限定**：文件主点 SHALL 视为 vault 本机形态专属配置面——executor 镜像 MUST NOT 含 `config/` 目录（patch.Dockerfile 不 COPY；全量构建面经 vault 根 `.dockerignore` 排除固化——run 93 实证 `COPY .` 曾把带 alias 值的 config 带进镜像，v0.1.23 临时删 context 重建后以此固化），hub 派发的执行容器内路由 SHALL 仅经 env 点（`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL`，经 hub 进程 env `PA_*` 透传注入容器；值须裸模型名——见值约束 requirement 的形态限定）。这是有意的部署面选择（裁决 2026-10-27）：路由随 hub.env 差异化、改后即刻生效，烤进镜像会把路由钉死在发布时点。文件主点在容器内缺失 SHALL 走既有 None 降级（零变更 baseline），MUST NOT 告警——镜像内本就不预期存在该文件。
 
 #### Scenario: config 文件配 pa-progress → persona cmd 含 --model
 

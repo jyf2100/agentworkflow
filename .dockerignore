@@ -1,0 +1,6 @@
+# 全量构建面（pa-executor.Dockerfile 的 COPY . /opt/pa）排除清单。
+# patch.Dockerfile 本就不 COPY config/；此处固化全量构建同边界（run 93 实证：
+# config/model-routing.json 带 alias 值进镜像 → 容器 CLI 把 alias 解析成裸
+# Anthropic id → roc 400 拒。spec: per-agent-model-routing 容器形态限定，
+# 裁决 2026-10-27：文件主点是本机形态专属配置面，容器内路由仅经 env 点）。
+Projects/项目推进流水线/config/
