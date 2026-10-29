@@ -14,6 +14,6 @@
 
 ## 3. 真机坐实 + 归档门
 
-- [ ] 3.1 quality.sh 全绿（pa + hub 两门）+ `openspec validate add-pipeline-outcome-observability` 过
+- [x] 3.1 quality.sh 全绿（pa + hub 两门）+ `openspec validate add-pipeline-outcome-observability` 过
 - [ ] 3.2 镜像 v0.1.25 叠带入队重跑一轮：MM 收到业务终态文本（红/绿计数 + PR 链接，非裸 exit 0）+ run_dir 有 `.stdout.log` + 挂载卷有 outcome 文件——四处核对（通知文本 / outcome / stdout / record 对称）齐后归档
-- [ ] 3.3 `RUNBOOK.md` 观测面小节：outcome 契约路径 + `.stdout.log` 语义 + 通知回退路径；`CONTEXT.md` 术语表补 pipeline_outcome
+- [x] 3.3 `RUNBOOK.md` 观测面小节：outcome 契约路径 + `.stdout.log` 语义 + 通知回退路径；`CONTEXT.md` 术语表补 pipeline_outcome

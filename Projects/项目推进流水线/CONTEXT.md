@@ -109,6 +109,10 @@ _Avoid_: checkpoint、evidence（那是 test_evidence 发布门证据）。
 `PA_VERIFY_AGENT` flag（默认 off）开的 verify 第二轨——verify worktree 内 headless verify agent 会话（编排器**机械拷入**考卷非 agent 自写），三锚判定 + verify-report（含环境奇偶节）落 `state/runs/`。off = 机械轨 byte-identical（npm ci+test / dev 上报命令重放）。invalid 三态契约：green/red/invalid，invalid → `status=verify_invalid`（terminal `external_blocked`）+ triage_reason 候选 `acceptance_suite_defective_candidate`。
 _Avoid_: verify 闭环（那是 dispatch 整个 for-round 循环）、pa-verify（那是语义审查 persona，两道闸）。
 
+**业务终态 (Pipeline Outcome)**:
+一次 run 的**机器可读**业务终态单文件快照（schema `pa.pipeline_outcome.v1`）——编排器 report 段终笔落 state 卷根 `pipeline_outcome_<stamp>.json`：summary 六桶计数（green/red/invalid/blocked/abnormal，桶语义对齐 report 段分类）+ prs[] 逐 PRD 终态（verdict 三态原值 + PR 指针 + reason_headline ≤200）+ container.exit_code **附录非判据**。hub 通知面消费它 lead 业务摘要（缺文件回退 exit-code 文本不猜终态）。范畴区分：容器退出码是执行面机械事实（done ≠ 绿）；报告 markdown 是人读面；outcome 是两世界之间的机器契约——「跑成功」与「干成绿活」的本体裂缝出口。写失败 fail-open 不拦 report。
+_Avoid_: 报告（人读面）、exit code（执行面）、metrics（无时序聚合，YAGNI）。
+
 ## 编排拓扑（LangGraph 重构后引入）
 
 > 以下术语随 `langgraph-workflow-upgrade` 重构落地引入（见 `openspec/changes/langgraph-workflow-upgrade/`）。重构前 `drop`/`triaged` 已用于 `run_daily.py`，此处为机械/语义边界精化。

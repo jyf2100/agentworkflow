@@ -647,3 +647,17 @@ dev 亲笔交接工件：断点后新 dev 会话拿到上一 iteration 的结构
 **出站归属路由（6.x）**：频道关系唯一真相 = hub DB `project_channels` 绑定表（`HUB_MM_PROJECT_CHANNELS` env 已废止——首次启动 seed 迁移一次，此后不读）。绑定项目：run 终态（成败皆进）+ 四类语义事件（critic/verify/PR/acceptance，pass/stored 也进——全事件时间线）+ 无 run 放弃告警全量进频道，消息带 `<@发起人>` 提及（26-hex 直拼；username 解析失败降级纯文本），**不重复私信**；频道 post 失败 fail-open 不回退 DM。未绑定项目：私信三代分流不变（§16）。
 
 **真机联调项（离线测试覆盖不了，7.2 留待真机）**：① MM 管理台 slash command 的 Request URL 签名校验行为（hmac.compare_digest 对真 form token）；② slash 转发的 form 字段形态（channel_id/user_id/user_name/text——不同 MM 版本可能带 `team_id` 等多余字段，hub 侧只取已知键应无碍）；③ `/pa run` 全链（bind → 成员发需求 → ephemeral 回执 → 频道时间线 → run 终态回频道含 @）；④ unbind 后出站回落 DM 复核。
+
+## 20. 业务终态观测面（add-pipeline-outcome-observability，2026-10）
+
+四轮真机标本（run 92/#83/#84/#85）钉死根因：容器退出码 ≠ 业务终态（#85 verify verdict=red、PR #60 留 review，MM 只收到「succeeded, exit 0」）。本节 = 三个观测出口的契约与运维。
+
+**pipeline_outcome.json（机器可读业务终态，核心出口）**：编排器 report 段终笔，落容器 state 卷根 `<data_root>/<project>/state/pipeline_outcome_<stamp>.json`（schema `pa.pipeline_outcome.v1`）——summary 六桶计数（green/red/invalid/blocked/abnormal，桶语义对齐 report 段分类：pr_open+绿=green、integrity四态=invalid、blocked 二态、skip/planned/fail=异常）+ prs[] 逐 PRD 终态（status、verify verdict 三态原值、pr_url、pr_number——url 单源兜底析出、reason_headline ≤200 字符）+ container.exit_code 附录（非判据）。**写失败 warn 不拦 report（fail-open）**。`--from-stage report` 断点重跑同命中（自包含从盘读 state）。
+
+**`.stdout.log`（容器 stdout 落盘）**：编排器 log() 全量 tee 落 `<state>/<stamp>.stdout.log`——容器销毁后宿主可复核全链段落行（此前只活在 `docker logs`，容器删即丢）。观测面非真相源：无 fsync、tee 目标不可写 warn 降级仅终端。LLM stream 不进（`.stream.jsonl` 既有面不变）。
+
+**hub 通知消费（MM 文本 lead 业务终态）**：hub `_finish_run` 读同卷 outcome 文件——在手 → 通知 lead 业务摘要（六桶计数 + 逐 PRD 行 🔴/🟢/⚪ + PR #N + reason_headline）+ 尾附「（run → {status}，容器 exit {n}）」；**文件缺 → 回退既有 exit-code 文本 + stderr `[notify][info] 无 pipeline_outcome` 留痕（旧镜像/中断 run 是常态非错误，不猜业务终态）**。升级镜像后首个 run 若仍见回退文本 = 容器在跑旧镜像（对照 §16 陈旧检测）。
+
+**verify-report 逐命令 output_ref**：agent 轨 verify 每条 declared 命令输出落 run_dir `<stem>.cmd<k>.out`，verify-report `commands.results[].output_ref` 持指针——诊红因不翻 10k 行原始 stream（#85 webServer 红因标本驱动）。unresolved 命令无输出无键；落盘失败降级无指针不拦判定。
+
+**dispatch record PR 身份对称**：三处开出点（实查 FOUND / 补开撞并发复用 / gh create 正常开）pr_url 与 pr_number 同源同写 + outcome 出口 url 兜底析出——终态不存在一有一缺。
