@@ -9,7 +9,7 @@
 
 ## 2. hub 通知面
 
-- [ ] 2.1 通知消费 outcome（测试先红）：hub run 完成路径读 run_dir `pipeline_outcome_*.json` 存在 → 通知文本 lead 业务摘要（计数 + PR 链接带 🔴/🟢 标记 + 首红 reason_headline）+ 尾附 exit code；文件缺 → 回退现 exit-code 文本 + hub log 记回退（不猜业务终态）
+- [x] 2.1 通知消费 outcome（测试先红）：hub run 完成路径读 run_dir `pipeline_outcome_*.json` 存在 → 通知文本 lead 业务摘要（计数 + PR 链接带 🔴/🟢 标记 + 首红 reason_headline）+ 尾附 exit code；文件缺 → 回退现 exit-code 文本 + hub log 记回退（不猜业务终态）
 - [ ] 2.2 hub 侧发版：通知改动过 `bash hub/quality.sh` 门；hub 容器小发版（用户授权后执行——生产容器动作逐次授权）
 
 ## 3. 真机坐实 + 归档门

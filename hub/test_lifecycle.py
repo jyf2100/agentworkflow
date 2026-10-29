@@ -554,3 +554,39 @@ def test_image_missing_notifies_failed_to_start(tmp_path):
     assert "failed_to_start" in text and "pa-executor:v0.1.3" in text
     assert d.get_item(qid)["status"] == "failed"  # F13 终态不受通知影响
 
+
+
+# ── add-pipeline-outcome-observability 2.1：_finish_run 读 outcome → 通知 lead 业务摘要 ──
+def test_reconcile_with_outcome_notifies_business_summary(tmp_path):
+    # outcome 文件在手（state 卷根 pipeline_outcome_<stamp>.json）→ 通知 lead 业务终态
+    # 计数 + PR 行，容器退出码降附录；状态机不扰动（done 照落）
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID_A})
+    lc, d, fake, data = _mk(tmp_path, mm=mm)
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    lc.tick_dispatch()
+    run = d.runs_for_item(qid)[0]
+    stamp = Path(run["run_dir"]).name.split("_", 1)[0]
+    (data / "proj-a" / "state" / f"pipeline_outcome_{stamp}.json").write_text(json.dumps({
+        "schema": "pa.pipeline_outcome.v1",
+        "summary": {"green": 0, "red": 1, "invalid": 0, "blocked": 0, "abnormal": 0},
+        "prs": [{"project": "proj-a", "status": "pr_open", "pr_number": 60,
+                 "verify_verdict": "red", "reason_headline": "e2e exit 1"}],
+        "container": {"exit_code": 0}}), encoding="utf-8")
+    fake.finish(run["container_ref"], exit_code=0)
+    lc.reconcile_running()
+    text = mm.dms[0][1]
+    assert "业务终态：🟢0 🔴1" in text and "🔴 PR #60：e2e exit 1" in text
+    assert "容器 exit 0" in text                      # 退出码附录（非 lead）
+    assert d.get_item(qid)["status"] == "done"
+
+
+def test_reconcile_missing_outcome_fallback_logged(tmp_path, capsys):
+    # 无 outcome 文件（旧镜像/中断 run 常态）→ 回退 exit-code 文本 + stderr 留痕不猜
+    mm = notify.FakeMMClient(user_ids={"roc": _MM_ID_A})
+    lc, d, fake, _ = _mk(tmp_path, mm=mm)
+    qid = lc.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    lc.tick_dispatch()
+    fake.finish(d.runs_for_item(qid)[0]["container_ref"], exit_code=0)
+    lc.reconcile_running()
+    assert "→ succeeded，exit 0" in mm.dms[0][1]      # 既有回退文本回归锁
+    assert "无 pipeline_outcome" in capsys.readouterr().err

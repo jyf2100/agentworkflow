@@ -202,11 +202,23 @@ class Lifecycle:
         self._event_seen = {k for k in self._event_seen if k[0] != rid}  # 终态即清（内存有界）
         if self.notifier is None:
             return
+        # 业务终态 outcome 读面（add-pipeline-outcome-observability 2.1）：在手 →
+        # 通知 lead 业务摘要；缺 → 回退 exit-code 文本并 stderr 留痕（不猜业务终态——
+        # 旧镜像/中断 run 无 outcome 文件是常态非错误，info 级）。
+        try:
+            outcome = notify.load_pipeline_outcome(
+                self.cfg.data_root / project / "state", run_dir_name)
+        except Exception as e:  # noqa: BLE001——读面异常同回退（观察面不阻断落库路径）
+            outcome = None
+            print(f"[notify][warn] run#{rid} outcome 读取异常（回退 exit-code 文本）: {type(e).__name__}", file=sys.stderr)
+        if outcome is None:
+            print(f"[notify][info] run#{rid} 无 pipeline_outcome——通知回退 exit-code 文本", file=sys.stderr)
         try:
             self.notifier.notify_run(
                 run_id=rid, project=project, run_dir_name=run_dir_name, status=status,
                 exit_code=exit_code, enqueued_by=(item or {}).get("enqueued_by"),
                 initiator=(item or {}).get("initiator"), last_error=last_error,
+                outcome=outcome,
             )
         except Exception as e:  # noqa: BLE001——观察面绝不阻断执行面（fail-open）
             print(f"[notify][warn] run#{rid} {status} 通知失败（fail-open 不阻断）: {type(e).__name__}", file=sys.stderr)

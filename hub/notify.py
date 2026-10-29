@@ -20,8 +20,10 @@ db 不落卷，丢失兜底是读面查询——绑定表读是路由判据非�
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
+from pathlib import Path
 from typing import Protocol
 
 import httpx
@@ -33,6 +35,25 @@ _MM_ID_RE = re.compile(r"[0-9a-z]{26}")
 
 # 与 api._DELIVER_ENQUEUED_BY 同值（机机通道来源字面量）——测试锁相等防漂移
 VAULT_DELIVER_LITERAL = "vault-deliver"
+
+# verify verdict → 通知图标（outcome 消费面；invalid/无 verdict 统一 ⚪）
+_VERDICT_ICON = {"green": "🟢", "red": "🔴"}
+
+
+def load_pipeline_outcome(state_root: Path, run_dir_name: str) -> dict | None:
+    """run_dir 业务终态 outcome 读面（add-pipeline-outcome-observability 2.1）。
+
+    pa 编排器 report 段终笔落 ``<state_root>/pipeline_outcome_<stamp>.json``
+    （容器形态 state 卷根；stamp = run 目录名前缀，与 events.locate_pa_artifact
+    同判据）。缺/坏/非 dict → None（调用方回退 exit-code 文本，不猜业务终态）。
+    """
+    stamp = run_dir_name.split("_", 1)[0]
+    p = Path(state_root) / f"pipeline_outcome_{stamp}.json"
+    try:
+        o = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return o if isinstance(o, dict) else None
 
 
 def build_notifier(cfg, mm=None, database=None) -> "Notifier | None":
@@ -248,10 +269,11 @@ class Notifier:
 
     def notify_run(self, *, run_id: int, project: str, run_dir_name: str, status: str,
                    exit_code: int | None = None, enqueued_by: str | None = None,
-                   initiator: str | None = None, last_error: str | None = None) -> None:
+                   initiator: str | None = None, last_error: str | None = None,
+                   outcome: dict | None = None) -> None:
         text = self._message(run_id=run_id, project=project, run_dir_name=run_dir_name,
                              status=status, exit_code=exit_code, initiator=initiator,
-                             last_error=last_error)
+                             last_error=last_error, outcome=outcome)
         chan = self._binding_channel(project)
         if chan:  # 绑定 → 频道全终态（成败皆进——频道=项目工作区）+ @提及，不重复私信
             self._post_bound_channel(chan, f"{self._mention(enqueued_by)}{text}", f"run#{run_id}")
@@ -300,7 +322,29 @@ class Notifier:
             print(f"[notify][warn] 事件私信推递异常（fail-open）: {type(e).__name__}", file=sys.stderr)
 
     def _message(self, *, run_id: int, project: str, run_dir_name: str, status: str,
-                 exit_code: int | None, initiator: str | None, last_error: str | None) -> str:
+                 exit_code: int | None, initiator: str | None, last_error: str | None,
+                 outcome: dict | None = None) -> str:
+        """终态通知文本（add-pipeline-outcome-observability 2.1）：outcome 在手 →
+        lead 业务摘要（六桶计数 + 逐 PRD 终态行 🔴/🟢 + 首因 headline），容器退出码
+        降附录（#85 标本：verdict=red 而 MM 只见「succeeded, exit 0」）；outcome 缺 →
+        回退既有 exit-code 文本（不猜业务终态——回退留痕在 lifecycle 读面）。"""
+        if outcome is not None:
+            head = f"[pa-hub] {project} run #{run_id}（{run_dir_name}）"
+            if initiator:
+                head += f"｜发起 {initiator}"
+            lines = [head, self._outcome_summary(outcome)]
+            prs = outcome.get("prs") or []
+            lines += [f"- {self._pr_line(p)}" for p in prs[:8]]
+            if len(prs) > 8:
+                lines.append(f"- …等共 {len(prs)} 项")
+            tail = f"（run → {status}"
+            if exit_code is not None:
+                tail += f"，容器 exit {exit_code}"
+            tail += "）"
+            lines.append(tail)
+            if last_error:
+                lines.append(f"原因：{last_error}")
+            return "\n".join(lines)
         head = f"[pa-hub] {project} run #{run_id}（{run_dir_name}）→ {status}"
         if exit_code is not None:
             head += f"，exit {exit_code}"
@@ -309,6 +353,22 @@ class Notifier:
         if last_error:
             head += f"\n原因：{last_error}"
         return head
+
+    @staticmethod
+    def _outcome_summary(o: dict) -> str:
+        sm = o.get("summary") or {}
+        return (f"业务终态：🟢{sm.get('green', 0)} 🔴{sm.get('red', 0)}"
+                f" · invalid {sm.get('invalid', 0)} · blocked {sm.get('blocked', 0)}"
+                f" · 异常 {sm.get('abnormal', 0)}")
+
+    @staticmethod
+    def _pr_line(p: dict) -> str:
+        """逐 PRD 终态行：图标按 verify verdict（invalid/无 → ⚪），身份有 PR 号用
+        PR #N（MM 自动链接化依赖 pr_url 完整形态故不拼裸 url），否则用 status。"""
+        icon = _VERDICT_ICON.get(p.get("verify_verdict") or "", "⚪")
+        ident = f"PR #{p['pr_number']}" if p.get("pr_number") else (p.get("status") or "?")
+        head = (p.get("reason_headline") or "").replace("\n", " ")
+        return f"{icon} {ident}：{head}" if head else f"{icon} {ident}"
 
     def _send_dm(self, enqueued_by: str | None, text: str) -> None:
         """收件人三代分流（D4）：None/机机字面量 → cfg.user_id（username 路径）。"""

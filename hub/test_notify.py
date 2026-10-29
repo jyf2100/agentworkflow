@@ -261,3 +261,68 @@ def test_fake_channel_member_ids_programmable_faces():
     except notify.MMChannelNotFound:
         raised = True
     assert raised
+
+
+# ── add-pipeline-outcome-observability 2.1：通知消费 outcome（lead 业务摘要）──
+# #85 标本驱动：verify verdict=red、PR #60 留 review，MM 只见「succeeded, exit 0」。
+def _outcome_red_pr60():
+    return {"schema": "pa.pipeline_outcome.v1",
+            "summary": {"green": 0, "red": 1, "invalid": 0, "blocked": 0, "abnormal": 0},
+            "prs": [{"project": "cc-web-control", "status": "pr_open", "pr_number": 60,
+                     "pr_url": "https://github.com/o/r/pull/60", "verify_verdict": "red",
+                     "reason_headline": "playwright e2e 3 条 declared 全匹配但 exit 1"}],
+            "container": {"exit_code": 0}}
+
+
+def test_load_pipeline_outcome(tmp_path):
+    sr = tmp_path / "state"; sr.mkdir()
+    (sr / "pipeline_outcome_20261029m1.json").write_text('{"summary": {"red": 1}}', encoding="utf-8")
+    assert notify.load_pipeline_outcome(sr, "20261029m1_cc-web-control") == {"summary": {"red": 1}}
+    assert notify.load_pipeline_outcome(sr, "20261028m2_old") is None        # 缺文件
+    (sr / "pipeline_outcome_bad.json").write_text("{broken", encoding="utf-8")
+    assert notify.load_pipeline_outcome(sr, "bad_x") is None                 # 坏 json
+    (sr / "pipeline_outcome_arr.json").write_text("[1,2]", encoding="utf-8")
+    assert notify.load_pipeline_outcome(sr, "arr_x") is None                 # 非 dict
+
+
+def test_message_with_outcome_lead_business_summary(tmp_path):
+    n = notify.Notifier(_cfg(tmp_path), mm=notify.FakeMMClient())
+    msg = n._message(run_id=85, project="cc-web-control", run_dir_name="20261029m1_x",
+                     status="succeeded", exit_code=0, initiator=None, last_error=None,
+                     outcome=_outcome_red_pr60())
+    assert "业务终态：🟢0 🔴1 · invalid 0 · blocked 0 · 异常 0" in msg           # lead 计数
+    assert "🔴 PR #60：playwright e2e" in msg                                  # PR 行 + 首因
+    assert "（run → succeeded，容器 exit 0）" in msg                            # 退出码降附录
+    assert "→ succeeded，exit 0" not in msg.split("\n")[0]                     # 旧 lead 形态不再
+
+
+def test_message_without_outcome_fallback_unchanged(tmp_path):
+    n = notify.Notifier(_cfg(tmp_path), mm=notify.FakeMMClient())
+    msg = n._message(run_id=7, project="p", run_dir_name="d", status="succeeded",
+                     exit_code=0, initiator=None, last_error=None, outcome=None)
+    assert msg == "[pa-hub] p run #7（d）→ succeeded，exit 0"                  # 回退回归锁
+
+
+def test_notify_run_outcome_reaches_channel_and_dm(tmp_path):
+    o = _outcome_red_pr60()
+    mm = notify.FakeMMClient()
+    notify.Notifier(_cfg(tmp_path), mm=mm, database=_db_bound(tmp_path, ("cc-web-control", "c" * 26))
+                    ).notify_run(run_id=85, project="cc-web-control", run_dir_name="20261029m1_x",
+                                 status="succeeded", exit_code=0, outcome=o)
+    assert "业务终态" in mm.channels[0][1]                                     # 绑定频道
+    mm2 = notify.FakeMMClient()
+    notify.Notifier(_cfg(tmp_path), mm=mm2).notify_run(
+        run_id=85, project="cc-web-control", run_dir_name="20261029m1_x",
+        status="succeeded", exit_code=0, enqueued_by=_MM_ID, outcome=o)
+    assert "🔴 PR #60" in mm2.dms[0][1]                                        # 私信同文
+
+
+def test_pr_line_variants(tmp_path):
+    line = notify.Notifier._pr_line({"pr_number": 61, "verify_verdict": "green",
+                                     "reason_headline": "全绿开 PR", "status": "pr_open"})
+    assert line == "🟢 PR #61：全绿开 PR"
+    no_pr = notify.Notifier._pr_line({"status": "blocked_external_state",
+                                      "verify_verdict": None, "reason_headline": "远端分支已在"})
+    assert no_pr == "⚪ blocked_external_state：远端分支已在"                    # 无 PR 号 → status
+    no_head = notify.Notifier._pr_line({"pr_number": 9, "verify_verdict": "invalid"})
+    assert no_head == "⚪ PR #9"                                               # 无 headline 不拖冒号
