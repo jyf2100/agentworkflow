@@ -667,8 +667,17 @@ dev 亲笔交接工件：断点后新 dev 会话拿到上一 iteration 的结构
 四轮重跑（#86 v0.1.25 / #88 v0.1.25 / #89 v0.1.26）观测面全核对齐：3 桶真机（abnormal/blocked/skip）、回退路径正反对照（run#99 旧镜像回退留痕 vs run#100 新镜像消费无痕）、非 PR 终态双 None 对称、stdout 全程在盘。**红/绿桶未真机走到**——四轮四种死因全在 dev 链路质量侧（观测面自身无缺陷）：
 
 1. **#88 test_stale（已修）**：dev 绿后想「加更硬证据」动工作区 → evidence 过期 → 门拦（门语义正确）。修复：dev 守则「绿后禁写」纪律（f98c3c4，v0.1.26）。
-2. **#89 pa-progress 基建期误判 off_track ×2 止损（已修 f6f6d1d，待真机验证）**：dev 搭 playwright 测试基建（PRD 范围内）被「diff 是否直接实现验收点」判据误伤。修复：**验收基建豁免**三面一致落地——`semantic_gate.build_progress_prompt` prompt 面 + `.claude/agents/pa-progress.md` persona 面（判据定义 + 硬约束「验收基建算在轨」）+ `in-loop-semantic-checkpoint` spec 面（scenario「验收基建期不判 off_track」），测试锁 `test_build_progress_prompt_includes_infra_exemption`。真机验证待下轮 hub run。
+2. **#89 pa-progress 基建期误判 off_track ×2 止损（已修 f6f6d1d，✅ 真机验证通过）**：dev 搭 playwright 测试基建（PRD 范围内）被「diff 是否直接实现验收点」判据误伤。修复：**验收基建豁免**三面一致落地——`semantic_gate.build_progress_prompt` prompt 面 + `.claude/agents/pa-progress.md` persona 面（判据定义 + 硬约束「验收基建算在轨」）+ `in-loop-semantic-checkpoint` spec 面（scenario「验收基建期不判 off_track」），测试锁 `test_build_progress_prompt_includes_infra_exemption`。**真机验证（run 102 / 20261029m4 / v0.1.27）**：judge 5 轮全 on_track（03:49-04:04，summary 均「直接实现验收点」），dev 50+ turn 完整跑完未被误杀——同 PRD 同 judge 位对比 #89 同期已 2 次 off_track 止损，修复生效实锤。
 3. **#89 SDK asyncgen kill 竞态（立案，实锤标本）**：止损 kill dev 时 `RuntimeError: aclose(): asynchronous generator is already running`（`20261029m3` dev log 尾部标本）——此前多次目击未立案，本次有完整标本。SDK 0.2.128 `InternalClient._process_query_inner` 关流竞态。
 4. **#89 清理 `git push origin --delete` 30s 超时（立案）**：容器内 git 网络操作超时面（clone 600s 限通过、push 30s 限挂）——清理面超时预算与容器网络稳定性不匹配，异常桶如实导出但 run 蒙受 abnormal。
 
 另：hub 运行时 env 快照漂移——盘上 hub.env `HUB_IMAGE_TAG_DEFAULT` 升 v0.1.26 后，运行中容器若只 `docker restart` 不重读 env_file（v0.1.25 时期实证：盘上 v0.1.25 / 运行时 v0.1.24）。**改 hub.env 后必须 `compose up -d` 重建容器才生效**；条目级 `--tag` 覆盖可免重启应急（§16 陈旧检测比对 remote release tag）。
+
+### 20.2 run 102（20261029m4 / v0.1.27）标本
+
+**首个跑到 verify 独立验证终审的 hub run**（exit 0 / queue done / dispatch 桶 invalid）：
+
+1. **dev 声明 vs 实际执行不一致（立案）**：dev 终报声明 2 条测试命令（`playwright test e2e_login_version_footer.spec.ts` + `npm test`），实际证据链只匹配到 `npm test`（exit 0，node 单测）；e2e 声明命令 unresolved（无执行记录或变体不可判读）→ pa-verify 判 invalid（unresolved）→ triage 不进 revise。**invalid 语义按设计正确走**（声明了但没证据 = 不可判读，不放行不冤杀）。修向候选：dev prompt 补「声明的测试命令必须与实际执行的逐字一致，未实际执行的不得写进声明」纪律——与「绿后禁写」同族，攒下次发版窗口一起带。
+2. **invalid 桶 MM 通知真机走通**：pipeline_outcome invalid=1 → MM 发出（`[notify][warn] 提及目标降级纯文本`为 warn 非失败）——pipeline-outcome 观测面新增 invalid 桶真机对照（红/绿桶仍欠真机，后续自然 run 补）。
+3. **verify persona 真机完整轮（D1 喂上）**：verify-stream 2667 行完整会话（新三维度 persona 真机首跑），三机械锚全过（workspace_clean ok / injected_digests ok），verdict 由 persona 合成（非机械映射）。pass/revise 比率分布仍薄，持续 canary 靠后续自然 run 积累。
+4. **invalid 路径补开 PR 失败为次生噪声**：invalid 不 commit（设计）→ 分支无 commits → 兜底补开 PR 报 `No commits between main and auto/...`（rc=1）——现象符合预期路径，仅日志观感差；分支已保留。
