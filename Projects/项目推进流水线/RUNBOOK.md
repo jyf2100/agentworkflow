@@ -667,7 +667,7 @@ dev 亲笔交接工件：断点后新 dev 会话拿到上一 iteration 的结构
 四轮重跑（#86 v0.1.25 / #88 v0.1.25 / #89 v0.1.26）观测面全核对齐：3 桶真机（abnormal/blocked/skip）、回退路径正反对照（run#99 旧镜像回退留痕 vs run#100 新镜像消费无痕）、非 PR 终态双 None 对称、stdout 全程在盘。**红/绿桶未真机走到**——四轮四种死因全在 dev 链路质量侧（观测面自身无缺陷）：
 
 1. **#88 test_stale（已修）**：dev 绿后想「加更硬证据」动工作区 → evidence 过期 → 门拦（门语义正确）。修复：dev 守则「绿后禁写」纪律（f98c3c4，v0.1.26）。
-2. **#89 pa-progress 基建期误判 off_track ×2 止损（立案）**：dev 搭 playwright 测试基建（PRD 范围内）被「diff 是否直接实现验收点」判据误伤。修向前置：pa-progress 判据补「验收测试基建期豁免」（依赖安装/harness 配置/环境对接改动不判 off_track，除非与验收点完全无关）。
+2. **#89 pa-progress 基建期误判 off_track ×2 止损（已修 f6f6d1d，待真机验证）**：dev 搭 playwright 测试基建（PRD 范围内）被「diff 是否直接实现验收点」判据误伤。修复：**验收基建豁免**三面一致落地——`semantic_gate.build_progress_prompt` prompt 面 + `.claude/agents/pa-progress.md` persona 面（判据定义 + 硬约束「验收基建算在轨」）+ `in-loop-semantic-checkpoint` spec 面（scenario「验收基建期不判 off_track」），测试锁 `test_build_progress_prompt_includes_infra_exemption`。真机验证待下轮 hub run。
 3. **#89 SDK asyncgen kill 竞态（立案，实锤标本）**：止损 kill dev 时 `RuntimeError: aclose(): asynchronous generator is already running`（`20261029m3` dev log 尾部标本）——此前多次目击未立案，本次有完整标本。SDK 0.2.128 `InternalClient._process_query_inner` 关流竞态。
 4. **#89 清理 `git push origin --delete` 30s 超时（立案）**：容器内 git 网络操作超时面（clone 600s 限通过、push 30s 限挂）——清理面超时预算与容器网络稳定性不匹配，异常桶如实导出但 run 蒙受 abnormal。
 
