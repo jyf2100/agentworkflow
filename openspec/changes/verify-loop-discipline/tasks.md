@@ -35,6 +35,7 @@
 
 - [ ] D1 verdict 分布 canary：改造前后 pass / revise 比率对比（revise 率暴涨 → persona 调参，design D3）——**依赖 ≥1 个真实 verify 轮次跑新三维度 persona**
   - **2026-10-29 注记**：run #86 走 hub 镜像 v0.1.25 真机，但 dispatch 段被在途 PR #60（#85 所开，verdict=red 留 review）占 single-flight 名额正确 skip → 无 verify 轮次 → D1 仍未喂。前置 = 处置 PR #60（合/关，outward 用户拍板）→ 在途归零 → next run 走全 dispatch 喂新三维度 persona。
+  - **2026-10-29 二注（PR #60 已关，三轮重跑仍未喂）**：#88（v0.1.25）dev 全绿 65 turns 但 test_stale 拦（绿后写纪律缺失，已修 f98c3c4）；#89（v0.1.26）dev 60 turns 被 pa-progress 判 off_track ×2 止损（**疑似基建期误判**：dev 搭 playwright 测试基建属 PRD 范围，judge 以「diff 直接实现验收点」判方向必误伤——另立案）+ kill 竞态 SDK asyncgen RuntimeError（实锤标本 m3 log）+ 清理 push --delete 网络超时。verify 轮次仍 0。喂 D1 前置升级为：off_track 基建期误判修复（pa-progress 判据补「测试基建期豁免」）或等一次 judge 不误判的 run。
 - [ ] D2 同分支累积 canary：真实 cc-web-control 跑 verify revise 回环，断言单 PR（隔离 state + 临时 log + unset PA_HEARTBEAT，守 pa-test-no-dirty-data）——**outward（开真实 PR），须用户确认后执行**
 
 ## E. 运维（outward，须用户确认后执行）

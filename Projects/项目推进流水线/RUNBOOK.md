@@ -661,3 +661,14 @@ dev 亲笔交接工件：断点后新 dev 会话拿到上一 iteration 的结构
 **verify-report 逐命令 output_ref**：agent 轨 verify 每条 declared 命令输出落 run_dir `<stem>.cmd<k>.out`，verify-report `commands.results[].output_ref` 持指针——诊红因不翻 10k 行原始 stream（#85 webServer 红因标本驱动）。unresolved 命令无输出无键；落盘失败降级无指针不拦判定。
 
 **dispatch record PR 身份对称**：三处开出点（实查 FOUND / 补开撞并发复用 / gh create 正常开）pr_url 与 pr_number 同源同写 + outcome 出口 url 兜底析出——终态不存在一有一缺。
+
+### 20.1 四轮真机标本（2026-10-29）+ dev 链路侧立案
+
+四轮重跑（#86 v0.1.25 / #88 v0.1.25 / #89 v0.1.26）观测面全核对齐：3 桶真机（abnormal/blocked/skip）、回退路径正反对照（run#99 旧镜像回退留痕 vs run#100 新镜像消费无痕）、非 PR 终态双 None 对称、stdout 全程在盘。**红/绿桶未真机走到**——四轮四种死因全在 dev 链路质量侧（观测面自身无缺陷）：
+
+1. **#88 test_stale（已修）**：dev 绿后想「加更硬证据」动工作区 → evidence 过期 → 门拦（门语义正确）。修复：dev 守则「绿后禁写」纪律（f98c3c4，v0.1.26）。
+2. **#89 pa-progress 基建期误判 off_track ×2 止损（立案）**：dev 搭 playwright 测试基建（PRD 范围内）被「diff 是否直接实现验收点」判据误伤。修向前置：pa-progress 判据补「验收测试基建期豁免」（依赖安装/harness 配置/环境对接改动不判 off_track，除非与验收点完全无关）。
+3. **#89 SDK asyncgen kill 竞态（立案，实锤标本）**：止损 kill dev 时 `RuntimeError: aclose(): asynchronous generator is already running`（`20261029m3` dev log 尾部标本）——此前多次目击未立案，本次有完整标本。SDK 0.2.128 `InternalClient._process_query_inner` 关流竞态。
+4. **#89 清理 `git push origin --delete` 30s 超时（立案）**：容器内 git 网络操作超时面（clone 600s 限通过、push 30s 限挂）——清理面超时预算与容器网络稳定性不匹配，异常桶如实导出但 run 蒙受 abnormal。
+
+另：hub 运行时 env 快照漂移——盘上 hub.env `HUB_IMAGE_TAG_DEFAULT` 升 v0.1.26 后，运行中容器若只 `docker restart` 不重读 env_file（v0.1.25 时期实证：盘上 v0.1.25 / 运行时 v0.1.24）。**改 hub.env 后必须 `compose up -d` 重建容器才生效**；条目级 `--tag` 覆盖可免重启应急（§16 陈旧检测比对 remote release tag）。
