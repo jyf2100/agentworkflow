@@ -4208,7 +4208,10 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
         out["test_rc"] = _bad[0] if _bad else (0 if verdict == "green" else None)
         out["note"] = {"green": "绿（agent 轨：全 declared 匹配 exit 0 + 三锚净）",
                        "red": "红→标 failing，PR 留待 review",
-                       "invalid": "invalid→triage（不进 revise 回环）"}[verdict] \
+                       "invalid": "invalid→triage（不进 revise 回环）"
+                       # run 20261029m4 标本：MM reason_headline 经 skip_reason 透传 note——不带根因则
+                       # 收到通知的人只看到分流去向，看不出「为什么 invalid」（须翻 verify-report 才知道）
+                       + (f"｜根因：{report['reason']}" if report.get("reason") else "")}[verdict] \
             + f"（命令来源 {gate_source}）"   # 2.6：record note 显式记来源（gate_source 键同在 rec["verify"]）
         if config_swaps:
             out["note"] += f"；config 换版 ×{len(config_swaps)}（dev 分支版优先: " \

@@ -210,6 +210,11 @@ def test_agent_track_unresolved_is_invalid(tmp_path, agent_env):
     out = run_daily.independent_verify(str(repo), "feat/x", "st", "slug", runs / "st_slug.log",
                                        prof=None, test_cmd_hint=None, suite_ref=suite)
     assert out["verdict"] == "invalid" and out["pass"] is False and out["test_rc"] is None
+    # run 20261029m4 标本：invalid 的 note（→ MM reason_headline）须透出人读根因
+    # （report.reason，如「unresolved（declared 未被执行/变体不可判读）」）——
+    # 否则收到通知的人只看到分流去向，看不出「为什么 invalid」。
+    assert out.get("invalid_reason") == "unresolved"
+    assert "unresolved" in out.get("note", "") and "不进 revise 回环" in out["note"]
 
 
 def test_agent_track_timeout_maps_invalid(tmp_path, agent_env, monkeypatch):
