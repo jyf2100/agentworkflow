@@ -92,9 +92,11 @@ pa-verify.md feedback_section 模板：① 定位 ② 原因 ③ 怎么改 ④ �
 ## Risks / Trade-offs
 
 - [jest/playwright 正则把字符串里的 `require('x')` 误判为 import] → 正则行首锚定语句形状（缩进后的 `import`/`const x = require`），字符串字面量内不匹配；即便漏进，扣留代价是 dev 回退 PRD 验收面（fail-open），非死锁。
+- [正则漏检非声明形态（如 `await import('x')` dynamic import、注释后行中 import）] → 漏检方向 fail-open（P1 collect / verify post-hoc 签名兜底）；提取面与 D1 声明的三种语句形状一致，保守漏检优于误报扣留。
 - [P0 拒绝仓绝对包名，短期压缩考卷写法] → v1 有意保守（黑盒验收面仍完整）；B 环 repo_facts 提供仓依赖清单后放开（衔接点：test-author prompt 注入 facts + 白名单读 facts）。
 - [P1 对 conftest 重的仓，收集范围失控/超时] → collect 目标显式圈定注入文件路径（不全仓）；超时归 indeterminate 不扣套件。
 - [控制面环境缺 pytest] → pa 自身 dev 依赖已含 pytest（quality.sh 依赖它），真身机 cron 装了 `.[dev]`；缺则 indeterminate，不误扣。
+- [P1 判活能力的真实边界] → collect 用控制面 `sys.executable`：注入文件自身的 import 面（相对导入 → worktree 仓源码）真判活，但**仓源码自身的传递依赖**（仓模块顶层 import 的第三方）不在控制面环境 → traceback 锚仓源码（非注入文件）→ indeterminate 不扣。「真判活」仅对注入文件直接 import 面成立，仓依赖链归环境面（三态分发天然保守，verify 兜底）。
 - [non_goals 写成空话（dev 无视）] → 与 ①—④ 同一反馈节拼接、同轮被 dev 读取；无机械强制，属 prompt 层纪律（与 veriloop repair_plan 同层级，其亦为 schema 约束而非运行时强制）；verify 下轮若发现围栏被破，定位元素天然点出（回滚即收尾门）。
 
 ## Migration Plan
