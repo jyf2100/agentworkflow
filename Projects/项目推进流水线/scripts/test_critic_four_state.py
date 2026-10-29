@@ -139,6 +139,7 @@ def test_needs_metrics_spec_author_failure_degrades_drop(tmp_path, monkeypatch):
     gate = run_daily.stage_critic(_args(), manifest, {"p1": {"name": "p1"}}, STAMP)
     assert gate[0]["verdict"] == "drop"
     assert "spec-author" in gate[0]["summary"]                 # 降级原因可观测
+    assert "重新 /pa run 提交" in gate[0]["summary"]             # 出路可操作（#103 真机反馈）
 
 
 def test_needs_metrics_refused_or_empty_degrades_drop(tmp_path, monkeypatch):
@@ -154,6 +155,7 @@ def test_needs_metrics_refused_or_empty_degrades_drop(tmp_path, monkeypatch):
                             lambda *a, payload=payload, **k: (payload, {"cost": 0.0}))
         gate = run_daily.stage_critic(_args(force=True), manifest, {"p1": {"name": "p1"}}, STAMP)
         assert gate[0]["verdict"] == "drop", payload
+        assert "重新 /pa run 提交" in gate[0]["summary"], payload  # 出路可操作（#103 真机反馈）
     ev = tmp_path / "runs" / "p1" / f"{STAMP}_{STAMP}_a.events.jsonl"
     rows = [json.loads(ln) for ln in ev.read_text(encoding="utf-8").splitlines()]
     assert not [r for r in rows if r["event"] == "metrics_proposed"]   # 拒拟绝不发事件

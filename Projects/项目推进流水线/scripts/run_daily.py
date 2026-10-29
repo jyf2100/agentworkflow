@@ -1853,7 +1853,10 @@ def _needs_metrics_route(entry: dict, prof: dict, stamp: str, mm_src: dict) -> d
         metrics = payload.get("metrics") or []
         if refused or not metrics:
             entry["verdict"] = "drop"
-            entry["summary"] = f"spec-author 拒拟（{refused or '指标清单为空'}），降级 drop"
+            # 出路必须可操作（真机 #103 实测反馈：只给原因不给下一步，发起人无从续）——
+            # drop 无确认行无 /pa 子命令可用，唯一出路是补写后重新 /pa run 提交
+            entry["summary"] = (f"spec-author 拒拟（{refused or '指标清单为空'}），降级 drop"
+                                "——请补写目标态（如色值/参考稿/组件级要求）后重新 /pa run 提交")
             log(f"[critic] ⚠ needs_metrics→drop：{path}｜{entry['summary']}")
             return entry
         entry["metrics"] = metrics
@@ -1865,7 +1868,7 @@ def _needs_metrics_route(entry: dict, prof: dict, stamp: str, mm_src: dict) -> d
         return entry
     except Exception as e:  # fail-safe：spec-author 失败面全量降级 drop（含熔断快速失败，见 docstring）
         entry["verdict"] = "drop"
-        entry["summary"] = f"spec-author 调用失败，降级 drop：{type(e).__name__}: {e}"
+        entry["summary"] = f"spec-author 调用失败，降级 drop：{type(e).__name__}: {e}——可稍后重新 /pa run 提交"
         log(f"[critic] ⚠ needs_metrics→drop：{path}｜{entry['summary']}")
         return entry
 
