@@ -2,10 +2,10 @@
 
 ## 1. outcome 契约 + stdout tee（run_daily 侧）
 
-- [ ] 1.1 `pipeline_outcome.json` 写入（测试先红）：`_write_pipeline_outcome(records, meta)` 单点写 `<state>/pipeline_outcome_<stamp>.json`（schema v1：run 身份 / summary 七计数 / prs[]（status + verify verdict 三态原值 + pr_url + pr_number + reason_headline ≤200 字符）/ container.exit_code 附录）；写失败 warn 不拦 report（fail-open）；graph_pa report 包装 node 直调同函数（两入口零分叉测试）
-- [ ] 1.2 stdout tee（测试先红）：编排器段落行 + `_run_capture` 输出全量 append run 根 `.stdout.log`（run 开始 open 持有，无 fsync——观测面非真相源）；tee 目标不可写 warn 降级仅终端；LLM stream 不进（.stream.jsonl 既有面不变）
-- [ ] 1.3 PR 身份对称（测试先红）：PR create/lookup 回执单次解析 `pr_url` + `pr_number` 同写 dispatch record（gh create 输出/`_lookup_pr` 回执两消费点）；断言不存在一有一缺终态
-- [ ] 1.4 verify-report 逐命令输出指针（测试先红）：`commands.results[]` 增 `output_ref`（分命令 `<stem>.cmd<k>.out` 落 run_dir）；`test_log` 单文件语义保留（pa-verify 行锚输入面不变）；红命令 output 含 stderr/stdout 尾——不翻 10k 行 stream 可诊红因
+- [x] 1.1 `pipeline_outcome.json` 写入（测试先红）：`_write_pipeline_outcome(records, meta)` 单点写 `<state>/pipeline_outcome_<stamp>.json`（schema v1：run 身份 / summary 七计数 / prs[]（status + verify verdict 三态原值 + pr_url + pr_number + reason_headline ≤200 字符）/ container.exit_code 附录）；写失败 warn 不拦 report（fail-open）；graph_pa report 包装 node 直调同函数（两入口零分叉测试）
+- [x] 1.2 stdout tee（测试先红）：编排器段落行 + `_run_capture` 输出全量 append run 根 `.stdout.log`（run 开始 open 持有，无 fsync——观测面非真相源）；tee 目标不可写 warn 降级仅终端；LLM stream 不进（.stream.jsonl 既有面不变）
+- [x] 1.3 PR 身份对称（测试先红）：PR create/lookup 回执单次解析 `pr_url` + `pr_number` 同写 dispatch record（gh create 输出/`_lookup_pr` 回执两消费点）；断言不存在一有一缺终态
+- [x] 1.4 verify-report 逐命令输出指针（测试先红）：`commands.results[]` 增 `output_ref`（分命令 `<stem>.cmd<k>.out` 落 run_dir）；`test_log` 单文件语义保留（pa-verify 行锚输入面不变）；红命令 output 含 stderr/stdout 尾——不翻 10k 行 stream 可诊红因
 
 ## 2. hub 通知面
 

@@ -146,6 +146,39 @@ DISPATCH_LOCKS: dict[str, threading.Lock] = {}   # per-owner_repo 串行锁（�
 def log(msg: str) -> None:
     with LOG_LOCK:
         print(msg, flush=True)
+        # add-pipeline-outcome-observability：stdout tee（观测面）。容器销毁后宿主可复核编排
+        # 全链段落行/子进程输出（m11 实证靠 docker logs 还原现场是补救非保障）。失败即降级
+        # 关闭（warn 静默——终端面不受影响；观测面永不拦编排）。LLM stream 不走 log（.stream.jsonl）。
+        if _STDOUT_TEE_F is not None:
+            try:
+                _STDOUT_TEE_F.write(msg + "\n")
+                _STDOUT_TEE_F.flush()
+            except Exception:
+                _stdout_tee_close()
+
+
+_STDOUT_TEE_F = None   # tee 句柄（None=未开/已降级）；run 根 <stamp>.stdout.log
+
+
+def _stdout_tee_open(path: Path) -> None:
+    """开 tee（main 入口 stamp 解析后单次调用）；失败 warn 降级仅终端。"""
+    global _STDOUT_TEE_F
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _STDOUT_TEE_F = open(path, "a", encoding="utf-8")
+    except Exception as e:
+        print(f"[stdout-tee] ⚠ 打开失败（降级仅终端）: {e}", file=sys.stderr, flush=True)
+        _STDOUT_TEE_F = None
+
+
+def _stdout_tee_close() -> None:
+    global _STDOUT_TEE_F
+    if _STDOUT_TEE_F is not None:
+        try:
+            _STDOUT_TEE_F.close()
+        except Exception:
+            pass
+        _STDOUT_TEE_F = None
 
 
 def resolve_claude_bin() -> str:
@@ -2201,6 +2234,92 @@ def _clone_workspace_repo(repo: str, clone_url: str, slug: str,
     return True, ""
 
 
+def _pr_number_from_url(url: str | None) -> int | None:
+    """add-pipeline-outcome-observability：PR 号自 url 单源析出（github.com/<o/r>/pull/<N>）。
+
+    record pr_number/pr_url 对称契约：开出点显式同写 + outcome 出口兜底析出双保险
+    （#85 实证：pr_url 有而 pr_number None——同一次 PR 身份两字段填写不对称）。非
+    github 形态（forge merge_requests 等）→ None（不猜）。
+    """
+    if not url:
+        return None
+    m = re.search(r"/pull/(\d+)", str(url))
+    return int(m.group(1)) if m else None
+
+
+def _write_pipeline_outcome(disp: list, stamp: str, exit_code: int | None = None,
+                            dropped: int = 0) -> Path | None:
+    """add-pipeline-outcome-observability：业务终态结构化出口（report 段终笔，fail-open）。
+
+    单文件 ``<state>/pipeline_outcome_<stamp>.json``（schema ``pa.pipeline_outcome.v1``）：
+    通知/hub 消费面读它而非容器退出码（四标本：run 92/#83/#84/#85 容器 exit 0 但业务
+    各异，MM 只收到 succeeded exit 0）。桶语义对齐 stage_report（review 归 green、
+    integrity 四态归 invalid、blocked 二态、skip/planned/fail 归 abnormal）；verify
+    verdict 三态原值不折算；``reason_headline`` = note/triage_reason/skip_reason 首个
+    非空截 200；pr_number 兜底自 pr_url 析出。写失败 warn 不拦 report（观测面
+    fail-open——通知消费方回退 exit-code 路径）。
+    """
+    prs, counts = [], {"green": 0, "red": 0, "invalid": 0, "blocked": 0, "drop": dropped, "abnormal": 0}
+    _blocked = {"blocked_external_state", "blocked_test_gate"}
+    _integrity = {"blocked_evidence", "state_corrupt", "verify_invalid", "blocked_infra"}
+    for d in disp:
+        v = d.get("verify") or {}
+        st = d.get("status") or "?"
+        verd = v.get("verdict") or ("green" if v.get("pass") else "red" if v else None)
+        if st in ("pr_open", "interrupted_pr") and (v.get("pass") or verd == "green"):
+            k = "green"
+        elif v and not v.get("pass") and st not in _blocked | _integrity:
+            k = "red"
+        elif st in _integrity:
+            k, verd = "invalid", verd or "invalid"
+        elif st in _blocked:
+            k = "blocked"
+        else:
+            k = "abnormal"
+        counts[k] += 1
+        for s in (v.get("note"), d.get("triage_reason"), d.get("skip_reason")):
+            headline = (str(s)[:200] if s else "")
+            if headline:
+                break
+        prs.append({"prd_id": d.get("slug"), "status": st, "verify_verdict": verd,
+                    "pr_url": d.get("pr_url") or None,
+                    "pr_number": d.get("pr_number") or _pr_number_from_url(d.get("pr_url")),
+                    "reason_headline": headline})
+    out = {"schema": "pa.pipeline_outcome.v1",
+           "run": {"stamp": stamp, "finished_at": _now_iso()},
+           "summary": counts, "prs": prs,
+           "container": {"exit_code": exit_code, "note": "附录非判据：业务终态以 summary/prs 为准"}}
+    p = STATE_DIR / f"pipeline_outcome_{stamp}.json"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"[report] pipeline_outcome → {p}（{'/'.join(f'{k}={v}' for k, v in counts.items() if v) or 'empty'}）")
+        return p
+    except Exception as e:
+        log(f"[report] ⚠ pipeline_outcome 写失败（fail-open，通知回退 exit-code 路径）: {e}")
+        return None
+
+
+def _write_per_cmd_outputs(log_file: Path, matched: dict) -> dict[str, str]:
+    """add-pipeline-outcome-observability：verify 逐命令输出落 ``<stem>.cmd<k>.out``。
+
+    #85 实证：红命令真实输出只在 10k 行原始 stream 里，verify-report ``results[].stdout``
+    空指针——诊红因必须翻原始流。分命令小文件（declared 序号 k）+ report ``output_ref``
+    指针，机械落盘无解析歧义；unresolved 命令无输出 → 无键。失败降级 {}（观测面不拦判定）。
+    """
+    out: dict[str, str] = {}
+    try:
+        for k, (declared, ex) in enumerate(matched.items()):
+            if ex is None or not ex.output:
+                continue
+            p = log_file.parent / f"{log_file.stem}.cmd{k}.out"
+            p.write_text(ex.output, encoding="utf-8")
+            out[declared] = str(p)
+    except Exception as e:
+        log(f"[verify] ⚠ 逐命令输出落盘失败（降级无 output_ref）: {e}")
+    return out
+
+
 # ─── verify 闭环辅助（dev→独立验证→pa-verify，docs/verify-commit-loop-design.md §3/§5）──
 def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
              feedback_artifact: str | None = None, *,
@@ -3808,6 +3927,7 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
     if pr.state is ExtState.FOUND:
         pr_url, pr_state = pr.value.get("url"), pr.value.get("state")
         rec["pr_url"] = pr_url
+        rec["pr_number"] = _pr_number_from_url(pr_url)   # outcome 契约：PR 身份两字段同源同写
         rec["status"] = "pr_open" if (pr_state or "").upper() == "OPEN" else f"pr_{(pr_state or '').lower()}"
         log(f"  ✅ {slug}: 已开 PR {pr_url}（{pr_state}）"); return
 
@@ -3851,14 +3971,18 @@ def reconcile_pr(repo: str, owner_repo: str, rec: dict, base: str, slug: str,
                     # 另一进程开了——graph 路径/并发 cron）→ 重查复用（对齐 A2 幂等语义），仍无才 blocked。
                     recheck = _lookup_pr(owner_repo, branch)
                     if recheck.state is ExtState.FOUND and (recheck.value.get("state") or "").upper() == "OPEN":
-                        rec["pr_url"] = recheck.value.get("url"); rec["status"] = new_status
+                        rec["pr_url"] = recheck.value.get("url")
+                        rec["pr_number"] = _pr_number_from_url(rec["pr_url"])   # 对称同写
+                        rec["status"] = new_status
                         log(f"  ♻ {slug}: 补开撞并发 open PR，复用 {rec['pr_url']}（A5 幂等对齐）")
                         return
                     rec.update(status="blocked_external_state", blocked_check="pr_create",
                                skip_reason=f"保留分支-补开PR失败(rc={r.returncode}): {sanitize(r.stderr)}")
                     log(f"  ⛔ {slug}: {rec['skip_reason']}"); return
                 url = r.stdout.strip()
-            rec["pr_url"] = url or None; rec["status"] = new_status
+            rec["pr_url"] = url or None
+            rec["pr_number"] = _pr_number_from_url(url)   # 对称同写（gh create 输出 url 单源）
+            rec["status"] = new_status
             log(f"  {'⏸' if interrupted else '✅'} {slug}: {'中断' if interrupted else '正常'} PR 已补开 {url}")
             return   # 坑3 修复（2026-07-17）：has_commit 且 PR 已补开 → 到此为止，不再落到下方删分支。原代码漏 return，导致失败时「开完中断 PR 又删它的分支 + status 被覆盖成 orphan_deleted + dev 工作 branch -D 丢失」
         except Exception as e:
@@ -4049,6 +4173,9 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
         _swapped = {s["rel"] for s in config_swaps}
         # 锚③豁免换版 config（有意保留 dev 版 ≠ 被篡改；两版 sha 已在 config_swaps 对照）
         dg_viol = VS_MOD.check_injected_digests(vt, {r: d for r, d in digests.items() if r not in _swapped})
+        # outcome 契约：逐命令输出落盘（declared 序号）+ report output_ref 指针（诊红因
+        # 不翻 10k 行 stream；#85 实证 results[].stdout 空指针）。失败降级 {}（不拦判定）。
+        _cmd_outputs = _write_per_cmd_outputs(log_file, matched)
         report = VS_MOD.build_verify_report(
             run_id=stamp, project=project, prd_id=slug, iteration_id=iteration, harness=harness,
             gate_cmd=gate_cmd, gate_source=gate_source, matched=matched,
@@ -4056,7 +4183,8 @@ def _agent_track_verify(repo: str, branch: str, stamp: str, slug: str, log_file:
             stream_path=str(stream_path) if stream_path else "",
             session_meta=meta, env_spec=env_spec,
             env_observed=VS_MOD.observed_env_exports(execs),
-            anchor_workspace_detail=ws_detail)
+            anchor_workspace_detail=ws_detail,
+            cmd_outputs=_cmd_outputs)
         rp = log_file.parent / (log_file.stem + ".verify-report.json")
         try:
             rp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -4602,6 +4730,10 @@ def stage_report(args, profiles: dict, stamp: str) -> Path:
             log(f"[report] ⚠️ triage_reason 漂移：{_reason} 不在固定枚举（slug={_d.get('slug')}）")
     target_repos = sorted({d.get("project", "?") for d in disp})
 
+    # add-pipeline-outcome-observability：业务终态结构化出口（report 段终笔；--from-stage
+    # report 重跑同命中——自包含从盘读 state）。fail-open：写失败不拦报告（消费方回退）。
+    _write_pipeline_outcome(disp, stamp, dropped=len(dropped))
+
     def repo_of(d: dict) -> str:
         url = d.get("pr_url") or ""   # pr_url 可能显式为 None（skip/planned 项无 PR）→ coerce 防 re.search TypeError
         m = re.search(r"github\.com/([^/]+/[^/]+)/pull/", url)
@@ -4955,6 +5087,7 @@ def main():
     if args.from_stage == "inject" and not args.inject_prd:
         ap.error("--from-stage inject 需要 --inject-prd <path>")
     _load_claude_settings_env()   # 供 node dev-agent 的 SDK 子进程拿到 ANTHROPIC_* 认证（cron/SSH 启动兜底）
+    _stdout_tee_open(STATE_DIR / f"{args.stamp}.stdout.log")   # outcome 契约：stdout tee（失败降级仅终端）
 
     # run 级互斥锁（SPEC #30 ③）：锁获取在 STATE_DIR.mkdir 后（默认⑦），包整个 pipeline，try/finally 全路径释放
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -4965,6 +5098,7 @@ def main():
         _run_pipeline(args)
     finally:
         release_run_lock()
+        _stdout_tee_close()
 
 
 def _run_pipeline(args) -> None:

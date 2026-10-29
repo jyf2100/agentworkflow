@@ -258,16 +258,20 @@ def build_verify_report(*, run_id: str, project: str, prd_id: str, iteration_id:
                         anchor_workspace_ok: bool, anchor_digest_violations: list[str],
                         stream_path: str, session_meta: dict,
                         env_spec: str, env_observed: dict[str, list[str]],
-                        anchor_workspace_detail: str = "") -> dict:
+                        anchor_workspace_detail: str = "",
+                        cmd_outputs: dict[str, str] | None = None) -> dict:
     """完整测试报告（⑤：两轨统一输出契约，机械组装零 LLM）。
 
     落 ``state/runs/<stamp>.verify-report.json``（hub 容器形态必须命中挂载卷——D13）；
     dispatch record 持路径。命令来源与清单 / 逐命令 exit code / 锚检查 / 判定与证据指针 /
     会话元 / 环境奇偶节（declared spec vs transcript 观测，T3 v1 记录不阻断）全字段。
     """
+    # outcome 契约：逐命令 output_ref（分命令输出文件指针）——诊红因不翻原始 stream。
+    _refs = cmd_outputs or {}
     results = [{"declared": d, "unresolved": ex is None,
                 "matched_command": ex.command if ex else None,
-                "exit_code": ex.exit_code if ex else None}
+                "exit_code": ex.exit_code if ex else None,
+                "output_ref": _refs.get(d)}
                for d, ex in matched.items()]
     verdict = derive_verdict(matched, anchor_workspace_ok, anchor_digest_violations)
     reason = {
