@@ -80,7 +80,11 @@ REPO_ROOT = Path.cwd()
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit"}   # 写类工具（Bash 跑 test/git，不计入"尝试修代码"）
 N_STALL = 100                # verifiedRed 后连续 N 轮无写类 tool_use → stalled（2026-07-18：3→100，避免 dev「先诊断后改」被过早刹车）
 INPUT_TRUNC = 500            # tool_use.input 落盘截断
-MAX_BUDGET = 10              # maxBudgetUsd（降级兜底，宽松）
+# maxBudgetUsd（降级兜底，非硬保证——SDK 0.2.121 似可被绕过，见 _build_options 注）。
+# 默认 25：run #109 真机（2026-10-29）qwen3.8 后端多 turn dev loop 烧 $10 被掐（活干到
+# contract tests 尾声），当年「宽松」校准对分钟级长思考后端失效；PA_DEV_MAX_BUDGET 可
+# 覆盖（hub.env PA_* 透传链直达容器，调预算不重建镜像）。
+MAX_BUDGET = float(os.environ.get("PA_DEV_MAX_BUDGET") or "25")
 STATE_RUNS_DIR = REPO_ROOT / "state" / "runs"
 
 # run #105 真机（2026-10-29）：推理网关后端（qwen3.8-27b-coding）reasoning effort 只认

@@ -143,3 +143,12 @@ def test_dev_effort_env_override_and_empty_fallback(monkeypatch):
     assert m._dev_effort() == "xhigh"
     monkeypatch.setenv("PA_DEV_EFFORT", "")
     assert m._dev_effort() == "medium"
+
+
+def test_max_budget_default_and_env_override(monkeypatch):
+    """MAX_BUDGET 默认 25（run #109：$10 掐死干到尾声的 dev loop）；PA_DEV_MAX_BUDGET 覆盖生效。"""
+    monkeypatch.delenv("PA_DEV_MAX_BUDGET", raising=False)
+    m = _load_dev_agent()
+    assert m.MAX_BUDGET == 25.0
+    monkeypatch.setenv("PA_DEV_MAX_BUDGET", "40")
+    assert _load_dev_agent().MAX_BUDGET == 40.0
