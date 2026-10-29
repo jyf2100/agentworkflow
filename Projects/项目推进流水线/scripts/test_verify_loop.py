@@ -84,11 +84,12 @@ def test_verify_prompt_red_round2(tmp_path):
     # Arrange / Act
     p = run_daily.verify_prompt("PRD", "auto/b", "main", tmp_path / "d.diff",
                                 {"test_rc": 1, "test_log": "L"}, 2, {"name": PROJ})
-    # Assert：四要素都喂到了
+    # Assert：五要素都喂到了
     assert "第2轮" in p and "auto/b" in p
     assert str(tmp_path / "d.diff") in p
     assert "红（test_rc=1" in p
     assert "同分支累积" in p    # verify-loop-discipline A4a：round≥2 标注「同分支累积」（base=默认分支、diff 全量）
+    assert "五要素" in p and "non_goals" in p   # add-acceptance-preflight-guard D4：⑤不动什么进 verify prompt
 
 
 def test_verify_prompt_test_not_run(tmp_path):

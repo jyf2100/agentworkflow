@@ -31,6 +31,7 @@ For future Claude：控制面 cron 编排器。Phase-2 只实现前半段：
 from __future__ import annotations
 
 import argparse
+import ast       # add-acceptance-preflight-guard P0：作者期 import 白名单 AST 提取（纯 stdlib，cron 安全）
 import contextlib
 import hashlib
 import json
@@ -918,8 +919,11 @@ E2E 专则（硬性，违反 = 结构自检拒收）：
 - 只 `import '@playwright/test'`——镜像全局已装（NODE_PATH resolve），勿在仓内装依赖/引新 devDependency。
 """
     else:
-        shape = ("*.test.js / *.test.ts（只 import 仓内已有依赖面，不引新 devDependency）"
-                 if harness == "jest" else "test_*.py（纯标准库 + 仓内已有 fixtures，不引新第三方）")
+        shape = ("*.test.js / *.test.ts（只 import 相对路径 + jest 面 jest/@jest/globals——"
+                 "编排器 import 白名单机械强制，其余裸包名违规即扣）"
+                 if harness == "jest" else
+                 "test_*.py（只 import 标准库 + 相对导入——编排器 import 白名单机械强制，"
+                 "其余裸包名违规即扣）")
         e2e_rules = ""
     return f"""为过闸 PRD 编写验收测试（harness={harness}）。
 
@@ -964,6 +968,65 @@ def _collect_authored_files(payload: dict, out_dir: Path) -> tuple[dict[str, str
     return files, suite_ids
 
 
+_JS_IMPORT_RE = re.compile(
+    r"""^[ \t]*(?:
+        import\s+(?:[\w${},\s*]+\s+from\s+)?['"]([^'"]+)['"]
+      | (?:const|let|var)\s+[\w${},\s]+\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)
+      | require\(\s*['"]([^'"]+)['"]\s*\)
+    )""",
+    re.MULTILINE | re.VERBOSE,
+)
+# jest/playwright 面 import 白名单（design D2：作者期无仓事实下的绝对保守集）。
+# 放行 = 白名单包 + 相对/绝对路径形态（'.' '..' '/' 开头）；其余裸包名拒——
+# 无法区分仓真有还是幻觉（run #76 jsdom 标本），保守拒并留 detail 供 journal 透传。
+_JS_IMPORT_WHITELIST = {
+    "jest": {"jest", "@jest/globals"},
+    "playwright": {"@playwright/test"},
+}
+
+
+def _extract_imports_py(content: str) -> list[str] | None:
+    """pytest 面顶层绝对 import specifier 列表（AST）；相对导入（level>0）天然合法不列；
+    语法不可解析返回 None（调用方归作者期第一层失败面——坏考卷第一发生点即拦）。"""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
+    specs: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            specs.extend(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:  # from x import y（x 为绝对名）
+                specs.append(node.module)
+    return specs
+
+
+def _extract_imports_js(content: str) -> list[str]:
+    """jest/playwright 面 import/require specifier 列表（行首语句形状正则，design D1）。
+    行首锚定 → 字符串字面量/注释内出现的 require('x') 不匹配（误判面收紧）。"""
+    return [next(g for g in tup if g) for tup in _JS_IMPORT_RE.findall(content)]
+
+
+def _import_whitelist_violation(rel: str, content: str, harness: str) -> str | None:
+    """作者期 import 白名单（add-acceptance-preflight-guard P0）：返回 None=放行 / str=违规 detail。"""
+    if harness == "pytest":
+        specs = _extract_imports_py(content)
+        if specs is None:
+            return f"pytest 文件语法不可解析（ast.parse SyntaxError）: {rel}"
+        for s in specs:
+            if s.split(".")[0] not in sys.stdlib_module_names:
+                return (f"import 白名单外依赖 {s!r}（{rel}）——pytest 面只放行 stdlib + 相对导入，"
+                        f"裸第三方/仓包名作者期无法核实（run #76 jsdom 标本），保守拒")
+    elif harness in _JS_IMPORT_WHITELIST:
+        for s in _extract_imports_js(content):
+            if s.startswith((".", "..", "/")) or s in _JS_IMPORT_WHITELIST[harness]:
+                continue
+            return (f"import 白名单外依赖 {s!r}（{rel}）——{harness} 面只放行 "
+                    f"{sorted(_JS_IMPORT_WHITELIST[harness])} + 相对/绝对路径，裸包名保守拒")
+    return None
+
+
 def _structural_self_check(files: dict[str, str], harness: str,
                            valid_ids: set[str],
                            expected_port: int | None = None) -> tuple[bool, str]:
@@ -995,6 +1058,9 @@ def _structural_self_check(files: dict[str, str], harness: str,
                 return False, f"playwright 套件含非 e2e_*.spec.ts 文件: {rel}"
             if "page.waitForTimeout(" in content:
                 return False, f"禁固定等待 page.waitForTimeout（E2E 条件等待纪律）: {rel}"
+        _iv = _import_whitelist_violation(rel, content, harness)
+        if _iv:
+            return False, _iv
         ann |= _parse_criterion_annotations(content)
     if not ann:
         return False, "零 criterion 标注（覆盖闭合不可机械审计）"
@@ -1002,6 +1068,37 @@ def _structural_self_check(files: dict[str, str], harness: str,
     if bad:
         return False, f"标注了不存在的 criterion id: {sorted(bad)[:3]}"
     return True, "ok"
+
+
+def _collect_check(wt: Path, injected: dict[str, str]) -> tuple[str, str]:
+    """add-acceptance-preflight-guard P1（第二层，dispatch 期，pytest-only）：worktree 内
+    ``pytest <注入文件> --collect-only -q`` 一次子进程真判活——相对导入按文件系统路径解析到
+    仓源码（就在 worktree），不依赖 site-packages（design D2：P0 管无事实时保守，本层管有
+    仓源码时验证）。
+
+    三态（D3，锚定归属不惩罚环境）：
+      pass           exit 0。
+      fail           exit≠0 且最后 traceback 帧锚定注入文件（ImportError/收集错在考卷）→ 扣套件。
+      indeterminate  锚定外部（conftest/pytest 缺失）/超时——环境 UNKNOWN ≠ 套件坏，不扣
+                     （verify 侧 post-hoc ERROR collecting 签名既有兜底）。
+    """
+    files = [str(wt / rel) for rel in sorted(injected)]
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pytest", *files, "--collect-only", "-q"],
+            cwd=str(wt), capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return "indeterminate", "collect 超时（120s，圈定注入文件仍超——环境面嫌疑，不扣）"
+    except FileNotFoundError as e:
+        return "indeterminate", f"collect 环境缺失: {e}"
+    if r.returncode == 0:
+        return "pass", "ok"
+    out = (r.stdout or "") + (r.stderr or "")
+    frames = re.findall(r"(\S+\.py):\d+(?::|,)", out)   # traceback 帧行（最后帧 = 失败发生处）
+    last = frames[-1] if frames else ""
+    if any(last == rel or last.endswith("/" + rel) or last.endswith("\\" + rel) for rel in injected):
+        return "fail", f"collection 失败锚定注入文件 {last}（exit {r.returncode}）: {out.strip()[:160]}"
+    return "indeterminate", f"collection 失败锚定外部（exit {r.returncode}）: {out.strip()[:160]}"
 
 
 def _author_acceptance_suite(entry: dict, prof: dict, stamp: str) -> dict | None:
@@ -1194,7 +1291,7 @@ git diff（{base}..{branch}）：{diff_path}
 - **功能对齐**：diff 是否实现各验收点（对照 id 列表；绿轻红重——测试绿 quick sanity 即可，测试红须逐项核对）。
 - **开发遗漏**：验收点是否被静默丢弃（id 列表有而 diff 无对应实现且无说明）。
 - **质量达标（{dims}）**：是否存在阻塞性硬缺陷（绿测试不豁免）。
-{bundle_guidance}- 三维度全过 → verdict=pass；任一维度有阻塞性缺陷 → verdict=revise，写 feedback_section 四要素：{locate_hint}（非测试缺陷锚验收点 id 或 diff 位置；测试缺陷锚失败测试位置） ②原因 ③怎么改（可执行）④收尾门（全量测试绿才算过）。
+{bundle_guidance}- 三维度全过 → verdict=pass；任一维度有阻塞性缺陷 → verdict=revise，写 feedback_section 五要素：{locate_hint}（非测试缺陷锚验收点 id 或 diff 位置；测试缺陷锚失败测试位置） ②原因 ③怎么改（可执行）④收尾门（全量测试绿才算过）⑤不动什么（non_goals——上轮已绿实现/公共 API 形状/已注入验收测试文件，无则显式写「无」，add-acceptance-preflight-guard D4）。
 - round=2 表示 dev 已按上轮反馈在同分支上累积重做过一次，重点看反馈是否被落实（marker 定位本轮增量）。
 只吐那一行 JSON，多一个字都算失败。"""
 
@@ -3423,6 +3520,44 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
         _sj.emit("acceptance_bound", _iter, _prd, payload={
             "digest": _suite_snap["digest"], "iteration_snapshot": True,
             "supersedes": _suite_snap.get("supersedes")})
+    # add-acceptance-preflight-guard P1（第二层收集级自检，dev 启动前一次，verify 回环外）：临时把考卷
+    #   落进 worktree 跑 pytest --collect-only 真判活，完即清（dev-agent 仍是唯一正式注入源，worktree
+    #   不残留）。fail = 失败锚定注入文件 → 本 iteration 扣留（_suite_snap 置 None：dev 无
+    #   acceptance_injection 启动，fail-open 回退 PRD 验收面）；indeterminate 不扣（环境 UNKNOWN ≠
+    #   套件坏，D3）；jest/playwright v1 豁免记 skipped（无 worktree 内 node 工具链，design Non-Goals）。
+    if _suite_snap:
+        _harness = str(_suite_snap.get("harness") or "")
+        if _harness == "pytest":
+            _cverdict, _cnote = "indeterminate", "未执行"
+            _inj: dict[str, str] = {}
+            try:
+                _inj = acceptance_tests.inject_files(STATE_DIR / "acceptance_store", _suite_snap)
+                for _rel, _content in _inj.items():
+                    _tp = wt / _rel
+                    _tp.parent.mkdir(parents=True, exist_ok=True)
+                    _tp.write_text(_content, encoding="utf-8")
+                _cverdict, _cnote = _collect_check(wt, _inj)
+            except Exception as e:   # store 读回/digest 校验/collect 接线异常 → 不扣（观测面 fail-open）
+                _cverdict, _cnote = "indeterminate", f"collect 接线异常: {e}"
+            finally:
+                for _rel in _inj:
+                    try:
+                        (wt / _rel).unlink()
+                    except OSError:
+                        pass
+            if _sj.enabled:
+                _sj.emit("acceptance_collect", _iter, _prd,
+                         payload={"verdict": _cverdict, "note": str(_cnote)[:200],
+                                  "digest": _suite_snap["digest"]})
+            log(f"[collect:{slug}] verdict={_cverdict} {str(_cnote)[:120]}")
+            if _cverdict == "fail":
+                log(f"[collect:{slug}] ✗ 考卷扣留（本 iteration 不注入，dev 回退 PRD 验收面）")
+                _suite_snap = None
+        elif _sj.enabled:
+            _sj.emit("acceptance_collect", _iter, _prd, payload={
+                "verdict": "skipped",
+                "note": f"harness={_harness} v1 豁免（无 worktree 内 node 工具链，design Non-Goals）",
+                "digest": _suite_snap["digest"]})
     for round_n in range(1, VERIFY_MAX_ROUNDS + 1):
         _iter = _coord.next_iteration(round_n)   # task 3.3：每轮 distinct deterministic iteration（seq=round_n；
         #   planned/running 用 run 级 seq0，每 attempt 一个新 iteration；distinct 使 reducer/recovery 可按 attempt 切片）
