@@ -37,6 +37,9 @@ class FakeLC:
     def reconcile_running(self):
         self.reconciles += 1
 
+    def sweep_confirmations(self):  # 2.4 确认环超时挂点替身（计数供断言）
+        self.sweeps = getattr(self, "sweeps", 0) + 1
+
 
 class StopAfter:
     """fake sleep：第 n 次间隔时置 stop_event（零真睡眠驱动循环收尾）。"""

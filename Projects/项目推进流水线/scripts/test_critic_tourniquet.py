@@ -33,7 +33,7 @@ def test_critic_missing_verdict_degrades_not_crash(tmp_path, monkeypatch):
     monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
     manifest = {"prds": [{"project": "p1", "path": "a.md", "source_path": "s"}]}
     monkeypatch.setattr(run_daily, "_critic_one",
-                        lambda path, src, prof: {"prd_path": path, "project": "p1"})  # 故意无 verdict
+                        lambda path, src, prof, mm_src=None: {"prd_path": path, "project": "p1"})  # 故意无 verdict
     gate = run_daily.stage_critic(_args(), manifest, {}, "20260728")
     assert len(gate) == 1
     assert gate[0]["verdict"] == "drop"                       # 降级，不崩
@@ -66,6 +66,6 @@ def test_critic_normal_verdicts_unaffected(tmp_path, monkeypatch):
     ]}
     verdicts = iter(["pass", "drop"])
     monkeypatch.setattr(run_daily, "_critic_one",
-                        lambda path, src, prof: {"verdict": next(verdicts), "prd_path": path})
+                        lambda path, src, prof, mm_src=None: {"verdict": next(verdicts), "prd_path": path})
     gate = run_daily.stage_critic(_args(), manifest, {}, "20260728")
     assert {g["verdict"] for g in gate} == {"pass", "drop"}   # 原样穿过

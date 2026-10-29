@@ -55,12 +55,25 @@ def _profile_forges(profiles_root: Path) -> set[str] | None:
     return forges or None
 
 
-def _event_text(run: dict, row: dict) -> str:
+def _event_text(run: dict, row: dict, rid: int | None = None) -> str:
     """事件通知文本 = 事实字段机械拼接（hub 零语义加工），头部带 run 标识可回查。"""
     head = f"[pa-hub] {row.get('project') or run['project']} run #{run['id']}（{Path(run['run_dir']).name}）"
     ev = row.get("event")
     if ev == "critic_verdict":
         return f"{head} critic 判定 → {row.get('verdict')}\n{row.get('summary') or ''}".rstrip()
+    if ev == "metrics_proposed":
+        # 确认环文案（2.2 spec：逐条一行 ≤8 截断；proxy 逐条标注；requires: 前置在
+        # metric 文本内随行带出；@发起人由 notify_event 层 _mention 统一处理）。
+        parts = [f"{head} 需求缺验收指标，已拟指标清单（确认行 #{rid}）待拍板："]
+        metrics = [m for m in (row.get("metrics") or []) if isinstance(m, dict)]
+        for m in metrics[:8]:
+            tag = "〔代理指标〕" if m.get("coverage") == "proxy" else ""
+            parts.append(f"- {m.get('metric')}{tag}（依据：{m.get('from')}）")
+        if len(metrics) > 8:
+            parts.append(f"（共 {len(metrics)} 条，超出 8 条截断——完整清单见确认行 #{rid}）")
+        parts.append(f"用法：/pa confirm #{rid} 拍板入队 ｜ /pa reject #{rid} 放弃 ｜ "
+                     f"/pa metrics #{rid} <补充> 带上下文重拟")
+        return "\n".join(parts)
     if ev == "pr_opened":
         repo = row.get("repo")
         return f"{head} PR 开出{f'（{repo}）' if repo else ''}：{row.get('pr_url')}"
@@ -362,12 +375,86 @@ class Lifecycle:
                 if key in self._event_seen:
                     continue
                 self._event_seen.add(key)
+                if row.get("event") == "metrics_proposed":
+                    # 确认环建行（2.2）：文案须带确认行 #id 才可 confirm——先建行再转发；
+                    # 建行不成（无 initiator 等）不 post（无行可确认的清单只会困惑，fail-safe）。
+                    rid = self._open_confirmation(run, item, row)
+                    if rid is None:
+                        continue
+                    self.notifier.notify_event(
+                        text=_event_text(run, row, rid=rid), enqueued_by=item.get("enqueued_by"),
+                        project=run["project"],
+                    )
+                    continue
                 self.notifier.notify_event(
                     text=_event_text(run, row), enqueued_by=item.get("enqueued_by"),
                     project=run["project"],  # 归属路由（6.2）：绑定频道全量进，per-event 判定废止
                 )
         except Exception as e:  # 观察面 fail-open——绝不炸 reconcile 主路径
             print(f"[events][warn] run#{run['id']} 事件转发失败（fail-open）: {type(e).__name__}", file=sys.stderr)
+
+    def _open_confirmation(self, run: dict, item: dict, row: dict) -> int | None:
+        """metrics_proposed → confirmation_requests 建行（2.2，spec: 指标清单回流）。
+
+        字段映射（spec）：initiator=enqueued_by（入队会话用户 = mm_user_id）、
+        channel_id=建行时刻项目绑定快照（未绑定存 ""，confirm 实时查绑定为判据）、
+        prd_text=item prd_path 全文快照（confirm 并节的原料）、metrics_json=事件
+        metrics、origin_sha=祖先链根（同 project+发起人有前行则继承——confirm/metrics
+        重入队后新 prd_sha 不换根；首次 = 事件 prd_sha）。
+        无 initiator / PRD 读失败 → 不建行 + warn（回归信号）；事件重复到达幂等
+        （idx_confirm_item UNIQUE，已存在回查既有 rid——hub 重启重发语义）。
+        fail-open：任一异常 stderr 告警不抛（reconcile 同步路径，观察面纪律）。
+        """
+        try:
+            initiator = (item.get("enqueued_by") or "").strip()
+            if not initiator:
+                print(f"[confirm][warn] run#{run['id']} metrics_proposed 无 initiator"
+                      "（enqueued_by 缺）——不建行", file=sys.stderr)
+                return None
+            try:
+                prd_text = Path(item["prd_path"]).read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                print(f"[confirm][warn] run#{run['id']} PRD 快照读失败——不建行: {type(e).__name__}",
+                      file=sys.stderr)
+                return None
+            binding = self._db.get_channel_binding_by_project(run["project"])
+            origin = (self._db.latest_confirmation_origin(run["project"], initiator)
+                      or str(row.get("prd_sha") or ""))
+            rid = self._db.insert_confirmation(
+                item_id=run["queue_item_id"], project=run["project"],
+                channel_id=binding["channel_id"] if binding else "",
+                initiator=initiator, prd_text=prd_text,
+                metrics_json=json.dumps(row.get("metrics") or [], ensure_ascii=False),
+                origin_sha=origin)
+            if rid is not None:
+                return rid
+            existing = self._db.get_confirmation_by_item(run["queue_item_id"])
+            return existing["id"] if existing else None
+        except Exception as e:  # noqa: BLE001——建行挂点在 reconcile 同步路径，fail-open
+            print(f"[confirm][warn] run#{run['id']} 建行失败（fail-open）: {type(e).__name__}",
+                  file=sys.stderr)
+            return None
+
+
+    def sweep_confirmations(self) -> None:
+        """确认环超时扫描（2.4，spec: 确认超时）：requested >72h → expired + 回执
+        （notify_event 三代分流 @发起人）。观察面 fail-open；notifier 关闭仅落库
+        静默（对齐放弃告警纪律——超时是机械事实，通道关不阻断置态）。"""
+        try:
+            swept = self._db.expire_sweep_confirmations()
+        except Exception as e:  # noqa: BLE001——观察面挂点，绝不炸 reconcile tick
+            print(f"[confirm][warn] 超时扫描异常（fail-open）: {type(e).__name__}", file=sys.stderr)
+            return
+        for row in swept:
+            if self.notifier is None:
+                continue
+            try:
+                self.notifier.notify_event(
+                    text=(f"[pa-hub] 确认行 #{row['id']}（{row['project']}）超 72h 未决——已过期；"
+                          "如仍需要请 `/pa run` 重新提交（expired 不可再 confirm）"),
+                    enqueued_by=row["initiator"], project=row["project"])
+            except Exception as e:  # noqa: BLE001
+                print(f"[confirm][warn] 过期回执失败（fail-open）: {type(e).__name__}", file=sys.stderr)
 
     def reconcile_running(self) -> None:
         """轮询 running run 行：exited → 记终态走状态机；gone → 按卷证据归档。"""
@@ -379,6 +466,7 @@ class Lifecycle:
             if st.state == "exited":
                 rc = st.exit_code if st.exit_code is not None else 1  # None 不该出现，兜底按失败
                 status = "succeeded" if rc == 0 else "failed"
+                self._forward_events(run)  # 终态 flush（2.4）：末轮 running 后新写行不丢（metrics_proposed 丢 = 确认环死链）
                 self._finish_run(run["id"], status, exit_code=rc, project=run["project"],
                                  run_dir_name=Path(run["run_dir"]).name,
                                  item=self._safe_item(run["queue_item_id"]))
@@ -386,6 +474,7 @@ class Lifecycle:
             else:  # gone——终态不明，以卷上 journal 证据归档，绝不静默当成功
                 has_journal = _journal_exists(run["run_dir"])
                 status = "failed" if has_journal else "failed_to_start"
+                self._forward_events(run)  # 终态 flush（2.4）：卷在事件文件就可能在——flush 先于归档
                 self._finish_run(run["id"], status, project=run["project"],
                                  run_dir_name=Path(run["run_dir"]).name,
                                  item=self._safe_item(run["queue_item_id"]),

@@ -78,7 +78,7 @@ def test_stage_critic_emits_verdict_events(tmp_path, monkeypatch):
     verdicts = iter(["pass", "drop"])
     proj_of = {f"{STAMP}_a.md": "p1", f"{STAMP}_b.md": "p2"}
     monkeypatch.setattr(run_daily, "_critic_one",
-                        lambda path, src, prof: {"verdict": next(verdicts), "prd_path": path,
+                        lambda path, src, prof, mm_src=None: {"verdict": next(verdicts), "prd_path": path,
                                                  "project": proj_of[path], "summary": "s1"})
     run_daily.stage_critic(_args(), manifest, {}, STAMP)
     # Assert：两 project 各自事件文件（slug = PRD stem），verdict 机械转发。
@@ -98,7 +98,7 @@ def test_stage_critic_reuse_gate_does_not_reemit(tmp_path, monkeypatch):
     monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
     manifest = {"prds": [{"project": "p1", "path": f"{STAMP}_a.md", "source_path": "s"}]}
     monkeypatch.setattr(run_daily, "_critic_one",
-                        lambda path, src, prof: {"verdict": "pass", "prd_path": path,
+                        lambda path, src, prof, mm_src=None: {"verdict": "pass", "prd_path": path,
                                                  "project": "p1", "summary": "s"})
     run_daily.stage_critic(_args(), manifest, {}, STAMP)
     ev = tmp_path / "runs" / "p1" / f"{STAMP}_{STAMP}_a.events.jsonl"

@@ -64,6 +64,21 @@ def _critic_fn(state: dict) -> dict:
     entry = dict(payload)
     entry.setdefault("round", rnd)
     entry.setdefault("revised", rnd > 1)             # round2+ 是 revise 后的再过闸
+    # add-acceptance-spec-confirmation D3 镜像：needs_metrics 路由（spec-author 拟指标回流）——
+    # 复用 run_daily._needs_metrics_route 零逻辑分叉（critic prompt 四态已由 _critic_build_prompt
+    # 来源分叉注入）；非 MM 源违规吐四态同样保守降级 drop。路由后 verdict 不再是 revise，
+    # route_critic 自然走 done（不进 revise 回环；dispatch 聚合 verdict==pass 过滤天然不投）。
+    if entry.get("verdict") == "needs_metrics":
+        import run_daily
+        mm_src = run_daily._mm_source_of(state.get("_prd_path", ""))
+        if mm_src:
+            entry = run_daily._needs_metrics_route(
+                entry, state.get("_prof") or {},
+                state.get("stamp") or run_daily._current_stamp(), mm_src)
+        else:
+            entry["verdict"] = "drop"
+            entry["summary"] = "非 MM 源不可判 needs_metrics（graph critic 契约违规），降级 drop"
+        update["_critic_verdict"] = entry.get("verdict", "needs_metrics")
     update["entries"] = list(state.get("entries", [])) + [entry]
     return update
 

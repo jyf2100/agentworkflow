@@ -23,6 +23,7 @@ ephemeral JSON + 后置频道 post）；本文件承载全部语义面：
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 import sys
@@ -56,8 +57,15 @@ _USAGE = (
     "用法：\n"
     "• `/pa run <需求正文> 出处: <链接或说明>` —— 需求入队（project 由频道推断）\n"
     "• `/pa bind <project>` —— 绑定本频道与项目（仅 admin）\n"
-    "• `/pa unbind` —— 解除本频道绑定（仅 admin）"
+    "• `/pa unbind` —— 解除本频道绑定（仅 admin）\n"
+    "• `/pa confirm #<行id>` —— 拍板指标清单并入 PRD 入队（仅发起人）\n"
+    "• `/pa reject #<行id>` —— 放弃指标清单（仅发起人）\n"
+    "• `/pa metrics #<行id> <补充>` —— 补充上下文重新拟指标（仅发起人）"
 )
+
+# D5 重入队上界：同一原始需求（origin_sha 祖先链）confirm/metrics 重入队达 3 次
+# 未收敛 → 回执人工改写（对照 revise 既有 1 次额度，全链重试语义有界）
+CONFIRM_REENQUEUE_MAX = 3
 
 
 def readable_projects(data_root: Path) -> list[str]:
@@ -201,6 +209,14 @@ def handle_command(*, database, engine, cfg, mm, form: dict,
         return _handle_run(database=database, engine=engine, cfg=cfg, mm=mm,
                            channel_id=channel_id, user_id=user_id, user_name=user_name,
                            body=arg, member_cache=member_cache, now_utc=now_utc)
+    if cmd == "confirm":
+        return _handle_confirm(database=database, engine=engine, cfg=cfg,
+                               user_id=user_id, arg=arg, now_utc=now_utc)
+    if cmd == "reject":
+        return _handle_reject(database=database, user_id=user_id, arg=arg)
+    if cmd == "metrics":
+        return _handle_metrics(database=database, engine=engine, cfg=cfg,
+                               user_id=user_id, arg=arg, now_utc=now_utc)
     return _ephemeral(_USAGE)  # 空/未知子命令：用法清单（教育回执）
 
 
@@ -320,3 +336,157 @@ def _handle_unbind(*, database, cfg, channel_id: str, user_name: str) -> dict:
     if row is None:
         return _ephemeral("本频道未绑定项目（无需解绑）——`/pa bind <project>` 可绑定")
     return _ephemeral(f"已解绑：{row['project']} ↔ 本频道——入站将拒绝、出站通知回落私信")
+
+
+# ── 确认环三子命令（add-acceptance-spec-confirmation 2.3，spec: confirm/reject/metrics）──
+# 共同判据链：行存在 → 发起人 user_id 相等 → requested 态（终态幂等回执）。发起人
+# 判据走行内 initiator（事实判据，不随频道成员/绑定漂移）；不做频道成员校验。
+
+def _parse_rid(arg: str) -> int | None:
+    """`#77` / `77` → 77；非法/空 → None（# 前缀容忍——spec 写法 `#<id>`）。"""
+    s = arg.split()[0].lstrip("#") if arg.split() else ""
+    return int(s) if s.isdigit() else None
+
+
+def _confirmation_gate(database, rid: int | None, user_id: str) -> tuple[dict | None, dict | None]:
+    """共享前置闸：行查无 / 非发起人 / 非 requested（终态幂等回执）。
+
+    返回 (row, denial)——denial 非 None 即调用方直接回执；row 仅在 requested 且
+    发起人本人时非 None。
+    """
+    if rid is None:
+        return None, _ephemeral("缺行 id——用法：`/pa confirm #<行id>`（行 id 见指标清单通知）")
+    row = database.get_confirmation(rid)
+    if row is None:
+        return None, _ephemeral(f"确认行 #{rid} 不存在——行 id 见指标清单通知")
+    if row["initiator"] != user_id:
+        return None, _ephemeral(f"确认行 #{rid} 仅发起人本人可操作")
+    if row["status"] != "requested":
+        label = {"confirmed": "已确认", "rejected": "已放弃", "expired": "已过期"}.get(
+            row["status"], row["status"])
+        return None, _ephemeral(f"确认行 #{rid} {label}——无需重复处理（幂等回执）")
+    return row, None
+
+
+def _reenqueue_guard(database, row: dict) -> dict | None:
+    """D5 祖先链重入队上界：同 origin_sha 已 confirmed 达 3 次 → 回执人工改写。"""
+    if database.count_confirm_origin(row["origin_sha"]) >= CONFIRM_REENQUEUE_MAX:
+        return _ephemeral(
+            f"同一需求的重拟次数已达上界（{CONFIRM_REENQUEUE_MAX} 次）——"
+            "请人工改写需求后重新提交（`/pa run <改写后的需求> 出处: ...`）")
+    return None
+
+
+def _metrics_section(metrics: list) -> str:
+    """指标清单 →「验收指标（发起人确认）」节（机械并入，id 前缀保留供 test-author
+    criterion 对位；proxy 逐条标注；id=infra 的基建缺口尾注条目不是指标，跳过）。"""
+    lines = ["## 验收指标（发起人确认）", ""]
+    for m in metrics:
+        if not isinstance(m, dict) or m.get("id") == "infra":
+            continue
+        tag = "〔代理指标〕" if m.get("coverage") == "proxy" else ""
+        lines.append(f"- [ ] {m.get('id')}: {m.get('metric')}{tag}")
+    return "\n".join(lines)
+
+
+def _store_and_enqueue(database, engine, cfg, project: str, user_id: str,
+                       merged: str, now_utc) -> tuple[int | None, str | None]:
+    """confirm/metrics 共用入队尾段（复用 run 面路径：新 sha 新文件名、deliver_key
+    小时窗幂等、落盘/入队异常转拒绝回执）。返回 (item_id, denial)。"""
+    sha = hashlib.sha256(merged.encode("utf-8")).hexdigest()
+    key = deliver_key_for(project, user_id, merged, now_utc)
+    existing = database.get_item_by_deliver_key(key)
+    if existing is not None:  # 同窗重试幂等（改写措辞即绕过——有意）
+        return existing["id"], None
+    try:
+        target = prd_store.store_prd(
+            cfg.data_root, project, f"mm-{sha[:8]}.md", merged,
+            declared_sha=sha, overwrite=False,
+        )
+    except prd_store.PrdStoreError as e:
+        return None, _ephemeral(f"落盘失败：{e}——请重试或走面板")
+    try:
+        return engine.enqueue(project, str(target), user_id, deliver_key=key), None
+    except sqlite3.IntegrityError:
+        winner = database.get_item_by_deliver_key(key)  # 并发撞键 db 层兜底（run 面先例）
+        if winner is None:
+            return None, _ephemeral("入队状态不一致（撞键后查无既有项）——请重试")
+        return winner["id"], None
+
+
+def _decide(database, rid: int, new_status: str) -> None:
+    """置态（requested 已在闸内验过；ValueError 防御转静默——单线程内不期望出现）。"""
+    try:
+        database.decide_confirmation(rid, new_status)
+    except ValueError as e:
+        print(f"[mm-intake][warn] 确认行 #{rid} 置态异常: {e}", file=sys.stderr)
+
+
+def _handle_confirm(*, database, engine, cfg, user_id: str, arg: str,
+                    now_utc) -> dict:
+    rid = _parse_rid(arg)
+    row, denial = _confirmation_gate(database, rid, user_id)
+    if denial:
+        return denial
+    capped = _reenqueue_guard(database, row)
+    if capped:
+        return capped
+    binding = database.get_channel_binding_by_project(row["project"])
+    if binding is None:  # spec：行保持 requested，绑定恢复后可再 confirm
+        return _ephemeral(f"项目 {row['project']} 当前未绑定频道——确认行 #{rid} 保持待确认，绑定恢复后可再拍板")
+    try:
+        metrics = json.loads(row["metrics_json"] or "[]")
+    except ValueError:
+        metrics = []
+    merged = row["prd_text"].rstrip() + "\n\n" + _metrics_section(metrics) + "\n"
+    item_id, failure = _store_and_enqueue(database, engine, cfg, row["project"],
+                                          user_id, merged, now_utc)
+    if failure:
+        return failure
+    _decide(database, rid, "confirmed")
+    return _ephemeral(
+        f"已拍板入队 #{item_id}（{row['project']}）——指标并入 PRD，run 终态与本频道同步",
+        channel_post=f"<@{user_id}> 已确认指标并入 PRD：#{item_id}（{row['project']}，确认行 #{rid}）",
+    )
+
+
+def _handle_reject(*, database, user_id: str, arg: str) -> dict:
+    rid = _parse_rid(arg)
+    row, denial = _confirmation_gate(database, rid, user_id)
+    if denial:
+        return denial
+    _decide(database, rid, "rejected")
+    return _ephemeral(
+        f"已放弃确认行 #{rid} 的指标清单（需求未入队——可 `/pa run` 改写后重提）",
+        channel_post=f"<@{user_id}> 放弃了确认行 #{rid} 的指标清单（{row['project']}）",
+    )
+
+
+def _handle_metrics(*, database, engine, cfg, user_id: str, arg: str,
+                    now_utc) -> dict:
+    parts = arg.split(None, 1)
+    rid = _parse_rid(parts[0]) if parts else None
+    extra = parts[1].strip() if len(parts) > 1 else ""
+    if rid is None or not extra:
+        return _ephemeral("用法：`/pa metrics #<行id> <补充说明>`——补充上下文后重新拟指标")
+    row, denial = _confirmation_gate(database, rid, user_id)
+    if denial:
+        return denial
+    capped = _reenqueue_guard(database, row)
+    if capped:
+        return capped
+    binding = database.get_channel_binding_by_project(row["project"])
+    if binding is None:  # 与 confirm 同判据：未绑定不入队，行保持 requested
+        return _ephemeral(f"项目 {row['project']} 当前未绑定频道——确认行 #{rid} 保持待确认，绑定恢复后可再补充")
+    merged = row["prd_text"].rstrip() + f"\n\n## 发起人补充\n\n{extra}\n"
+    item_id, failure = _store_and_enqueue(database, engine, cfg, row["project"],
+                                          user_id, merged, now_utc)
+    if failure:
+        return failure
+    # 置 confirmed（非语义上的「拍板」）：D5 计数面 = COUNT(status='confirmed')，
+    # metrics 重拟与 confirm 同计数才能让 3 次上界覆盖两种重入队路径
+    _decide(database, rid, "confirmed")
+    return _ephemeral(
+        f"已带补充重新入队 #{item_id}（{row['project']}）——新指标清单拟好后将再次通知你确认",
+        channel_post=f"<@{user_id}> 补充了需求上下文，重新入队：#{item_id}（{row['project']}，源确认行 #{rid}）",
+    )

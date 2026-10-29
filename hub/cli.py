@@ -184,6 +184,21 @@ def _check_intake(cfg: config.HubConfig, *, mm, database) -> int:
             ok = False
         else:
             print(f"✓ 3/3 {row['project']} ↔ {chan} 可达（成员 {len(ids)} 人，含 bot）")
+    # 确认环面（add-acceptance-spec-confirmation 2.4）：待决行数 + 最老行龄——
+    # 观察输出不占步号、不影响退出码（超时置 expired 是 daemon sweep 的机械职责）
+    try:
+        from datetime import datetime, timezone
+        pending = database.list_confirmations_pending()
+        if pending:
+            ages_h = [(datetime.now(timezone.utc) - datetime.fromisoformat(r["created_at"])
+                       ).total_seconds() / 3600 for r in pending]
+            ids = "、".join(f"#{r['id']}" for r in pending[:5])
+            more = f"（+{len(pending) - 5} 行）" if len(pending) > 5 else ""
+            print(f"• 确认环：{len(pending)} 行待决（最老 {max(ages_h):.0f}h，72h 过期）——{ids}{more}")
+        else:
+            print("• 确认环：无待决行")
+    except Exception as e:  # noqa: BLE001——观察面不破坏自检主判定
+        print(f"• 确认环：查询异常（{type(e).__name__}）——不影响入站判定", file=sys.stderr)
     if ok:
         print("✓ 入站自检通过")
     else:

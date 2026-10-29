@@ -121,9 +121,9 @@ def _nvm_claude() -> Path | None:
 # 每段 wall-clock 超时（秒）——防挂死，非成本控制（SPEC §6/R2）
 # verify=pa-verify 裁判段（dev 产出验证闸，docs/verify-commit-loop-design.md §5-②）
 TIMEOUT = {"fetch": 1500, "radar": 600, "prd": 900, "critic": 300, "verify": 300,
-           "test-author": 600}
+           "test-author": 600, "spec-author": 300}
 MAX_TURNS = {"fetch": 40, "radar": 60, "prd": 90, "critic": 40, "verify": 30,
-             "test-author": 40}
+             "test-author": 40, "spec-author": 40}
 
 STAGES = ["fetch", "radar", "prd", "inject", "critic", "dispatch", "report"]
 
@@ -755,7 +755,34 @@ candidates / 上下文：
 {chr(10).join(prof_block) or '（见 candidate.project）'}"""
 
 
-def critic_prompt(prd_path: str, source_path: str, prof: dict) -> str:
+def _mm_source_of(prd_path: str) -> dict | None:
+    """读 PRD frontmatter 判 MM 绑定源（add-acceptance-spec-confirmation D3 来源分叉判据）。
+
+    hub 侧 wrap_mm_prd 产出的确定性 frontmatter 自带 source: mm-channel + user_id/username/
+    channel_id——pa 容器内无 hub 数据库，PRD 文件头即来源事实的唯一可达面。MM 入队路径
+    前置 bind 存在，故 frontmatter 在场 = 入队时刻项目已绑定（窗内 unbind 由 hub confirm
+    面兜底）。非 MM 源（radar/panel/手写）无此标记 → None → critic 保持三态判据。
+    简易 k: "v" 行解析（wrap 形态封闭集），零 yaml 依赖。"""
+    try:
+        text = Path(prd_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+    if not m:
+        return None
+    kv: dict[str, str] = {}
+    for ln in m.group(1).splitlines():
+        if ":" in ln:
+            k, _, v = ln.partition(":")
+            kv[k.strip()] = v.strip().strip('"')
+    if kv.get("source") != "mm-channel":
+        return None
+    user_id = kv.get("user_id", "")
+    return {"user_id": user_id, "username": kv.get("username", ""),
+            "channel_id": kv.get("channel_id", "")} if user_id else None
+
+
+def critic_prompt(prd_path: str, source_path: str, prof: dict, four_state: bool = False) -> str:
     ms = prof.get("match_surface", {})
     # source_path 空（投递/手写 PRD 常态）不留裸空白——尾随空白会诱导 critic 判无据（F12 单标准「不看出身」）
     src_line = (
@@ -763,11 +790,20 @@ def critic_prompt(prd_path: str, source_path: str, prof: dict) -> str:
         if source_path
         else "信息源原文：（无——投递/手写 PRD 常态形态，依据看 PRD 自带的背景交代/出处标注，不看出身，见你 persona traceability 硬规则）"
     )
+    # add-acceptance-spec-confirmation D1/D3：四态判据仅对 MM 绑定源声明（来源分叉）——非 MM 源
+    # 保持三态行零变化（radar/panel 模糊 PRD 走旧径，不产无人可确认的滞留行）。
+    verdict_line = (
+        "只吐一行 gate JSON（verdict=pass|drop|revise|needs_metrics——本 PRD 走四态判据："
+        "有据（traceability 过）但验收不可执行（无可断言指标）→ verdict=needs_metrics + reason=\"no_metrics\"；"
+        "drop 仅留无据/无关/自相矛盾/scope 过载）"
+        if four_state else
+        "只吐一行 gate JSON（verdict=pass|drop|revise）"
+    )
     return f"""待过闸 PRD：{prd_path}
 {src_line}
 项目 profile：name={prof.get('name')} goal="{prof.get('goal','')}" match_surface.one_liner="{ms.get('one_liner','')}"
 
-按你的 persona 输出契约：Read PRD + 信息源 + profile，逐条验（有据/可执行/贴合/scope），只吐一行 gate JSON（verdict=pass|drop|revise）。"""
+按你的 persona 输出契约：Read PRD + 信息源 + profile，逐条验（有据/可执行/贴合/scope），{verdict_line}。"""
 
 
 def _render_anchor_block(anchors: list) -> str:
@@ -1708,26 +1744,44 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
             log(f"[critic] ⚠ prd 缺 path（project={proj}）→ 降级 drop")
             entries.append({"prd_path": path, "project": proj, "verdict": "drop",
                             "summary": "prd manifest 缺 path，无法过闸"}); continue
-        entry = _critic_one(path, src, prof)
+        entry = _critic_one(path, src, prof, mm_src=_mm_source_of(path))
         # Phase 0 止血：critic 漏吐 verdict → 降级 drop，不 entry["verdict"] KeyError 穿透 _run_pipeline except
         if "verdict" not in entry:
             log(f"[critic] ⚠ critic 漏吐 verdict（{path}）→ 降级 drop")
             entry.setdefault("prd_path", path); entry.setdefault("project", proj)
             entry["verdict"] = "drop"; entry.setdefault("summary", "critic 输出缺 verdict 字段，降级")
+        # add-acceptance-spec-confirmation D3：needs_metrics 路由（仅 MM 绑定源合法产出）——
+        # spec-author 拟指标回流，不进 revise 回环不 dispatch；非 MM 源违规吐四态 = 契约违规，保守降级 drop。
+        if entry["verdict"] == "needs_metrics":
+            mm_src = _mm_source_of(path)
+            if mm_src:
+                entry = _needs_metrics_route(entry, prof, stamp, mm_src)
+            else:
+                log(f"[critic] ⚠ 非 MM 源吐 needs_metrics（{path}）→ 降级 drop（三态契约）")
+                entry["verdict"] = "drop"
+                entry["summary"] = "非 MM 源不可判 needs_metrics（critic 契约违规），降级 drop"
         entries.append(entry)
 
         # revise 回环：1 次修订机会（SPEC §4.3）
         if entry["verdict"] == "revise":
             log(f"[critic] revise：{path} → 喂回 pa-prd round 2")
             rev = entry
+            # 四态判据按 round1 原 PRD 来源定（rev_path 是 pa-prd 重写文件，frontmatter 不保证随行）
+            _mm_src2 = _mm_source_of(path)
             try:
                 rev_payload, _ = run_persona_with_backoff(
                     "pa-prd", prd_prompt([], profiles, stamp, revise=rev), "prd", f"prd-revise:{proj}")
                 rev_prd = (rev_payload.get("prds") or [{}])[0]
                 rev_path = rev_prd.get("path", path)
-                entry2 = _critic_one(rev_path, src, prof)
+                entry2 = _critic_one(rev_path, src, prof, mm_src=_mm_src2)
                 entry2["round"] = 2
                 entry2["revised"] = True
+                if entry2.get("verdict") == "needs_metrics":
+                    if _mm_src2:
+                        entry2 = _needs_metrics_route(entry2, prof, stamp, _mm_src2)
+                    else:
+                        entry2["verdict"] = "drop"
+                        entry2["summary"] = "非 MM 源不可判 needs_metrics（round2 契约违规），降级 drop"
                 entries.append(entry2)
             except SB.CircuitBreakerTripped:
                 raise   # pa-hardening P0-1：熔断终态须穿透 revise 回环隔离层（按 drop 吞掉=熔断失效）
@@ -1750,9 +1804,11 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
     return entries
 
 
-def _critic_one(path: str, source_path: str, prof: dict) -> dict:
+def _critic_one(path: str, source_path: str, prof: dict, mm_src: dict | None = None) -> dict:
     label = f"critic:{Path(path).stem}"
-    payload, meta = run_persona_with_backoff("pa-prd-critic", critic_prompt(path, source_path, prof), "critic", label)
+    payload, meta = run_persona_with_backoff(
+        "pa-prd-critic", critic_prompt(path, source_path, prof, four_state=mm_src is not None),
+        "critic", label)
     log(f"[critic] {payload.get('verdict','?').upper():6} {path}｜cost=${meta['cost']:.4f} "
         f"issues={len(payload.get('issues',[]))}")
     payload.setdefault("round", 1)
@@ -1768,6 +1824,50 @@ def _critic_one(path: str, source_path: str, prof: dict) -> dict:
         log(f"[critic] dual {payload['dual_channel']}: claude={payload['channels']['claude']} "
             f"codex={payload['channels']['codex']} → {payload['verdict']}")
     return payload
+
+
+def _spec_author_prompt(prd_path: str, prof: dict) -> str:
+    """add-acceptance-spec-confirmation D2：spec-author prompt（needs_metrics PRD 拟指标清单）。"""
+    harness = str(prof.get("harness") or "").strip() or "未声明（纯逻辑断言面）"
+    return f"""待拟指标 PRD：{prd_path}（critic 已判 needs_metrics：有据但验收不可执行）
+项目 profile：name={prof.get('name')} goal="{prof.get('goal','')}" harness={harness}
+
+按你的 persona 输出契约：Read PRD + profile，从 PRD 原文模糊描述反推可断言验收指标清单（≤8 条，逐条注原文依据），只吐一行 JSON（metrics + refused）。"""
+
+
+def _needs_metrics_route(entry: dict, prof: dict, stamp: str, mm_src: dict) -> dict:
+    """add-acceptance-spec-confirmation D3：needs_metrics 路由——调 spec-author 拟指标 → 事件回流。
+
+    成功：entry 附 metrics + journal 侧事件 metrics_proposed（hub 收件建 confirmation_requests 行），
+    verdict 保持 needs_metrics（≠pass，dispatch 段 verdict==pass 过滤天然不投）。失败（refused/
+    空清单/异常含熔断快速失败）：降级 drop + summary 注原因——绝不半拟指标入队（fail-safe 最坏
+    退回现状 drop 行为）。熔断不穿透：spec-author 是独立 stage 键，快速失败零成本，吞掉不影响
+    critic 面熔断语义（与 revise 回环 P0-1 场景不同——那边吞熔断会让同 stage 继续烧钱）。"""
+    path = entry.get("prd_path") or ""
+    proj = entry.get("project") or prof.get("name") or ""
+    label = f"spec-author:{Path(path).stem}"
+    try:
+        payload, meta = run_persona_with_backoff(
+            "pa-spec-author", _spec_author_prompt(path, prof), "spec-author", label)
+        refused = payload.get("refused")
+        metrics = payload.get("metrics") or []
+        if refused or not metrics:
+            entry["verdict"] = "drop"
+            entry["summary"] = f"spec-author 拒拟（{refused or '指标清单为空'}），降级 drop"
+            log(f"[critic] ⚠ needs_metrics→drop：{path}｜{entry['summary']}")
+            return entry
+        entry["metrics"] = metrics
+        prd_sha = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        EO.append_event(STATE_DIR, proj, stamp, Path(path).stem, "metrics_proposed",
+                        metrics=metrics, prd_sha=prd_sha, initiator=mm_src.get("user_id", ""))
+        log(f"[critic] needs_metrics→spec-author：{path}｜{len(metrics)} 条指标已回流（initiator="
+            f"{mm_src.get('user_id', '?')}）｜cost=${meta['cost']:.4f}")
+        return entry
+    except Exception as e:  # fail-safe：spec-author 失败面全量降级 drop（含熔断快速失败，见 docstring）
+        entry["verdict"] = "drop"
+        entry["summary"] = f"spec-author 调用失败，降级 drop：{type(e).__name__}: {e}"
+        log(f"[critic] ⚠ needs_metrics→drop：{path}｜{entry['summary']}")
+        return entry
 
 
 # ─── dispatch 段（投递 + 对账 + 独立验证，纯机械，SPEC §4.4 / ADR-0004）───

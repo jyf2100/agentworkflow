@@ -681,3 +681,31 @@ dev 亲笔交接工件：断点后新 dev 会话拿到上一 iteration 的结构
 2. **invalid 桶 MM 通知真机走通**：pipeline_outcome invalid=1 → MM 发出（`[notify][warn] 提及目标降级纯文本`为 warn 非失败）——pipeline-outcome 观测面新增 invalid 桶真机对照（红/绿桶仍欠真机，后续自然 run 补）。
 3. **verify persona 真机完整轮（D1 喂上）**：verify-stream 2667 行完整会话（新三维度 persona 真机首跑），三机械锚全过（workspace_clean ok / injected_digests ok），verdict 由 persona 合成（非机械映射）。pass/revise 比率分布仍薄，持续 canary 靠后续自然 run 积累。
 4. **invalid 路径补开 PR 失败为次生噪声**：invalid 不 commit（设计）→ 分支无 commits → 兜底补开 PR 报 `No commits between main and auto/...`（rc=1）——现象符合预期路径，仅日志观感差；分支已保留。
+
+## 21. MM 需求确认环（add-acceptance-spec-confirmation，2026-10）
+
+MM 频道模糊需求（「有据但验收不可执行」）不再被 critic 一刀 drop：第四态 **needs_metrics**（仅 MM 绑定源，radar/panel 仍三态）触发「spec-author 拟指标 → 频道清单 → 人拍板」确认环。spec: `openspec/specs/acceptance-spec-confirmation`（归档后）。
+
+**生命周期**：`/pa run` 模糊需求 → run 内 critic 判 needs_metrics（reason=no_metrics）→ pa-spec-author 拟指标清单（≤8 条，`coverage:proxy` 逐条标注、`requires:` 前置超 harness 面标注 + infra 尾注）→ 事件 `metrics_proposed` 回流 → hub 建确认行（requested）+ 频道 @发起人 清单与用法 → 发起人三择一：
+
+| 子命令 | 动作 | 行终态 |
+|---|---|---|
+| `/pa confirm #<行id>` | 指标并入 PRD 快照（「验收指标（发起人确认）」节，id 前缀 + proxy 标注）新 sha 新 deliver_key 入队 | confirmed |
+| `/pa reject #<行id>` | 置态放弃（需求未入队） | rejected |
+| `/pa metrics #<行id> <补充>` | 补充并入快照（「发起人补充」节）重新入队，critic→spec-author 自然重拟新清单 | confirmed（计入祖先链） |
+
+- **判据链**：行存在 → 发起人 user_id 相等（非发起人 ephemeral 拒）→ requested 态（终态幂等回执「已确认/已放弃/已过期」）。发起人判据走行内 initiator（= 入队时 enqueued_by），不随频道成员/绑定漂移。
+- **confirm 时项目未绑定**：行保持 requested + 回执「项目未绑定」——绑定恢复后可再拍板（无入队发生）。
+- **重入队上界（D5）**：同原始需求（origin_sha 祖先链，首次建行 = PRD sha，重拟继承链根不换）confirm/metrics 计数达 **3 次**未收敛 → 回执「请人工改写需求后重新提交」，不再自动重拟。
+- **超时（D6）**：requested 72h 未决 → daemon tick sweep 置 expired + 频道 @发起人 回执；expired 不可再 confirm。`check-intake` 尾附确认面（待决行数 + 最老行龄）。
+- **幂等**：行 item_id UNIQUE——事件重复到达（hub 重启重发）不重建行；deliver_key 小时窗对重复 confirm 同窗幂等。
+
+**故障形态与排查**：
+1. **spec-author 失败降级 drop**：refused（原文信息量不足）/ 空清单 / persona 调用异常 / 非 MM 源违规吐四态——全部保守降级 **drop**（fail-safe 最坏退回现状），gate.json summary 注明原因；**不发 metrics_proposed 事件**（频道无清单无确认行，发起人看到的是 critic drop 通知）。
+2. **事件未注册死链**：pa 侧发了事件但 hub `events.KNOWN_EVENTS` 无 `metrics_proposed` → 整行静默丢弃，确认环断（无行无清单）。排查：确认 hub 镜像/代码已带本 change；单测 `test_known_events_regression_unregistered_dropped` 锁死该形态。
+3. **终态 flush**：metrics_proposed 写在 running 末轮后（容器随即退出）→ reconcile exited/gone 分支 `_finish_events` 先于归档补读，不丢事件；run 早退（failed）同样建行——确认环不因 run 失败而断。
+4. **无 initiator**：面板源（无 enqueued_by）事件到达 → 不建行 + `[confirm][warn]` stderr（回归信号，非 MM 源不应产该事件）。
+
+**双质量门**：`bash scripts/quality.sh`（pa 侧：critic 四态/来源分叉/spec-author 路由单测）+ `bash hub/quality.sh`（hub 侧：状态机全转移/建行幂等/三子命令/超时扫描单测）——本 change 后两者必须同绿。
+
+**真机坐实（3.1，待 rocju 参与）**：重放 #74 模糊原文 → 频道收清单 → `/pa confirm` → 新 run critic 直接 pass 进 dispatch；`/pa reject` 与超时形态抽查；radar 源模糊信号仍三态零 metrics_proposed 复核。

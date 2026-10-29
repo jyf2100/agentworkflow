@@ -524,7 +524,10 @@ node_inject = make_mechanical_node(name="inject", stage="inject", op=_inject_op)
 # verdict 提取供条件边路由（critic 子图 route_critic）；to_state 暂存 _critic_payload（含 revisions_needed 供 revise）。
 def _critic_build_prompt(state: dict) -> str:
     import run_daily
-    return run_daily.critic_prompt(state["_prd_path"], state.get("_source_path", ""), state["_prof"])
+    # add-acceptance-spec-confirmation D3 来源分叉镜像：MM 绑定源（frontmatter source: mm-channel）
+    # 附四态判据，非 MM 源保持三态（对齐 run_daily.critic_prompt four_state 语义）。
+    return run_daily.critic_prompt(state["_prd_path"], state.get("_source_path", ""), state["_prof"],
+                                   four_state=run_daily._mm_source_of(state["_prd_path"]) is not None)
 
 
 def _critic_label(ni: dict) -> str:

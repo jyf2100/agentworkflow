@@ -47,6 +47,7 @@ def run_forever(
         try:
             lc.tick_dispatch()
             lc.reconcile_running()
+            lc.sweep_confirmations()  # 2.4：确认环超时扫描（内部 fail-open，观察面不崩循环）
             consecutive = 0
         except Exception as e:  # noqa: BLE001——docker CLI 瞬时失败等：记日志续跑
             consecutive += 1

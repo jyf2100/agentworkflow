@@ -12,7 +12,7 @@ import re
 import sqlite3
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ITEM_STATUSES = ("pending", "running", "done", "failed")
@@ -52,9 +52,28 @@ CREATE TABLE IF NOT EXISTS project_channels (
     bound_by    TEXT NOT NULL,
     bound_at    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS confirmation_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id      INTEGER NOT NULL,
+    project      TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    initiator    TEXT NOT NULL,
+    prd_text     TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    origin_sha   TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('requested','confirmed','rejected','expired')),
+    created_at   TEXT NOT NULL,
+    decided_at   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_confirm_item ON confirmation_requests(item_id);
+CREATE INDEX IF NOT EXISTS idx_confirm_status ON confirmation_requests(status);
+CREATE INDEX IF NOT EXISTS idx_confirm_origin ON confirmation_requests(origin_sha);
 """  # deliver_key UNIQUE 索引不在此——旧表存在时 executescript 先于 _migrate 跑，索引引用新列会炸；统一在 _migrate 建
 # project_channels 是全新表（add-mm-channel-intake D2）：旧库 executescript 直接建出含 UNIQUE
 # 的完整表，无补列问题——UNIQUE 内联声明安全，不走 _migrate。
+# confirmation_requests 同为全新表（add-acceptance-spec-confirmation D4：确认环旁表，零侵入
+# queue_items CHECK）；item_id UNIQUE = 事件重复到达幂等（同 queue item 只建一行）；
+# origin_sha = 原始需求 sha 祖先链根（confirm/metrics 重入队计数判据，D5 上界 3 次）。
 
 
 class DBError(Exception):
@@ -351,3 +370,104 @@ class HubDB:
             count += 1
         self._conn.commit()
         return count
+
+    # ── confirmation_requests（add-acceptance-spec-confirmation D4）──────────
+
+    @_locked
+    def insert_confirmation(
+        self, item_id: int, project: str, channel_id: str, initiator: str,
+        prd_text: str, metrics_json: str, origin_sha: str,
+    ) -> int | None:
+        """建 requested 行。item_id UNIQUE = 事件重复到达幂等：撞键返回 None
+        （调用面按「行已存在跳过」处理，不重复建行/重复 post）。"""
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO confirmation_requests"
+                " (item_id, project, channel_id, initiator, prd_text, metrics_json, origin_sha, status, created_at)"
+                " VALUES (?,?,?,?,?,?,?,'requested',?)",
+                (item_id, project, channel_id, initiator, prd_text, metrics_json, origin_sha, _now()),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            return None
+
+    def get_confirmation(self, rid: int) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM confirmation_requests WHERE id=?", (rid,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_confirmation_by_item(self, item_id: int) -> dict | None:
+        """幂等查重 + 确认态回查（2.3 子命令经 #id 定位，此面供事件面）。"""
+        row = self._conn.execute(
+            "SELECT * FROM confirmation_requests WHERE item_id=?", (item_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    @_locked
+    def decide_confirmation(self, rid: int, new_status: str) -> dict | None:
+        """状态机转移：仅 requested → confirmed/rejected/expired 合法（D6）。
+        非法转移（含终态重放）raise ValueError——调用面 catch 后转幂等回执「已处理」。
+        行不存在返 None。"""
+        if new_status not in ("confirmed", "rejected", "expired"):
+            raise ValueError(f"非法目标态：{new_status}")
+        row = self.get_confirmation(rid)
+        if row is None:
+            return None
+        if row["status"] != "requested":
+            raise ValueError(f"非 requested 态不可转移（当前 {row['status']}）")
+        self._conn.execute(
+            "UPDATE confirmation_requests SET status=?, decided_at=? WHERE id=?",
+            (new_status, _now(), rid),
+        )
+        self._conn.commit()
+        return self.get_confirmation(rid)
+
+    @_locked
+    def expire_sweep_confirmations(self, max_age_hours: int = 72) -> list[dict]:
+        """requested 行龄超窗 → expired（D6 超时面）。返回被过期行（调用面频道回执）。
+        ISO UTC 字符串比较（_now 同格式，时区恒 UTC）。"""
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=max_age_hours)).isoformat(timespec="seconds")
+        rows = self._conn.execute(
+            "SELECT * FROM confirmation_requests WHERE status='requested' AND created_at<?",
+            (cutoff,),
+        ).fetchall()
+        swept = []
+        for row in rows:
+            self._conn.execute(
+                "UPDATE confirmation_requests SET status='expired', decided_at=? WHERE id=?",
+                (_now(), row["id"]),
+            )
+            swept.append(dict(row))
+        self._conn.commit()
+        return swept
+
+    def count_confirm_origin(self, origin_sha: str) -> int:
+        """同祖先链已 confirmed 次数（D5 重入队上界判据：达 3 → 回执人工改写）。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM confirmation_requests WHERE origin_sha=? AND status='confirmed'",
+            (origin_sha,),
+        ).fetchone()
+        return int(row[0])
+
+    def list_confirmations_pending(self) -> list[dict]:
+        """requested 态行（check-intake 确认面：待决行数 + 最老行龄，2.4）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM confirmation_requests WHERE status='requested' ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def latest_confirmation_origin(self, project: str, initiator: str) -> str | None:
+        """同 project+发起人最近一行的 origin_sha（建行时祖先链根继承判据，2.2）。
+
+        confirm/metrics 重入队后新 run 的 metrics_proposed 带新 prd_sha，但祖先链根
+        须保持最初 sha——有前行则继承，查无（首次到达）则调用方以本事件 prd_sha 为根。
+        """
+        row = self._conn.execute(
+            "SELECT origin_sha FROM confirmation_requests WHERE project=? AND initiator=? "
+            "ORDER BY id DESC LIMIT 1",
+            (project, initiator),
+        ).fetchone()
+        return row["origin_sha"] if row else None

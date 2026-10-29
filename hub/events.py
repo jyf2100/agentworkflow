@@ -14,7 +14,8 @@ import sys
 from pathlib import Path
 
 EVENT_VERSION = 1  # 与 pa event_outlet.EVENT_VERSION 同值——两文件一处契约
-KNOWN_EVENTS = frozenset({"critic_verdict", "pr_opened", "verify_verdict", "acceptance_suite"})
+KNOWN_EVENTS = frozenset({"critic_verdict", "pr_opened", "verify_verdict", "acceptance_suite",
+                            "metrics_proposed"})  # add-acceptance-spec-confirmation 2.2：未注册整行丢弃即死链（spec scenario）
 
 
 def read_events(path: Path) -> list[dict]:
