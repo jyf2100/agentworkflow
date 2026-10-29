@@ -120,8 +120,11 @@ def _nvm_claude() -> Path | None:
 
 # 每段 wall-clock 超时（秒）——防挂死，非成本控制（SPEC §6/R2）
 # verify=pa-verify 裁判段（dev 产出验证闸，docs/verify-commit-loop-design.md §5-②）
-TIMEOUT = {"fetch": 1500, "radar": 600, "prd": 900, "critic": 300, "verify": 300,
-           "test-author": 600, "spec-author": 300}
+# critic/verify/spec-author 300→900（2026-10-29 qwen3.8 后端真机：m10 连续两轮 revise 回环
+# critic 300s 贴爆 kill→drop，非偶发；persona_call m14 同路径前科）。超时是上界，跑得快早回
+# 不受影响；真挂死多等一个 backoff 周期（有 run_persona_with_backoff 重试兜底）。
+TIMEOUT = {"fetch": 1500, "radar": 600, "prd": 900, "critic": 900, "verify": 900,
+           "test-author": 600, "spec-author": 900}
 MAX_TURNS = {"fetch": 40, "radar": 60, "prd": 90, "critic": 40, "verify": 30,
              "test-author": 40, "spec-author": 40}
 
