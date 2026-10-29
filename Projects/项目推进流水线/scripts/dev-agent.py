@@ -83,6 +83,17 @@ INPUT_TRUNC = 500            # tool_use.input 落盘截断
 MAX_BUDGET = 10              # maxBudgetUsd（降级兜底，宽松）
 STATE_RUNS_DIR = REPO_ROOT / "state" / "runs"
 
+# run #105 真机（2026-10-29）：推理网关后端（qwen3.8-27b-coding）reasoning effort 只认
+# xhigh/medium/low，SDK/CLI 缺省发 high → 500「Unexpected reasoning effort high」建分支前崩。
+# persona 面同坑已修（persona_call PERSONA_EFFORT_DEFAULT，--effort medium）；SDK 会话
+# 正道是 ClaudeAgentOptions.effort 显式下发。PA_DEV_EFFORT 可覆盖（canary A/B），不设=medium。
+DEV_EFFORT_DEFAULT = "medium"
+
+
+def _dev_effort() -> str:
+    """dev loop SDK effort 档（PA_DEV_EFFORT > medium 默认）。"""
+    return os.environ.get("PA_DEV_EFFORT") or DEV_EFFORT_DEFAULT
+
 
 # dev_slugify 已上移至 slug_utils.py（本文件顶部 import；ADR-0006 #5 单一源头，消解 ADR-0004 #4 shadow）
 
@@ -1219,6 +1230,7 @@ async def main() -> int:
             return ClaudeAgentOptions(
                 cwd=str(REPO_ROOT),
                 model=_model,
+                effort=_dev_effort(),                   # 网关 effort 枚举守卫（run #105：CLI 缺省 high 被 qwen 拒 500）
                 permission_mode="acceptEdits",          # 编辑类自动过；Bash 不自动批 → 走 can_use_tool 闸（下）
                 can_use_tool=_can_use_tool,             # ADR-0006 #7：Bash 放行长效修法，摆脱机器本地 settings 依赖
                 setting_sources=["project"],            # 加载仓 CLAUDE.md(仓特定守则) + .claude/hooks

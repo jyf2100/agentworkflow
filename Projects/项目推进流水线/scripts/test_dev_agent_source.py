@@ -118,3 +118,28 @@ def test_dev_cmd_python_repo_without_local_executor_uses_control_plane(python_ta
     """Python 目标仓（pyproject.toml，无 scripts/dev-agent.*）→ 执行器仍是控制面 dev-agent.py。"""
     cmd = run_daily._dev_cmd({"conda_env": ""}, "PRD", "main", "")
     assert str(run_daily.DEV_AGENT_PY) in " ".join(cmd)
+
+
+# ─── dev loop SDK effort 档（run #105 真机：CLI 缺省 high 被 qwen 网关拒 500）───
+def _load_dev_agent():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dev_agent_effort_test", Path(__file__).parent / "dev-agent.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_dev_effort_default_medium(monkeypatch):
+    """不设 env → medium（对齐 persona 面 PERSONA_EFFORT_DEFAULT；high 会被网关拒）。"""
+    monkeypatch.delenv("PA_DEV_EFFORT", raising=False)
+    m = _load_dev_agent()
+    assert m._dev_effort() == m.DEV_EFFORT_DEFAULT == "medium"
+
+
+def test_dev_effort_env_override_and_empty_fallback(monkeypatch):
+    """PA_DEV_EFFORT 覆盖生效；空串回退默认（与 per-agent model 路由空串语义一致）。"""
+    m = _load_dev_agent()
+    monkeypatch.setenv("PA_DEV_EFFORT", "xhigh")
+    assert m._dev_effort() == "xhigh"
+    monkeypatch.setenv("PA_DEV_EFFORT", "")
+    assert m._dev_effort() == "medium"
