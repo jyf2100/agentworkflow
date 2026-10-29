@@ -785,7 +785,8 @@ def _mm_source_of(prd_path: str) -> dict | None:
             "channel_id": kv.get("channel_id", "")} if user_id else None
 
 
-def critic_prompt(prd_path: str, source_path: str, prof: dict, four_state: bool = False) -> str:
+def critic_prompt(prd_path: str, source_path: str, prof: dict, four_state: bool = False,
+                  revisions: list | None = None) -> str:
     ms = prof.get("match_surface", {})
     # source_path 空（投递/手写 PRD 常态）不留裸空白——尾随空白会诱导 critic 判无据（F12 单标准「不看出身」）
     src_line = (
@@ -802,9 +803,18 @@ def critic_prompt(prd_path: str, source_path: str, prof: dict, four_state: bool 
         if four_state else
         "只吐一行 gate JSON（verdict=pass|drop|revise）"
     )
+    # revise 回环 round2 复审语义（2026-10-29 run #109 实证修复）：r2 不再盲审——注入
+    # round1 的 revisions_needed，明确「验证这些问题是否已解决」，防同文件两次独立判定
+    # 靠抖动放行（#109：r1 判米白不可断言，r2 盲审同文件反判具名色类可断言）。
+    rev_block = ""
+    if revisions:
+        rev_block = ("\n这是 revise 回环 round=2 复审：round1 曾判 revise，指出以下问题——"
+                     "逐条验证当前 PRD 是否已解决（全部解决且其余维度达标才 pass；未解决的写进 issues）：\n"
+                     + "\n".join(f"- {r}" for r in revisions))
     return f"""待过闸 PRD：{prd_path}
 {src_line}
 项目 profile：name={prof.get('name')} goal="{prof.get('goal','')}" match_surface.one_liner="{ms.get('one_liner','')}"
+{rev_block}
 
 按你的 persona 输出契约：Read PRD + 信息源 + profile，逐条验（有据/可执行/贴合/scope），{verdict_line}。"""
 
@@ -1771,12 +1781,26 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
             rev = entry
             # 四态判据按 round1 原 PRD 来源定（rev_path 是 pa-prd 重写文件，frontmatter 不保证随行）
             _mm_src2 = _mm_source_of(path)
+            _sha_before = _file_sha(Path(path))
             try:
                 rev_payload, _ = run_persona_with_backoff(
                     "pa-prd", prd_prompt([], profiles, stamp, revise=rev), "prd", f"prd-revise:{proj}")
                 rev_prd = (rev_payload.get("prds") or [{}])[0]
                 rev_path = rev_prd.get("path", path)
-                entry2 = _critic_one(rev_path, src, prof, mm_src=_mm_src2)
+                # 假通防御（2026-10-29 run #109 实证）：pa-prd 声称重写但原文件未变（frontmatter
+                # round 仍 1）→ critic r2 盲审原文件靠判定抖动放行 = 假 pass。机械校验 sha：
+                # 修订文件读不到或与原文件同容 → 重写未发生，按 drop 不进 r2（fail-closed——
+                # 重写了但 byte-identical 同样视为问题未解决）。
+                _sha_after = _file_sha(Path(rev_path))
+                if _sha_before is not None and (_sha_after is None or _sha_after == _sha_before):
+                    log(f"[critic] revise 重写未发生（{rev_path} 未变/缺）→ 按 drop（防 r2 盲审假 pass）")
+                    entries.append({"prd_path": path, "project": proj, "verdict": "drop",
+                                    "summary": "revise 重写未发生：pa-prd round2 未落盘修订（文件未变），"
+                                               "按 drop——可稍后重新 /pa run 提交",
+                                    "round": 2, "revised": True})
+                    continue
+                entry2 = _critic_one(rev_path, src, prof, mm_src=_mm_src2,
+                                     revisions=rev.get("revisions_needed"))
                 entry2["round"] = 2
                 entry2["revised"] = True
                 if entry2.get("verdict") == "needs_metrics":
@@ -1807,10 +1831,20 @@ def stage_critic(args, manifest, profiles, stamp) -> list[dict]:
     return entries
 
 
-def _critic_one(path: str, source_path: str, prof: dict, mm_src: dict | None = None) -> dict:
+def _file_sha(p: Path) -> str | None:
+    """文件 sha256（revise 回环假通防御的机械锚）；不可读 → None。"""
+    try:
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def _critic_one(path: str, source_path: str, prof: dict, mm_src: dict | None = None,
+                revisions: list | None = None) -> dict:
     label = f"critic:{Path(path).stem}"
     payload, meta = run_persona_with_backoff(
-        "pa-prd-critic", critic_prompt(path, source_path, prof, four_state=mm_src is not None),
+        "pa-prd-critic", critic_prompt(path, source_path, prof, four_state=mm_src is not None,
+                                       revisions=revisions),
         "critic", label)
     log(f"[critic] {payload.get('verdict','?').upper():6} {path}｜cost=${meta['cost']:.4f} "
         f"issues={len(payload.get('issues',[]))}")
