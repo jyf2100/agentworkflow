@@ -24,6 +24,6 @@
 
 ## 5. 质量门与收尾
 
-- [ ] 5.1 `cd Projects/项目推进流水线 && bash scripts/quality.sh` 全绿（compileall + pytest + ruff）
-- [ ] 5.2 对照 delta 自查：openspec/changes/add-acceptance-preflight-guard/specs/ 的两个新 scenario（import 白名单扣留、dispatch 期收集三态扣留）各有对应测试路径
-- [ ] 5.3 git 线性提交（P0/P1/1-2 commit + persona 措辞 1 commit），commit message 引 change 名
+- [x] 5.1 `cd Projects/项目推进流水线 && bash scripts/quality.sh` 全绿（compileall + pytest + ruff）
+- [x] 5.2 对照 delta 自查：openspec/changes/add-acceptance-preflight-guard/specs/ 的两个新 scenario（import 白名单扣留、dispatch 期收集三态扣留）各有对应测试路径
+- [x] 5.3 git 线性提交（P0/P1/1-2 commit + persona 措辞 1 commit），commit message 引 change 名
