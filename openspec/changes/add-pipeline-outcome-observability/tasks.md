@@ -16,4 +16,5 @@
 
 - [x] 3.1 quality.sh 全绿（pa + hub 两门）+ `openspec validate add-pipeline-outcome-observability` 过
 - [ ] 3.2 镜像 v0.1.25 叠带入队重跑一轮：MM 收到业务终态文本（红/绿计数 + PR 链接，非裸 exit 0）+ run_dir 有 `.stdout.log` + 挂载卷有 outcome 文件——四处核对（通知文本 / outcome / stdout / record 对称）齐后归档
+  - **2026-10-29 run #86（runs.id=98，succeeded exit 0）四处核对**：② outcome 文件实锤（`pipeline_outcome_20261029.json` schema v1，summary={abnormal:1}，prs[0] skip + reason_headline「跳过-超额（在途 1 ≥ 1）」，附录 exit_code=null 非判据注记）；③ `.stdout.log` 全程段落行在盘（dispatch 跳过行 + `[report] pipeline_outcome → …（abnormal=1）`）；④ record 对称（skip 终态 pr_url/pr_number 双 None）；① 间接坐实（通知成功发送不留 hub log 痕迹，docker logs 3h 回退行计数=0 → outcome 被读到走 lead 路径；文本构造由 test_notify 5 测锁）。**不勾原因**：判据点名的红/绿计数+PR 链接形态未真机走到——本轮被在途 PR #60 占 single-flight 名额挡成 skip 桶（观测面把非绿终态如实上出口本身即契约坐实，对照 #85「succeeded exit 0 静默」标本）。**差一步**：处置 PR #60（合/关）→ 在途归零 → next run 走全 dispatch → 红/绿路径补验后勾选归档。
 - [x] 3.3 `RUNBOOK.md` 观测面小节：outcome 契约路径 + `.stdout.log` 语义 + 通知回退路径；`CONTEXT.md` 术语表补 pipeline_outcome
