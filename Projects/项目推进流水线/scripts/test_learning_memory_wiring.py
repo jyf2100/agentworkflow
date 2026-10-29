@@ -571,6 +571,19 @@ class TestDevAgentBuildPromptInjection:
         assert "裸测试命令" in prompt
         assert "先纯净跑一次" in prompt
 
+    def test_build_prompt_includes_post_green_no_write_rule(self, tmp_path):
+        """守则 2 含「绿后禁写」规约——防回归（run 20261029m2 标本：dev 绿后又想加证据动
+        工作区 → evidence stale → test_stale 阻断整轮白做；门语义正确（verified-dev-execution
+        fail-safe），缺的是 dev 侧纪律告知）。"""
+        da = self._import_dev_agent()
+        prd = "# PRD\n"
+        args = {"base": "main", "dry_run": True, "source": None, "feedback_artifact": None,
+                "lessons_artifact": None}
+        prompt = da.build_prompt(args, prd, None)
+        assert "绿后禁写" in prompt
+        assert "test_stale" in prompt
+        assert "重跑裸测试命令重采证据" in prompt
+
     def test_lessons_artifact_passed_through_to_prompt(self, tmp_path):
         """有 --lessons-artifact → build_prompt 读 artifact + lesson_block append 到 prompt 末尾。"""
         da = self._import_dev_agent()
