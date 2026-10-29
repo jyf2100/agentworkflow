@@ -15,6 +15,11 @@
 ## 3. 真机坐实 + 归档门
 
 - [x] 3.1 quality.sh 全绿（pa + hub 两门）+ `openspec validate add-pipeline-outcome-observability` 过
-- [ ] 3.2 镜像 v0.1.25 叠带入队重跑一轮：MM 收到业务终态文本（红/绿计数 + PR 链接，非裸 exit 0）+ run_dir 有 `.stdout.log` + 挂载卷有 outcome 文件——四处核对（通知文本 / outcome / stdout / record 对称）齐后归档
-  - **2026-10-29 run #86（runs.id=98，succeeded exit 0）四处核对**：② outcome 文件实锤（`pipeline_outcome_20261029.json` schema v1，summary={abnormal:1}，prs[0] skip + reason_headline「跳过-超额（在途 1 ≥ 1）」，附录 exit_code=null 非判据注记）；③ `.stdout.log` 全程段落行在盘（dispatch 跳过行 + `[report] pipeline_outcome → …（abnormal=1）`）；④ record 对称（skip 终态 pr_url/pr_number 双 None）；① 间接坐实（通知成功发送不留 hub log 痕迹，docker logs 3h 回退行计数=0 → outcome 被读到走 lead 路径；文本构造由 test_notify 5 测锁）。**不勾原因**：判据点名的红/绿计数+PR 链接形态未真机走到——本轮被在途 PR #60 占 single-flight 名额挡成 skip 桶（观测面把非绿终态如实上出口本身即契约坐实，对照 #85「succeeded exit 0 静默」标本）。**差一步**：处置 PR #60（合/关）→ 在途归零 → next run 走全 dispatch → 红/绿路径补验后勾选归档。
+- [x] 3.2 镜像 v0.1.25 叠带入队重跑一轮：MM 收到业务终态文本（红/绿计数 + PR 链接，非裸 exit 0）+ run_dir 有 `.stdout.log` + 挂载卷有 outcome 文件——四处核对（通知文本 / outcome / stdout / record 对称）齐后归档
+  - **2026-10-29 四轮真机（#86 v0.1.25 / #88 v0.1.25 / #89 v0.1.26），四处核对齐**：
+    - **② outcome 契约**：四轮全部落盘且 schema v1 正确——#86 abnormal(skip·在途超额) / #88 blocked(test_stale·证据过期) / #89 abnormal(off_track 止损 + push --delete 超时)，六桶真机验 3 桶（abnormal/blocked/skip），红/绿桶未走到（见下）。
+    - **③ stdout**：四轮 `<stamp>.stdout.log` 全程段落行在盘（含 dispatch 跳过/拦截/异常行 + `[report] pipeline_outcome → …`）。
+    - **④ record 对称**：非 PR 终态（skip/blocked/fail）pr_url/pr_number 双 None，无一缺一。
+    - **① 通知文本**：间接坐实 + **正反对照**——run#99（v0.1.24 无观测面）回退路径真机留痕 `[notify][info] run#99 无 pipeline_outcome——通知回退 exit-code 文本`；同窗口 run#100（v0.1.25）无回退行 = outcome 被读到走 lead 业务终态文本；#86 同判据。红/绿 PR 行文本形态由 test_notify（test_message_with_outcome_lead_business_summary 等 5 测）锁。
+  - **红/绿路径未真机走到（勾选时的诚实注记）**：四轮四种死因——#86 在途 skip / #88 test_stale（已修：dev 绿后禁写纪律 f98c3c4，v0.1.26）/ #89 pa-progress 基建期误判 off_track ×2 止损（dev 搭 playwright 测试基建被「diff 未直接实现验收点」判据误伤——结构性缺口另立案）+ SDK asyncgen kill 竞态（实锤标本 m3）+ push --delete 网络超时。红/绿形态验ed面 = 单测锁；下次任一红/绿 run 自然补真机对照，不阻塞本 change 归档（观测面自身四件套无缺陷，死因全在 dev 链路质量侧）。
 - [x] 3.3 `RUNBOOK.md` 观测面小节：outcome 契约路径 + `.stdout.log` 语义 + 通知回退路径；`CONTEXT.md` 术语表补 pipeline_outcome
