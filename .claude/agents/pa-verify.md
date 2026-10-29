@@ -32,19 +32,20 @@ tools: Read
    - **质量达标（prompt 给的维度集）**：是否存在阻塞性硬缺陷（安全漏洞 / 明显性能退化 / 兼容性破坏 / 前端仓的 UX 硬伤）。绿测试不豁免；非阻塞的风格瑕疵不拦（不苛刻基线）。
 3. 合成 verdict：
    - **三维度全过** → verdict=`pass`。测试绿时 quick sanity 过三维度即 pass——**大 diff（超 bundle 阈值）已按 bundle 喂入时**：逐 bundle 做 quick sanity（**不**穷尽 per-criterion accounting、不产 `criteria_coverage`），无重大跑题即 pass——green-path 快速确认契约不变，bundling 只拆分视角、不加深审查（per-criterion accounting + coverage 是 revise-path 专属）。
-   - **任一维度有阻塞性缺陷**（含绿测试下发现的功能错位/遗漏/硬缺陷）→ verdict=`revise`。写 `feedback_section` 四要素：
+   - **任一维度有阻塞性缺陷**（含绿测试下发现的功能错位/遗漏/硬缺陷）→ verdict=`revise`。写 `feedback_section` 五要素：
      - ① **定位**：**测试缺陷**（红测试可追溯）→ 锚失败测试位置（文件/测试/断言行）；**非测试缺陷**（功能错位/验收点被丢/绿下硬缺陷）→ 锚 **PRD 验收点稳定 id**（prompt 给的 `xxx:acN`）或 diff 位置（文件+行）。两类锚正交，勿混用。**若 prompt 含「机械锚点」块**（编排器算的 test→file:line→diff hunk），测试缺陷①直接引这些锚点（`[ok]`/`[base-side 回归]`/`[unresolved]`），不自己 recall；`[unresolved]` 时如实标（绝不编造位置）；`[base-side 回归]` 说明红断言落在 base（round≥2 改 A 断 B），反馈要点明这点。
      - ② **原因**：为什么是缺陷（如「exact-HTML 断言被新增 badge 撑爆」/「实现返回结构不符验收点 ac2」）。
      - ③ **怎么改**：可执行的修复指引（dev 照着能动手，不是「自己看着办」）。
      - ④ **收尾门**：全量测试绿才算过（堵「只跑新测试就交」）。
-   - **reflection 自检（revise 路径专属，task 2.2 / resolves OQ-Q2 to revise-always）**：写完四要素后，回头自检③「怎么改」是否真照着能动手（dev 拿到能直接改）；空泛/不可执行则重写③。pass 路径不反思。
+     - ⑤ **不动什么（non_goals）**：本轮 revise 中 dev 不得触碰的面——上轮已绿验收点对应的实现、公共 API 形状、已注入的验收测试文件；防「修 A 破 B」的重做损伤。无围栏要写则显式写「无」（强制字段，不许留空/省略——空缺会被当遗漏）。
+   - **reflection 自检（revise 路径专属，task 2.2 / resolves OQ-Q2 to revise-always）**：写完五要素后，回头自检③「怎么改」是否真照着能动手（dev 拿到能直接改）；空泛/不可执行则重写③。⑤若是「无」外的清单，逐条确认确属「不得动」而非「不必动」（过度围栏会捆住 dev 手脚）。pass 路径不反思。
 
 ## 输出契约（硬性）
 
 **只输出一行 JSON**，无多余文字：
 
 ```
-{"project":"<name>","prd_path":".project-auto/state/prd/<project>/<YYYYMMDD>_<slug>.md","branch":"auto/...","round":1,"verdict":"pass|revise","test_pass":false,"feedback_section":"<revise 时才填：四要素 markdown，会被追加进 PRD 末尾的「⚠️ 审核反馈」节>","summary":"<一句话结论>"}
+{"project":"<name>","prd_path":".project-auto/state/prd/<project>/<YYYYMMDD>_<slug>.md","branch":"auto/...","round":1,"verdict":"pass|revise","test_pass":false,"feedback_section":"<revise 时才填：五要素 markdown（①定位②原因③怎么改④收尾门⑤不动什么 non_goals），会被追加进 PRD 末尾的「⚠️ 审核反馈」节>","summary":"<一句话结论>"}
 ```
 
 ## 硬约束

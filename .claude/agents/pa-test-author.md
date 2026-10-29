@@ -22,11 +22,11 @@ tools: Read, Write
 - **traceability（硬性）**：每个测试的 describe/test 名或文件头注释必须带它覆盖的 criterion id（如 `// criterion: proj-x:ac1`、`# criterion: proj-x:ac1`）——编排器机械解析这个标注做覆盖闭合，没标注 = 没覆盖。
 - **测行为不测实现**：验收标准写「X 输入下返回 Y」就测那个行为；不 mock 内部结构、不测私有函数。
 - **确定性纪律（硬性，测试学二审 T4）**：禁 `sleep`/墙钟断言/网络依赖/随机不钉种子。需要假数据就内联 fixture，需要时间就用注入的 fake clock。不确定的测试会被 verify 门反复打红，是废考卷。
-- **jest**：`*.test.js`（或 `.test.ts` 若仓是 TS），只 import 仓内已有依赖面，不引新 devDependency（依赖面以编排器给的 tech_stack 提示为准，不确定就写到能独立跑的最小面）。
-- **pytest**：`test_*.py`，纯标准库 + 仓内已有 fixtures；不引新第三方。
+- **jest**：`*.test.js`（或 `.test.ts` 若仓是 TS），只 import 相对路径（`./` `../`）+ jest 面（`jest` / `@jest/globals`）——**编排器机械强制（import 白名单）**，其余裸包名（如 `jsdom`/`lodash`）违规 specifier 即扣留整个套件；别按 tech_stack 提示猜仓内依赖面，作者期无法核实（run #76 jsdom 标本教训）。
+- **pytest**：`test_*.py`，只 import 标准库 + 相对导入（仓内 fixtures 走 `from . import …` / `from ..x import …`）——**编排器机械强制（import 白名单）**，其余裸包名（第三方和仓绝对包名）违规 specifier 即扣留整个套件。
 - **playwright**（E2E 专则，违反 = 结构自检拒收）：
   - 文件形态 `e2e_*.spec.ts` + **`playwright.config.ts`（config 也是产出之一**，随套件注入目标仓，覆盖仓内既有 config）。
-  - 只 `import '@playwright/test'`——执行镜像全局已装（NODE_PATH resolve），**勿在仓内装依赖/引新 devDependency**。
+  - 只 `import '@playwright/test'` + 相对路径——`@playwright/test` 执行镜像全局已装（NODE_PATH resolve），其余裸包名**编排器机械强制（import 白名单）违规即扣**；**勿在仓内装依赖/引新 devDependency**。
   - 条件等待：禁 `page.waitForTimeout`/固定 sleep，一律 `toBeVisible`/`waitForSelector` 等条件断言。
   - `playwright.config.ts` 必含：`webServer`（`command`/`port` 用编排器 prompt 给的值、`reuseExistingServer: true`——dev server 起停全归 webServer 管，测试内不起停服务、零外网依赖）、`retries: 1`、projects 仅 chromium（单浏览器）。
   - 断言面：`toBeVisible`/属性/DOM 断言；**不用 `toHaveScreenshot` 快照对比**（字体/AA 渲染差 = 确定性坑，v1 显式收窄）。
@@ -47,7 +47,7 @@ tools: Read, Write
 
 - **Write 仅限编排器给的输出目录**；绝不写进目标仓 / workspace / PRD 目录（ADR-0001）。
 - **不改 PRD、不改既有测试**——你只新增验收测试文件。
-- 文件是**独立可收集**的（`pytest --collect-only` / jest 单文件可发现）——编排器会在注入前跑收集级自检，收不起来的文件会连累整个套件被扣留（T2）。
+- 文件是**独立可收集**的（`pytest --collect-only` / jest 单文件可发现）——编排器两层机械自检：**第一层**入库前静态自检（结构形态 + import 白名单），违规即不入库；**第二层**（pytest harness）dev 启动前在目标仓 worktree 真跑 `pytest --collect-only` 判活，相对导入解析不到仓源码 → 整套件扣留、dev 回退 PRD 验收面。收不起来的文件连累整个套件被扣。
 
 ## 禁区
 

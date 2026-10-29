@@ -577,7 +577,7 @@ node_prd_revise = make_persona_node(
 # _pa_verify_round L1420 调用形态：run_persona("pa-verify", verify_prompt(...), "verify", f"verify:{slug}:r{round_n}")
 # label per-round f"verify:{slug}:r{round_n}"（对齐 L1420，journal 事件 per-round 区分）；allowed_tools=None
 # （pa-verify 只 Read，不限制）。verdict=pass|revise（expose_verdict=True）；feedback_section → verdict.feedback
-# （revise 反馈四要素：定位/原因/怎么改/收尾门，供 dev redo 注入）。to_state 暂存 _verify_result + _verify_verdict。
+# （revise 反馈五要素：定位/原因/怎么改/收尾门/不动什么，供 dev redo 注入）。to_state 暂存 _verify_result + _verify_verdict。
 # install_log 接入（task 4.1 预留）：build_prompt 读 state._install_log（ArtifactHandle 形态），handle 在 → prompt
 # 追加 store+rel 段落（传递通道）；默认 None → byte-identical。resolve 绝对 + must_exist fail-closed 留 task 4.1
 # （graph state 不持绝对路径 R8，node 环境注入 vault_root/state_dir 在 task 4.1 接 independent_verify 上游实装时一并落）。
@@ -604,7 +604,7 @@ def _verify_to_state(payload: dict, state: dict) -> dict:
 
 def _verify_verdict_mapper(payload: dict) -> dict:
     """verify payload.{verdict,feedback_section,summary} → NodeOutput.verdict。
-    pa-verify 吐 feedback_section（修订反馈四要素）；summary 作 reason（validate 要求非空）；
+    pa-verify 吐 feedback_section（修订反馈五要素）；summary 作 reason（validate 要求非空）；
     feedback_section 作 feedback（供 dev redo 注入）。"""
     return {"value": payload.get("verdict"),
             "reason": payload.get("summary") or payload.get("verdict", ""),
