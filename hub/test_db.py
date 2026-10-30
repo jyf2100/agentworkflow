@@ -1,6 +1,9 @@
 """db.py 单测——队列/_run 两表持久层（add-hub-skeleton 任务 2.1，spec: execution-hub「队列排度」+ D2/A3 重派语义）。"""
+import json
 import sqlite3
 from pathlib import Path
+
+import pytest
 
 import db
 
@@ -314,3 +317,144 @@ def test_seed_rejects_malformed_channel_id(capsys, tmp_path):
     assert d.get_channel_binding_by_project("proj-c")["channel_id"] == _C1
     err = capsys.readouterr().err
     assert "proj-a" in err and "proj-b" in err  # 拒入 stderr 可见（无静默失败）
+
+
+# ── runners 服务器池（add-hub-runner-pool）────────────────────────────────
+
+def _reg(d, name, capacity=1, probe=True):
+    """注册 + 可选探针转绿——调度候选前提 probe_ok=1（未探不参选）。"""
+    rid = d.register_runner(name, "tcp://10.0.0.1:2375", "/mnt/nfs/pa", capacity)
+    if probe:
+        d.set_runner_probe(rid, True, {"daemon": "ok", "image": "ok", "mount": "ok"})
+    return rid
+
+
+def test_runner_register_validation_rejects_bad_forms(tmp_path):
+    d = _open(tmp_path)
+    bad = [
+        ("Bad-Name", "tcp://h:2375", "/m", 1),   # 大写
+        ("-x", "tcp://h:2375", "/m", 1),         # 首字符非字母数字
+        ("r 1", "tcp://h:2375", "/m", 1),        # 空格
+        ("r1", "ssh://h", "/m", 1),              # 非 tcp:// transport
+        ("r1", "10.0.0.1:2375", "/m", 1),        # 裸地址无前缀
+        ("r1", "tcp://h:2375", "mnt/pa", 1),     # 相对路径
+        ("r1", "tcp://h:2375", "/m", 0),         # capacity<1
+        ("r1", "tcp://h:2375", "/m", "2"),       # 非整数
+    ]
+    for name, host, mount, cap in bad:
+        with pytest.raises(db.DBError):
+            d.register_runner(name, host, mount, cap)
+    assert d.list_runners() == []  # fail fast：零半配置行
+
+
+def test_runner_register_duplicate_name_rejected(tmp_path):
+    d = _open(tmp_path)
+    d.register_runner("gpu-a", "tcp://10.0.0.1:2375", "/mnt/pa", 1)
+    with pytest.raises(db.DBError):  # name UNIQUE
+        d.register_runner("gpu-a", "tcp://10.0.0.2:2375", "/mnt/pa", 1)
+
+
+def test_dispatch_picks_least_loaded_green_runner(tmp_path):
+    d = _open(tmp_path)
+    _reg(d, "gpu-a", capacity=2); _reg(d, "gpu-b", capacity=1)
+    q = d.enqueue("p1", "/p1", "t", "u")
+    d.create_run(q, "p1", "runs/p1/r1", runner_name="gpu-a")  # A load 1/2
+    assert {r["name"]: r["load"] for r in d.list_runners()} == {"gpu-a": 1, "gpu-b": 0}
+    assert d.pick_runner_for_dispatch()["name"] == "gpu-b"    # 负载 0<1 更闲
+    d.create_run(d.enqueue("p2", "/p2", "t", "u"), "p2", "runs/p2/r1", runner_name="gpu-b")
+    assert d.pick_runner_for_dispatch()["name"] == "gpu-a"    # B 满载后 A 是唯一未满载
+
+
+def test_dispatch_tie_breaks_by_registration_order(tmp_path):
+    d = _open(tmp_path)
+    _reg(d, "gpu-a"); _reg(d, "gpu-b")
+    assert d.pick_runner_for_dispatch()["name"] == "gpu-a"  # 平局（都 0/1）按登记序 id
+
+
+def test_dispatch_excludes_red_and_unprobed(tmp_path):
+    d = _open(tmp_path)
+    rid = _reg(d, "gpu-red", probe=False)
+    d.set_runner_probe(rid, False, {"daemon": "unreachable"})  # 探针红
+    _reg(d, "gpu-unprobed", probe=False)                       # 未探（probe_ok NULL）
+    assert d.has_enabled_runners() is True
+    assert d.pick_runner_for_dispatch() is None  # 红不候选、未探不参选 → 无可用候选
+
+
+def test_dispatch_full_pool_waits_not_local(tmp_path):
+    d = _open(tmp_path)
+    _reg(d, "gpu-a", capacity=1)
+    q = d.enqueue("p", "/p", "t", "u")
+    d.create_run(q, "p", "runs/p/r1", runner_name="gpu-a")
+    # 满载：has_enabled=True 而 pick None → 调度层「留 pending 等待」，绝不回落本机
+    assert d.pick_runner_for_dispatch() is None and d.has_enabled_runners() is True
+
+
+def test_dispatch_empty_or_all_disabled_pool_means_local(tmp_path):
+    d = _open(tmp_path)
+    assert d.pick_runner_for_dispatch() is None and d.has_enabled_runners() is False  # 表空=本机
+    rid = _reg(d, "gpu-a")
+    d.set_runner_enabled(rid, False)  # 软下线：全禁用 = 本机形态
+    assert d.has_enabled_runners() is False
+    d.set_runner_enabled(rid, True)   # 重启用立即回候选（探针缓存未清）
+    assert d.pick_runner_for_dispatch()["name"] == "gpu-a"
+
+
+def test_runner_update_clears_probe_cache(tmp_path):
+    d = _open(tmp_path)
+    rid = _reg(d, "gpu-a")
+    assert d.pick_runner_for_dispatch() is not None
+    assert d.update_runner(rid, "gpu-a", "tcp://10.0.0.9:2375", "/mnt/pa2", 2) is True
+    row = d.get_runner(rid)
+    assert row["probe_ok"] is None and row["probe_json"] is None and row["probed_at"] is None
+    assert d.pick_runner_for_dispatch() is None  # 编辑后未探不参选，等下轮探针
+
+
+def test_runner_get_delete(tmp_path):
+    d = _open(tmp_path)
+    rid = _reg(d, "gpu-a")
+    assert d.get_runner(rid)["name"] == "gpu-a"
+    assert d.delete_runner(rid) is True and d.get_runner(rid) is None  # 删除放行（软下线在禁用）
+    assert d.delete_runner(rid) is False
+
+
+def test_seed_runner_once_then_env_silently_ignored(tmp_path):
+    d = _open(tmp_path)
+    assert d.seed_runner("seed-183", "tcp://172.32.153.183:2375", "/mnt/nfs/pa") == 1
+    row = d.list_runners()[0]
+    assert row["probe_ok"] == 1 and json.loads(row["probe_json"]) == {"seed": True}
+    assert d.pick_runner_for_dispatch()["name"] == "seed-183"  # seed 机立即可参选（行为等价前提）
+    assert d.seed_runner("seed-x", "tcp://1.2.3.4:2375", "/m") == 0  # 表非空跳过，env 静默无效
+    assert len(d.list_runners()) == 1
+
+
+def test_seed_runner_rejects_bad_env_form(tmp_path):
+    d = _open(tmp_path)
+    with pytest.raises(db.DBError):  # env 值不合形 = 拒灌 + 启动 fail loud（serve 不捕获）
+        d.seed_runner("seed-x", "ssh://1.2.3.4", "/m")
+
+
+def test_create_run_runner_snapshot_columns(tmp_path):
+    d = _open(tmp_path)
+    q = d.enqueue("p", "/p", "t", "u")
+    rid_old = d.create_run(q, "p", "runs/p/r0")  # 不传快照参数
+    rid_new = d.create_run(q, "p", "runs/p/r1", runner_name="gpu-a",
+                           runner_docker_host="tcp://10.0.0.1:2375")
+    assert d.get_run(rid_old)["runner_name"] is None  # 旧行 NULL = 本机形态
+    r = d.get_run(rid_new)
+    assert r["runner_name"] == "gpu-a" and r["runner_docker_host"] == "tcp://10.0.0.1:2375"
+
+
+def test_migrate_legacy_runs_table_adds_runner_columns_keeps_rows(tmp_path):
+    db_file = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, queue_item_id INTEGER,"
+        " project TEXT, run_dir TEXT, status TEXT, started_at TEXT, container_ref TEXT,"
+        " exit_code INTEGER, ended_at TEXT)"
+    )
+    conn.execute("INSERT INTO runs (queue_item_id, project, run_dir, status) VALUES (1,'p','r','running')")
+    conn.commit(); conn.close()
+    d = db.HubDB(db_file)  # 打开即 _migrate 补列
+    cols = {r[1] for r in d._conn.execute("PRAGMA table_info(runs)")}
+    assert {"runner_name", "runner_docker_host"} <= cols
+    assert d.list_all_runs()[0]["runner_name"] is None  # 旧行保留且 NULL = 本机

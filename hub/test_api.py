@@ -866,3 +866,127 @@ def test_unbind_then_intake_denied_and_education(tmp_path):
     assert "未绑定" in r2.json()["text"]
     r3 = _slash(client, text="run 修 bug 出处: https://x/1")  # 入站回落未绑定拒绝
     assert "未绑定" in r3.json()["text"] and d.list_items() == []
+
+
+# ── 服务器池端点（add-hub-runner-pool 5.2）────────────────────────────
+# 权限分层：观察面（GET /runners、GET /panel/runners）任何有效会话；改行为面
+# （注册/编辑/禁启用/删除/探针）挂 HUB_PANEL_ADMINS 门（非白名单 403、无会话 401）。
+
+_POOL_ENV = {**_MM_ENV, "HUB_PANEL_ADMINS": "rocju"}  # admins 白名单单用户
+
+
+def _mk_pool(tmp_path):
+    return _mk(tmp_path, extra_env=_POOL_ENV)
+
+
+_BODY = {"name": "gpu-a", "docker_host": "tcp://10.0.0.1:2375", "mount_root": "/mnt/nfs/pa", "capacity": 2}
+
+
+def test_runner_observation_any_valid_session(tmp_path):
+    # 观察面放行：普通登录用户（非白名单）也能看池列表红绿灯 + 面板池页
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    _login(client, lc)  # zhang3（无 admins 配置 = 空，本用例仅证读面守卫）
+    r = client.get("/runners")
+    assert r.status_code == 200 and r.json() == []
+    assert client.get("/panel/runners").status_code == 200
+
+
+def test_runner_register_and_validation_passthrough(tmp_path):
+    client, d, eng, lc = _mk_pool(tmp_path)
+    _login(client, lc, username="rocju")
+    r = client.post("/runners", json=_BODY)
+    assert r.status_code == 201
+    v = r.json()
+    assert v["name"] == "gpu-a" and v["running"] == 0 and v["capacity"] == 2
+    assert v["enabled"] is True and v["probe_ok"] is None  # 入池未探——不参选
+    # 校验透传 db 层：三种坏形态各 400 带原因（name 大写 / host 无 tcp:// / capacity 0）
+    for bad in [{"name": "GPU-A"}, {"docker_host": "http://10.0.0.1:2375"}, {"capacity": 0}]:
+        resp = client.post("/runners", json={**_BODY, **bad})
+        assert resp.status_code == 400 and resp.json()["detail"], bad
+    assert d.list_runners() != [] and len(d.list_runners()) == 1  # 坏形态零落行
+
+
+def test_runner_mutation_admin_gate(tmp_path):
+    # 改行为面白名单门：非白名单登录 403、无会话 401（观察面同身份放行）
+    client, d, eng, lc = _mk_pool(tmp_path)
+    d.register_runner("gpu-a", "tcp://10.0.0.1:2375", "/mnt/nfs/pa", 1)
+    _login(client, lc)  # zhang3 不在白名单
+    assert client.get("/runners").status_code == 200  # 观察面同身份放行
+    assert client.post("/runners", json=_BODY).status_code == 403
+    assert client.post("/runners/1", json=_BODY).status_code == 403
+    for path in ("/runners/1/enable", "/runners/1/disable", "/runners/1/probe"):
+        assert client.post(path).status_code == 403, path
+    assert client.delete("/runners/1").status_code == 403
+    client.cookies.delete(auth.SESSION_COOKIE)  # 无会话：401（登录前置）
+    assert client.post("/runners/1/enable").status_code == 401
+
+
+def test_runner_disable_soft_offline_with_inflight_run(tmp_path):
+    # 禁用软下线放行：有在飞 run（快照在 runs 行）亦放行——不拒绝不断账
+    client, d, eng, lc = _mk_pool(tmp_path)
+    _login(client, lc, username="rocju")
+    rid = d.register_runner("gpu-a", "tcp://10.0.0.1:2375", "/mnt/nfs/pa", 1)
+    prd = tmp_path / "p.md"; prd.write_text("# PRD\n", encoding="utf-8")
+    iid = eng.enqueue("proj-a", str(prd), "zhang3")
+    d.create_run(iid, "proj-a", str(tmp_path / "run-x"),
+                 runner_name="gpu-a", runner_docker_host="tcp://10.0.0.1:2375")
+    r = client.post(f"/runners/{rid}/disable")
+    assert r.status_code == 200 and r.json()["enabled"] is False
+    # 在飞 run 快照不受禁用影响（对账仍路由原机）
+    detail = api_mod.run_detail(d, 1)
+    assert detail["runner_name"] == "gpu-a" and detail["runner_docker_host"] == "tcp://10.0.0.1:2375"
+    assert client.post(f"/runners/{rid}/enable").json()["enabled"] is True
+
+
+def test_runner_probe_and_delete(tmp_path, monkeypatch):
+    client, d, eng, lc = _mk_pool(tmp_path)
+    _login(client, lc, username="rocju")
+    rid = d.register_runner("gpu-a", "tcp://10.0.0.1:2375", "/mnt/nfs/pa", 1)
+
+    def fake_probe(db_, r_, cfg_):  # 三项绿写缓存；缺行 KeyError → 端点 404
+        if db_.get_runner(r_) is None:
+            raise KeyError(r_)
+        detail = {"daemon": "ok", "image": "ok", "mount": "ok"}
+        db_.set_runner_probe(r_, True, detail)
+        return detail
+
+    import health_probe as hp
+    monkeypatch.setattr(hp, "probe_and_store", fake_probe)
+    r = client.post(f"/runners/{rid}/probe")
+    assert r.status_code == 200 and r.json()["probe_ok"] is True
+    assert client.post("/runners/999/probe").status_code == 404
+    assert client.delete(f"/runners/{rid}").json() == {"deleted": rid}
+    assert client.delete(f"/runners/{rid}").status_code == 404  # 再删缺行
+    assert d.list_runners() == []
+
+
+def test_panel_runner_form_flow(tmp_path):
+    # 面板皮全流程：form 注册 → 422 回显回填 → ?edit 回填 → edit 提交（清探针缓存）
+    # → 禁用/启用薄壳
+    client, d, eng, lc = _mk_pool(tmp_path)
+    _login(client, lc, username="rocju")
+    rv = client.post("/panel/runners", data=_BODY)
+    assert rv.status_code == 200 and "gpu-a" in rv.text
+    assert d.list_runners()[0]["capacity"] == 2
+    # 坏表单 422：错误可见 + 非密码字段回填（不丢输入）
+    rv = client.post("/panel/runners", data={**_BODY, "name": "gpu-b", "docker_host": "http://x"})
+    assert rv.status_code == 422 and "tcp://" in rv.text and 'value="gpu-b"' in rv.text
+    # 编辑模式同页回填（action 指向 edit 端点）
+    rid = d.list_runners()[0]["id"]
+    rv = client.get(f"/panel/runners?edit={rid}")
+    assert f"/panel/runners/{rid}/edit" in rv.text and 'value="gpu-a"' in rv.text
+    # 探针转绿后再编辑：缓存被清（回未探不参选）
+    d.set_runner_probe(rid, True, {"daemon": "ok", "image": "ok", "mount": "ok"})
+    rv = client.post(f"/panel/runners/{rid}/edit",
+                     data={**_BODY, "docker_host": "tcp://10.0.0.9:2375", "capacity": "3"})
+    assert rv.status_code == 200
+    row = d.get_runner(rid)
+    assert row["docker_host"] == "tcp://10.0.0.9:2375" and row["capacity"] == 3
+    assert row["probe_ok"] is None and row["probed_at"] is None
+    # 面板禁用/启用薄壳
+    assert client.post(f"/panel/runners/{rid}/disable").status_code == 200
+    assert d.get_runner(rid)["enabled"] == 0
+    assert client.post(f"/panel/runners/{rid}/enable").status_code == 200
+    assert d.get_runner(rid)["enabled"] == 1
+    # 行内红绿灯渲染（探针缓存清后 = 未探）
+    assert "⚪ 未探" in client.get("/panel/runners").text

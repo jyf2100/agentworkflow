@@ -114,3 +114,30 @@ def test_project_channels_bad_segments_skipped(capsys):
     got = config.parse_project_channels("ok:chan1, badseg, :empty, proj:")
     assert got == {"ok": "chan1"}
     assert "坏段" in capsys.readouterr().err
+
+
+# ── 远程 runner 面（add-hub-remote-runner 1.2，spec scenario「不设零变化」/「非法形态 fail fast」）──
+
+
+def test_remote_runner_env_defaults_none():
+    cfg = config.load_config(_full_env())  # 两 env 不设 = 零变化（byte-identical 前提）
+    assert cfg.docker_host is None
+    assert cfg.runner_mount_root is None
+
+
+def test_remote_runner_env_parsed():
+    cfg = config.load_config(_full_env(
+        HUB_DOCKER_HOST="tcp://172.32.153.183:2375",
+        HUB_RUNNER_MOUNT_ROOT="/mnt/nfs/pa",
+    ))
+    assert cfg.docker_host == "tcp://172.32.153.183:2375"
+    assert cfg.runner_mount_root == config.Path("/mnt/nfs/pa")
+
+
+def test_docker_host_raw_passthrough_to_seed_gate():
+    # add-hub-runner-pool 6.1：限形校验移出 load_config（注册/seed 入口单点——db 层
+    # _validate_runner_fields）——本层对任意形态原样解析透传，不再 ConfigError 拒起。
+    # 表空态坏值由 serve → seed_runner DBError 启动 fail loud（行为等价迁移前）。
+    for raw in ("ssh://user@host", "172.32.153.183", "http://host:2375"):
+        cfg = config.load_config(_full_env(HUB_DOCKER_HOST=raw))
+        assert cfg.docker_host == raw

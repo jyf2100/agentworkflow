@@ -8,6 +8,7 @@ runs 表是索引不是真相（F10：卷上 meta 可重建）。sqlite3 标准�
 from __future__ import annotations
 
 import functools
+import json
 import re
 import sqlite3
 import sys
@@ -68,12 +69,26 @@ CREATE TABLE IF NOT EXISTS confirmation_requests (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_confirm_item ON confirmation_requests(item_id);
 CREATE INDEX IF NOT EXISTS idx_confirm_status ON confirmation_requests(status);
 CREATE INDEX IF NOT EXISTS idx_confirm_origin ON confirmation_requests(origin_sha);
+CREATE TABLE IF NOT EXISTS runners (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    name              TEXT NOT NULL UNIQUE,
+    docker_host       TEXT NOT NULL,
+    runner_mount_root TEXT NOT NULL,
+    capacity          INTEGER NOT NULL DEFAULT 1,
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    probe_ok          INTEGER,
+    probe_json        TEXT,
+    probed_at         TEXT
+);
 """  # deliver_key UNIQUE 索引不在此——旧表存在时 executescript 先于 _migrate 跑，索引引用新列会炸；统一在 _migrate 建
 # project_channels 是全新表（add-mm-channel-intake D2）：旧库 executescript 直接建出含 UNIQUE
 # 的完整表，无补列问题——UNIQUE 内联声明安全，不走 _migrate。
 # confirmation_requests 同为全新表（add-acceptance-spec-confirmation D4：确认环旁表，零侵入
 # queue_items CHECK）；item_id UNIQUE = 事件重复到达幂等（同 queue item 只建一行）；
 # origin_sha = 原始需求 sha 祖先链根（confirm/metrics 重入队计数判据，D5 上界 3 次）。
+# runners 是全新表（add-hub-runner-pool D2）：服务器池登记 + 忙闲自动调度。probe_ok 冗余列
+# （NULL=未探、0=红、1=绿）而非运行时 json_extract——调度查询零 JSON 依赖；候选判据
+# enabled=1 AND probe_ok=1（未探不参选——新注册须先探针转绿，seed 行例外见 seed_runner）。
 
 
 class DBError(Exception):
@@ -83,6 +98,25 @@ class DBError(Exception):
 # MM 频道 id 公开事实：26 字符小写字母数字（与 user_id 同形态族；落库与 seed 迁移的
 # 机械判据，防频道名/URL 误填——add-mm-channel-intake D2）
 MM_CHANNEL_ID_RE = re.compile(r"[0-9a-z]{26}")
+RUNNER_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")  # 同 project 判据（D6）
+
+
+def _validate_runner_fields(
+    name: str, docker_host: str, runner_mount_root: str, capacity: int = 1,
+) -> dict:
+    """runners 登记行入口校验（D6）：name `[a-z0-9][a-z0-9_-]*` / docker_host 限
+    `tcp://` 前缀（第一期内网明文 transport）/ runner_mount_root 绝对路径 /
+    capacity ≥1 整数。不合形抛 DBError（fail fast，不产生半配置行）。"""
+    if not RUNNER_NAME_RE.fullmatch(name or ""):
+        raise DBError(f"runner name 非法（须 [a-z0-9][a-z0-9_-]*）：{name!r}")
+    if not (docker_host or "").startswith("tcp://"):
+        raise DBError(f"docker_host 须 tcp:// 前缀（如 tcp://172.32.153.183:2375）：{docker_host!r}")
+    if not runner_mount_root or not runner_mount_root.startswith("/"):
+        raise DBError(f"runner_mount_root 须绝对路径：{runner_mount_root!r}")
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+        raise DBError(f"capacity 须 ≥1 整数：{capacity!r}")
+    return {"name": name, "docker_host": docker_host,
+            "runner_mount_root": runner_mount_root, "capacity": capacity}
 
 
 def _now() -> str:
@@ -136,6 +170,13 @@ class HubDB:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_items_deliver_key ON queue_items(deliver_key)"
         )
         self._conn.commit()
+        # add-hub-runner-pool D2：runs 快照列（派发时选中行的 runner 名与 docker_host——
+        # 对账按行内快照路由对应 daemon，runner 行被改/被禁用不断账）。旧行 NULL = 本机形态。
+        run_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(runs)")}
+        for col in ("runner_name", "runner_docker_host"):
+            if col not in run_cols:
+                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
+                self._conn.commit()
 
     @_locked
     def close(self) -> None:
@@ -244,10 +285,16 @@ class HubDB:
     # ── runs（索引非真相，F10）──────────────────────────────────────
 
     @_locked
-    def create_run(self, queue_item_id: int, project: str, run_dir: str) -> int:
+    def create_run(
+        self, queue_item_id: int, project: str, run_dir: str,
+        runner_name: str | None = None, runner_docker_host: str | None = None,
+    ) -> int:
+        """runner_name/runner_docker_host（add-hub-runner-pool D2）= 派发时选中行的
+        快照（None = 本机形态）——此后 runner 行漂移不影响本 run 对账路由。"""
         cur = self._conn.execute(
-            "INSERT INTO runs (queue_item_id, project, run_dir, status, started_at) VALUES (?,?,?,'running',?)",
-            (queue_item_id, project, run_dir, _now()),
+            "INSERT INTO runs (queue_item_id, project, run_dir, status, started_at, runner_name, runner_docker_host)"
+            " VALUES (?,?,?,'running',?,?,?)",
+            (queue_item_id, project, run_dir, _now(), runner_name, runner_docker_host),
         )
         self._conn.commit()
         return int(cur.lastrowid)
@@ -471,3 +518,122 @@ class HubDB:
             (project, initiator),
         ).fetchone()
         return row["origin_sha"] if row else None
+
+    # ── runners 服务器池（add-hub-runner-pool D1/D2/D6）────────────────────
+
+    @staticmethod
+    def _runner_load_sql(alias: str = "r") -> str:
+        """负载子查询：该机 running run 数——按 runs.runner_name 快照列统计（D2），
+        纯 SQL 机械事实，不依赖 runner 行现状。"""
+        return (
+            f"(SELECT COUNT(*) FROM runs WHERE runs.runner_name = {alias}.name"
+            " AND runs.status='running')"
+        )
+
+    @_locked
+    def register_runner(self, name: str, docker_host: str,
+                        runner_mount_root: str, capacity: int = 1) -> int:
+        f = _validate_runner_fields(name, docker_host, runner_mount_root, capacity)
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO runners (name, docker_host, runner_mount_root, capacity, enabled)"
+                " VALUES (?,?,?,?,1)",
+                (f["name"], f["docker_host"], f["runner_mount_root"], f["capacity"]),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError as exc:  # name UNIQUE
+            raise DBError(f"runner name 已存在：{name}") from exc
+        return int(cur.lastrowid)
+
+    @_locked
+    def update_runner(self, runner_id: int, name: str, docker_host: str,
+                      runner_mount_root: str, capacity: int) -> bool:
+        """编辑字段即清探针缓存（probe_ok 置 NULL）：docker_host/挂载根变了，
+        旧探针结论已 stale——回「未探不参选」，下轮探针或手动探针转绿再进候选。"""
+        f = _validate_runner_fields(name, docker_host, runner_mount_root, capacity)
+        try:
+            cur = self._conn.execute(
+                "UPDATE runners SET name=?, docker_host=?, runner_mount_root=?, capacity=?,"
+                " probe_ok=NULL, probe_json=NULL, probed_at=NULL WHERE id=?",
+                (f["name"], f["docker_host"], f["runner_mount_root"], f["capacity"], runner_id),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError as exc:  # 改名撞他行 UNIQUE
+            raise DBError(f"runner name 已存在：{name}") from exc
+        return cur.rowcount > 0
+
+    @_locked
+    def set_runner_enabled(self, runner_id: int, enabled: bool) -> bool:
+        """禁用/启用对任何行放行（软下线 D2）：在飞 run 按行内快照跑完，新派发
+        不再选该机。禁用不清探针缓存——机器本身没变，重启用即回候选。"""
+        cur = self._conn.execute(
+            "UPDATE runners SET enabled=? WHERE id=?", (1 if enabled else 0, runner_id)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_locked
+    def delete_runner(self, runner_id: int) -> bool:
+        """删除对任何行放行（建议先禁用观察一轮是 RUNBOOK 注记，非硬门——D6）。"""
+        cur = self._conn.execute("DELETE FROM runners WHERE id=?", (runner_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_locked
+    def get_runner(self, runner_id: int) -> dict | None:
+        row = self._conn.execute("SELECT * FROM runners WHERE id=?", (runner_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    @_locked
+    def list_runners(self) -> list[dict]:
+        """池列表（面板观察面）：附 load 列（该机 running run 数）供负载红绿灯展示。"""
+        rows = self._conn.execute(
+            f"SELECT r.*, {self._runner_load_sql()} AS load FROM runners r ORDER BY r.id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @_locked
+    def has_enabled_runners(self) -> bool:
+        """是否存在 enabled 行（含探针红/未探）——派发前先问：False = 本机形态
+        （byte-identical 回落），True 而 pick 无行 = 全红/满载不派发留 pending。"""
+        return self._conn.execute(
+            "SELECT 1 FROM runners WHERE enabled=1 LIMIT 1"
+        ).fetchone() is not None
+
+    @_locked
+    def pick_runner_for_dispatch(self) -> dict | None:
+        """忙闲自动调度选机（D2）：候选 = enabled 且 probe_ok=1 的行；未满载
+        （load < capacity）中取负载最小，平局按登记序 id。返回 None 的两分语义由
+        调用方经 has_enabled_runners 区分（本机形态 vs 不派发等待）。"""
+        row = self._conn.execute(
+            f"SELECT * FROM (SELECT r.*, {self._runner_load_sql()} AS load"
+            " FROM runners r WHERE r.enabled=1 AND r.probe_ok=1)"
+            " WHERE load < capacity ORDER BY load, id LIMIT 1"
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    @_locked
+    def set_runner_probe(self, runner_id: int, ok: bool, detail: dict) -> None:
+        """探针结果缓存表行（D4）：probe_ok 0/1 + 各项明细 JSON + 时间戳。"""
+        self._conn.execute(
+            "UPDATE runners SET probe_ok=?, probe_json=?, probed_at=? WHERE id=?",
+            (1 if ok else 0, json.dumps(detail, ensure_ascii=False), _now(), runner_id),
+        )
+        self._conn.commit()
+
+    @_locked
+    def seed_runner(self, name: str, docker_host: str, runner_mount_root: str) -> int:
+        """HUB_DOCKER_HOST env 一次性 seed（D5，先例 seed_project_channels）：仅表空
+        才灌。probe_ok=1——信任 env 部署期已人工核实，否则 seed 机因「未探不参选」
+        回落本机、行为不等价。此后表是唯一真相，env 继续配置静默无效。值不合形
+        抛 DBError（serve 侧不捕获 = 启动 fail loud，D5）。返回入库行数。"""
+        if self._conn.execute("SELECT 1 FROM runners LIMIT 1").fetchone():
+            return 0
+        f = _validate_runner_fields(name, docker_host, runner_mount_root, 1)
+        self._conn.execute(
+            "INSERT INTO runners (name, docker_host, runner_mount_root, capacity, enabled,"
+            " probe_ok, probe_json, probed_at) VALUES (?,?,?,1,1,1,?,?)",
+            (f["name"], f["docker_host"], f["runner_mount_root"], '{"seed": true}', _now()),
+        )
+        self._conn.commit()
+        return 1

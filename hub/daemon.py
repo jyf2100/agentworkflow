@@ -59,6 +59,13 @@ def run_forever(
                 stale_check.check_stale(lc.cfg, stale_seen, notifier=lc.notifier)
         except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
             print(f"[stale][warn] 陈旧检测异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
+        try:  # add-hub-runner-pool 4.1：每 cfg.probe_ticks 个 tick 池健康探针一轮
+            # （同型防御——探针任何异常绝不崩排度循环；probe_enabled_runners 内部
+            # 逐行 fail-open，本层兜底整体异常如配置异常值）
+            if tick % lc.cfg.probe_ticks == 0:
+                lc.probe_runners()
+        except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
+            print(f"[probe][warn] 探针挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
         if not stop_event.is_set():
             sleep(interval)
     print(f"[daemon] 优雅退出：当前迭代已收尾，连续异常 {consecutive}（在跑容器不动，重启经对账接管）")

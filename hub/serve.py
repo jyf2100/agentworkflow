@@ -7,6 +7,7 @@ join（优雅退出路由链）；compose stop_grace_period 30s 兜底慢迭代�
 from __future__ import annotations
 
 import os
+import re
 
 import uvicorn
 
@@ -33,6 +34,13 @@ def build_app(cfg: config.HubConfig | None = None):
     # env 一次性 seed 迁移（add-mm-channel-intake D2）：表空才灌（幂等），此后
     # HUB_MM_PROJECT_CHANNELS env 键废止——绑定表是唯一真相。
     database.seed_project_channels(cfg.project_channels)
+    # env 两键一次性 seed（add-hub-runner-pool D5，同上先例）：首启表空且 HUB_DOCKER_HOST
+    # 有值才灌一行 runner（此后 runners 表是唯一真相，env 静默无效）；值不合形
+    # seed 内部抛 DBError 不捕获 = 启动 fail loud（地址非凭据可入消息）。
+    if cfg.docker_host:
+        _seed_name = "seed-" + re.sub(r"[^0-9a-z]+", "-", cfg.docker_host.removeprefix("tcp://")).strip("-")
+        database.seed_runner(_seed_name, cfg.docker_host,
+                             str(cfg.runner_mount_root or cfg.data_root))
     engine = queue_engine.QueueEngine(database, cfg.max_containers, cfg.max_retries, cfg.image_tag_default)
     try:
         key = vault_store.load_key()
@@ -45,7 +53,11 @@ def build_app(cfg: config.HubConfig | None = None):
     mm_client = notify_mod.HttpMMClient(cfg) if (cfg.mm_bot_token and cfg.mm_base_url) else None
     # database = 归属路由判据（6.x）：Notifier 按绑定表路由 run 终态/语义事件/放弃告警
     notifier = notify_mod.build_notifier(cfg, mm=mm_client, database=database)
-    lc = lifecycle_mod.Lifecycle(database, engine, runner_mod.DockerRunner(), cfg, vault=vault, notifier=notifier)
+    lc = lifecycle_mod.Lifecycle(
+        database, engine, runner_mod.DockerRunner(), cfg,
+        vault=vault, notifier=notifier,
+    )  # docker_host 是 per-call 参数（add-hub-runner-pool D2）：派发选机/对账快照
+    # 逐次传入，运行时不再构造固化；无 enabled 远程行 = 恒 None 调用（本机 socket 零变化）
     interval = float(os.environ.get("HUB_TICK_INTERVAL") or 5)
     app = create_app(database, engine, lc, vault=vault, tick_interval=interval, mm_client=mm_client)
     return app, lc, cfg

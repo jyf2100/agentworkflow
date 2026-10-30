@@ -12,6 +12,7 @@ D1 形态：render 函数族 + f-string 拼 HTML，零新依赖（否决 Jinja2/
 """
 from __future__ import annotations
 
+import json
 from html import escape
 from typing import Any
 
@@ -55,7 +56,7 @@ def _page(title: str, body: str) -> str:
         "<body><main>"
         "<nav><a href=\"/panel\">提交 PRD</a><a href=\"/panel/queue\">队列</a>"
         "<a href=\"/panel/runs\">runs</a><a href=\"/panel/projects/new\">建项目</a>"
-        "<a href=\"/panel/credentials\">凭据</a>"
+        "<a href=\"/panel/credentials\">凭据</a><a href=\"/panel/runners\">服务器池</a>"
         "<a href=\"/auth/logout\">登出</a></nav>"
         f"{body}</main></body></html>"
     )
@@ -350,3 +351,95 @@ def render_run_detail(detail: dict, journal_tail: list[str], report_md: str | No
 def render_503() -> str:
     """auth 未配置态面板整体 503（面板以会话为前提）。"""
     return _page("面板不可用", "<h1>面板不可用</h1><p>hub 未配置 Mattermost OAuth（auth 未配置态）——面板以会话为前提。REST 面与 cron 投递链不受影响。</p>")
+
+
+# ── 服务器池页（add-hub-runner-pool 5.1：列表 + 红绿灯 + 忙闲 + 行内操作 +
+#    注册/编辑表单；观察面任何有效会话，改行为操作 api.py 侧挂 admins 门）──
+
+
+def _probe_cell(r: dict) -> str:
+    """红绿灯 + title 悬停坏项明细（probe_json 非 ok 项——探针红时看哪项断链）。"""
+    try:
+        detail = json.loads(r.get("probe_json") or "")
+    except (json.JSONDecodeError, TypeError):
+        detail = {}
+    bad = "；".join(f"{k}: {v}" for k, v in detail.items() if v != "ok")
+    ok = r.get("probe_ok")
+    if ok == 1:
+        return '<span class="ok">🟢 绿</span>'
+    if ok == 0:
+        return f'<span class="err" title="{_esc(bad)}">🔴 红</span>'
+    return '<span class="warn">⚪ 未探</span>'
+
+
+def _enabled_cell(r: dict) -> str:
+    """状态列（独立 helper——f-string 表达式内嵌带引号 HTML 是 py312 语法，py311 不容）。"""
+    return '<span class="ok">启用</span>' if r["enabled"] else '<span class="warn">已禁用</span>'
+
+
+def _runner_actions(r: dict) -> str:
+    """行内操作：探针 / 禁用|启用 / 编辑（同页 ?edit 回填）/ 删除（confirm 防误点——
+    行删了在飞 run 按快照跑完但行审计没了，二档破坏性先例用原生 confirm）。"""
+    rid = r["id"]
+    toggle, toggle_action = (("禁用", f"/panel/runners/{rid}/disable") if r["enabled"]
+                             else ("启用", f"/panel/runners/{rid}/enable"))
+    return (
+        f'<form method="post" action="/panel/runners/{rid}/probe"><button type="submit">探针</button></form>'
+        f'<form method="post" action="{toggle_action}"><button type="submit">{toggle}</button></form>'
+        f'<a href="/panel/runners?edit={rid}">编辑</a>'
+        f'<form method="post" action="/panel/runners/{rid}/delete"'
+        " onclick=\"return confirm('确认删除？在飞 run 按快照跑完，但行与探针历史不可恢复')\">"
+        "<button type=\"submit\">删除</button></form>"
+    )
+
+
+def render_runners(rows: list[dict], *, current_user: str = "", error: str | None = None,
+                   success: str | None = None, edit_row: dict | None = None,
+                   values: dict[str, str] | None = None) -> str:
+    """服务器池页：每行 name / docker_host / 挂载根 / 忙闲（running/capacity）/
+    探针红绿灯（title 坏项）/ 状态 / 行内操作。表单双态：edit_row 非空 = 编辑
+    模式回填（action 指向 edit 端点），否则注册模式（values = 422 回显回填）。"""
+    def _fv(key: str) -> str:
+        if edit_row is not None:
+            src = {"name": edit_row.get("name"), "docker_host": edit_row.get("docker_host"),
+                   "mount_root": edit_row.get("runner_mount_root") or edit_row.get("mount_root"),
+                   "capacity": edit_row.get("capacity") or (values or {}).get("capacity")}
+            return str(src.get(key) or "")
+        return (values or {}).get(key, "")
+
+    trs = "".join(
+        f"<tr><td>#{r['id']}</td><td>{_esc(r['name'])}</td>"
+        f"<td>{_esc(r['docker_host'])}</td><td>{_esc(r['runner_mount_root'])}</td>"
+        f"<td>{r['load']}/{r['capacity']}</td><td>{_probe_cell(r)}</td>"
+        f"<td title=\"{_esc(r.get('probed_at') or '')}\">{_esc(_short_time(r.get('probed_at') or ''))}</td>"
+        f"<td>{_enabled_cell(r)}</td>"
+        f"<td>{_runner_actions(r)}</td></tr>"
+        for r in rows
+    )
+    err = f'<div class="error">{_esc(error)}</div>' if error else ""
+    ok = f'<div class="ok">{_esc(success)}</div>' if success else ""
+    form_title = f"编辑 runner #{edit_row['id']}" if edit_row is not None else "注册服务器入池"
+    form_action = f"/panel/runners/{edit_row['id']}/edit" if edit_row is not None else "/panel/runners"
+    cancel = ' <a href="/panel/runners">取消编辑</a>' if edit_row is not None else ""
+    body = (
+        f"<h1>服务器池（{len(rows)} 台）</h1>{ok}{err}"
+        '<div class="tablewrap"><table><tr><th>id</th><th>name</th><th>docker_host</th>'
+        "<th>挂载根</th><th>忙闲</th><th>探针</th><th>探针时间</th><th>状态</th><th>操作</th></tr>"
+        f"{trs}</table></div>"
+        f"<h2>{_esc(form_title)}</h2>{cancel}"
+        f"<form method=\"post\" action=\"{form_action}\">"
+        '<label for="r-name">name</label>'
+        '<p class="hint">机名（小写字母/数字/-/_ 开头小写字母数字）——派发 run 快照引用它</p>'
+        f'<input name="name" id="r-name" required value="{_esc(_fv("name"))}" placeholder="gpu-a">'
+        '<label for="r-host">docker_host</label>'
+        '<p class="hint">daemon 地址，限 tcp:// 前缀（明文内网 transport，如 tcp://172.32.153.183:2375）</p>'
+        f'<input name="docker_host" id="r-host" required value="{_esc(_fv("docker_host"))}" placeholder="tcp://10.0.0.1:2375">'
+        '<label for="r-mount">挂载根（runner_mount_root）</label>'
+        '<p class="hint">daemon 侧挂载视角的 data_root 投影根（绝对路径）——须与 hub data_root 指同一共享存储</p>'
+        f'<input name="mount_root" id="r-mount" required value="{_esc(_fv("mount_root"))}" placeholder="/mnt/nfs/pa">'
+        '<label for="r-cap">capacity（并行容量）</label>'
+        '<p class="hint">该机最多同时在飞 run 数（忙闲调度：候选中取负载最小）</p>'
+        f'<input name="capacity" id="r-cap" type="number" min="1" value="{_esc(_fv("capacity") or "1")}">'
+        "<button type=\"submit\">保存</button></form>"
+    )
+    return _page("服务器池", body)

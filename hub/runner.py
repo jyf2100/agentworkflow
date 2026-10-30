@@ -45,15 +45,19 @@ class ImageMissingError(Exception):
 
 @dataclass(frozen=True)
 class RunSpec:
-    """单次容器载荷：tag 钉死 + 命令 + 挂载 + 注入通道 + 资源限额参数。"""
+    """单次容器载荷：tag 钉死 + 命令 + 挂载 + 注入通道 + 资源限额参数。
+
+    四挂载源路径是 **daemon 侧视角**（-v 在目标 daemon 上解析；本机形态下与 hub 侧
+    路径重合——远程形态由 lifecycle 派发时投影换算，add-hub-remote-runner D2）。
+    """
 
     image_tag: str
     command: list[str]                 # 传给镜像 ENTRYPOINT（run_daily.py）的纯参数（tag 后 args）
-    state_root: Path                   # host 侧 state 卷根（挂给容器内 pa 期望路径）
+    state_root: Path                   # state 写卷挂载源（daemon 侧视角；挂给容器内 pa 期望路径）
     project: str                       # 派发对象 project（runs/<proj>/ 布局）
-    prd_input: Path | None = None      # PRD host 文件（只读输入卷挂 /input/）
-    profiles_root: Path | None = None  # host 侧 profiles 目录（只读卷挂 .project-auto/profiles）
-    sources_file: Path | None = None   # host 侧 sources.yaml（只读单文件挂 .project-auto/）
+    prd_input: Path | None = None      # PRD 文件（daemon 侧视角；只读输入卷挂 /input/）
+    profiles_root: Path | None = None  # profiles 挂载源（daemon 侧视角；只读卷挂 .project-auto/profiles）
+    sources_file: Path | None = None   # sources.yaml 挂载源（daemon 侧视角；只读单文件挂 .project-auto/）
     env_file: Path | None = None       # 凭据 env-file（0600，容器退出后删）
     container_env: tuple[str, ...] = ()  # 非凭据 env 直传（K=V；docker -e，与凭据 env-file 分离）
     cpus: str = "2"
@@ -66,18 +70,31 @@ class ContainerStatus:
     exit_code: int | None
 
 
+def cli_env(docker_host: str | None = None) -> dict[str, str] | None:
+    """docker CLI 子进程 env（add-hub-remote-runner D1；D2 改 per-call；模块级供
+    health_probe 同型复用）：不设 = None（subprocess 继承父进程，与现状等价）；
+    设置 = 父进程 env + 恰一个 DOCKER_HOST（覆盖同名键——显式配置胜出）。只影响
+    CLI 子进程，绝不进 run 容器 --env 面；TLS 相关键（DOCKER_TLS_VERIFY /
+    DOCKER_CERT_PATH）不透传不声明支持（D5）。"""
+    if docker_host is None:
+        return None
+    return {**os.environ, "DOCKER_HOST": docker_host}
+
+
 class ContainerRunner(Protocol):
-    """运行时接缝——lifecycle 经此起容器/查状态/停止；镜像检查同判（Fake/Docker）。"""
+    """运行时接缝——lifecycle 经此起容器/查状态/停止；镜像检查同判（Fake/Docker）。
+    docker_host 是 per-call 参数（add-hub-runner-pool D2）：None = 本机 daemon，每次
+    调用按参数路由（调度选机/对账快照各自传值），运行时不再构造固化。"""
 
-    def image_exists(self, tag: str) -> bool: ...
+    def image_exists(self, tag: str, docker_host: str | None = None) -> bool: ...
 
-    def start(self, spec: RunSpec) -> str:
+    def start(self, spec: RunSpec, docker_host: str | None = None) -> str:
         """起容器返回 container_ref；镜像缺失抛 ImageMissingError（绝不回退其他 tag）。"""
         ...
 
-    def status(self, container_ref: str) -> ContainerStatus: ...
+    def status(self, container_ref: str, docker_host: str | None = None) -> ContainerStatus: ...
 
-    def stop(self, container_ref: str) -> None: ...
+    def stop(self, container_ref: str, docker_host: str | None = None) -> None: ...
 
 
 class FakeRunner:
@@ -88,12 +105,15 @@ class FakeRunner:
         self.crash_on_start = crash_on_start
         self.containers: dict[str, dict] = {}
         self._n = 0
+        self.calls: list[tuple[str, str | None]] = []  # (method, docker_host) 调用日志——per-call 路由断言
 
-    def image_exists(self, tag: str) -> bool:
+    def image_exists(self, tag: str, docker_host: str | None = None) -> bool:
+        self.calls.append(("image_exists", docker_host))
         return tag in self.images
 
-    def start(self, spec: RunSpec) -> str:
-        if not self.image_exists(spec.image_tag):
+    def start(self, spec: RunSpec, docker_host: str | None = None) -> str:
+        self.calls.append(("start", docker_host))
+        if not self.image_exists(spec.image_tag, docker_host):
             raise ImageMissingError(
                 f"镜像缺失：{spec.image_tag}（先手动 build 该 tag 再重新入队；不回退其他 tag）"
             )
@@ -101,10 +121,12 @@ class FakeRunner:
             raise self.crash_on_start
         self._n += 1
         ref = f"fake-{self._n}"
-        self.containers[ref] = {"spec": spec, "state": "running", "exit_code": None}
+        self.containers[ref] = {"spec": spec, "state": "running", "exit_code": None,
+                                "docker_host": docker_host}
         return ref
 
-    def status(self, container_ref: str) -> ContainerStatus:
+    def status(self, container_ref: str, docker_host: str | None = None) -> ContainerStatus:
+        self.calls.append(("status", docker_host))
         c = self.containers.get(container_ref)
         if c is None:
             return ContainerStatus(state="gone", exit_code=None)
@@ -115,14 +137,17 @@ class FakeRunner:
         self.containers[container_ref]["state"] = "exited"
         self.containers[container_ref]["exit_code"] = exit_code
 
-    def stop(self, container_ref: str) -> None:
+    def stop(self, container_ref: str, docker_host: str | None = None) -> None:
+        self.calls.append(("stop", docker_host))
         c = self.containers.get(container_ref)
         if c is not None and c["state"] == "running":
             c["state"] = "gone"  # 已终态容器 stop 幂等，不复活不改码
 
 
 class DockerRunner:
-    """docker CLI 包装——无 SDK 依赖（cron 非 login shell 的教训：依赖极薄）。"""
+    """docker CLI 包装——无 SDK 依赖（cron 非 login shell 的教训：依赖极薄）。
+    docker_host 不在构造固化：per-call 参数（add-hub-runner-pool D2），一次实例
+    服务整个服务器池（本机/远程按每次调用路由）。"""
 
     def __init__(self, docker_bin: str = "docker"):
         self._bin = docker_bin
@@ -131,9 +156,10 @@ class DockerRunner:
     # 5.3 真机坐实 permission denied 曾被误报「镜像缺失」进 fail 终态带偏排障）
     _DAEMON_UNREACHABLE = ("cannot connect", "permission denied", "is the docker daemon running")
 
-    def image_exists(self, tag: str) -> bool:
+    def image_exists(self, tag: str, docker_host: str | None = None) -> bool:
         proc = subprocess.run(
-            [self._bin, "image", "inspect", tag], capture_output=True, text=True, timeout=60
+            [self._bin, "image", "inspect", tag], capture_output=True, text=True, timeout=60,
+            env=cli_env(docker_host),
         )
         if proc.returncode == 0:
             return True
@@ -163,20 +189,23 @@ class DockerRunner:
         argv.append(spec.image_tag)
         return argv + list(spec.command)
 
-    def start(self, spec: RunSpec) -> str:
-        if not self.image_exists(spec.image_tag):
+    def start(self, spec: RunSpec, docker_host: str | None = None) -> str:
+        if not self.image_exists(spec.image_tag, docker_host):
             raise ImageMissingError(
                 f"镜像缺失：{spec.image_tag}（先手动 build 该 tag 再重新入队；不回退其他 tag）"
             )
-        proc = subprocess.run(self._docker_cmd(spec), capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(
+            self._docker_cmd(spec), capture_output=True, text=True, timeout=120,
+            env=cli_env(docker_host),
+        )
         if proc.returncode != 0:
             raise RuntimeError(f"docker run 失败（rc={proc.returncode}）：{proc.stderr.strip()}")
         return proc.stdout.strip()
 
-    def status(self, container_ref: str) -> ContainerStatus:
+    def status(self, container_ref: str, docker_host: str | None = None) -> ContainerStatus:
         proc = subprocess.run(
             [self._bin, "inspect", "-f", "{{json .State}}", container_ref],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=cli_env(docker_host),
         )
         if proc.returncode != 0:
             return ContainerStatus(state="gone", exit_code=None)
@@ -185,10 +214,13 @@ class DockerRunner:
             return ContainerStatus(state="running", exit_code=None)
         return ContainerStatus(state="exited", exit_code=state.get("ExitCode"))
 
-    def stop(self, container_ref: str) -> None:
-        if self.status(container_ref).state != "running":
+    def stop(self, container_ref: str, docker_host: str | None = None) -> None:
+        if self.status(container_ref, docker_host).state != "running":
             return  # gone/exited 均幂等 no-op
-        subprocess.run([self._bin, "stop", container_ref], capture_output=True, timeout=120)
+        subprocess.run(
+            [self._bin, "stop", container_ref], capture_output=True, timeout=120,
+            env=cli_env(docker_host),
+        )
 
 
 @contextmanager

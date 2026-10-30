@@ -474,7 +474,7 @@ graph canary 一律 `PA_VERIFY_AGENT=off` 跑（不进双源对照面）。
 - 优雅退出：`docker compose stop`（SIGTERM → uvicorn lifespan shutdown → daemon 线程有界等待当前迭代收尾（join 上限 10s），超界随进程退出、悬挂 run 由重启对账归档兜底；`stop_grace_period: 30s` 外层兜底）——在跑执行容器不动，重启后 `reconcile_startup` 幂等对账接管。
 - 崩溃自愈：进程内崩溃（exit/OOM/容器内 `kill -9 1`）由 `restart: unless-stopped` 拉起，先 `reconcile_startup` 幂等对账再进排度（2026-10-21 实证：runs 行数不变、无重复派发）。注意 **`docker kill`/`docker stop` 是显式操作，restart 策略不覆盖**——显式停后须手动 `docker start`。
 - socket 权限：hub 以 uid=1001 跑而宿主 `/var/run/docker.sock` 是 `root:docker 0660`——compose `group_add: "${HUB_DOCKER_GID:-999}"` 补宿主 docker 组 gid（本机实测 999；换机核 `stat -c %g /var/run/docker.sock`，可在 hub.env 覆盖）。症状缺失时派发报 connect permission denied。
-- data 卷是**同路径 bind**（`/data/pa:/data/pa`）：hub 容器内生成的 `-v` 源路径被宿主 daemon 按字面解析，内外必须同路径——改挂载点须同改 `HUB_DATA_ROOT`。属主不对齐（漏 chown）的症状：每个 tick 日志刷 `[daemon][ALERT]` PermissionError、队列项永留 pending 无终态——核 `ls -ln /data/pa` 属主是否 1001，补跑三步②。
+- data 卷是**同路径 bind**（`/data/pa:/data/pa`）：hub 容器内生成的 `-v` 源路径被宿主 daemon 按字面解析，内外必须同路径——改挂载点须同改 `HUB_DATA_ROOT`。属主不对齐（漏 chown）的症状：每个 tick 日志刷 `[daemon][ALERT]` PermissionError、队列项永留 pending 无终态——核 `ls -ln /data/pa` 属主是否 1001，补跑三步②。远程 runner 形态（§22）放宽此前提：hub 视角与 daemon 机视角可不同路径名（同一共享存储双挂，派发时投影）。
 
 **MM OAuth 身份（2b，可选面）**：MM 做 IdP（不新建用户系统），hub 发自包含 HMAC 签名会话 cookie（重启/MM 宕机会话不丢；`HUB_SESSION_SECRET` 与 vault master key 分离）。启用前置：MM 管理员在 **系统控制台 → 集成 → OAuth 2.0 应用** 注册 confidential client，**redirect_uri 填 `http://<hub-host>:<port>/auth/callback`**（与部署可达地址严格一致）；`hub.env` 补四项（见 `hub/deploy/hub.env.example`）：`HUB_MM_BASE_URL` / `HUB_MM_CLIENT_ID` / `HUB_MM_CLIENT_SECRET` / `HUB_SESSION_SECRET`（`openssl rand -base64 32`；可选 `HUB_SESSION_TTL_S` 默认 7d）。**四项全不配 = 2a 单用户回退态**（auth 群 503、`POST /queue` 走 `HUB_USER_ID` 兜底，零行为变化）。
 
@@ -709,3 +709,37 @@ MM 频道模糊需求（「有据但验收不可执行」）不再被 critic 一
 **双质量门**：`bash scripts/quality.sh`（pa 侧：critic 四态/来源分叉/spec-author 路由单测）+ `bash hub/quality.sh`（hub 侧：状态机全转移/建行幂等/三子命令/超时扫描单测）——本 change 后两者必须同绿。
 
 **真机坐实（3.1，待 rocju 参与）**：重放 #74 模糊原文 → 频道收清单 → `/pa confirm` → 新 run critic 直接 pass 进 dispatch；`/pa reject` 与超时形态抽查；radar 源模糊信号仍三态零 metrics_proposed 复核。
+
+## 22. 远程 runner 与服务器池（add-hub-remote-runner → add-hub-runner-pool，2026-10）
+
+形态：hub 容器照旧本机跑（队列/通知/落盘不变），run 容器派发到**服务器池**——runners 表多行（name / `docker_host`（tcp://）/ 挂载根 / capacity / enabled / 探针缓存），面板「服务器池」页或 API（`POST /runners` 群，挂 `HUB_PANEL_ADMINS` 门）注册管理。数据面 = 共享存储双挂：hub 侧 `HUB_DATA_ROOT` 路径名 / GPU 侧挂载根路径名，指**同一存储**。hub 侧一切文件系统操作恒走 `HUB_DATA_ROOT`；仅 `docker -v` 挂载源在派发时投影成 GPU 机路径名（队列项 `prd_path` 恒存 hub 视角）。
+
+**seed 一次性迁移**：`HUB_DOCKER_HOST` + `HUB_RUNNER_MOUNT_ROOT` 两 env 键降级为首启 seed（表空才灌一行 `seed-*`，probe_ok 初始记绿——信任部署期人工核实；此后面板表是唯一真相，env 再改静默无效）。表空态 env 值形态坏（非 tcp://）= seed 拒灌 → 启动 fail loud（DBError，行为等价旧 ConfigError 拒起）。
+
+**池调度语义（忙闲自动选机，每派发 tick）**：
+- 候选 = enabled 且探针绿的行；选中 = 候选中「该机在飞 run 数 < capacity」取负载最小（平局按登记序）。派发时把选中行 name/docker_host **快照进 run 行**——此后该行被改/禁用/删除不影响在飞 run 的对账与 stop 路由（旧行 NULL = 本机形态）。
+- 全候选红/满载 → 本轮不派发，item 留 pending 等待（**不 abandon、不烧失败、不回落本机**）；无 enabled 行（空池/全禁用）→ 本机 daemon 形态（byte-identical 回落）。
+- **健康探针**（三项：daemon 可达 / 入队默认 tag 镜像在场 / 双挂 nonce 回读比对）每 `HUB_PROBE_TICKS`（默认 60 ≈ 5 分钟）自动一轮，也可面板行内手动触发（同步，最坏 ~3×60s）。绿 = 参选必要条件；**编辑行任何字段即清探针缓存**（地址变了旧绿灯 stale，回未探不参选，重探转绿再进）；禁用**不清**缓存（机器没变，重启用即回候选）。
+- **禁用 = 软下线**：对任何行放行（含有在飞 run 的行）——即刻不参选，在飞 run 按快照跑完。删除同放行（快照列在 runs 表，不依赖 runners 行存活）。
+
+**入池 checklist（每台目标机一次，顺序执行）**：
+
+1. **目标机开 2375 + 防火墙限源**：`dockerd` 监听 tcp 2375（`/etc/docker/daemon.json` `hosts` + systemd override）+ 防火墙只放行 hub 宿主 IP。**2375 明文无认证 = 连上即目标机 root——仅内网 + 限源，绝不可暴露公网**。TLS（2376）本期不支持（`DOCKER_TLS_*` 不透传；配了 TLS 的 daemon 连接失败，报错可见）。
+2. **预载同 tag 镜像**：在 hub 侧 `docker image save <tag> | ssh <gpu 机> docker image load`（或经内网 registry）；tag 须与 `HUB_IMAGE_TAG_DEFAULT` 一致（探针镜像项会红、派发时 `image_exists` False 报错可见；hub 绝不自动拉取）。
+3. **共享存储双挂验证**：GPU 机把同一存储挂到计划挂载根（如 `/mnt/nfs/pa`）。**入池后探针第三项就是自动化的双挂验证**（nonce 写读比对——不匹配报「两根未指同一共享数据面」）；首次手动探针转绿即坐实。
+4. **面板注册入池**：`/panel/runners` 填 name / `tcp://host:2375` / 挂载根 / capacity → 行内「探针」手动跑一轮 → 🟢 绿即入候选。首启 seed 形态（env 两键）等价于预灌一行，此后增删机走面板，不再动 env。
+5. **验收**：`/pa run` 或面板入队一次——容器出现在目标机（`ssh <gpu 机> docker ps`）、池页该机 running 计数 +1、hub 侧 run 终态与 MM 通知正常回流。
+
+**运行期监控项（部署前提；断链不 fail loud）**：共享存储链路中断 hub 自身不报错——stamp 防撞与 run 容器读写都依赖共享数据面持续有效。症状：GPU 机侧容器报 mount/IO 错、队列项 pending 滞留（另一成因是探针全红不派发——池页红绿灯可分辨）、同名 run 目录双写（stamp 防撞失效）。把「GPU 机 `df /mnt/nfs/pa` 可用 + 探针红绿灯绿」列入巡检（探针第三项就是持续的双挂验证）。
+
+**变更契约**：
+- **改挂载根/地址（编辑行）**：即时生效无需排空队列（在飞 run 按快照不受影响）；唯一前提：新根与 `HUB_DATA_ROOT` 仍指同一共享存储。编辑清探针缓存——重探转绿才再参选（防「改完地址旧绿灯直通车」）。
+- **换池机器 / 回滚本机**：新机入池 + 旧机禁用即可（软下线语义，无排空前提）；**回滚到单机 env 形态**须以无 running run 为前提（容器 id 是 daemon 相对的——两台 daemon 同时认领同一 run 名会双跑；切走后原机遗留容器 hub 不再可见）。
+
+**回滚**：确认无在飞 run（面板 / `GET /runs` 全终态）→ 面板禁用或删除全部行（回本机形态）→ **远程机遗留容器人工清理**（`ssh <gpu 机> docker ps -a | grep pa-run` 逐个 `docker stop` / `docker rm`）。注记：**代码回滚到 add-hub-remote-runner 或更早时代同样安全**——旧代码不读 runners 表，表行/env 残留对它是死数据（runs 快照列亦无人写读），行为即旧 env 形态。
+
+**故障形态与排查**：
+1. 表空态 seed env 值非 `tcp://` 前缀 → seed 拒灌 DBError，hub 启动 fail loud（限形校验在注册/seed 入口单点——`load_config` 只解析透传）。
+2. PRD 不在 `HUB_DATA_ROOT` 树内（POST /queue / CLI 外部传入路径）→ 派发时投影失败 → 该队列项 abandon（status=failed，`last_error` 带 `HUB_DATA_ROOT` 提示）——重新落盘树内再入队。
+3. 远程 daemon 连不上（防火墙 / daemon 未监听）→ 探针 daemon 项红（面板红绿灯 + title 坏项可见）、该机不参选；在飞 run 对账 `status` 查不到按既有 reconcile 状态机走。hub 主循环不受影响。
+4. 队列 pending 滞留 + 池页全红或全满载 → 忙闲调度按设计等待（非故障）：修机器/加容量/补镜像后探针转绿即恢复派发。

@@ -53,6 +53,17 @@ STALE_CHECK_TICKS_ENV = "HUB_STALE_CHECK_TICKS"
 # 推递）/ slash token（入站校验）三者独立分职。
 MM_SLASH_TOKEN_ENV = "HUB_MM_SLASH_TOKEN"
 DEFAULT_STALE_CHECK_TICKS = 720  # ≈ 5s tick 下每小时一次
+# runner 池健康探针周期（add-hub-runner-pool D4，stale_check 同型 N tick 计数）
+PROBE_TICKS_ENV = "HUB_PROBE_TICKS"
+DEFAULT_PROBE_TICKS = 60  # ≈ 5s tick 下每 5 分钟一轮（三项各一次 CLI 子进程，别更密）
+
+# 可选远程 runner 面（add-hub-remote-runner，ADR-0009）：两键全不配 = 本机 daemon +
+# data_root 挂载，现状 byte-identical。add-hub-runner-pool 后两键降级为**首启 seed
+# 一次性消费**（serve 表空才灌一行 runners，此后面板 runners 表是唯一真相，env 再改
+# 静默无效）。限形校验（tcp:// 前缀）在注册/seed 入口（db._validate_runner_fields
+# 单点）：表空态 env 值形态坏 = seed_runner 抛 DBError → serve 启动 fail loud。
+DOCKER_HOST_ENV = "HUB_DOCKER_HOST"
+RUNNER_MOUNT_ROOT_ENV = "HUB_RUNNER_MOUNT_ROOT"
 
 
 def parse_project_channels(raw: str | None) -> dict[str, str]:
@@ -105,6 +116,11 @@ class HubConfig:
     mm_slash_token: str | None = None        # 入站 slash command 校验 token（None = 入站关闭零行为）
     image_template_repo: str | None = None   # 陈旧检测比对源 owner/repo（None = 检测关闭）
     stale_check_ticks: int = DEFAULT_STALE_CHECK_TICKS  # 检测周期（N tick 一次）
+    probe_ticks: int = DEFAULT_PROBE_TICKS  # runner 池健康探针周期（N tick 一次）
+    # 远程 runner 面（add-hub-remote-runner D1/D2 → add-hub-runner-pool seed 化）：
+    # None = 零变化（本机 daemon / data_root 挂载）；有值仅 serve 首启 seed 消费一次
+    docker_host: str | None = None          # seed 行 docker_host（限形在 seed/注册入口，不在本层）
+    runner_mount_root: Path | None = None   # seed 行挂载根（daemon 侧视角；此后表是唯一真相）
 
     def user_env(self) -> dict[str, str]:
         """容器 env-file 内容：三值 + 可选模型路由（与切片 2 保险箱同通道）。"""
@@ -155,6 +171,21 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
     if stale_check_ticks < 1:
         raise ConfigError(f"{STALE_CHECK_TICKS_ENV} 须 ≥1：{stale_check_ticks}")
 
+    # add-hub-runner-pool D4：探针周期同型校验（0 炸 modulo、负数静默关闭——fail fast）
+    pt_raw = e.get(PROBE_TICKS_ENV)
+    try:
+        probe_ticks = int(pt_raw) if pt_raw else DEFAULT_PROBE_TICKS
+    except ValueError:
+        raise ConfigError(f"{PROBE_TICKS_ENV} 非整数：{pt_raw!r}") from None
+    if probe_ticks < 1:
+        raise ConfigError(f"{PROBE_TICKS_ENV} 须 ≥1：{probe_ticks}")
+
+    # add-hub-runner-pool 6.1：docker_host 限形校验移至注册/seed 入口（db 层
+    # _validate_runner_fields 单点）——本层只解析透传（seed 消费；表空态坏值 =
+    # serve seed_runner 抛 DBError 启动 fail loud，行为等价原 ConfigError 拒起）。
+    docker_host = e.get(DOCKER_HOST_ENV) or None
+    rmr_raw = e.get(RUNNER_MOUNT_ROOT_ENV) or None
+
     return HubConfig(
         user_id=e["HUB_USER_ID"],
         anthropic_base_url=e["HUB_USER_ANTHROPIC_BASE_URL"],
@@ -177,4 +208,7 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         mm_slash_token=e.get(MM_SLASH_TOKEN_ENV) or None,
         image_template_repo=e.get(IMAGE_TEMPLATE_REPO_ENV) or None,
         stale_check_ticks=stale_check_ticks,
+        probe_ticks=probe_ticks,
+        docker_host=docker_host,
+        runner_mount_root=Path(rmr_raw) if rmr_raw is not None else None,
     )

@@ -26,6 +26,7 @@ from uuid import uuid4
 import auth
 import daemon
 import events
+import health_probe
 import mm_intake
 import panel
 import prd_store
@@ -58,6 +59,15 @@ class DeliverBody(BaseModel):
     filename: str
     sha256: str
     content: str
+
+
+class RunnerBody(BaseModel):
+    """add-hub-runner-pool D3：注册/编辑入池（name 形态 / docker_host 限 tcp:// /
+    mount_root 绝对路径 / capacity≥1——全量校验在 db 层单点，端点只透传 400）。"""
+    name: str
+    docker_host: str
+    mount_root: str
+    capacity: int = 1
 
 
 _DELIVER_MAX_BYTES = 1024 * 1024  # body 正文上限 1MB（超限 400 确定性拒绝）
@@ -661,6 +671,204 @@ def create_app(
         except (json.JSONDecodeError, OSError, ValueError):
             return None
         return data if isinstance(data, dict) else None
+
+    # ── 服务器池端点（add-hub-runner-pool 5.1，spec: execution-hub「runner 池」）──
+    # 观察面（GET 池列表）挂读面守卫（任何有效会话，同 /queue）；改行为面（注册/
+    # 编辑/禁启用/删除/手动探针）挂 _require_admin（HUB_PANEL_ADMINS 门，空 = 任何
+    # 有效会话，单用户回退态）。JSON API 与面板表单两皮一芯（芯 = db 层校验单点 +
+    # health_probe 同源三项）。探针绿 = 调度候选必要条件（D4）——入池未探不参选。
+
+    def _runner_view(r: dict) -> dict:
+        """行 → API 视图：load 列暴露为 running（该机在飞 run 数），探针缓存三列
+        原样透传（probe_ok None = 未探）。入参须带 load 列（list_runners 产物——
+        改行为端点一律经 _runner_by_id 查回，get_runner 单行无负载列）。"""
+        detail = None
+        if r.get("probe_json"):
+            try:
+                detail = json.loads(r["probe_json"])
+            except (json.JSONDecodeError, TypeError):
+                detail = None
+        return {
+            "id": r["id"], "name": r["name"], "docker_host": r["docker_host"],
+            "mount_root": r["runner_mount_root"], "capacity": r["capacity"],
+            "enabled": bool(r["enabled"]), "running": r["load"],
+            "probe_ok": (None if r["probe_ok"] is None else bool(r["probe_ok"])),
+            "probe_detail": detail, "probed_at": r["probed_at"],
+        }
+
+    def _runner_by_id(runner_id: int) -> dict | None:
+        """带负载列查单行（list_runners 过滤——池规模个位数十位，全列表扫可忽略）。"""
+        return next((r for r in database.list_runners() if r["id"] == runner_id), None)
+
+    @app.get("/runners")
+    def list_runners(request: Request) -> list[dict]:
+        """池观察面：各行 + 负载（running/capacity）+ 探针健康——读面守卫。"""
+        _require_session(request)
+        return [_runner_view(r) for r in database.list_runners()]
+
+    @app.post("/runners", status_code=201)
+    def register_runner(body: RunnerBody, request: Request) -> dict:
+        """注册入池（admins 门）：校验透传 db 层（400 带原因）。入池即 enabled，
+        但未探（probe_ok NULL）不参选——点手动探针或等周期轮转绿。"""
+        _require_admin(request)
+        try:
+            rid = database.register_runner(body.name, body.docker_host, body.mount_root, body.capacity)
+        except db.DBError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
+        return _runner_view(_runner_by_id(rid))
+
+    @app.post("/runners/{runner_id}")
+    def update_runner(runner_id: int, body: RunnerBody, request: Request) -> dict:
+        """编辑（admins 门）：全字段更新；改字段即清探针缓存（db 层语义——地址变了
+        旧绿灯 stale，回未探不参选）。"""
+        _require_admin(request)
+        try:
+            ok = database.update_runner(runner_id, body.name, body.docker_host, body.mount_root, body.capacity)
+        except db.DBError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"runner 不存在：{runner_id}")
+        return _runner_view(_runner_by_id(runner_id))
+
+    @app.post("/runners/{runner_id}/enable")
+    def enable_runner(runner_id: int, request: Request) -> dict:
+        """启用（admins 门）：不清探针缓存——机器本身没变，重启用即回候选（若缓存仍绿）。"""
+        _require_admin(request)
+        if not database.set_runner_enabled(runner_id, True):
+            raise HTTPException(status_code=404, detail=f"runner 不存在：{runner_id}")
+        return _runner_view(_runner_by_id(runner_id))
+
+    @app.post("/runners/{runner_id}/disable")
+    def disable_runner(runner_id: int, request: Request) -> dict:
+        """禁用 = 软下线（admins 门，对任何行放行）：即刻不参选，在飞 run 按行内
+        快照跑完不受影响（D2）。"""
+        _require_admin(request)
+        if not database.set_runner_enabled(runner_id, False):
+            raise HTTPException(status_code=404, detail=f"runner 不存在：{runner_id}")
+        return _runner_view(_runner_by_id(runner_id))
+
+    @app.delete("/runners/{runner_id}")
+    def delete_runner(runner_id: int, request: Request) -> dict:
+        """删除行（admins 门）：在飞 run 仍按 runs 行内快照跑完（快照列不依赖
+        runners 行存活）；建议先禁用观察一轮（RUNBOOK 注记，非硬门）。"""
+        _require_admin(request)
+        if not database.delete_runner(runner_id):
+            raise HTTPException(status_code=404, detail=f"runner 不存在：{runner_id}")
+        return {"deleted": runner_id}
+
+    @app.post("/runners/{runner_id}/probe")
+    def probe_runner(runner_id: int, request: Request) -> dict:
+        """手动探针（admins 门）：同步三项（daemon/镜像/双挂）写缓存——最坏
+        ~3×60s CLI 超时，admin 低频操作可接受；周期探针另挂 daemon tick 不走此。"""
+        _require_admin(request)
+        try:
+            health_probe.probe_and_store(database, runner_id, lc.cfg)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"runner 不存在：{runner_id}") from None
+        return _runner_view(_runner_by_id(runner_id))
+
+    # 面板皮（form → 同芯 db 层；错误 422 回显回填，成功直接 render 池页）
+
+    def _form_runner_fields(form) -> tuple[str, str, str, int]:
+        """表单字段抽取（与 RunnerBody 同口径）：capacity 非整数送 -1 下去——db 层
+        统一「capacity 须 ≥1」拒绝消息，不在端点重复校验逻辑。"""
+        try:
+            cap = int(str(form.get("capacity") or "1").strip() or "1")
+        except ValueError:
+            cap = -1
+        return (str(form.get("name") or "").strip(), str(form.get("docker_host") or "").strip(),
+                str(form.get("mount_root") or "").strip(), cap)
+
+    @app.get("/panel/runners")
+    def panel_runners(request: Request, edit: int | None = None):
+        """池页（观察面守卫同其余面板页）：列表 + 红绿灯 + running/capacity + 行内
+        操作 + 注册表单；?edit=<id> 同页回填编辑模式。"""
+        guard = _panel_get(request)
+        if guard is not None:
+            return guard
+        ident = _session_identity(request)
+        return HTMLResponse(panel.render_runners(
+            database.list_runners(), current_user=(ident or {}).get("username", ""),
+            edit_row=database.get_runner(edit) if edit is not None else None))
+
+    @app.post("/panel/runners")
+    async def panel_runner_register(request: Request):
+        ident = _require_admin(request)
+        form = await request.form()
+        try:
+            database.register_runner(*_form_runner_fields(form))
+        except db.DBError as e:
+            return HTMLResponse(panel.render_runners(
+                database.list_runners(), current_user=ident["username"], error=str(e),
+                values={"name": str(form.get("name") or "").strip(),
+                        "docker_host": str(form.get("docker_host") or "").strip(),
+                        "mount_root": str(form.get("mount_root") or "").strip(),
+                        "capacity": str(form.get("capacity") or "")}), status_code=422)
+        return HTMLResponse(panel.render_runners(
+            database.list_runners(), current_user=ident["username"],
+            success="已入池（探针绿前不参选——点行内「探针」或等周期轮转绿）"))
+
+    @app.post("/panel/runners/{runner_id}/edit")
+    async def panel_runner_edit(runner_id: int, request: Request):
+        ident = _require_admin(request)
+        form = await request.form()
+        try:
+            ok = database.update_runner(runner_id, *_form_runner_fields(form))
+        except db.DBError as e:
+            return HTMLResponse(panel.render_runners(
+                database.list_runners(), current_user=ident["username"], error=str(e),
+                edit_row={"id": runner_id, **dict(zip(
+                    ("name", "docker_host", "runner_mount_root", "capacity"),
+                    _form_runner_fields(form)))}), status_code=422)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"runner 不存在：{runner_id}")
+        return HTMLResponse(panel.render_runners(
+            database.list_runners(), current_user=ident["username"],
+            success=f"已编辑 #{runner_id}（探针缓存已清——重探转绿再参选）"))
+
+    def _panel_runner_action(runner_id: int, request: Request, fn, ok_msg: str) -> HTMLResponse:
+        """行内单键动作薄壳（禁用/启用/删除）：芯 fn(rid)→bool（False = 行不存在，
+        404 面板呈现）。"""
+        ident = _require_admin(request)
+        if not fn(runner_id):
+            return HTMLResponse(panel.render_runners(
+                database.list_runners(), current_user=ident["username"],
+                error=f"runner 不存在：{runner_id}"), status_code=404)
+        return HTMLResponse(panel.render_runners(
+            database.list_runners(), current_user=ident["username"], success=ok_msg))
+
+    @app.post("/panel/runners/{runner_id}/enable")
+    def panel_runner_enable(runner_id: int, request: Request):
+        return _panel_runner_action(
+            runner_id, request, lambda rid: database.set_runner_enabled(rid, True),
+            f"已启用 #{runner_id}（探针缓存保留——绿则即刻回候选）")
+
+    @app.post("/panel/runners/{runner_id}/disable")
+    def panel_runner_disable(runner_id: int, request: Request):
+        return _panel_runner_action(
+            runner_id, request, lambda rid: database.set_runner_enabled(rid, False),
+            f"已禁用 #{runner_id}（软下线：在飞 run 按快照跑完，新派发不再选它）")
+
+    @app.post("/panel/runners/{runner_id}/delete")
+    def panel_runner_delete(runner_id: int, request: Request):
+        return _panel_runner_action(
+            runner_id, request, database.delete_runner,
+            f"已删除 #{runner_id}（在飞 run 按快照跑完；行不可恢复）")
+
+    @app.post("/panel/runners/{runner_id}/probe")
+    def panel_runner_probe(runner_id: int, request: Request):
+        """面板手动探针（admins 门）：同步三项写缓存后回池页看结果——红绿与坏项
+        一并呈现在行内红绿灯（title 悬停）。"""
+        ident = _require_admin(request)
+        if database.get_runner(runner_id) is None:
+            return HTMLResponse(panel.render_runners(
+                database.list_runners(), current_user=ident["username"],
+                error=f"runner 不存在：{runner_id}"), status_code=404)
+        detail = health_probe.probe_and_store(database, runner_id, lc.cfg)
+        bad = "；".join(f"{k}: {v}" for k, v in detail.items() if v != "ok")
+        return HTMLResponse(panel.render_runners(
+            database.list_runners(), current_user=ident["username"],
+            success=("探针三项全绿——已入候选" if not bad else f"探针红（不参选）：{bad}")))
 
     # ── MM 入站端点（add-mm-channel-intake D1/D6/D7，spec: hub-mm-intake）─────
     # 薄壳：token 恒时校验（未配 503 对齐 auth 群未配置回退态 / 不匹配 401）→

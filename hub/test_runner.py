@@ -141,7 +141,7 @@ def test_docker_status_parses_inspect_state(monkeypatch):
 
 def test_docker_start_missing_image_raises_before_run(monkeypatch):
     dr = runner.DockerRunner()
-    monkeypatch.setattr(dr, "image_exists", lambda tag: False)
+    monkeypatch.setattr(dr, "image_exists", lambda tag, docker_host=None: False)
     started = []
     monkeypatch.setattr(runner.subprocess, "run", lambda cmd, **kw: started.append(cmd))
     try:
@@ -185,6 +185,85 @@ def test_env_file_0600_content_and_transient():
         assert p.read_text(encoding="utf-8") == "ANTHROPIC_BASE_URL=https://x\nGH_TOKEN=tok\n"
         captured = str(p)
     assert not Path(captured).exists()  # 容器即弃后删——退出即删（D6）
+
+
+# ── 远程 daemon 路由（add-hub-remote-runner 2.2 → add-hub-runner-pool per-call；
+#    spec scenario「CLI 调用路由」/「不泄漏进容器」）─────────────────────────
+
+
+def _capture_cli(monkeypatch):
+    """Fake CLI：捕获全部 subprocess.run 的 (cmd, env kwarg) 供四调用点断言。
+    docker_host 已是 per-call 参数——不再经构造注入。"""
+    dr = runner.DockerRunner()
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw.get("env")))
+        # stdout 须合法 JSON：status() 会 json.loads(inspect -f 输出)；其余调用点不解析
+        class P: returncode = 0; stdout = '{"Running": false, "ExitCode": 0}'; stderr = ""
+        return P()
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    return dr, calls
+
+
+def test_cli_env_absent_without_docker_host(monkeypatch):
+    # 不传 = 与父进程等价：env kwarg 为 None（subprocess 继承），不注入任何键
+    dr, calls = _capture_cli(monkeypatch)
+    dr.image_exists("t:v1"); dr.start(_spec("t:v1")); dr.status("c1"); dr.stop("c1")
+    assert calls and all(env is None for _, env in calls)  # 四调用点（stop 内含 status）全不设 env
+
+
+def test_cli_env_injected_on_all_callsites(monkeypatch):
+    # 传入时四调用点 env 均含该值；其余键继承父进程（不漂移）；TLS 键不透传（D5）
+    import os
+    host = "tcp://172.32.153.183:2375"
+    dr, calls = _capture_cli(monkeypatch)
+    dr.image_exists("t:v1", docker_host=host); dr.start(_spec("t:v1"), docker_host=host)
+    dr.status("c1", docker_host=host); dr.stop("c1", docker_host=host)
+    assert calls and all(env is not None for _, env in calls)
+    for cmd, env in calls:
+        assert env.get("DOCKER_HOST") == host            # 恰一个（dict 键唯一）
+        assert env.get("PATH") == os.environ.get("PATH")  # 其余键继承父进程
+        assert "DOCKER_TLS_VERIFY" not in env and "DOCKER_CERT_PATH" not in env
+
+
+def test_cli_env_per_call_routing_same_instance(monkeypatch):
+    # 同一 DockerRunner 实例两次调用不同 docker_host 各自注入（池调度前提）：
+    # 构造零状态——每次调用按参数路由，互不串扰
+    import os
+    h1, h2 = "tcp://10.0.0.1:2375", "tcp://10.0.0.2:2375"
+    dr, calls = _capture_cli(monkeypatch)
+    dr.image_exists("t:v1", docker_host=h1)
+    dr.image_exists("t:v1", docker_host=h2)
+    dr.image_exists("t:v1")  # 不传 = 本机（None）
+    envs = [env for _, env in calls]
+    assert envs[0].get("DOCKER_HOST") == h1 and envs[0].get("PATH") == os.environ.get("PATH")
+    assert envs[1].get("DOCKER_HOST") == h2
+    assert envs[2] is None  # 本机形态 = 不设 env kwarg
+
+
+def test_run_container_env_face_excludes_docker_host():
+    # DOCKER_HOST 只进 CLI 子进程 env；run 容器 --env 面（-e/--env-file）不含它
+    dr = runner.DockerRunner()
+    argv = dr._docker_cmd(_spec("t:v1", env_file=Path("/tmp/e.env"),
+                                container_env=("PA_REPORT_DIR=/x",)))
+    join = " ".join(argv)
+    assert "DOCKER_HOST" not in join        # 不进 -e 面（pa 容器内进程看不到）
+    assert "-e PA_REPORT_DIR=/x" in join    # 非凭据 env 直传照常
+    assert "--env-file /tmp/e.env" in join  # 凭据通道照常
+
+
+def test_fake_runner_records_per_call_docker_host():
+    # FakeRunner 同步 per-call 形态：start 记录进容器行、calls 日志可断言路由
+    fr = runner.FakeRunner(images={"t:v1"})
+    assert fr.image_exists("t:v1", docker_host="tcp://10.0.0.1:2375") is True
+    ref = fr.start(_spec("t:v1"), docker_host="tcp://10.0.0.1:2375")
+    assert fr.containers[ref]["docker_host"] == "tcp://10.0.0.1:2375"
+    fr.status(ref, docker_host="tcp://10.0.0.1:2375"); fr.stop(ref, docker_host=None)
+    assert ("image_exists", "tcp://10.0.0.1:2375") in fr.calls
+    assert ("start", "tcp://10.0.0.1:2375") in fr.calls
+    assert ("status", "tcp://10.0.0.1:2375") in fr.calls and ("stop", None) in fr.calls
 
 
 # ── real-docker 标记测试（本机有 daemon 且镜像在才跑；冷 checkout 恒 skip）──

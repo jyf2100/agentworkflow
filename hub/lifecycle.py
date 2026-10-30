@@ -17,6 +17,7 @@ from pathlib import Path
 import config
 import db
 import events
+import health_probe
 import notify
 import queue_engine
 import runner as runner_mod
@@ -270,6 +271,36 @@ class Lifecycle:
             self._abandon(item, project, f"PRD 文件不存在：{prd}（重新入队正确路径）")
             return False
 
+        # add-hub-runner-pool D2（忙闲自动调度，取代 env 固定两键）：派发那一刻
+        # 选机——候选 = enabled 且探针绿，负载最低未满载者胜（平局登记序）。
+        # 池空/全禁用 = 本机形态（docker_host None + 投影根 data_root，byte-identical）；
+        # 池非空但全红/满载 = 本轮不派发（item 留 pending 等下轮——等待安全，不烧
+        # 失败、不回落本机：单机红是部署事故须人肉，静默改道只会掩盖）。
+        runner_row = None
+        if self._db.has_enabled_runners():
+            runner_row = self._db.pick_runner_for_dispatch()
+            if runner_row is None:
+                return False  # pick_next 只读——item 天然留 pending，与「无可派」同径
+        docker_host = runner_row["docker_host"] if runner_row else None
+        # 投影模型不变（add-hub-remote-runner D2）：hub 侧文件系统操作（必读面检查、
+        # mkdir / stamp 防撞 / run_dir 记账）恒走 data_root；仅交付 docker -v 的四路
+        # 路径换投影根（daemon 侧解析）。本机形态投影根即 data_root，byte-identical。
+        # 固化类 PRD 在 data_root 树外（POST /queue 外部传入）→ 远程形态投影失败
+        # abandon fail loud（本机形态照旧直挂原路径）。
+        mount_root = Path(runner_row["runner_mount_root"]) if runner_row else self.cfg.data_root
+        if runner_row is not None:
+            try:
+                prd_mount = mount_root / prd.relative_to(self.cfg.data_root)
+            except ValueError:
+                self._abandon(
+                    item, project,
+                    f"PRD 不在 HUB_DATA_ROOT 树内，远程形态无法投影挂载源：{prd}"
+                    f"（外部传入路径须落 {self.cfg.data_root} 树内后重新入队）",
+                )
+                return False
+        else:
+            prd_mount = prd
+
         state_root = self.cfg.data_root / project / "state"
         profiles_root = self.cfg.data_root / project / "profiles"
         sources_file = self.cfg.data_root / project / "sources.yaml"
@@ -307,7 +338,11 @@ class Lifecycle:
             self._abandon(item, project, f"meta 署名失败：{e}")
             return False
 
-        rid = self._db.create_run(item["id"], project, str(run_dir))
+        rid = self._db.create_run(
+            item["id"], project, str(run_dir),
+            runner_name=runner_row["name"] if runner_row else None,   # per-run 快照（D2）：
+            runner_docker_host=docker_host,  # 此后行被改/禁用不影响本 run 对账路由
+        )
         # 纯参数（镜像 ENTRYPOINT 已收敛 run_daily.py——docker run tag 后 args 附加到 ENTRYPOINT）
         # --to-stage report：执行链段范围 inject→report（fix-hub-form-parity，spec: execution-hub
         # 「执行链段范围」）——report 段双写产物落 state/reports/ 供面板渲染；run_daily 默认值不动。
@@ -315,9 +350,13 @@ class Lifecycle:
                "--inject-prd", f"/input/{prd.name}", "--stamp", stamp]
         with env_file(user_env) as ef:
             spec = RunSpec(
-                image_tag=item["image_tag"], command=cmd, state_root=state_root,
-                project=project, prd_input=prd, profiles_root=profiles_root,
-                sources_file=sources_file, env_file=ef,
+                # 派生类三挂载源从投影根现算（daemon 侧视角）；hub 侧同名三变量
+                # （state_root/profiles_root/sources_file）只做本机检查与记账，不进 RunSpec
+                image_tag=item["image_tag"], command=cmd,
+                state_root=mount_root / project / "state",
+                project=project, prd_input=prd_mount,
+                profiles_root=mount_root / project / "profiles",
+                sources_file=mount_root / project / "sources.yaml", env_file=ef,
                 # 4b 任务 3.3：report 双写出口（docker -e 直传——非凭据，与 env-file 分离）；
                 # 落容器内 state 卷（host 可见），run 详情页按 stamp 对齐读。
                 # 组5.1 hub 全链 #22：hub 进程 env 的 PA_* 透传（编排器 feature flag 如
@@ -329,7 +368,7 @@ class Lifecycle:
                                  if k.startswith("PA_") and k != "PA_REPORT_DIR")),
             )
             try:
-                ref = self._runner.start(spec)
+                ref = self._runner.start(spec, docker_host=docker_host)
             except ImageMissingError as e:
                 self._finish_run(rid, "failed_to_start", project=project, run_dir_name=run_dir.name,
                                  item=item, last_error=str(e))
@@ -456,10 +495,19 @@ class Lifecycle:
             except Exception as e:  # noqa: BLE001
                 print(f"[confirm][warn] 过期回执失败（fail-open）: {type(e).__name__}", file=sys.stderr)
 
+    def probe_runners(self) -> None:
+        """定期健康探针挂点（add-hub-runner-pool 4.1，daemon tick N 周期调用）：
+        逐 enabled 行三项探针（daemon 可达 / 镜像在场 / 双挂回读），结果写 runners
+        表行缓存（绿 = 调度候选必要条件）。fail-open——内部逐行吞异常，观察面
+        绝不崩排度循环（与 sweep_confirmations 同纪律）。"""
+        health_probe.probe_enabled_runners(self._db, self.cfg)
+
     def reconcile_running(self) -> None:
         """轮询 running run 行：exited → 记终态走状态机；gone → 按卷证据归档。"""
         for run in self._db.runs_in_status("running"):
-            st = self._runner.status(run["container_ref"])
+            # 对账按行内快照路由（add-hub-runner-pool D2）：runner 行此后被改/被禁用
+            # 不断账——NULL（旧行/本机形态）= 本机 daemon。
+            st = self._runner.status(run["container_ref"], docker_host=run["runner_docker_host"])
             if st.state == "running":
                 self._forward_events(run)  # 4b：running 中读伴生事件文件转发新行（观察面）
                 continue

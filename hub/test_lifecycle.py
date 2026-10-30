@@ -36,11 +36,12 @@ def _boot_inputs(data_root: Path, project: str) -> None:
     (data_root / project / "sources.yaml").write_text("sources: []\n", encoding="utf-8")
 
 
-def _mk(tmp_path: Path, images=None, max_retries: int = 2, boot_inputs: bool = True, vault=None, mm=None):
+def _mk(tmp_path: Path, images=None, max_retries: int = 2, boot_inputs: bool = True, vault=None, mm=None,
+        env_over: dict | None = None):
     d = hub_db.HubDB(tmp_path / "h.sqlite3")
     eng = qe.QueueEngine(d, max_containers=2, max_retries=max_retries, image_tag_default="pa-executor:v0.1.3")
     fake = FakeRunner(images=images if images is not None else {"pa-executor:v0.1.3"})
-    cfg = config.load_config(_env(tmp_path / "data"))
+    cfg = config.load_config(_env(tmp_path / "data", **(env_over or {})))
     if boot_inputs:
         _boot_inputs(tmp_path / "data", "proj-a")
     notifier = notify.Notifier(cfg, mm=mm) if mm is not None else None  # 4a D3：注入式通知（None=关闭）
@@ -50,6 +51,14 @@ def _mk(tmp_path: Path, images=None, max_retries: int = 2, boot_inputs: bool = T
 
 def _prd(tmp_path: Path, name: str = "my-feature.md") -> Path:
     p = tmp_path / name
+    p.write_text("# PRD\n", encoding="utf-8")
+    return p
+
+
+def _prd_in_tree(data: Path, project: str = "proj-a", name: str = "mm-abc12345.md") -> Path:
+    """data_root 树内 PRD（hub 落盘通道的真实形态——远程形态投影换算的前提）。"""
+    p = data / project / name
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("# PRD\n", encoding="utf-8")
     return p
 
@@ -93,6 +102,125 @@ def test_dispatch_cmd_runs_full_second_half_inject_to_report(tmp_path):
         if tok == "--to-stage":
             assert cmd[i + 1] == "report"
     assert "--to-stage" in cmd and "--from-stage" in cmd  # 两个 flag 都在（防只断相邻不防缺位）
+
+
+# ── 挂载源投影（add-hub-remote-runner 3.2，spec scenario「挂载源前缀分离」/「外部路径 fail loud」）──
+
+
+def test_dispatch_mounts_default_to_data_root(tmp_path):
+    # 不设 HUB_RUNNER_MOUNT_ROOT：四路挂载源与现状 byte-identical（data_root 派生、PRD 直取）
+    lc, d, fake, data = _mk(tmp_path)
+    prd = _prd_in_tree(data)
+    qid = lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is True
+    spec = fake.containers[d.runs_for_item(qid)[0]["container_ref"]]["spec"]
+    assert spec.state_root == data / "proj-a" / "state"
+    assert spec.profiles_root == data / "proj-a" / "profiles"
+    assert spec.sources_file == data / "proj-a" / "sources.yaml"
+    assert spec.prd_input == prd  # 原对象直取（不设 = 零投影）
+
+
+def test_dispatch_mount_root_projection(tmp_path):
+    # 调度选中远程行（mount_root=/mnt/nfs/pa）：四路挂载源换投影根（daemon 侧视角
+    # 交付 docker -v）；队列项 prd_path、署名/stamp/run_dir 记账、hub 侧检查恒走
+    # data_root（D2 投影模型；add-hub-runner-pool：投影根来源 = 调度选中行非 env）
+    lc, d, fake, data = _mk(tmp_path)
+    _reg_runner(d, mount="/mnt/nfs/pa")
+    prd = _prd_in_tree(data)
+    qid = lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is True
+    spec = fake.containers[d.runs_for_item(qid)[0]["container_ref"]]["spec"]
+    assert spec.state_root == Path("/mnt/nfs/pa/proj-a/state")
+    assert spec.profiles_root == Path("/mnt/nfs/pa/proj-a/profiles")
+    assert spec.sources_file == Path("/mnt/nfs/pa/proj-a/sources.yaml")
+    assert spec.prd_input == Path("/mnt/nfs/pa/proj-a/mm-abc12345.md")  # 固化类投影换算
+    assert d.get_item(qid)["prd_path"] == str(prd)  # 队列项恒存 hub 视角
+    run_dir = data / "proj-a" / "state" / "runs" / "proj-a" / "20261021_mm-abc12345"
+    assert (run_dir / "20261021_mm-abc12345.meta.json").is_file()  # 署名/stamp 恒走 data_root
+
+
+def test_dispatch_prd_outside_data_root_abandoned_remote(tmp_path):
+    # PRD 不在 data_root 树内（POST /queue / CLI 外部传入）→ 远程形态投影失败 abandon
+    # fail loud 带原因（spec scenario「外部路径 fail loud」——绝不静默用 hub 视角挂错 daemon）
+    lc, d, fake, data = _mk(tmp_path)
+    _reg_runner(d, mount="/mnt/nfs/pa")
+    prd = _prd(tmp_path)  # 树外（data_root 之外直放）
+    qid = lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is False
+    item = d.get_item(qid)
+    assert item["status"] == "failed" and "HUB_DATA_ROOT" in item["last_error"]
+    assert not fake.containers  # 不产出容器
+
+
+# ── 服务器池派发与对账（add-hub-runner-pool 3.3）───────────────────────────
+
+_HOST = "tcp://10.0.0.1:2375"
+
+
+def _reg_runner(d, name="gpu-a", host=_HOST, mount="/mnt/nfs/pa", capacity=1, probe=True):
+    """注册 runner 行并可选探针转绿（调度候选前提）。"""
+    rid = d.register_runner(name, host, mount, capacity)
+    if probe:
+        d.set_runner_probe(rid, True, {"daemon": "ok", "image": "ok", "mount": "ok"})
+    return rid
+
+
+def test_dispatch_empty_pool_is_local_byte_identical(tmp_path):
+    # 池空 = 本机形态：全部 runner 调用 docker_host=None（CLI env 与父进程等价），
+    # 挂载源/记账走 data_root——回归锚（byte-identical 现状）
+    lc, d, fake, data = _mk(tmp_path)
+    prd = _prd_in_tree(data)
+    lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is True
+    assert fake.calls and all(h is None for _, h in fake.calls)  # 含 start/image_exists
+    run = d.runs_for_item(d.list_items("running")[0]["id"])[0]
+    assert run["runner_name"] is None and run["runner_docker_host"] is None  # 快照 NULL=本机
+
+
+def test_dispatch_pool_row_drives_cli_host_and_snapshot(tmp_path):
+    # 选中行参数进派发 CLI（docker_host per-call 注入）与挂载源；快照入 run 行
+    lc, d, fake, data = _mk(tmp_path)
+    _reg_runner(d, host=_HOST, mount="/mnt/nfs/pa")
+    prd = _prd_in_tree(data)
+    qid = lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is True
+    ref = d.runs_for_item(qid)[0]["container_ref"]
+    assert fake.containers[ref]["docker_host"] == _HOST      # start 路由到选中行 daemon
+    assert ("start", _HOST) in fake.calls
+    run = d.runs_for_item(qid)[0]
+    assert run["runner_name"] == "gpu-a" and run["runner_docker_host"] == _HOST  # per-run 快照
+
+
+def test_reconcile_routes_by_snapshot_after_disable(tmp_path):
+    # 禁用软下线：在飞 run 对账仍按行内快照路由原机（status 带 docker_host），
+    # 终态正常记账——runner 行漂移不断账
+    lc, d, fake, data = _mk(tmp_path)
+    rid = _reg_runner(d, host=_HOST, mount="/mnt/nfs/pa")
+    prd = _prd_in_tree(data)
+    qid = lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is True
+    d.set_runner_enabled(rid, False)  # 软下线：在飞 run 不管
+    ref = d.runs_for_item(qid)[0]["container_ref"]
+    fake.finish(ref, 0)
+    fake.calls.clear()
+    lc.reconcile_running()
+    assert ("status", _HOST) in fake.calls          # 对账按快照路由原 daemon
+    run = d.runs_for_item(qid)[0]
+    assert run["status"] == "succeeded"             # 终态正常记账（不因禁用变孤儿）
+
+
+def test_dispatch_all_red_pool_waits_not_abandons(tmp_path):
+    # 池非空但全红（或满载）：本轮不派发、item 留 pending 等下轮——不 abandon、
+    # 不烧失败、不回落本机（单机红是部署事故须人肉）
+    lc, d, fake, data = _mk(tmp_path)
+    rid = _reg_runner(d, probe=False)
+    d.set_runner_probe(rid, False, {"daemon": "unreachable"})  # 唯一 enabled 机红
+    prd = _prd_in_tree(data)
+    qid = lc.engine.enqueue("proj-a", str(prd), "roc")
+    assert lc.tick_dispatch() is False
+    item = d.get_item(qid)
+    assert item["status"] == "pending" and not item["last_error"]
+    assert not fake.containers and d.list_all_runs() == []  # 零 run 零容器零放弃
 
 
 def test_dispatch_missing_image_fails_item_records_no_container(tmp_path):
