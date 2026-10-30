@@ -34,33 +34,43 @@ def _cfg(tmp_path: Path, repo="acme/pa-executor", tag="pa-executor:v0.1.3", **ov
 
 def test_stale_alert_once_then_deduped(tmp_path, capsys):
     # FOUND 且 ≠ 默认 → 私信配置单用户 + stderr 留痕；同组合第二次去抖
-    remote = FakeRemote(("pa-executor:v0.2.0", None))
+    # remote = 真实 release tag 形态（纯 tag）；本地默认 = 完整镜像引用
+    remote = FakeRemote(("v0.2.0", None))
     mm = notify.FakeMMClient(user_ids={"roc": "a" * 26})
     n = notify.Notifier(_cfg(tmp_path), mm=mm)
     seen: set = set()
     stale_check.check_stale(_cfg(tmp_path), seen, client=remote, notifier=n)
     stale_check.check_stale(_cfg(tmp_path), seen, client=remote, notifier=n)
-    assert len(mm.dms) == 1 and "pa-executor:v0.2.0" in mm.dms[0][1] and "pa-executor:v0.1.3" in mm.dms[0][1]
+    assert len(mm.dms) == 1 and "v0.2.0" in mm.dms[0][1] and "pa-executor:v0.1.3" in mm.dms[0][1]
     assert "镜像陈旧" in capsys.readouterr().err
-    assert seen == {("acme/pa-executor", "pa-executor:v0.2.0", "pa-executor:v0.1.3")}
+    assert seen == {("acme/pa-executor", "v0.2.0", "pa-executor:v0.1.3")}
 
 
 def test_new_remote_tag_alerts_again(tmp_path):
     # 去抖按组合：remote 又出新版（新组合）→ 再告一次（新陈旧是事实）
-    remote = FakeRemote(("pa-executor:v0.2.0", None))
+    remote = FakeRemote(("v0.2.0", None))
     mm = notify.FakeMMClient(user_ids={"roc": "a" * 26})
     n = notify.Notifier(_cfg(tmp_path), mm=mm)
     seen: set = set()
     stale_check.check_stale(_cfg(tmp_path), seen, client=remote, notifier=n)
-    remote.result = ("pa-executor:v0.3.0", None)
+    remote.result = ("v0.3.0", None)
     stale_check.check_stale(_cfg(tmp_path), seen, client=remote, notifier=n)
     assert len(mm.dms) == 2 and "v0.3.0" in mm.dms[1][1]
 
 
 def test_tags_match_no_alert(tmp_path, capsys):
-    remote = FakeRemote(("pa-executor:v0.1.3", None))
+    # remote 纯 tag == 本地完整引用的 tag 段（剥前缀比对）→ 一致不告警
+    remote = FakeRemote(("v0.1.3", None))
     seen: set = set()
     stale_check.check_stale(_cfg(tmp_path), seen, client=remote)
+    assert seen == set() and "镜像陈旧" not in capsys.readouterr().err
+
+
+def test_legacy_pure_tag_value_still_matches(tmp_path, capsys):
+    # 旧形态兼容：本地值本身无冒号（纯 tag）时 rsplit 返回原串，比对照常
+    remote = FakeRemote(("v0.1.3", None))
+    seen: set = set()
+    stale_check.check_stale(_cfg(tmp_path, tag="v0.1.3"), seen, client=remote)
     assert seen == set() and "镜像陈旧" not in capsys.readouterr().err
 
 
@@ -88,13 +98,13 @@ def test_unknown_no_alert_retry_next_round(tmp_path, capsys):
     err = capsys.readouterr().err
     assert mm.dms == [] and "镜像陈旧" not in err and "ERROR" not in err  # 只有普通日志行
     assert "下轮再查" in err and seen == set()  # 不记去抖 → 下轮可再查
-    remote.result = ("pa-executor:v0.2.0", None)  # 恢复
+    remote.result = ("v0.2.0", None)  # 恢复
     stale_check.check_stale(_cfg(tmp_path), seen, client=remote, notifier=n)
     assert len(mm.dms) == 1  # 恢复后正常告警（未被去抖吞掉）
 
 
 def test_repo_unconfigured_zero_behavior(tmp_path):
-    remote = FakeRemote(("pa-executor:v0.9.0", None))
+    remote = FakeRemote(("v0.9.0", None))
     seen: set = set()
     stale_check.check_stale(_cfg(tmp_path, repo=None), seen, client=remote)
     assert remote.calls == [] and seen == set()  # 未配置 = 检测关闭零行为

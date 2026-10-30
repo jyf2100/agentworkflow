@@ -60,8 +60,10 @@ def probe_runner(row: dict, cfg, docker_bin: str = "docker") -> dict:
     try:
         probe_file.write_text(nonce, encoding="utf-8")
         mount = Path(row["runner_mount_root"])
-        r = _run([docker_bin, "run", "--rm", "-v", f"{mount / probe_file.name}:/probe:ro",
-                  cfg.image_tag_default, "cat", "/probe"])
+        # --entrypoint cat：镜像 ENTRYPOINT 是 run_daily.py（docker run tag 后 args 附加到
+        # ENTRYPOINT），不覆盖则 "cat /probe" 变成 run_daily.py 的参数被 argparse 拒（真机实证）
+        r = _run([docker_bin, "run", "--rm", "--entrypoint", "cat",
+                  "-v", f"{mount / probe_file.name}:/probe:ro", cfg.image_tag_default, "/probe"])
         if r.returncode == 0 and r.stdout.strip() == nonce:
             detail["mount"] = "ok"
         elif r.returncode == 0:

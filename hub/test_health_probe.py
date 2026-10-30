@@ -80,6 +80,9 @@ def test_probe_all_green_writes_cache(tmp_path, monkeypatch):
     # 容器侧挂载路径是 runner_mount_root 投影（daemon 侧视角）
     mount_argv = next(c for c, _ in calls if c[1] == "run")
     assert any(str(a).startswith("/mnt/nfs/pa/.probe-") for a in mount_argv)
+    # ENTRYPOINT 覆盖在场（镜像 ENTRYPOINT=run_daily.py，不覆盖 args 会被 argparse 吞）
+    i = mount_argv.index("--entrypoint")
+    assert mount_argv[i + 1] == "cat" and mount_argv[-1] == "/probe"
 
 
 def test_probe_items_fail_independently(tmp_path, monkeypatch):

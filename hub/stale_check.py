@@ -90,7 +90,9 @@ def check_stale(cfg, seen: set, client=None, notifier=None) -> None:
     if tag is None:  # UNKNOWN：瞬时失败不告警不误报
         print(f"[stale] 查询 {repo} 失败（瞬时/网络），下轮再查", file=sys.stderr)
         return
-    if tag == cfg.image_tag_default:
+    # release tag 是纯 tag（v0.1.34），本地默认是完整镜像引用（pa-executor:v0.1.34）——
+    # 比对取引用的 tag 段（值无冒号时 rsplit 返回原串，旧纯 tag 形态兼容）
+    if tag == cfg.image_tag_default.rsplit(":", 1)[-1]:
         return  # 一致：无事
     combo = (repo, tag, cfg.image_tag_default)
     if combo in seen:

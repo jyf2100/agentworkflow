@@ -98,7 +98,7 @@ class HubConfig:
     anthropic_auth_token: str
     gh_token: str
     user_model: str | None          # 可选模型路由（F9 补记：非凭据，与三值同 env-file 通道注入）
-    image_tag_default: str          # F13：入队未显式传 tag 时的固化默认（生产显式钉版本）
+    image_tag_default: str          # F13：入队未显式传 tag 时的固化默认（生产显式钉版本）；值=完整镜像引用 repo:tag（docker run/inspect 直接消费；stale 比对取 tag 段）
     data_root: Path                 # 数据卷根（服务器 /data/pa 同构约定）
     max_containers: int             # 跨项目并行峰值上限（design doc §2：峰值 5-10 可配）
     max_retries: int                # 单队列项重派上限（0=一次失败即放弃，A3）
