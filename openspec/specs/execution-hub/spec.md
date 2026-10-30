@@ -35,7 +35,7 @@
 - **WHEN** 派发时镜像检查因 docker daemon 不可达而失败（cannot connect / permission denied）
 - **THEN** 该项按基础设施异常记日志并走重试路径，不转 failed 终态、不给 build 提示（UNKNOWN ≠ NOT_FOUND）
 ### Requirement: F10 卷上署名 meta 与写面钉死
-hub SHALL 在起容器前向 state 卷 `runs/<proj>/` 写入 `<stamp>_<slug>.meta.json`（字段：initiator / queue_item_id / image_tag / written_at）。hub 对 state 卷的写面 MUST 钉死为**两类枚举**：① meta 署名文件——写入口只接受数据卷根 + project + stamp + slug 四元组拼路径，文件名必须匹配 `^\d{8}(m\d*)?_[a-z0-9-]+\.meta\.json$`（stamp 形态 = 8 位日期 + 可选 mN 避碰后缀，对齐 run_daily `_bump_stamp_suffix` 事实）；② 投递 PRD 落盘（add-hub-slice-3）——写入口只接受 `<卷根>/<project>/prd/<文件名>` 单一拼法，文件名必须匹配 `^\d{8}(m\d*)?_[a-z0-9-]+(-[a-f0-9]{8})?\.md$`（vault 侧 PRD 产出名 `<stamp>_<slug>.md` + 撞名异容 `-<sha8>` 后缀形态），落盘前校验 `sha256(content)` 与幂等键声明一致；同文件名已存在且 sha 相同（同名同容）幂等复用不重写，sha 不同（同名异容）时落盘名追加 `-<sha8>` 后缀。两类之外 hub MUST NOT 写 journal、删改 state 其他内容（不存在 state 卷通用写函数）。run 名 SHALL 由 hub 派发时预分配：基于 PRD 文件名的 `<stamp>_<slug>` 扫卷撞名则自增后缀直到 fresh，经 run_daily 既有 `--stamp` 参数传入容器——依赖契约「inject 段仅在撞名时 bump」（见 durable-loop-state delta），由此 meta 文件名、`--stamp`、实际 run 目录三者对齐。容器内执行链经既有 inject 桥消费投递 PRD（挂载 `/input/` + `--from-stage inject --inject-prd`，见 spec: prd-delivery）——容器内 pa 写自己的 state（含 inject 规范化落 `state/prd/<project>/` 与 manifest）是 pa 既有写面，不属 hub 写面枚举管辖。hub DB 的 runs 表是索引而非真相，可从卷上 meta 重建。
+hub SHALL 在起容器前向 state 卷 `runs/<proj>/` 写入 `<stamp>_<slug>.meta.json`（字段：initiator / queue_item_id / image_tag / written_at）。hub 对 state 卷的写面 MUST 钉死为**两类枚举**：① meta 署名文件——写入口只接受数据卷根 + project + stamp + slug 四元组拼路径，文件名必须匹配 `^\d{8}(m\d*)?_[a-z0-9-]+\.meta\.json$`（stamp 形态 = 8 位日期 + 可选 mN 避碰后缀，对齐 run_daily `_bump_stamp_suffix` 事实）；② 投递 PRD 落盘（add-hub-slice-3）——写入口只接受 `<卷根>/<project>/prd/<文件名>` 单一拼法，文件名必须匹配**两形态之一**：`^\d{8}(m\d*)?_[a-z0-9-]+(-[a-f0-9]{8})?\.md$`（vault 侧 PRD 产出名 `<stamp>_<slug>.md` + 撞名异容 `-<sha8>` 后缀形态），或 `^mm-[a-f0-9]{8}(-[a-f0-9]{8})?\.md$`（MM 入站确定性文件名，本 change D5：`mm-<sha256(wrapped)[:8]>.md` 由 wrap 内容衍生，**零时间戳零随机成分**——同输入 byte-identical 是 deliver_key 幂等的前提；与 stamp 前缀形态**有意偏离**，勿「顺手统一」加回日期/uuid；可选 `-<sha8>` 为撞名异容避碰后缀）；落盘前校验 `sha256(content)` 与幂等键声明一致；同文件名已存在且 sha 相同（同名同容）幂等复用不重写，sha 不同（同名异容）时落盘名追加 `-<sha8>` 后缀。两类之外 hub MUST NOT 写 journal、删改 state 其他内容（不存在 state 卷通用写函数）。run 名 SHALL 由 hub 派发时预分配：stamp 为派发时分配（当日 8 位日期，扫卷撞名自增 mN 后缀直到 fresh）、slug 为 PRD 文件名 stem 的规范化（下划线→横线；stamp 形态 stem 即 `<stamp>_<slug>` 原样、`mm-<sha8>` 形态 stem 整体作 slug），经 run_daily 既有 `--stamp` 参数传入容器——依赖契约「inject 段仅在撞名时 bump」（见 durable-loop-state delta），由此 meta 文件名、`--stamp`、实际 run 目录三者对齐。容器内执行链经既有 inject 桥消费投递 PRD（挂载 `/input/` + `--from-stage inject --inject-prd`，见 spec: prd-delivery）——容器内 pa 写自己的 state（含 inject 规范化落 `state/prd/<project>/` 与 manifest）是 pa 既有写面，不属 hub 写面枚举管辖。hub DB 的 runs 表是索引而非真相，可从卷上 meta 重建。
 
 #### Scenario: 起容器前署名
 - **WHEN** 排度器决定为某队列项起容器
@@ -52,6 +52,10 @@ hub SHALL 在起容器前向 state 卷 `runs/<proj>/` 写入 `<stamp>_<slug>.met
 #### Scenario: 投递 PRD 落盘模式钉死
 - **WHEN** `POST /deliver` 落盘一份新 PRD 至 `<卷根>/<project>/prd/<文件名>`
 - **THEN** 落盘前 sha256 校验通过才写；同文件名同容（sha 相同）幂等复用不重写，异容时落盘名带 `-<sha8>` 后缀；journal 与其他 state 内容零触碰
+
+#### Scenario: MM 入站确定性文件名落盘
+- **WHEN** MM 频道入站需求经确定性 wrap 后走 `/panel/prd` 同源链落盘
+- **THEN** 文件名匹配 `mm-[a-f0-9]{8}(-[a-f0-9]{8})?\.md` 形态被写面②接受（sha 校验与幂等复用规则与 stamp 形态同权）；同输入重投递落同名同容（确定性前提），不产生日期/uuid 类漂移文件名
 
 #### Scenario: 孤儿 meta = failed-to-start
 - **WHEN** 恢复对账发现某 run 目录存在 meta 署名文件但 journal 缺失
@@ -75,11 +79,19 @@ run 与容器 SHALL 为 1:N：容器即弃载体，崩溃续跑 = 同一 run 的
 - **WHEN** 同一队列项的容器失败次数达到重派上限
 - **THEN** 队列项转 failed 终态，不再派发
 ### Requirement: 单用户凭据来源（vault 优先 + env 兜底）
-hub SHALL 以凭据保险箱（hub-credential-vault capability）为容器注入的凭据来源：派发时按发起 user 从保险箱取三值（ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / GH_TOKEN）与可选模型路由，起容器时写 0600 权限临时 env-file 注入、容器即弃后删除。单用户过渡形态 SHALL 保留 env 直注兜底：保险箱无该 user 记录时降级读 hub 进程 env（warn 日志可见），保证切片 1 部署形态不破。凭据 MUST NOT 落入 hub DB、日志或 meta 文件。
+hub SHALL 以凭据保险箱（hub-credential-vault capability）为容器注入的凭据来源：派发时按发起 user 从保险箱取必填两值（ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN）与可选模型路由，以及按**目标项目 forge 声明**要求的对应平台 token（github/未声明 → `GH_TOKEN`；`forge: gitlab` → `GITLAB_TOKEN`；`forge: gitcode` → `GITCODE_TOKEN`；GH_TOKEN 仅 github/未声明项目必需），起容器时写 0600 权限临时 env-file 注入、容器即弃后删除。容器凭据为**派发时点快照**：起容器后 vault 记录变更不影响在跑 run，只影响后续派发。单用户过渡形态 SHALL 保留 env 直注兜底：保险箱无该 user 记录时降级读 hub 进程 env（warn 日志可见），保证切片 1 部署形态不破。凭据 MUST NOT 落入 hub DB、日志或 meta 文件。
 
 #### Scenario: vault 优先注入
 - **WHEN** 派发起容器且保险箱存在该 user 的凭据记录
-- **THEN** env-file 内容取自保险箱解密结果（三值 + 可选模型路由），不经 hub 进程 env
+- **THEN** env-file 内容取自保险箱解密结果（必填两值 + 可选模型路由 + 按项目 forge 的平台 token），不经 hub 进程 env
+
+#### Scenario: 跑中 vault 变更不影响在跑容器
+- **WHEN** run 执行中用户重提交凭据（vault 记录变更）
+- **THEN** 在跑容器继续使用派发时点的 env-file 快照；变更自下一次派发生效
+
+#### Scenario: gitlab 项目缺平台 token
+- **WHEN** 项目声明 `forge: gitlab` 而保险箱记录（及 env 兜底）均无 GITLAB_TOKEN
+- **THEN** 派发 fail-fast abandon 并明确列出缺失键（与缺三值同口径），不起容器不烧配额
 
 #### Scenario: 保险箱缺记录时 env 兜底
 - **WHEN** 保险箱无该 user 记录但 hub 进程 env 具备必需值
