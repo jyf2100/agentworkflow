@@ -11,7 +11,7 @@ hub 可经 `HUB_DOCKER_HOST` 把 run 容器派发到远程 docker daemon（如 G
 ## 约束（这条决定的适用边界）
 
 1. **前提双重时间性**：共享数据面须配置时对**且运行期持续有效**。运行中断链（NFS 掉挂/降级）**不 fail loud**——stamp 防撞（`allocate_fresh_stamp` 读 hub 侧树须能看见 daemon 侧新写入的 run 目录）依赖该前提，断链可能撞 stamp → 双 run 互踩 state 的静默竞争。故共享存储监控是部署前提的一部分，不是可选项。
-2. **变更契约**：daemon 切换/回滚以**无在飞 run** 为前提（容器标识 = container id，是 daemon 相对的——切换后 status 查无 → 孤儿判定 → 重派 → 双机双跑）；`HUB_RUNNER_MOUNT_ROOT` 变更排空 pending 队列后生效（PRD input 是入队时固化路径，见 change design D2 两范畴）。
+2. **变更契约**：daemon 切换/回滚以**无在飞 run** 为前提（容器标识 = container id，是 daemon 相对的——切换后 status 查无 → 孤儿判定 → 重派 → 双机双跑）；`HUB_RUNNER_MOUNT_ROOT` 是派发时投影参数，变更即时生效、无队列契约（队列项 `prd_path` 恒存 hub 视角，派发时投影为挂载视角，见 change design D2 投影模型——apply 期修正：原「入队固化 daemon 视角」与 `prd_path` 的 hub 侧 5 处消费及 POST /queue / CLI / 重跑三外部通道冲突）。
 3. **配置期误配的 fail 机理**：dockerd 对缺失挂载源自动建目录，fail 点后移至容器内 pa 运行时（读不到 PRD / state 断链）→ run failed 可见，但不是「容器启动失败」。真正的防 drift 防线 = 确定性 hash 文件名（`mm-<sha8>.md`）+ 文件级挂载——该确定性同时是 `deliver_key` 幂等的前提，**双重依赖**：文件名形态的任何改动须同时审幂等与远程完整性两面。
 4. **零变化不变式**：两 env 不设 = 现状 byte-identical（本决定的全部代码面都在 opt-in 配置后）。
 

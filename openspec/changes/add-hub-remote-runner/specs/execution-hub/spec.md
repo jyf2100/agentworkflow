@@ -2,7 +2,7 @@
 
 ### Requirement: run 容器宿主可配（远程 daemon + 挂载源分离）
 
-hub SHALL 允许经两个配置项把 run 容器派发到远程 docker daemon：`HUB_DOCKER_HOST`（docker CLI 子进程注入 `DOCKER_HOST`，值形态限 `tcp://` 前缀，第一期限明文内网 transport）与 `HUB_RUNNER_MOUNT_ROOT`（run 容器 bind mount 挂载源根，与 hub 侧读写根 `HUB_DATA_ROOT` 分离）。挂载源分两范畴：**派生类**（state 写面 / profiles / sources.yaml——派发时从挂载源根现算）与**固化类**（PRD input——入队落盘时按当时生效挂载源根固化绝对路径入队列项）。两项缺省（不设）时全部行为 MUST 与现状 byte-identical。容器署名、重派、崩溃对账、F10 写面钉死语义在远程形态下 MUST 不变。
+hub SHALL 允许经两个配置项把 run 容器派发到远程 docker daemon：`HUB_DOCKER_HOST`（docker CLI 子进程注入 `DOCKER_HOST`，值形态限 `tcp://` 前缀，第一期限明文内网 transport）与 `HUB_RUNNER_MOUNT_ROOT`（run 容器 bind mount 挂载源根，与 hub 侧读写根 `HUB_DATA_ROOT` 分离）。挂载源分两范畴（投影模型）：**派生类**（state 写面 / profiles / sources.yaml——派发时从投影根现算）与**固化类**（PRD input——队列项恒存 hub 视角路径，派发时投影为挂载视角交付 docker）。两项缺省（不设）时全部行为 MUST 与现状 byte-identical。容器署名、重派、崩溃对账、F10 写面钉死语义在远程形态下 MUST 不变。
 
 部署前提（hub 不在代码层闭合、配置期错误 MUST fail-loud 可见而非静默）：`HUB_RUNNER_MOUNT_ROOT`（daemon 侧路径）与 `HUB_DATA_ROOT`（hub 侧路径）须指同一共享数据面，且该前提**运行期持续有效**（断链属部署事故，stamp 防撞依赖它）；pa-executor 镜像须在目标 daemon 预载（验证时点 = 派发时 `DockerRunner.start()` 首步复查，检查本身路由到目标 daemon）。
 
@@ -21,10 +21,10 @@ hub SHALL 允许经两个配置项把 run 容器派发到远程 docker daemon：
 - **WHEN** `HUB_DOCKER_HOST` 设为非 `tcp://` 前缀的值（如 `ssh://...` 或裸主机名）
 - **THEN** hub 启动即抛 ConfigError 拒绝起服（列出合法形态），不进入半配置运行
 
-#### Scenario: 挂载源前缀分离（两范畴）
+#### Scenario: 挂载源前缀分离（两范畴·投影）
 
 - **WHEN** `HUB_RUNNER_MOUNT_ROOT=/mnt/nfs/pa` 而 `HUB_DATA_ROOT=/data/pa`
-- **THEN** 派生类三挂载源（state 写面 / profiles / sources.yaml）派发时以 `/mnt/nfs/pa/<project>/...` 现算；固化类（PRD input）入队落盘即按 `/mnt/nfs/pa/<project>/mm-<sha8>.md` 固化入队列项；hub 侧投递落盘、通知面读工件、vault 读写继续走 `/data/pa/<project>/...`
+- **THEN** 派生类三挂载源（state 写面 / profiles / sources.yaml）派发时以 `/mnt/nfs/pa/<project>/...` 现算；固化类（PRD input）队列项仍存 `/data/pa/<project>/mm-<sha8>.md`（hub 视角），派发时投影为 `/mnt/nfs/pa/<project>/mm-<sha8>.md` 交付 docker `-v`；hub 侧投递落盘、通知面读工件、vault 读写、队列项路径、stamp 防撞与 run 目录记账全部走 `/data/pa/<project>/...`
 
 #### Scenario: 目标 daemon 镜像缺失沿既有 fail 语义
 
@@ -41,10 +41,15 @@ hub SHALL 允许经两个配置项把 run 容器派发到远程 docker daemon：
 - **WHEN** `HUB_DOCKER_HOST` 变更或回滚（含删除配置回本机 socket）时存在 running run
 - **THEN** 视为违规操作——容器标识（container id）是 daemon 相对的，切换后 status 查无 → 孤儿判定 → 重派将导致同一 run 双机双跑；RUNBOOK 变更流程 MUST 先确认无 running run（drain）
 
-#### Scenario: 挂载源根变更排空队列后生效
+#### Scenario: 挂载源根变更派发时即时生效（投影参数）
 
 - **WHEN** `HUB_RUNNER_MOUNT_ROOT` 变更时 pending 队列非空
-- **THEN** 存量队列项固化的旧前缀 PRD 路径不随配置变（变更契约：排空 pending 后再变更）；新入队项按新前缀落盘
+- **THEN** 存量队列项派发时按新根投影挂载源（队列项路径是 hub 视角稳定坐标，挂载根是派发时投影参数——无排空队列契约；部署前提不变：新根与 `HUB_DATA_ROOT` 仍须指同一共享存储）
+
+#### Scenario: 远程形态下外部路径不在数据根内 fail loud
+
+- **WHEN** 配置了 `HUB_RUNNER_MOUNT_ROOT` 且队列项 `prd_path` 不在 `HUB_DATA_ROOT` 树内（POST /queue / CLI 外部传入的路径）
+- **THEN** 派发时投影换算失败 → 该项 abandon 并带明确原因（fail loud，绝不静默用 hub 视角路径挂错 daemon）
 
 #### Scenario: DOCKER_HOST 不泄漏进 run 容器
 

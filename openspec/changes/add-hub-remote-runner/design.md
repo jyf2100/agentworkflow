@@ -12,7 +12,7 @@ docker CLI 原生支持 `DOCKER_HOST` env 把调用路由到远程 daemon，但�
 |---|---|---|
 | **daemon 机** | 目标 docker daemon 所在机器（即「run 容器宿主」） | 勿与 hub 机（hub 进程所在机）混——既有代码注释里 "host 侧" 一律指 hub 机 |
 | **挂载源·派生类** | state 写面 / profiles / sources.yaml——**派发时**从配置根现算 | 跟 `HUB_RUNNER_MOUNT_ROOT` 即时走 |
-| **挂载源·固化类** | PRD input——**入队时**落盘绝对路径固化进队列项（`item["prd_path"]`） | 不跟配置即时走，见 D2 变更契约 |
+| **挂载源·固化类** | PRD input——队列项存 **hub 视角**路径（存储稳定坐标），派发时投影为挂载视角（D2 投影模型） | 跟配置即时走（派发时投影）；勿混「固化 = daemon 视角入列」（已弃） |
 | **daemon 侧路径** | `-v` 挂载源——在 daemon 机上解析 | `--env-file` 是 CLI 侧读（hub 机 tempfile），路径语义相反 |
 | **共享数据面** | 两配置根（挂载源根 / data_root）双挂的同一存储——**部署期断言 + 运行期持续有效前提**（非运行时保证，见 D4） | 不是 hub 可验证的不变式 |
 
@@ -40,19 +40,24 @@ docker CLI 原生支持 `DOCKER_HOST` env 把调用路由到远程 daemon，但�
 - **弃**：hub.env 直接设 `DOCKER_HOST` 让子进程自然继承——零代码但隐式、全局污染 hub 进程 env、无形态校验、与 hub.env 的 `HUB_*` 语系不一致。
 - **注意**：注入只发生在 CLI 子进程 env；run 容器的 `--env` 面不含它，pa 容器内进程看不到 DOCKER_HOST。
 
-### D2: 挂载源两范畴——派生类换单前缀 `HUB_RUNNER_MOUNT_ROOT`，固化类靠变更生效契约
+### D2: 挂载源两范畴——派生类现算投影根，固化类存 hub 视角、派发时投影
 
-代码现实（本体审核 O-2）：四个挂载源不同构——
+代码现实（本体审核 O-2 + apply 期消费面补审）：四个挂载源不同构，且 `prd_path` 列有**双侧消费**——
 
 | 挂载源 | 范畴 | 现实代码 |
 |---|---|---|
 | state 写面 / profiles / sources.yaml | **派生类**（派发时现算） | `lifecycle.py` `cfg.data_root / <project>/...` |
-| PRD input | **固化类**（入队时绝对路径进 SQLite） | `mm_intake.py:266` 落盘 → `str(target)` 入 `prd_path` 列 |
+| PRD input | **固化类**（入队时 hub 视角路径进 SQLite） | `mm_intake.py:266` 落盘 → `str(target)` 入 `prd_path` 列 |
 
-- **选**：HubConfig 新字段 `runner_mount_root`（env `HUB_RUNNER_MOUNT_ROOT`，缺省 None）。派生类三个在 lifecycle 用 `runner_mount_root or data_root` 作父目录；固化类在**入队落盘时**就按当时生效的挂载根落（PRD 内容由 hub 写，落盘路径 = 挂载视角路径），派发时直取队列项路径、不重写。
-- **弃**：派发时对固化路径做前缀重写——字符串前缀替换脆弱（路径非纯前缀派生时错位），且掩盖「入队与派发间配置变更」的语义；四个挂载点各配一个 env——YAGNI。
-- **变更生效契约（必须显式）**：`HUB_RUNNER_MOUNT_ROOT` 变更 = **排空 pending 队列后生效**——存量队列项固化的是旧前缀路径，跨变更派发必挂错。`HUB_DOCKER_HOST` 变更无此约束（路径不随 daemon 变），但受 D-回滚前提约束（见 Migration）。
-- **hub 侧读写不变**：投递、通知面、vault 继续走 `data_root`。共享数据面（D4）下两者是同一存储。
+`prd_path` 不止喂 docker `-v`（daemon 侧解析）——hub 侧还有 5 处本机消费：派发前 `is_file` 检查（`lifecycle.py:269`）、confirm 并节 `read_text`（`lifecycle.py:415`）、重跑检查 + 原样再入队（`api.py:473-475`）、POST /queue 入口校验（`api.py:117`）；且 POST /queue / CLI / 重跑三通道传入的天然是 hub 视角路径。**daemon 视角路径入列 = 同列双视角混存**——派发无法区分，hub 侧 5 处全部查空。
+
+- **选（投影模型，apply 期修正原案）**：HubConfig 新字段 `runner_mount_root`（env `HUB_RUNNER_MOUNT_ROOT`，缺省 None）。挂载视角是**派发时投影参数**，不是存储坐标：
+  - 队列项 `prd_path` 恒存 hub 视角（四处落盘点 `mm_intake.py`×2 / `api.py`×2 零改动；重跑 / POST /queue / CLI 天然兼容）；
+  - 派发时 lifecycle **一处**换算：`mount_root / prd.relative_to(data_root)`（派生类三源同点从投影根现算）；`prd` 不在 `data_root` 下 → abandon fail loud 带原因（远程形态下外部传入路径必须落数据根树内）。
+- **弃（原案·入队固化 daemon 视角，apply 期证实不可行）**：daemon 视角入列 → hub 侧 5 处消费点各需反向翻译 + POST /queue / CLI / 重跑传入的 hub 视角路径与它同列混存 → 派发必挂错。原拍板（含本体审核 O-2）只审了派发面四个 `-v` 挂载源，漏审 `prd_path` 的 hub 侧消费链。
+- **弃**：四个挂载点各配一个 env——YAGNI。
+- **变更语义（投影模型的红利）**：`HUB_RUNNER_MOUNT_ROOT` 是派发时投影参数——变更**即时生效、无排空队列契约**（存量 pending 项派发时自动按新根投影；共享数据面前提不变：新根仍须与 `HUB_DATA_ROOT` 指同一存储）。`HUB_DOCKER_HOST` 变更仍受 drain 前提约束（见 Migration）。
+- **hub 侧读写不变**：落盘、通知面、vault、队列项路径全部走 `data_root`；共享数据面（D4）下挂载视角与 hub 视角是同一存储的两个路径名。
 
 ### D3: 镜像不自动拉取——预载声明 + 既有 fail 语义
 
@@ -78,7 +83,7 @@ docker CLI 原生支持 `DOCKER_HOST` env 把调用路由到远程 daemon，但�
 - [无共享存储误配：挂载源缺失] → dockerd 自动建目录使 fail 点后移至 pa 运行时（读不到 PRD / state 断链）→ run failed 仍可见（O-3 机理，非「启动失败」）；hash 文件名 + 文件级挂载防 stale 同名。RUNBOOK 部署 checklist 逐项核对（2375 + 防火墙 + 镜像预载 + 双挂验证）。
 - [共享存储**运行中**断链（NFS 掉挂/降级）] → 不 fail loud：stamp 防撞失效可能撞 `run_dir` → 双 run 互踩 state 的静默竞争（O-1）→ 共享存储监控列入部署前提；断链恢复后核对最近 run 的 state 一致性。
 - [daemon 切换/回滚时在飞 run 双跑] → 容器标识 = container id，daemon 相对——切回本机后 id 查无 → 孤儿判定 → 重派，远程那份在新视野外继续跑（烧钱/可能开重复 PR）（O-4）→ **切换/回滚硬前提 = 无 running run**（见 Migration），RUNBOOK 粗体。
-- [挂载根变更穿越队列：存量项固化旧前缀路径] → D2 变更生效契约：排空 pending 后再变更；hub 可在启动时对存量项与当前前缀做一致性告警（观测面，不阻断）。
+- [远程形态下外部路径不在数据根内] → POST /queue / CLI 传入的 hub 视角路径若不在 `HUB_DATA_ROOT` 树内，派发时投影换算失败 → abandon fail loud 带原因（这些通道在远程形态下须先落盘进数据根树；/deliver、/pa run、面板三通道 hub 自己落盘天然满足）。（原「挂载根变更穿越队列」风险随投影模型消失：队列项路径是 hub 视角稳定坐标，挂载根变更派发时即时生效。）
 - [2375 无认证 = 连上即目标机 root] → 仅内网 + 防火墙限源为硬前提，RUNBOOK 用粗体声明绝不可暴露公网。
 - [目标机镜像缺失] → `image_exists` fail 语义既有（F13），failed-to-start 可见，重派止损既有。
 - [CLI 子进程 env 与父进程漂移] → runner 单测断言：不设 `docker_host` 时子进程 env 与父进程等价（不注入键）；设置时恰注入一个 `DOCKER_HOST`。
@@ -91,7 +96,7 @@ docker CLI 原生支持 `DOCKER_HOST` env 把调用路由到远程 daemon，但�
 3. 验证：`/pa run` 一次真机（run 容器 `docker ps` 出现在目标机而非 hub 宿主机；通知正常回流）。
 4. **切换 / 回滚硬前提：无 running run**（drain——等在飞 run 终态或确认放弃后才变更 `HUB_DOCKER_HOST`，本体审核 O-4：容器 id 是 daemon 相对的，切换后 status 在新 daemon 查无 → 孤儿判定 → 重派 → 远程那份在新视野外双跑）。
 5. 回滚：确认无在飞 run → 删两 env 重启 hub（回本机 socket 形态；队列与 run 记录不受影响；远程遗留容器若有人工放弃的，`docker stop` 手工清理）。
-6. `HUB_RUNNER_MOUNT_ROOT` 单独变更（不切 daemon）：排空 pending 队列后再变（D2 固化类契约）；`HUB_DOCKER_HOST` 单独变更：无在飞 run（第 4 条），存量 pending 项派发时对新 daemon 复验镜像（D3 时间窗自愈）。
+6. `HUB_RUNNER_MOUNT_ROOT` 单独变更（不切 daemon）：派发时投影参数，即时生效无队列契约（唯一前提：新根与 `HUB_DATA_ROOT` 仍指同一共享存储）；`HUB_DOCKER_HOST` 单独变更：无在飞 run（第 4 条），存量 pending 项派发时对新 daemon 复验镜像（D3 时间窗自愈）。
 
 ## Open Questions
 

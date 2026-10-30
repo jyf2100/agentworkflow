@@ -7,7 +7,7 @@ hub 目前把 run 容器派发到**hub 进程所在宿主机**的 docker daemon�
 ## What Changes
 
 - **run 容器宿主可配**：新配置 `HUB_DOCKER_HOST`——设置后 runner 的全部 docker CLI 调用（image_exists / start / status / stop）路由到该 daemon；不设 = 本机 socket，现状 byte-identical 零变化。
-- **bind mount 挂载源可配（两范畴）**：新配置 `HUB_RUNNER_MOUNT_ROOT`——挂载源与 hub 侧 `HUB_DATA_ROOT`（读工件、通知面、面板）分离；不设 = `HUB_DATA_ROOT`，现状 byte-identical 零变化。挂载源分两类（代码现实：`lifecycle.py` 派发时现算 vs `mm_intake.py:266` 入队时固化路径入队列项）：**派发时派生源**（state 写面 / profiles 只读 / sources.yaml——三个，派发时换前缀）与**入队时固化源**（PRD input——入队落盘即按当时生效前缀）。由此 `HUB_RUNNER_MOUNT_ROOT` 变更的生效契约 = **排空 pending 队列后**（存量项固化旧路径）。
+- **bind mount 挂载源可配（两范畴·投影模型）**：新配置 `HUB_RUNNER_MOUNT_ROOT`——挂载源（daemon 侧解析）与 hub 侧 `HUB_DATA_ROOT`（读工件、通知面、面板）分离；不设 = `HUB_DATA_ROOT`，现状 byte-identical 零变化。挂载视角是**派发时投影参数**：**派生类**（state 写面 / profiles / sources.yaml——派发时从投影根现算）与**固化类**（PRD input——队列项恒存 hub 视角路径，派发时一处投影换算成挂载视角；hub 侧消费与 POST /queue / CLI / 重跑通道零改动，apply 期修正原「入队固化 daemon 视角」案——该案与 `prd_path` 的 hub 侧 5 处消费及三外部通道冲突）。`HUB_RUNNER_MOUNT_ROOT` 变更即时生效、无排空队列契约。
 - **共享存储假设显式声明**：`HUB_RUNNER_MOUNT_ROOT` 与 `HUB_DATA_ROOT` 必须指**同一数据面**（NFS / 同盘双挂载，即两台机各自路径名下的同一份数据）。run 容器在远程 daemon 写 state，hub 在本机路径读 pipeline_outcome / 报告——数据链靠部署层共享存储闭合，hub 代码不新增远程读通道。
 - **镜像分发约束声明**：pa-executor 镜像须在目标 daemon 上存在。验证时点 = **派发时**（`DockerRunner.start()` 首步 `image_exists` 复查，`runner.py:167`）且检查本身路由到目标 daemon——daemon 配置变更后存量队列项派发时对新 daemon 自动复验，时间窗自愈；缺失沿 F13 既有「镜像缺失 fail」语义走 failed-to-start，不误判 daemon 不可达。
 - **transport 第一期限 tcp://**：`DOCKER_HOST` 值限定 `tcp://host:port` 形态（2375 明文，仅内网，部署侧须防火墙限源）。`ssh://` 形态明确 out of scope（hub 容器内无 ssh 客户端，且需私钥注入面，留后续 change）。
@@ -27,7 +27,7 @@ hub 目前把 run 容器派发到**hub 进程所在宿主机**的 docker daemon�
 
 ## Impact
 
-- **代码**：`hub/config.py`（HubConfig 增 `docker_host` / `runner_mount_root` 两字段 + env 解析）、`hub/runner.py`（CLI 子进程 env 注入 DOCKER_HOST；挂载源改由 lifecycle 传入的显式路径构造）、`hub/lifecycle.py`（挂载源派生从 `data_root` 改为 `runner_mount_root or data_root`）。
+- **代码**：`hub/config.py`（HubConfig 增 `docker_host` / `runner_mount_root` 两字段 + env 解析）、`hub/runner.py`（CLI 子进程 env 注入 DOCKER_HOST；挂载源改由 lifecycle 传入的显式路径构造）、`hub/lifecycle.py`（派发时 RunSpec 挂载源四路投影到 `runner_mount_root or data_root`——派生类三源现算 + 固化类 PRD 一处 `relative_to` 换算；mkdir / stamp 防撞 / run_dir 记账 / 启动必读面检查恒走 `data_root`）。
 - **部署**：`hub/deploy/hub.env.example` 两个新 env 注释样例；目标 daemon 侧 ops 前提（开 2375 + 防火墙限源 + 镜像预载 + 共享存储双挂）写入 RUNBOOK/部署说明。
 - **测试**：runner 单测覆盖 env 注入路径与挂载源前缀替换；不设 env 的回归断言现状参数 byte-identical。
 - **依赖**：零新依赖（docker CLI 原生能力）。
