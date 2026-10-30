@@ -2507,7 +2507,11 @@ def _write_pipeline_outcome(disp: list, stamp: str, exit_code: int | None = None
         v = d.get("verify") or {}
         st = d.get("status") or "?"
         verd = v.get("verdict") or ("green" if v.get("pass") else "red" if v else None)
-        if st in ("pr_open", "interrupted_pr") and (v.get("pass") or verd == "green"):
+        if st in ("pr_open", "interrupted_pr", "merged") and not d.get("reverted") \
+                and (v.get("pass") or verd == "green"):
+            # merged+绿+未 revert = auto-merge 最好终态（verify 绿→合 main→post-merge 绿），归 green；
+            # run #112 真机立案：曾落 abnormal 兜底，MM 通知「🟢0 · 异常 1」与详情行自相矛盾。
+            # reverted=True（post-merge 红已回滚进 triage）不 green，落 abnormal 引人注意。
             k = "green"
         elif v and not v.get("pass") and st not in _blocked | _integrity:
             k = "red"

@@ -118,3 +118,32 @@ def test_write_per_cmd_outputs(tmp_path):
     assert p0.endswith(".cmd0.out") and "webServer port" in Path(p0).read_text()   # 红因就地可诊
     assert m["npm test"].endswith(".cmd1.out")
     assert m.get("pytest -q") is None                                             # unresolved 无输出无键
+
+
+# ── merged 归类（2026-10-29 run #112 真机立案）：auto-merge 终态不落 abnormal ──
+
+def test_write_pipeline_outcome_merged_green_not_abnormal(tmp_path, monkeypatch):
+    """single-flight auto-merge 终态：status=merged + verify 绿 + 未 revert → 归 green。
+
+    run #112 真机形态：verify 绿→rebase CLEAN→合 main→post-merge 绿，dispatch rec
+    status=merged——但 green 桶只认 pr_open/interrupted_pr，最好终态落 abnormal 兜底，
+    MM 通知报「🟢0 · 异常 1」自相矛盾（详情行明明绿）。"""
+    disp = [{"slug": "s1", "project": "p", "status": "merged",
+             "pr_url": "https://github.com/o/r/pull/61", "pr_number": 61,
+             "verify": {"verdict": "green", "pass": True, "note": "绿（agent 轨：三锚净）"},
+             "skip_reason": None, "triage_reason": None, "reverted": False}]
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
+    o = json.loads(run_daily._write_pipeline_outcome(disp, "s", exit_code=0).read_text())
+    assert o["summary"]["green"] == 1 and o["summary"]["abnormal"] == 0
+
+
+def test_write_pipeline_outcome_merged_then_reverted_not_green(tmp_path, monkeypatch):
+    """post-merge 红→auto-revert REVERTED：status 停留 merged 但 reverted=True → 不算 green
+    （main 已回绿进 triage，须引人注意，落 abnormal 兜底）。"""
+    disp = [{"slug": "s2", "project": "p", "status": "merged",
+             "pr_url": "https://github.com/o/r/pull/62", "pr_number": 62,
+             "verify": {"verdict": "green", "pass": True, "note": None},
+             "skip_reason": None, "triage_reason": "post_merge_red_reverted", "reverted": True}]
+    monkeypatch.setattr(run_daily, "STATE_DIR", tmp_path)
+    o = json.loads(run_daily._write_pipeline_outcome(disp, "s", exit_code=0).read_text())
+    assert o["summary"]["green"] == 0
