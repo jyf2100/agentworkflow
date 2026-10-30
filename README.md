@@ -3,7 +3,7 @@
 > 自动化 R&D 编排器的**控制面大脑** —— 一个 Obsidian vault，托管 **pa**（项目推进流水线）：全自动研发流水线编排器 + 控制面标准执行器，以及 **hub**：服务器集中式执行 hub（队列 + run 记录 + 容器生命周期）。
 
 [![license](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
-[![pa-pipeline](https://img.shields.io/badge/pa--pipeline-v1.0.0-blue)](Projects/项目推进流水线/CHANGELOG.md)
+[![pa-pipeline](https://img.shields.io/badge/pa--pipeline-v1.1.0-blue)](Projects/项目推进流水线/CHANGELOG.md)
 [![tests](https://img.shields.io/badge/quality.sh-passing-brightgreen)](Projects/项目推进流水线/scripts/quality.sh)
 [![python](https://img.shields.io/badge/python-%E2%89%A53.11-3776AB)](Projects/项目推进流水线/pyproject.toml)
 [![style](https://img.shields.io/badge/ruff-E9%2BF-261230)](Projects/项目推进流水线/pyproject.toml)
@@ -102,7 +102,7 @@ cd hub/deploy && docker compose up -d        # 起 hub 服务（队列 + MM 入�
 │   └── 项目推进流水线/             # pa —— 主力代码区
 │       ├── scripts/               # run_daily.py / dev-agent.py / durable runtime / 测试
 │       ├── CONTEXT.md / SPEC.md / RUNBOOK.md / CHANGELOG.md
-│       └── pyproject.toml         # pa-pipeline v1.0.0
+│       └── pyproject.toml         # pa-pipeline v1.1.0
 ├── hub/                           # hub —— 第二代码区（服务器集中式执行）
 │   ├── queue_engine.py / lifecycle.py / mm_intake.py / api.py
 │   └── deploy/                    # docker-compose + pa-executor.Dockerfile + env 模板
@@ -118,4 +118,4 @@ cd hub/deploy && docker compose up -d        # 起 hub 服务（队列 + MM 入�
 
 ---
 
-**pa-pipeline v1.0.0** · Python ≥3.11 · [MIT](LICENSE) · [CHANGELOG](Projects/项目推进流水线/CHANGELOG.md)
+**pa-pipeline v1.1.0** · Python ≥3.11 · [MIT](LICENSE) · [CHANGELOG](Projects/项目推进流水线/CHANGELOG.md)

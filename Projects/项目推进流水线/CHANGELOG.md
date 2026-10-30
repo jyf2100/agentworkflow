@@ -2,6 +2,45 @@
 
 本项目推进流水线（pa-pipeline）版本记录。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵从 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-10-30
+
+从单机 cron 编排器到「**hub 服务器集中式执行 + MM 渠道入口 + 验收面闭环**」。自 1.0.0 起 178+ commits，OpenSpec change 全程驱动（提案 → 多轮评审 → 落地 → 归档 delta sync）。
+
+### hub：服务器集中式执行（新代码区 `hub/`）
+- **执行 hub**（spec: `execution-hub`）：队列 + run 记录 + 容器生命周期；pa-executor 镜像容器化跑 pa 全链，per-project 串行派发（`oldest_pending_excluding_running_projects`）。
+- **MM OAuth 身份面 + 面板控制台**（登录 / 凭据 / 队列 / runs / projects）+ 投递 API（PRD state ownership 交接协议，幂等 deliver_key）。
+- **通知面**：MM bot 出站归属路由 + 语义事件出口 + 无 run 放弃告警 + 镜像陈旧检测；通知以 `pipeline_outcome` 业务终态 lead，容器退出码降附录。
+- **executor 内置工程技能包**（20 skill 快照：9 可调用 / 11 惰性随行）。
+
+### MM 渠道入口
+- Mattermost 频道 `/pa run <一句话需求>` 直通流水线（单 run 容器 inject→report）；频道绑定推断 project。
+- 成员三态授权（FOUND 授权 / NOT_MEMBER 拒 / UNKNOWN fail-closed 拒不回执）；bind/unbind 仅 admin。
+
+### 验收面闭环
+- **agent-verify-injection**：验收测试控制面工件链（外部编写 → content-addressed store → dev/verify 双注入，观测面 fail-open）；verify 执行 agent 化三机械锚 + invalid 三态。
+- **e2e-acceptance-harness**：playwright 进 harness 声明面。
+- **acceptance-preflight-guard**：作者期 import 白名单 + dispatch 期收集级自检。
+- **确认环**：critic 第四态 needs_metrics × pa-spec-author 拟指标 → `metrics_proposed` 事件回流 → `/pa confirm|reject|metrics` + 72h 超时 + 重入队上界。
+
+### dispatch 侧演进
+- **single-flight-auto-merge**：verify 绿 + rebase CLEAN → 自动合 main（post-merge 全量测试 + 红 auto-revert + revert 循环熔断 + slot journal 跨进程 flock）。
+- **dev-handoff 工件**：dev 断点结构化自述（围栏快照 / 崩溃收养 / 下轮注入；flag 默认 off）。
+- **forge 适配器**：gitlab/gitcode 双平台（dispatch PR 面 + fetch 采集 + 凭据面）。
+
+### persona 7 → 11
+新增 pa-fetch-forge-repo（多 forge 预取语义半段）、pa-fetch-deepresearch、pa-spec-author、pa-test-author、pa-progress（dev 内循环方向抽查）；pa-prd-critic 升四态。
+
+### 渐进迁移（flag-gated，baseline 零变更）
+- **LangGraph 编排层**：`graph_pa.py` 7 node StateGraph 与 run_daily 并行存在；shadow parity canary + cutover 9 维发布门；flag off 零耦合秒回退。
+- **per-agent model routing**：env > config 文件 > roc 默认。
+
+### 真机修复链（hub 镜像 v0.1.28–v0.1.34，生产排障）
+- persona wall-clock 壳 300→900s（qwen3.8 后端分钟级响应，300s 结构性不够）。
+- revise 回环假通防御（重写 sha 机械校验 fail-closed drop + critic r2 注入 round1 反馈复审）+ pa-prd headless Write 预批准（`--allowedTools Read,Write`）。
+- dev loop 预算 10→25（`PA_DEV_MAX_BUDGET` 透传链）+ SDK effort 显式下发（网关后端只认 xhigh/medium/low）。
+- `pipeline_outcome` merged 终态归 green（auto-merge 绿不再误报「异常」）。
+- spec-author 降级 drop 通知补可操作出路（重新 /pa run 提交）。
+
 ## [1.0.0] - 2026-07-29
 
 首个正式版本。pa 编排器达到「生产可用」：7 段流水线在 cron 真实环境端到端跑通，dispatch 真开 PR，durable runtime 经崩溃恢复验证。
