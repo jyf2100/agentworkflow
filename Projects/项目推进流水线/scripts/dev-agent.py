@@ -779,13 +779,15 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     # add-context-loading-protocol：flag 开 → 五通道 stub 化（≤80 字摘要+[展开: path]+预算截断）
     # 替代 PRD 全文与各注入 block 的全量拼贴；flag 关（缺省）→ byte-identical 既有路径。
     import context_loader
+    _stub_block = ""
     if context_loader.stub_enabled():
         _stub_block = context_loader.render_stub(args, prd_text)
         if _stub_block:
             prd_text = _stub_block
             source_block = feedback_block = human_notes_block = ""
-            handoff_injection = acceptance_injection = ""
-            # acceptance 不截断（考卷）——flag 开时仍走全量注入面（spec scenario）
+            handoff_injection = ""
+            # acceptance_injection 不清空——考卷不可截断/不可删（spec scenario）：
+            # 验收测试是 dev 的完成判据，stub 化只影响 PRD/lessons/handoff 等上下文通道
     base_prompt = "\n".join([
         head,
         prot,

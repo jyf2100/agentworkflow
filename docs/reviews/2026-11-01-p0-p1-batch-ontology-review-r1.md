@@ -87,3 +87,33 @@ fetch 的 date-marker 按自然日、digest 的终态计数按滚动 24h（ended
 - attention 纯投影零新真相源（四节各链回源实体 ✓）；空节隐藏/全空安静 ✓
 
 **总裁定**：P1 一处已当场修复；P2 一处注记。两 change 可进 P2-③。
+
+---
+
+## 附录二：P3 三件补审（2026-11-01 实施后追加）
+
+### P1-4（当场修复）：context_loader stub 路径静默清空验收测试注入
+
+**证据**：`acceptance_injection = ""` 在 stub 分支中被清空，但 spec 场景明确「verify 面注入 MUST NOT stub 化（考卷不可截断）」——清空比截断更严重：dev 的**完成判据**（红→绿是完成标准）被静默丢弃，dev 会以为没有验收测试。
+**修法**：`acceptance_injection` 保留不清空（stub 只影响 PRD/lessons/handoff/feedback/human_notes 五个上下文通道，验收测试是考卷不是上下文）。
+
+### P1-5（当场修复）：effects 表缺既有库迁移
+
+**证据**：真机 `/data/pa/hub.sqlite3` 无 effects 表（`no such table: effects`）——CREATE TABLE 只在新库建表脚本里，旧库 `_migrate()` 没有补建，`insert_effect` 直接 OperationalError 崩。
+**修法**：`_migrate()` 增 `CREATE TABLE IF NOT EXISTS effects`（幂等，先例 = intake_watermarks）。
+
+### P2-6：effects 仅包裹 2/6 副作用类型（范围缺口）
+
+hub 侧只包裹容器启动（state_write）+ MM 通知（mm_notify）；commit/push/pr_open 发生在 executor 容器（pa 侧），不经 hub db。tasks.md 已声明 follow-up，但 spec「每个副作用」的范围承诺与实装面有差距。**注记在案**。
+
+### P2-7：memory_graph 模块就绪但零数据
+
+无 lessons catalog 含 refs 字段——模块是纯代码就绪（6 测试绿），flag 开也是空图 no-op。预期行为（新模块），列观测项等 lessons 积累 refs 后接线。
+
+### 通过项
+
+- stub 预算截断优先级正确（高→低分配，PRD 永不截——单测覆盖）
+- effects 状态机单向正确（pending→done/failed，无回滚——CHECK 约束 + complete 单向）
+- memory_graph Top-K k=0 全量 baseline、dormant 修剪/复活、冲突对边界（等效不冲突）全绿
+
+**总裁定**：2 P1 已当场修复；2 P2 注记。P3 三件可进部署/观测。

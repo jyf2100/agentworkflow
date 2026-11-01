@@ -190,6 +190,19 @@ class HubDB:
             if col not in run_cols:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
                 self._conn.commit()
+        # add-effects-queue D1：effects 表既有库迁移（CREATE IF NOT EXISTS 在建库脚本，
+        # 旧库须此处补建——否则 INSERT INTO effects 直接 OperationalError 崩）
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS effects (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind         TEXT NOT NULL CHECK (kind IN ('commit','push','pr_open','mm_notify','state_write','reconcile')),
+                payload_json TEXT NOT NULL,
+                status       TEXT NOT NULL CHECK (status IN ('pending','done','failed')),
+                created_at   TEXT NOT NULL,
+                completed_at TEXT
+            )
+        """)
+        self._conn.commit()
         # add-runner-image-sync 2.2：runners 分发结果列（幂等加列，先例 = runs 快照列）。
         # 旧行 NULL = 从未分发；探针列（probe_ok）仍由 probe_and_store 唯一权威写。
         runner_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(runners)")}
