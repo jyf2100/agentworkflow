@@ -18,6 +18,7 @@ import config
 import config_drift
 import daily_digest
 import db
+import event_poller
 import events
 import health_probe
 import image_sync
@@ -366,7 +367,11 @@ class Lifecycle:
                 state_root=mount_root / project / "state",
                 project=project, prd_input=prd_mount,
                 profiles_root=mount_root / project / "profiles",
-                sources_file=mount_root / project / "sources.yaml", env_file=ef,
+                sources_file=mount_root / project / "sources.yaml",
+                # add-event-sources：项目 events 增量目录存在才挂（hub 侧写、容器只读消费）
+                events_root=(mount_root / project / "events"
+                             if (self.cfg.data_root / project / "events").is_dir() else None),
+                env_file=ef,
                 # 4b 任务 3.3：report 双写出口（docker -e 直传——非凭据，与 env-file 分离）；
                 # 落容器内 state 卷（host 可见），run 详情页按 stamp 对齐读。
                 # 组5.1 hub 全链 #22：hub 进程 env 的 PA_* 透传（编排器 feature flag 如
@@ -549,6 +554,11 @@ class Lifecycle:
         任何异常不崩排度循环。"""
         daily_digest.emit_digest(self.cfg, self._db, notifier=self.notifier,
                                  drift_seen=self._drift_seen)
+
+    def poll_runner_events(self) -> None:
+        """事件轮询挂点（add-event-sources 1.1，daemon 第五低频槽）：全声明项目拉取过筛
+        落语料增量文件。fail-open——单 repo 异常不连坐，任何异常不崩排度循环。"""
+        event_poller.poll_events(self.cfg)
 
     def reconcile_running(self) -> None:
         """轮询 running run 行：exited → 记终态走状态机；gone → 按卷证据归档。"""

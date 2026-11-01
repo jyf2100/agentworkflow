@@ -79,6 +79,12 @@ def run_forever(
                 lc.emit_daily_digest()
         except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
             print(f"[digest][warn] 日报挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
+        try:  # add-event-sources 1.1：第五低频槽——事件轮询（机械筛→语料增量文件）
+            # （同型防御——轮询任何异常绝不崩排度循环；单 repo 异常在 poll_events 内不连坐）
+            if tick % lc.cfg.event_ticks == 0:
+                lc.poll_runner_events()
+        except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
+            print(f"[events][warn] 事件轮询挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
         if not stop_event.is_set():
             sleep(interval)
     print(f"[daemon] 优雅退出：当前迭代已收尾，连续异常 {consecutive}（在跑容器不动，重启经对账接管）")

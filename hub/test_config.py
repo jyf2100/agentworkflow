@@ -176,3 +176,11 @@ def test_digest_ticks_validation():
     for bad in ("0", "-1", "x"):
         with pytest.raises(config.ConfigError, match="HUB_DIGEST_TICKS"):
             config.load_config(_full_env(HUB_DIGEST_TICKS=bad))
+
+
+def test_event_ticks_validation():
+    assert config.load_config(_full_env()).event_ticks == config.DEFAULT_EVENT_TICKS
+    assert config.load_config(_full_env(HUB_EVENT_TICKS="360")).event_ticks == 360
+    for bad in ("0", "-1", "x"):
+        with pytest.raises(config.ConfigError, match="HUB_EVENT_TICKS"):
+            config.load_config(_full_env(HUB_EVENT_TICKS=bad))

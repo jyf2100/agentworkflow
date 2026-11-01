@@ -36,6 +36,7 @@ CONTAINER_PA_HOME = f"{CONTAINER_VAULT}/.project-auto"
 CONTAINER_STATE = f"{CONTAINER_PA_HOME}/state"    # 写面（run_daily VAULT_ROOT=parents[3] 推导）
 CONTAINER_PROFILES = f"{CONTAINER_PA_HOME}/profiles"   # inject 校验必读（load_profiles）
 CONTAINER_SOURCES = f"{CONTAINER_PA_HOME}/sources.yaml"  # _run_pipeline 顶部无条件必读
+CONTAINER_EVENTS = f"{CONTAINER_PA_HOME}/events"   # add-event-sources：事件语料增量（hub 写 ro；directory 源 root 指此）
 CONTAINER_INPUT = "/input"
 
 
@@ -58,6 +59,7 @@ class RunSpec:
     prd_input: Path | None = None      # PRD 文件（daemon 侧视角；只读输入卷挂 /input/）
     profiles_root: Path | None = None  # profiles 挂载源（daemon 侧视角；只读卷挂 .project-auto/profiles）
     sources_file: Path | None = None   # sources.yaml 挂载源（daemon 侧视角；只读单文件挂 .project-auto/）
+    events_root: Path | None = None    # 事件语料增量挂载源（add-event-sources：hub 写、容器只读）
     env_file: Path | None = None       # 凭据 env-file（0600，容器退出后删）
     container_env: tuple[str, ...] = ()  # 非凭据 env 直传（K=V；docker -e，与凭据 env-file 分离）
     cpus: str = "2"
@@ -184,6 +186,8 @@ class DockerRunner:
             argv += ["-v", f"{spec.profiles_root}:{CONTAINER_PROFILES}:ro"]
         if spec.sources_file is not None:
             argv += ["-v", f"{spec.sources_file}:{CONTAINER_SOURCES}:ro"]
+        if spec.events_root is not None:
+            argv += ["-v", f"{spec.events_root}:{CONTAINER_EVENTS}:ro"]
         if spec.prd_input is not None:
             argv += ["-v", f"{spec.prd_input}:{CONTAINER_INPUT}/{spec.prd_input.name}:ro"]
         argv.append(spec.image_tag)

@@ -772,3 +772,9 @@ MM 频道模糊需求（「有据但验收不可执行」）不再被 critic 一
 **runner 镜像自动分发（add-runner-image-sync，2026-11）**：探针报「daemon 项 ok 且镜像项非 ok」→ hub 自动 `docker save <默认tag> | docker -H <runner> load` 流式分发（两端 CLI 都在 hub 容器内，与 2026-10-31 人工修复同构；断连机不烧传输）。load 后源/目标 image ID（内容寻址）比对，不一致删目标侧按失败处理。成功后**复测探针**转绿回调度候选（绝不直写 probe_ok——探针是唯一绿灯权威）；失败 = MM 管理面告警（同组合去抖、成功重置）+ runner 保持红 + item 保持 pending（绝不静默跳过，绝不公网拉取顶替——镜像源恒 = hub 本机 daemon，hub 侧也缺源时告警文案指明先在 hub 本机 build）。单 worker 串行（多机缺片各自入队），`HUB_IMAGE_SYNC_TIMEOUT`（缺省 900s）超时终止两端。手动分发：`POST /runners/{id}/image-sync`（admins 门，判据同自动触发）；面板池页「分发」列显示上次结果。**同步失败排查**：先查 hub 本机 daemon 有无源镜像（`docker image inspect <tag>`），再查目标 2375 可达性；期间 item 持续 pending 属设计等待（非故障）。
 
 **运维日报（add-hub-daily-digest，2026-11）**：daemon 第四低频槽每 `HUB_DIGEST_TICKS`（缺省 17280 ≈ 每日）聚合一日一条 MM 私信（`notify_admin`，未配 bot 降级 stderr）：① 队列（pending 数 + 最老等待、running、近 24h succeeded/failed）；② runner 池（各行探针红绿+坏项名、忙闲、上次分发结果）；③ 配置漂移未消解项数。纯只读零写面、值不入面（计数/名称/时长 only）；单节异常独立吞不连坐。重启即重发一条（tick 计数重置，可接受）。
+
+## 24. 事件轮询接入（add-event-sources，2026-11）
+
+**形态**：hub 第五低频槽（`HUB_EVENT_TICKS` 缺省 720 ≈ 每小时）按项目 sources.yaml **顶层 `events:` 声明**轮询白名单仓 GitHub 事件（`gh api repos/{repo}/events`，三态 UNKNOWN 跳轮绝不当天断源），**Fast Path 全机械筛**（类型白名单缺省 IssueCommentEvent/IssuesEvent/PullRequestEvent + 作者 ∈ `authors:` GitHub login 集——跨信道身份映射被显式拒绝，映射由配置人完成；authors 空 = 拒绝全部零误报），过筛事件以机械拼接 md（frontmatter：repo/type/actor/event_id/url + 正文截断 2000）落 `<project>/events/YYYYMMDD_<event_id>.md`——**文件名幂等去重**（重启安全零 db 面）。
+
+**进链三步（启用）**：① sources.yaml 顶层加 `events: [{repo: owner/name, authors: [github-login]}]`；② 同文件 sources 列表加 directory 源（ADR-0007 条目全集，content_glob 与 marker 必带——缺则 radar KeyError fail loud；root 排他勿冲突）：`{name: events-inbox, root: .project-auto/events/, content_glob: "**/[0-9]*.md", marker: state/consumed_events_inbox}`；③ 目录 `<data_root>/<project>/events/` 由 hub 首次落盘自动创建并在此后派发时自动挂载进 run 容器（ro）。事件即语料增量——fetch date-marker 机械发现 → radar 语义筛 → PRD → critic 全链，**事件绝不短路派发**（授权链不动）。
