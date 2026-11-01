@@ -57,6 +57,22 @@ DEFAULT_STALE_CHECK_TICKS = 720  # ≈ 5s tick 下每小时一次
 PROBE_TICKS_ENV = "HUB_PROBE_TICKS"
 DEFAULT_PROBE_TICKS = 60  # ≈ 5s tick 下每 5 分钟一轮（三项各一次 CLI 子进程，别更密）
 
+# 配置六层漂移看门狗（add-config-drift-watchdog D2，stale/probe 同型第三低频槽）：
+# 周期 N tick 可配；intent 文件（ro 挂载的 hub.env 副本）不配 = R1 关闭零行为
+# （image_template_repo 不配即检测关闭的同型先例）。
+DRIFT_TICKS_ENV = "HUB_DRIFT_TICKS"
+DEFAULT_DRIFT_TICKS = 720  # ≈ 5s tick 下每小时一轮（漂移是低频 ops 事故；R3 出站/R4 exec 开销对齐 stale 的 gh 调用）
+DRIFT_ENV_INTENT_ENV = "HUB_DRIFT_ENV_INTENT"
+
+# runner 镜像自动分发超时（add-runner-image-sync D4）：save|load 流式管道的宽裕上限
+# （2.24GB LAN 实证量级；与 PROBE_TIMEOUT=60 不同物不共用）。
+IMAGE_SYNC_TIMEOUT_ENV = "HUB_IMAGE_SYNC_TIMEOUT"
+DEFAULT_IMAGE_SYNC_TIMEOUT = 900
+
+# 运维日报周期（add-hub-daily-digest D1）：默认 17280 ≈ 5s tick 下每日一条；配超大值即事实关闭。
+DIGEST_TICKS_ENV = "HUB_DIGEST_TICKS"
+DEFAULT_DIGEST_TICKS = 17280
+
 # 可选远程 runner 面（add-hub-remote-runner，ADR-0009）：两键全不配 = 本机 daemon +
 # data_root 挂载，现状 byte-identical。add-hub-runner-pool 后两键降级为**首启 seed
 # 一次性消费**（serve 表空才灌一行 runners，此后面板 runners 表是唯一真相，env 再改
@@ -121,6 +137,13 @@ class HubConfig:
     # None = 零变化（本机 daemon / data_root 挂载）；有值仅 serve 首启 seed 消费一次
     docker_host: str | None = None          # seed 行 docker_host（限形在 seed/注册入口，不在本层）
     runner_mount_root: Path | None = None   # seed 行挂载根（daemon 侧视角；此后表是唯一真相）
+    # 配置漂移看门狗面（add-config-drift-watchdog）：周期 + R1 intent 文件路径
+    drift_ticks: int = DEFAULT_DRIFT_TICKS  # 检查周期（N tick 一次，stale/probe 同型）
+    drift_env_intent: Path | None = None    # ro 挂载 hub.env 副本（None = R1 关闭零行为）
+    # runner 镜像分发面（add-runner-image-sync）：save|load 流式传输超时（秒）
+    image_sync_timeout: int = DEFAULT_IMAGE_SYNC_TIMEOUT
+    # 运维日报面（add-hub-daily-digest）：聚合周期（N tick 一次）
+    digest_ticks: int = DEFAULT_DIGEST_TICKS
 
     def user_env(self) -> dict[str, str]:
         """容器 env-file 内容：三值 + 可选模型路由（与切片 2 保险箱同通道）。"""
@@ -180,6 +203,34 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
     if probe_ticks < 1:
         raise ConfigError(f"{PROBE_TICKS_ENV} 须 ≥1：{probe_ticks}")
 
+    # add-config-drift-watchdog D2：看门狗周期同型校验（0 炸 modulo、负数静默关闭——fail fast）
+    dt_raw = e.get(DRIFT_TICKS_ENV)
+    try:
+        drift_ticks = int(dt_raw) if dt_raw else DEFAULT_DRIFT_TICKS
+    except ValueError:
+        raise ConfigError(f"{DRIFT_TICKS_ENV} 非整数：{dt_raw!r}") from None
+    if drift_ticks < 1:
+        raise ConfigError(f"{DRIFT_TICKS_ENV} 须 ≥1：{drift_ticks}")
+    drift_intent_raw = e.get(DRIFT_ENV_INTENT_ENV) or None
+
+    # add-runner-image-sync D4：分发超时同型校验（≥1；0/负 = 立即超时无意义）
+    ist_raw = e.get(IMAGE_SYNC_TIMEOUT_ENV)
+    try:
+        image_sync_timeout = int(ist_raw) if ist_raw else DEFAULT_IMAGE_SYNC_TIMEOUT
+    except ValueError:
+        raise ConfigError(f"{IMAGE_SYNC_TIMEOUT_ENV} 非整数：{ist_raw!r}") from None
+    if image_sync_timeout < 1:
+        raise ConfigError(f"{IMAGE_SYNC_TIMEOUT_ENV} 须 ≥1：{image_sync_timeout}")
+
+    # add-hub-daily-digest D1：日报周期同型校验
+    dg_raw = e.get(DIGEST_TICKS_ENV)
+    try:
+        digest_ticks = int(dg_raw) if dg_raw else DEFAULT_DIGEST_TICKS
+    except ValueError:
+        raise ConfigError(f"{DIGEST_TICKS_ENV} 非整数：{dg_raw!r}") from None
+    if digest_ticks < 1:
+        raise ConfigError(f"{DIGEST_TICKS_ENV} 须 ≥1：{digest_ticks}")
+
     # add-hub-runner-pool 6.1：docker_host 限形校验移至注册/seed 入口（db 层
     # _validate_runner_fields 单点）——本层只解析透传（seed 消费；表空态坏值 =
     # serve seed_runner 抛 DBError 启动 fail loud，行为等价原 ConfigError 拒起）。
@@ -211,4 +262,8 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         probe_ticks=probe_ticks,
         docker_host=docker_host,
         runner_mount_root=Path(rmr_raw) if rmr_raw is not None else None,
+        drift_ticks=drift_ticks,
+        drift_env_intent=Path(drift_intent_raw) if drift_intent_raw is not None else None,
+        image_sync_timeout=image_sync_timeout,
+        digest_ticks=digest_ticks,
     )

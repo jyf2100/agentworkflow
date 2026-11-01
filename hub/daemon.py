@@ -66,6 +66,19 @@ def run_forever(
                 lc.probe_runners()
         except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
             print(f"[probe][warn] 探针挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
+        try:  # add-config-drift-watchdog 2.2：第三低频槽——配置六层漂移看门狗
+            # （同型防御——看门狗任何异常绝不崩排度循环；config_drift 内部逐规则
+            # 吞异常，本层兜底整体异常如配置异常值）
+            if tick % lc.cfg.drift_ticks == 0:
+                lc.check_config_drift()
+        except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
+            print(f"[drift][warn] 看门狗挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
+        try:  # add-hub-daily-digest 1.3：第四低频槽——运维日报（一日一条聚合）
+            # （同型防御——聚合/投递任何异常绝不崩排度循环；各节内部独立 fail-open）
+            if tick % lc.cfg.digest_ticks == 0:
+                lc.emit_daily_digest()
+        except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
+            print(f"[digest][warn] 日报挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
         if not stop_event.is_set():
             sleep(interval)
     print(f"[daemon] 优雅退出：当前迭代已收尾，连续异常 {consecutive}（在跑容器不动，重启经对账接管）")

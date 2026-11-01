@@ -3,6 +3,7 @@
 仅三端点（POST /queue、GET /queue、GET /runs/{id}），无语义判定面（审 PRD/判价值
 归 pa persona；hub 只做机械活）。cli.py 走本模块同一内部函数（8.2）。
 """
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -990,3 +991,33 @@ def test_panel_runner_form_flow(tmp_path):
     assert d.get_runner(rid)["enabled"] == 1
     # 行内红绿灯渲染（探针缓存清后 = 未探）
     assert "⚪ 未探" in client.get("/panel/runners").text
+
+
+# add-runner-image-sync 3.2：手动分发端点——admins 门 / 判据同自动触发 / 去重透传
+
+def test_runner_image_sync_endpoint_gate_and_judgment(tmp_path, monkeypatch):
+    client, d, eng, lc = _mk_pool(tmp_path)
+    rid = d.register_runner("gpu-a", "tcp://10.0.0.1:2375", "/mnt/nfs/pa", 1)
+    offered: list[tuple] = []
+
+    def _offer(r, tag, host, name):
+        if (r, tag) in offered:
+            return False
+        offered.append((r, tag))
+        return True
+
+    monkeypatch.setattr(lc, "image_sync", types.SimpleNamespace(offer=_offer))
+    _login(client, lc)  # zhang3 非白名单
+    assert client.post(f"/runners/{rid}/image-sync").status_code == 403
+    _login(client, lc, username="rocju")
+    assert client.post(f"/runners/{rid}/image-sync").status_code == 409  # daemon 未探/非 ok 拒绝
+    d.set_runner_probe(rid, False, {"daemon": "不可达: x", "image": "ok", "mount": "ok"})
+    assert client.post(f"/runners/{rid}/image-sync").status_code == 409  # daemon 红不烧传输
+    d.set_runner_probe(rid, False, {"daemon": "ok", "image": "镜像缺失: pa-executor:v0.1.3", "mount": "ok"})
+    r = client.post(f"/runners/{rid}/image-sync")
+    assert r.status_code == 200 and r.json()["queued"] is True  # 判据命中 → offer（同自动触发）
+    r2 = client.post(f"/runners/{rid}/image-sync")
+    assert r2.status_code == 200 and r2.json()["queued"] is False  # 去重合并语义透传
+    assert offered == [(rid, "pa-executor:v0.1.3")]  # 真实 offer 恰一次（第二次被去重吞）
+    v = client.get("/runners").json()[0]
+    assert "image_sync" in v  # 读面任何有效会话可见（含分发状态列）

@@ -15,9 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config
+import config_drift
+import daily_digest
 import db
 import events
 import health_probe
+import image_sync
 import notify
 import queue_engine
 import runner as runner_mod
@@ -141,6 +144,13 @@ class Lifecycle:
         # 4b 语义事件去重：已转发 (run_id, seq)——进程内存，run 终态即清（_finish_run），
         # 无持久写面；hub 重启重发一轮已发事件是接受的语义（文本幂等，最多一条重复私信）
         self._event_seen: set[tuple[int, int]] = set()
+        # 漂移看门狗去抖集合（add-config-drift-watchdog D4：进程内持有，重启重报可接受——
+        # stale_check 同款语义；漂移类键消解时清、info/premise 持续态键不清）
+        self._drift_seen: set = set()
+        # 镜像分发 worker（add-runner-image-sync D3：单线程后台，绝不阻塞排度 tick；
+        # 惰性起线程——首次 offer 才 spawn）
+        self.image_sync = image_sync.ImageSyncWorker(
+            self._runner, cfg, database, notifier=notifier)
 
     def _credentials(self, user: str | None = None,
                      project: str | None = None) -> tuple[dict[str, str] | None, str]:
@@ -501,6 +511,44 @@ class Lifecycle:
         表行缓存（绿 = 调度候选必要条件）。fail-open——内部逐行吞异常，观察面
         绝不崩排度循环（与 sweep_confirmations 同纪律）。"""
         health_probe.probe_enabled_runners(self._db, self.cfg)
+        self._offer_image_sync()
+
+    def _offer_image_sync(self) -> None:
+        """探针尾部消费本轮结果（add-runner-image-sync 2.1，D1 触发判据）：enabled 行
+        「daemon 项 ok 且 image 项非 ok」→ 分发 offer（tag = 入队默认）。断连机不烧传输
+        （load 也会失败）；offer 内排队/在飞去重。fail-open——任何异常绝不崩排度 tick。"""
+        try:
+            rows = self._db.list_runners()
+        except Exception as e:  # noqa: BLE001——观察面 fail-open
+            print(f"[image-sync][warn] 池列表读取失败（fail-open）: {type(e).__name__}", file=sys.stderr)
+            return
+        for row in rows:
+            if not row["enabled"]:
+                continue
+            try:
+                detail = json.loads(row["probe_json"]) if row["probe_json"] else {}
+            except ValueError:
+                continue
+            if detail.get("daemon") != "ok" or detail.get("image") == "ok":
+                continue  # 断连不触发 / 镜像在场无需分发（mount 红不拦分发——镜像项独立）
+            self.image_sync.offer(row["id"], self.cfg.image_tag_default,
+                                  row["docker_host"], row["name"])
+
+    def check_config_drift(self) -> None:
+        """配置六层漂移看门狗挂点（add-config-drift-watchdog 2.2，daemon 第三低频槽）：
+        R1-R4 层间一致性断言（probe_runners 同构薄挂点——装配 cfg/vault/db/notifier 调
+        config_drift.check_drift，seen 由本对象持有跨周期）。纯只读观察面：绝不进派发
+        路径，内部逐规则吞异常，任何异常不崩排度循环（daemon 槽再兜底一层）。"""
+        config_drift.check_drift(
+            self.cfg, self._vault, self._db, seen=self._drift_seen, notifier=self.notifier
+        )
+
+    def emit_daily_digest(self) -> None:
+        """运维日报挂点（add-hub-daily-digest 1.3，daemon 第四低频槽）：三面聚合
+        一日一条（drift_seen 直读未消解计数）。fail-open——内部各节独立吞异常，
+        任何异常不崩排度循环。"""
+        daily_digest.emit_digest(self.cfg, self._db, notifier=self.notifier,
+                                 drift_seen=self._drift_seen)
 
     def reconcile_running(self) -> None:
         """轮询 running run 行：exited → 记终态走状态机；gone → 按卷证据归档。"""

@@ -22,6 +22,14 @@ services:
       # data 卷（state/profiles/sources.yaml/vault/hub.sqlite3）。同路径 bind 是前提：
       # hub 容器内生成的 -v 源路径会被宿主 daemon 按字面解析，内外必须同路径。
       - /data/pa:/data/pa
+      # 漂移看门狗 R1 intent 面（add-config-drift-watchdog 4.1）：hub.env 的 ro 副本——
+      # 看门狗比对「盘上意图 vs 进程 env 快照」，抓「改了 hub.env 没重建容器」。
+      # 不挂载 = R1 关闭零行为（其余规则照跑）。bind mount 保留宿主属主/权限：hub.env
+      # 0600 属主 uid≠1001 时容器进程（user "1001:1001"）打开恒 EACCES → 部署对齐行：
+      #   chown "$(id -un)":1001 hub.env && chmod 0640 hub.env
+      # （新增可读方恰是 hub 进程自身——env_file 创建时已把生效值注入同一进程，不扩大
+      # 信任域；宿主 gid 1001 被占用时改 ACL：setfacl -m u:1001:r hub.env 保留 0600 基面）
+      - ./hub.env:/intent/hub.env:ro
     env_file:
       - hub.env                # 0600、gitignore：HUB_USER_ID + 三值 + HUB_IMAGE_TAG_DEFAULT
                                # + HUB_VAULT_MASTER_KEY（vault.key 内容；不配 = env-only 兜底形态）
@@ -31,5 +39,6 @@ services:
     environment:
       HUB_DATA_ROOT: /data/pa
       HUB_TICK_INTERVAL: "5"
+      HUB_DRIFT_ENV_INTENT: /intent/hub.env   # 看门狗 R1 intent 路径（挂载缺失时打开失败走前提告警，不崩）
     restart: unless-stopped    # 崩溃自愈：拉起后 reconcile_startup 幂等对账再进排度
     stop_grace_period: 30s     # docker stop 默认 10s 会 SIGKILL 斩断优雅退出（本体论审核 B3）

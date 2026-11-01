@@ -23,7 +23,9 @@ class FakeLC:
         self.reconciles = 0
         self.startups = 0
         self.raise_at: set[int] = set()
-        self.cfg = types.SimpleNamespace(stale_check_ticks=10**9)
+        # 三低频槽默认天文数——既有测试零触发（各挂点测试单独设小值）
+        self.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
+                                       digest_ticks=10**9)
         self.notifier = None
 
     def reconcile_startup(self):
@@ -39,6 +41,12 @@ class FakeLC:
 
     def sweep_confirmations(self):  # 2.4 确认环超时挂点替身（计数供断言）
         self.sweeps = getattr(self, "sweeps", 0) + 1
+
+    def check_config_drift(self):  # add-config-drift-watchdog 2.2 挂点替身（计数供断言）
+        self.drifts = getattr(self, "drifts", 0) + 1
+
+    def emit_daily_digest(self):  # add-hub-daily-digest 1.3 挂点替身（计数供断言）
+        self.digests = getattr(self, "digests", 0) + 1
 
 
 class StopAfter:
@@ -137,3 +145,46 @@ def test_stale_check_exception_does_not_kill_loop(monkeypatch):
     lc.cfg = types.SimpleNamespace(stale_check_ticks=1)  # 每 tick 都查 → 必炸
     rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 3))
     assert rc == 0 and lc.ticks == 3  # 检测异常只记日志，循环续跑（观察面不崩执行面）
+
+
+# ── add-config-drift-watchdog 2.2：第三低频槽（每 drift_ticks 个 tick 一次）──
+
+def test_drift_check_runs_every_n_ticks():
+    lc, se = FakeLC(), threading.Event()
+    lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=2)
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
+    assert rc == 0 and lc.ticks == 5
+    assert lc.drifts == 2  # tick 2 / tick 4 触发；tick 1/3/5 不触发
+
+
+def test_drift_check_exception_does_not_kill_loop(capsys):
+    class BoomDrift(FakeLC):
+        def check_config_drift(self):
+            raise RuntimeError("intent IO 挂了")
+
+    lc, se = BoomDrift(), threading.Event()
+    lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=1)
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 3))
+    assert rc == 0 and lc.ticks == 3  # 看门狗异常只记日志，循环续跑（观察面不崩执行面）
+    assert "[drift][warn]" in capsys.readouterr().err
+
+
+def test_digest_runs_every_n_ticks():
+    lc, se = FakeLC(), threading.Event()
+    lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
+                                   digest_ticks=2)
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
+    assert rc == 0 and lc.digests == 2  # tick 2 / 4 触发
+
+
+def test_digest_exception_does_not_kill_loop(capsys):
+    class BoomDigest(FakeLC):
+        def emit_daily_digest(self):
+            raise RuntimeError("db 挂了")
+
+    lc, se = BoomDigest(), threading.Event()
+    lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
+                                   digest_ticks=1)
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 3))
+    assert rc == 0 and lc.ticks == 3
+    assert "[digest][warn]" in capsys.readouterr().err

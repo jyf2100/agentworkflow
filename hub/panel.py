@@ -407,11 +407,24 @@ def render_runners(rows: list[dict], *, current_user: str = "", error: str | Non
             return str(src.get(key) or "")
         return (values or {}).get(key, "")
 
+    def _sync_cell(r: dict) -> str:
+        """分发状态单元格（add-runner-image-sync 3.1）：上次结果 + 时间戳 title。"""
+        raw = r.get("image_sync_json")
+        try:
+            d = json.loads(raw) if raw else None
+        except (ValueError, TypeError):
+            d = None
+        if not d:
+            return '<span class="muted">—</span>'
+        mark = "✅" if d.get("ok") else "❌"
+        return f'<span title="{_esc(str(d.get("detail") or ""))} @ {_esc(str(d.get("at") or ""))}">{mark} {_esc(str(d.get("tag") or ""))}</span>'
+
     trs = "".join(
         f"<tr><td>#{r['id']}</td><td>{_esc(r['name'])}</td>"
         f"<td>{_esc(r['docker_host'])}</td><td>{_esc(r['runner_mount_root'])}</td>"
         f"<td>{r['load']}/{r['capacity']}</td><td>{_probe_cell(r)}</td>"
         f"<td title=\"{_esc(r.get('probed_at') or '')}\">{_esc(_short_time(r.get('probed_at') or ''))}</td>"
+        f"<td>{_sync_cell(r)}</td>"
         f"<td>{_enabled_cell(r)}</td>"
         f"<td>{_runner_actions(r)}</td></tr>"
         for r in rows
@@ -424,7 +437,7 @@ def render_runners(rows: list[dict], *, current_user: str = "", error: str | Non
     body = (
         f"<h1>服务器池（{len(rows)} 台）</h1>{ok}{err}"
         '<div class="tablewrap"><table><tr><th>id</th><th>name</th><th>docker_host</th>'
-        "<th>挂载根</th><th>忙闲</th><th>探针</th><th>探针时间</th><th>状态</th><th>操作</th></tr>"
+        "<th>挂载根</th><th>忙闲</th><th>探针</th><th>探针时间</th><th>分发</th><th>状态</th><th>操作</th></tr>"
         f"{trs}</table></div>"
         f"<h2>{_esc(form_title)}</h2>{cancel}"
         f"<form method=\"post\" action=\"{form_action}\">"

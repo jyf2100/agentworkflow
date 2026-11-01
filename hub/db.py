@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import functools
 import json
+from datetime import datetime, timezone
 import re
 import sqlite3
 import sys
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 
 ITEM_STATUSES = ("pending", "running", "done", "failed")
@@ -177,6 +178,22 @@ class HubDB:
             if col not in run_cols:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
                 self._conn.commit()
+        # add-runner-image-sync 2.2：runners 分发结果列（幂等加列，先例 = runs 快照列）。
+        # 旧行 NULL = 从未分发；探针列（probe_ok）仍由 probe_and_store 唯一权威写。
+        runner_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(runners)")}
+        if "image_sync_json" not in runner_cols:
+            self._conn.execute("ALTER TABLE runners ADD COLUMN image_sync_json TEXT")
+            self._conn.commit()
+
+    @_locked
+    def set_runner_image_sync(self, runner_id: int, ok: bool, tag: str, detail: str) -> None:
+        """分发结果写行同步列（add-runner-image-sync 2.2）：JSON {ok/tag/detail/at}。"""
+        self._conn.execute(
+            "UPDATE runners SET image_sync_json=? WHERE id=?",
+            (json.dumps({"ok": ok, "tag": tag, "detail": detail, "at": _now()},
+                        ensure_ascii=False), runner_id),
+        )
+        self._conn.commit()
 
     @_locked
     def close(self) -> None:
@@ -319,6 +336,26 @@ class HubDB:
             raise DBError(f"非法 run status：{status!r}")
         rows = self._conn.execute("SELECT * FROM runs WHERE status=? ORDER BY id", (status,))
         return [dict(r) for r in rows]
+
+    @_locked
+    def queue_snapshot(self) -> dict:
+        """队列现状快照（add-hub-daily-digest 1.1）：pending 数 / 最老 pending 等待
+        分钟 / running 数——单查询口径，drift/digest 共用读面。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM queue_items WHERE status='pending'"
+        ).fetchone()
+        running = self._conn.execute(
+            "SELECT COUNT(*) FROM queue_items WHERE status='running'"
+        ).fetchone()[0]
+        oldest_min = 0
+        if row and row["oldest"]:
+            try:
+                delta = datetime.now(timezone.utc) - datetime.fromisoformat(row["oldest"])
+                oldest_min = int(delta.total_seconds() // 60)
+            except ValueError:
+                oldest_min = 0
+        return {"pending": row["n"] if row else 0, "pending_oldest_min": max(oldest_min, 0),
+                "running": running}
 
     @_locked
     def list_all_runs(self) -> list[dict]:

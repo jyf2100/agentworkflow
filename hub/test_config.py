@@ -141,3 +141,38 @@ def test_docker_host_raw_passthrough_to_seed_gate():
     for raw in ("ssh://user@host", "172.32.153.183", "http://host:2375"):
         cfg = config.load_config(_full_env(HUB_DOCKER_HOST=raw))
         assert cfg.docker_host == raw
+
+
+# ── add-config-drift-watchdog 2.1：看门狗周期与 intent 路径解析 ──
+
+def test_drift_ticks_invalid_rejected():
+    for bad in ("0", "-1", "x"):
+        with pytest.raises(config.ConfigError, match="HUB_DRIFT_TICKS"):
+            config.load_config(_full_env(HUB_DRIFT_TICKS=bad))
+
+
+def test_drift_ticks_default_and_override():
+    assert config.load_config(_full_env()).drift_ticks == config.DEFAULT_DRIFT_TICKS
+    assert config.load_config(_full_env(HUB_DRIFT_TICKS="360")).drift_ticks == 360
+
+
+def test_drift_env_intent_parsed():
+    cfg = config.load_config(_full_env(HUB_DRIFT_ENV_INTENT="/intent/hub.env"))
+    assert cfg.drift_env_intent == config.Path("/intent/hub.env")
+    assert config.load_config(_full_env()).drift_env_intent is None  # 不配 = R1 关闭
+
+
+def test_image_sync_timeout_validation():
+    assert config.load_config(_full_env()).image_sync_timeout == config.DEFAULT_IMAGE_SYNC_TIMEOUT
+    assert config.load_config(_full_env(HUB_IMAGE_SYNC_TIMEOUT="60")).image_sync_timeout == 60
+    for bad in ("0", "-5", "x"):
+        with pytest.raises(config.ConfigError, match="HUB_IMAGE_SYNC_TIMEOUT"):
+            config.load_config(_full_env(HUB_IMAGE_SYNC_TIMEOUT=bad))
+
+
+def test_digest_ticks_validation():
+    assert config.load_config(_full_env()).digest_ticks == config.DEFAULT_DIGEST_TICKS
+    assert config.load_config(_full_env(HUB_DIGEST_TICKS="3600")).digest_ticks == 3600
+    for bad in ("0", "-1", "x"):
+        with pytest.raises(config.ConfigError, match="HUB_DIGEST_TICKS"):
+            config.load_config(_full_env(HUB_DIGEST_TICKS=bad))

@@ -544,6 +544,8 @@ PY
 
 **executor 工程技能面**（add-executor-eng-skills，v0.1.8 起，spec: execution-hub）：镜像内置 mattpocock-skills 1.3.1 engineering 面 20 个工程 skill（9 个模型可自主调用；11 个 `disable-model-invocation` 惰性随行），快照在 `hub/deploy/executor-skills/`（含 `PROVENANCE.md` 溯源；**投影 manifest 已纳管该路径**——投影仓原本不含 hub/，不纳管则后续 tag 的 build context 缺 COPY 源），build 时拷至容器 `/home/pa/.claude/skills/` 供 dev loop 会话发现（persona 工具面由 agent 定义 `tools:` 收窄，不受影响）。升级路径：按 PROVENANCE 内命令刷新快照 → patch 通道 build 新 tag → `hub.env` 与 example 同步升（同上第 2 步尾部流程）。
 
+**executor helix 技能面**（add-helix-target-harness，v0.1.35 起，spec: execution-hub）：镜像在工程技能包之外内置 HelixHarness（github.com/didi/helixharness，Apache-2.0）skills 面快照——**git commit 钉定**（`44ffc53`，来源、偏差记录与刷新流程见 `hub/deploy/helix-skills/PROVENANCE.md`；vault 外参考克隆 `/mnt/disk01/workspaces/worksummary/helixharness`），8 个 skill 全量入库、**6 个进容器**：`tdd` / `code-review` 与 executor-skills 同名让位 incumbent（helix 版深度绑定 /helix:* 工作流且依赖插件运行时，容器内不装插件主体；mattpocock 自包含通用版保留）。同名面由两个 Dockerfile 的 case 排除表 + **build 侧碰撞守卫**把守（守卫比对 executor-skills 快照源目录，上游新增表外撞名 build 即 fail loud，不静默覆盖）。纯技能快照**不含插件运行时**（commands / hooks / scripts / agents 16 个一律不进；d-d2c 上游 frontmatter 的 hooks 块已按 PROVENANCE 偏差记录中和并置 Apache-2.0 §4.1 修改标注——`${CLAUDE_PLUGIN_ROOT}` 悬空下该守卫会确定性 deny AskUserQuestion / block Stop；notice 三件 LICENSE/NOTICE/THIRD_PARTY_NOTICES 随包 vendor 满足再分发保留义务）：无遥测 consent 面（上游 consent 默认 disabled），consent 预授权与平台遥测整合是后续 change。升级路径：按 PROVENANCE 内命令重取快照并更新 commit（含 hooks 块重复中和核查）→ 全量版 Dockerfile 重建新 tag → `hub.env` 与 example 同步升（同上第 2 步流程）。
+
 **token**：`hub.env` 配 `HUB_DELIVER_TOKEN=<random>`（注释态默认无守卫，内网可接受；公网暴露前是硬门槛），mac 侧投递器 env `PA_DELIVER_TOKEN` 传同值、`PA_HUB_URL=http://<hub-host>:<port>`。
 
 **ledger / 死信排查**（`<state_dir>/deliver_ledger.jsonl` append-only，半行损坏自动跳过视为未投递）：
@@ -743,3 +745,30 @@ MM 频道模糊需求（「有据但验收不可执行」）不再被 critic 一
 2. PRD 不在 `HUB_DATA_ROOT` 树内（POST /queue / CLI 外部传入路径）→ 派发时投影失败 → 该队列项 abandon（status=failed，`last_error` 带 `HUB_DATA_ROOT` 提示）——重新落盘树内再入队。
 3. 远程 daemon 连不上（防火墙 / daemon 未监听）→ 探针 daemon 项红（面板红绿灯 + title 坏项可见）、该机不参选；在飞 run 对账 `status` 查不到按既有 reconcile 状态机走。hub 主循环不受影响。
 4. 队列 pending 滞留 + 池页全红或全满载 → 忙闲调度按设计等待（非故障）：修机器/加容量/补镜像后探针转绿即恢复派发。
+
+## 23. 配置六层漂移模型与看门狗（add-config-drift-watchdog，2026-11）
+
+**模型**：模型路由/凭据这一逻辑配置在六处独立存在、互不知晓——层间不一致是「改了无数次都没改回来」类事故的根因（各层各自正确、叠加不可排）：
+
+| 层 | 载体 | 消费形态 | 正确写法 | hub 容器可达 |
+|---|---|---|---|---|
+| L1 | `~/.claude/settings.json` env 块 | 本机 CLI 直调（ANTHROPIC_BASE_URL 指 roc 4000 + token） | 编辑该文件 | ✗（家目录无挂载） |
+| L2 | `Projects/项目推进流水线/config/model-routing.json` | 本机形态 per-agent 路由主点；`.dockerignore` 固化排除出镜像（run 93） | git 提交；容器形态按 spec 有意不读 | ✗（hub build context = hub/） |
+| L3 | `hub/deploy/hub.env` | hub 容器 env_file，**仅容器创建时读入**进程 env | 编辑后 `docker compose up -d` **重建**（restart 不重读） | 快照 ✓；意图面经 ro 挂载（§部署） |
+| L4 | 凭据保险箱（vault） | 派发凭据源（**vault 优先、env 兜底**） | `python cli.py vault-import --from-env`（merge 幂等）或面板凭据页；改 hub.env **不会**自动进 vault | ✓ |
+| L5 | roc LiteLLM 注册面 | 网关按注册名路由；**模型名按网关分家**（9001 直连认 qwen3.8-27b-fast，roc 注册面是另一套——同名不通） | admin API `/model/new`（master key = litellm 容器 env `LITELLM_MASTER_KEY`；virtual key 只能 llm_api_routes） | ✓（HTTP 只读探测） |
+| L6 | run 容器实况 | 最终生效面（env-file + PA_* 透传合成） | 无直写——修上游层后重派；验证通道 `docker exec <容器> printenv` | ✓（docker CLI 按 run 行快照路由） |
+
+**2026-10-31 事故链（实证案例）**：L4 停留 4000+glm-5.3 旧快照（派发 vault 优先 → 改 hub.env 不生效）+ L3 改后未 `up -d` 重建（restart 不重读 env_file）+ L5 死链注册（qwen3.6-35b→8896 已死）三者叠加 → run 全挂。修复路径即上表正确写法逐层执行 + `qwen3.8-27b-fast` 补注册进 roc。
+
+**看门狗（hub/config_drift.py，daemon 第三低频槽）**：每 `HUB_DRIFT_TICKS`（默认 720 ≈ 每小时）断言 hub 可达四层——R1 L3 意图（ro 挂载 hub.env 副本）vs 进程 env 快照（抓「改了没重建」）；R2 vault vs env 兜底源（凭据键漂移 =「vault 旧快照」主因形态；模型键分歧降档信息项——vault 值是合法显式选择，且 vault-import merge 会以 hub.env 非空值覆盖它）；R3 网关 `/v1/models` membership 精确匹配（大小写敏感——分家实证）+ alias 负向黑名单（haiku/sonnet/opus/fable 进容器必死，run 93）；R4 最老 running run 容器 printenv 在场+形态（只断言在场，绝无比值）。漂移项 MM 私信（notify_admin）+ 修复指引、去抖一次、全消解发一次回执；**只报不修**（重建/重导入/注册变更都是人工决定）；凭据值绝不入报文（键名/长度面）；任何异常不崩排度循环（观察面纪律）。L1/L2 hub 不可达不进断言——排障入口即本节表格。
+
+**部署（intent 面 + 权限对齐）**：compose 已带 `./hub.env:/intent/hub.env:ro` 挂载与 `HUB_DRIFT_ENV_INTENT=/intent/hub.env`。bind mount 保留宿主属主/权限——hub.env 0600 属主 uid≠1001 时容器进程恒 EACCES（看门狗把它当独立前提故障一次性高声告警，R1 降级其余规则照跑）。对齐行：`chown "$(id -un)":1001 hub.env && chmod 0640 hub.env`（宿主 gid 1001 被占改 `setfacl -m u:1001:r hub.env` 保留 0600 基面；新增可读方恰是 hub 进程自身——env_file 创建时已把生效值注入同一进程，不扩大信任域）。**回滚**：不挂载/删 env 键 = R1 关闭零行为，其余规则照跑；旧代码不读新键新模块，整体卸载无残留行为。
+
+**排障速查（报文 → 动作）**：R1 → `docker compose up -d` 重建；R2 → hub 容器内 `python cli.py vault-import --from-env`；R3 → LiteLLM admin API 注册/修正模型名（注意网关分家：9001 与 roc 各自的名字域）；R4 → 修上游层后重派（L6 无直写）。
+
+**R1 inode 盲窗注记（2026-11-01 真机实证）**：intent 面是单文件 bind mount——宿主侧 `sed -i`/vim 类编辑**换 inode** 后，容器内 `/intent/hub.env` 仍指旧文件（追加式编辑 `tee -a`/`echo >>` 保 inode 可见）。设计上无碍：改 hub.env 本就须 `up -d` 重建才生效，重建后挂载自动重新绑定新 inode；但「编辑后、重建前」窗口内 R1 读的是旧意图（对 sed 类编辑不报漂移）——排障时若疑此窗，先 `docker compose up -d` 再看心跳。
+
+**runner 镜像自动分发（add-runner-image-sync，2026-11）**：探针报「daemon 项 ok 且镜像项非 ok」→ hub 自动 `docker save <默认tag> | docker -H <runner> load` 流式分发（两端 CLI 都在 hub 容器内，与 2026-10-31 人工修复同构；断连机不烧传输）。load 后源/目标 image ID（内容寻址）比对，不一致删目标侧按失败处理。成功后**复测探针**转绿回调度候选（绝不直写 probe_ok——探针是唯一绿灯权威）；失败 = MM 管理面告警（同组合去抖、成功重置）+ runner 保持红 + item 保持 pending（绝不静默跳过，绝不公网拉取顶替——镜像源恒 = hub 本机 daemon，hub 侧也缺源时告警文案指明先在 hub 本机 build）。单 worker 串行（多机缺片各自入队），`HUB_IMAGE_SYNC_TIMEOUT`（缺省 900s）超时终止两端。手动分发：`POST /runners/{id}/image-sync`（admins 门，判据同自动触发）；面板池页「分发」列显示上次结果。**同步失败排查**：先查 hub 本机 daemon 有无源镜像（`docker image inspect <tag>`），再查目标 2375 可达性；期间 item 持续 pending 属设计等待（非故障）。
+
+**运维日报（add-hub-daily-digest，2026-11）**：daemon 第四低频槽每 `HUB_DIGEST_TICKS`（缺省 17280 ≈ 每日）聚合一日一条 MM 私信（`notify_admin`，未配 bot 降级 stderr）：① 队列（pending 数 + 最老等待、running、近 24h succeeded/failed）；② runner 池（各行探针红绿+坏项名、忙闲、上次分发结果）；③ 配置漂移未消解项数。纯只读零写面、值不入面（计数/名称/时长 only）；单节异常独立吞不连坐。重启即重发一条（tick 计数重置，可接受）。

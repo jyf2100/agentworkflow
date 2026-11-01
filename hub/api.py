@@ -688,12 +688,19 @@ def create_app(
                 detail = json.loads(r["probe_json"])
             except (json.JSONDecodeError, TypeError):
                 detail = None
+        sync = None
+        if r.get("image_sync_json"):
+            try:
+                sync = json.loads(r["image_sync_json"])
+            except (json.JSONDecodeError, TypeError):
+                sync = None
         return {
             "id": r["id"], "name": r["name"], "docker_host": r["docker_host"],
             "mount_root": r["runner_mount_root"], "capacity": r["capacity"],
             "enabled": bool(r["enabled"]), "running": r["load"],
             "probe_ok": (None if r["probe_ok"] is None else bool(r["probe_ok"])),
             "probe_detail": detail, "probed_at": r["probed_at"],
+            "image_sync": sync,
         }
 
     def _runner_by_id(runner_id: int) -> dict | None:
@@ -766,6 +773,26 @@ def create_app(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"runner 不存在：{runner_id}") from None
         return _runner_view(_runner_by_id(runner_id))
+
+    @app.post("/runners/{runner_id}/image-sync")
+    def image_sync_runner(runner_id: int, request: Request) -> dict:
+        """手动镜像分发（add-runner-image-sync 3.1，admins 门）：与自动触发同径同判据
+        同去重——offer 进同一后台 worker（排队/在飞去重），daemon 非 ok 拒绝（烧传输
+        无意义）；异步即返（结果进 runners 行 image_sync 列 + 复测探针 + 失败 MM 告警）。"""
+        _require_admin(request)
+        row = _runner_by_id(runner_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"runner 不存在：{runner_id}")
+        try:
+            detail = json.loads(row["probe_json"]) if row["probe_json"] else {}
+        except (json.JSONDecodeError, TypeError):
+            detail = {}
+        if detail.get("daemon") != "ok":
+            raise HTTPException(status_code=409, detail="daemon 项非 ok——先修连接再分发（判据同自动触发）")
+        queued = lc.image_sync.offer(runner_id, lc.cfg.image_tag_default,
+                                     row["docker_host"], row["name"])
+        return {"runner_id": runner_id, "tag": lc.cfg.image_tag_default,
+                "queued": queued, "note": "" if queued else "已在队列/在飞（去重合并）"}
 
     # 面板皮（form → 同芯 db 层；错误 422 回显回填，成功直接 render 池页）
 
