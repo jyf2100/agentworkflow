@@ -40,3 +40,32 @@
 **13 项确认 + 1 设计缺口（router CLI）+ 2 项待自然触发**——P1/P2 全链路行为与设计一致，观测数据足以支撑 P3 决策（影子命中率已有首个数据点 1/1=100%——样本太小，但链路已闭合可采集）。
 
 **P3 可以开工。**
+
+---
+
+## 附录：P3 实测报告（2026-11-01 补）
+
+### 模块级验证（全部通过）
+
+| # | 项 | 证据 | 状态 |
+|---|---|---|---|
+| P3-①-1 | context_loader stub 渲染 | `flag on: True` + `含 [展开: True` + `含 ## 📋: True`（hub 容器直调） | ✅ |
+| P3-①-2 | 预算截断 | `PA_CONTEXT_BUDGET=50` → 仅 PRD 存活（单测 + hub 容器验证） | ✅ |
+| P3-①-3 | flag 关 byte-identical | `flag off → render_stub 返回空串` → dev-agent 走全量路径 | ✅ |
+| P3-②-1 | effects 表迁移（旧库自动建表） | `effects 表: True`（真机 db 打开即建） | ✅ |
+| P3-②-2 | mm_notify Effect | `mm_notify done payload={"action": "run_finished", "run_id": 126}` | ✅ |
+| P3-③-1 | memory_graph 图构建 + Top-K | `graph nodes: 3 | top_k: ['L1', 'L2']`，关键词 `readme` 命中 L1 | ✅ |
+| P3-③-2 | 邻域 + 冲突对 | `L1 邻域: {'L2', 'L1', 'L3'}` + `conflicts: []` | ✅ |
+
+### 未完成验证（被 dispatch 面阻断）
+
+| # | 项 | 阻断原因 | 状态 |
+|---|---|---|---|
+| P3-①-4 | dev prompt 含 stub 标记（真实会话） | 两次入队均被 single-flight 跳过（在途 1≥1——dispatch 面问题与 P3 无关） | ⏸ 模块级已过 |
+
+### 新发现
+
+| 级别 | 发现 | 处置 |
+|---|---|---|
+| P2-8 | effects 缺 state_write（容器启动）包裹——编辑时在途文件文本不匹配导致断言静默失败 | 列 follow-up `add-effects-state-write-wrap` |
+| P2-9 | dispatch 面连续 skip「跳过-超额」——无在飞 run 仍判超额（single-flight 锁误判？） | 独立问题与 P3 无关，列 follow-up 排查 |
