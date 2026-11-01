@@ -261,14 +261,10 @@ def test_container_env_pa_report_dir(tmp_path, monkeypatch):
 def test_container_env_passes_pa_flags(tmp_path, monkeypatch):
     """#22：hub 进程 env 的 PA_* 透传进 run 容器（feature flag 通道，与凭据 env-file 分离）。"""
     for k in list(os.environ):
-        if k.startswith("PA_") or k.startswith("GIT_CONFIG_"):
+        if k.startswith("PA_"):
             monkeypatch.delenv(k)
     monkeypatch.setenv("PA_SINGLE_FLIGHT_AUTO_MERGE", "1")
     monkeypatch.setenv("PA_GRAPH_ORCHESTRATOR", "0")
-    # GIT_CONFIG_* 同通道透传（run 183 真机：git per-URL 代理注入，路由 git 不路由 LLM）
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "http.https://github.com/.proxy")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "http://10.0.0.9:7890")
     lc, d, fake, data = _mk(tmp_path)
     prd = tmp_path / _PRD_NAME
     prd.write_text("# PRD\n", encoding="utf-8")
@@ -278,12 +274,9 @@ def test_container_env_passes_pa_flags(tmp_path, monkeypatch):
     spec = fake.containers[ref]["spec"]
     assert spec.container_env == (
         f"PA_REPORT_DIR={CONTAINER_STATE}/reports",            # 生成项在前
-        "GIT_CONFIG_COUNT=1",                                  # sorted 确定性（GIT_ < PA_）
-        "GIT_CONFIG_KEY_0=http.https://github.com/.proxy",
-        "GIT_CONFIG_VALUE_0=http://10.0.0.9:7890",
-        "PA_GRAPH_ORCHESTRATOR=0",
+        "PA_GRAPH_ORCHESTRATOR=0",                              # sorted 确定性
         "PA_SINGLE_FLIGHT_AUTO_MERGE=1")
-    # 非透传前缀不渗进 run 容器（如 HUB_* 面板配置）
+    # 非 PA_ 前缀不透传（如 HUB_* 面板配置不渗进 run 容器）
     assert not any(kv.startswith("HUB_") for kv in spec.container_env)
 
 
