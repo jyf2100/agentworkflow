@@ -1025,7 +1025,6 @@ def test_runner_image_sync_endpoint_gate_and_judgment(tmp_path, monkeypatch):
 
 def test_attention_page_guarded_and_renders(tmp_path):
     """add-panel-attention：读面守卫（无会话 302）+ 登录后 200 含导航徽标与提案节。"""
-    import types as _t
     client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
     lc._drift_seen = {("drift", "R1", "K")}          # 漂移 1 项（lifecycle 内存面替身）
     r0 = client.get("/panel/attention", follow_redirects=False)

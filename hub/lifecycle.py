@@ -379,9 +379,12 @@ class Lifecycle:
                 # PA_SINGLE_FLIGHT_AUTO_MERGE 经 hub.env → hub 进程 env → run 容器；破坏性
                 # flag 默认关，部署机按需在 hub.env 本地面开，不进 compose/仓）。sorted 保
                 # 确定性；PA_REPORT_DIR 本处生成，排除防重复。
+                # GIT_CONFIG_*（run 183 真机实证）：git 原生 env 注入 config 机制（≥2.31），
+                # 远程 runner 机容器直连 github 被断时经 hub.env 配 per-URL 代理——只路由
+                # git 流量，LLM/roc 代理流量不经此通道（与 https_proxy 全局 env 的关键差别）。
                 container_env=(f"PA_REPORT_DIR={CONTAINER_STATE}/reports",
                                *(f"{k}={v}" for k, v in sorted(os.environ.items())
-                                 if k.startswith("PA_") and k != "PA_REPORT_DIR")),
+                                 if k.startswith(("PA_", "GIT_CONFIG_")) and k != "PA_REPORT_DIR")),
             )
             try:
                 ref = self._runner.start(spec, docker_host=docker_host)
