@@ -25,7 +25,7 @@ class FakeLC:
         self.raise_at: set[int] = set()
         # 三低频槽默认天文数——既有测试零触发（各挂点测试单独设小值）
         self.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
-                                       digest_ticks=10**9, event_ticks=10**9)
+                                       digest_ticks=10**9, event_ticks=10**9, relay_ticks=10**9)
         self.notifier = None
 
     def reconcile_startup(self):
@@ -50,6 +50,9 @@ class FakeLC:
 
     def poll_runner_events(self):  # add-event-sources 1.1 挂点替身（计数供断言）
         self.event_polls = getattr(self, "event_polls", 0) + 1
+
+    def relay_human_notes(self):  # add-thread-subscription 1.3 挂点替身（计数供断言）
+        self.relays = getattr(self, "relays", 0) + 1
 
 
 class StopAfter:
@@ -175,7 +178,7 @@ def test_drift_check_exception_does_not_kill_loop(capsys):
 def test_digest_runs_every_n_ticks():
     lc, se = FakeLC(), threading.Event()
     lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
-                                   digest_ticks=2)
+                                   digest_ticks=2, relay_ticks=10**9)
     rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
     assert rc == 0 and lc.digests == 2  # tick 2 / 4 触发
 
@@ -188,7 +191,7 @@ def test_event_poll_runs_every_n_ticks_and_survives_errors(capsys):
 
     lc, se = BoomPoll(), threading.Event()
     lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
-                                   digest_ticks=10**9, event_ticks=2)
+                                   digest_ticks=10**9, event_ticks=2, relay_ticks=10**9)
     rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
     assert rc == 0 and lc.ticks == 5 and lc.event_polls == 2  # tick 2/4 触发，异常不崩循环
     assert "[events][warn]" in capsys.readouterr().err
@@ -201,7 +204,21 @@ def test_digest_exception_does_not_kill_loop(capsys):
 
     lc, se = BoomDigest(), threading.Event()
     lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
-                                   digest_ticks=1, event_ticks=10**9)
+                                   digest_ticks=1, event_ticks=10**9, relay_ticks=10**9)
     rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 3))
     assert rc == 0 and lc.ticks == 3
     assert "[digest][warn]" in capsys.readouterr().err
+
+
+def test_relay_runs_every_n_ticks_and_survives_errors(capsys):
+    class BoomRelay(FakeLC):
+        def relay_human_notes(self):
+            self.relays = getattr(self, "relays", 0) + 1
+            raise RuntimeError("MM 挂了")
+
+    lc, se = BoomRelay(), threading.Event()
+    lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
+                                   digest_ticks=10**9, event_ticks=10**9, relay_ticks=2)
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
+    assert rc == 0 and lc.ticks == 5 and lc.relays == 2
+    assert "[relay][warn]" in capsys.readouterr().err

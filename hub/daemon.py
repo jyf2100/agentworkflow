@@ -85,6 +85,12 @@ def run_forever(
                 lc.poll_runner_events()
         except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
             print(f"[events][warn] 事件轮询挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
+        try:  # add-thread-subscription 1.3：第六低频槽——频道人话捕获（订阅直通排队面）
+            # （同型防御——relay 任何异常绝不崩排度循环；内部逐绑定 fail-open）
+            if tick % lc.cfg.relay_ticks == 0:
+                lc.relay_human_notes()
+        except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
+            print(f"[relay][warn] 直通挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
         if not stop_event.is_set():
             sleep(interval)
     print(f"[daemon] 优雅退出：当前迭代已收尾，连续异常 {consecutive}（在跑容器不动，重启经对账接管）")

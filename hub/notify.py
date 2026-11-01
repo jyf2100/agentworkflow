@@ -85,6 +85,8 @@ class MMClient(Protocol):
     def post_dm(self, mm_user_id: str, text: str) -> None: ...
     def post_channel(self, channel_id: str, text: str) -> None: ...
     def channel_member_ids(self, channel_id: str) -> "list[str] | None": ...
+    def read_channel_posts(self, channel_id: str, since_ms: int) -> "list[dict] | None": ...
+    def bot_user_id(self) -> "str | None": ...
 
 
 class HttpMMClient:
@@ -133,6 +135,32 @@ class HttpMMClient:
     def post_channel(self, channel_id: str, text: str) -> None:
         r = self._c.post(self._url("/posts"), json={"channel_id": channel_id, "message": text}, headers=self._hdr())
         r.raise_for_status()
+
+    def bot_user_id(self) -> "str | None":
+        """bot 自身 user id（relay 排除 bot 自己的帖）；me_id 的 None-安全包装（异常 → None）。"""
+        try:
+            return self.me_id()
+        except Exception:  # noqa: BLE001——观察面：取不到 = 排除不了，调用方按仅 bot 回执过滤降级
+            return None
+
+    def read_channel_posts(self, channel_id: str, since_ms: int) -> "list[dict] | None":
+        """读频道新帖（add-thread-subscription D3）：GET /channels/{id}/posts?since=ms（MM v4
+        since 语义 = 之后创建的帖）。返回升序 posts（[{id,user_id,message,create_at(ms)}]）；
+        网络/非 200/契约异常 = None（UNKNOWN，relay 跳轮）。"""
+        try:
+            r = self._c.get(self._url(f"/channels/{channel_id}/posts"),
+                            params={"since": since_ms, "per_page": 200}, headers=self._hdr())
+        except httpx.HTTPError:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            posts = (r.json() or {}).get("posts") or {}
+            out = [p for p in posts.values() if isinstance(p, dict) and p.get("id")]
+            out.sort(key=lambda p: int(p.get("create_at") or 0))
+            return out
+        except (ValueError, AttributeError, TypeError):
+            return None
 
     def channel_member_ids(self, channel_id: str) -> list[str] | None:
         """频道成员 user_id 全集（page/per_page=200 翻页取全）。三态契约（D3）：
@@ -226,6 +254,11 @@ class FakeMMClient:
         if channel_id in self.members_forbidden:
             return None  # 403 = UNKNOWN（判据不可用）
         return list(self.channel_members.get(channel_id, []))
+    def read_channel_posts(self, channel_id: str, since_ms: int) -> "list[dict] | None":
+        raise NotImplementedError  # thread_relay 单测自带替身（本 Fake 服务通知面用例）
+
+    def bot_user_id(self) -> "str | None":
+        return None
 
 
 class Notifier:

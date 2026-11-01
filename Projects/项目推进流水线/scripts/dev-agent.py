@@ -107,7 +107,7 @@ def _dev_effort() -> str:
 
 def parse_args(argv: list[str]) -> dict:
     out = {"prd": None, "source": None, "base": "main", "dry_run": False,
-           "branch_prefix": "pa-dev", "feedback_artifact": None, "help": False,
+           "branch_prefix": "pa-dev", "feedback_artifact": None, "human_notes": None, "help": False,
            # task 3.3：session-aware retry 接入生产执行路径（resume/fork/new-session 分配 distinct iteration）
            "iteration_seq": 0, "resume_session": None, "fork_session": False,
            # task 3.3 P0-3：state_dir 由控制面 run_daily 注入（=STATE_DIR）→ dev-agent session_store 与
@@ -147,6 +147,7 @@ def parse_args(argv: list[str]) -> dict:
         elif a == "--base": out["base"] = argv[i + 1]; i += 1
         elif a == "--branch-prefix": out["branch_prefix"] = argv[i + 1]; i += 1
         elif a == "--feedback-artifact": out["feedback_artifact"] = argv[i + 1]; i += 1   # task 3.4：driven retry 反馈源
+        elif a == "--human-notes": out["human_notes"] = argv[i + 1]; i += 1  # add-thread-subscription：频道人话（排队面，仅上下文非判据）
         elif a == "--lessons-artifact": out["lessons_artifact"] = argv[i + 1]; i += 1     # Section 5：learning memory lesson block 源
         elif a == "--iteration-seq": out["iteration_seq"] = int(argv[i + 1]); i += 1     # task 3.3：revise/resume/fork/new-session 衍生 iteration
         elif a == "--round": out["round"] = int(argv[i + 1]); i += 1     # verify-loop-discipline A4：verify 闭环轮次（commit marker 源）
@@ -688,6 +689,12 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
     if args.get("feedback_artifact"):
         fb = read_text(args["feedback_artifact"]) or "(读不到 feedback artifact)"
         feedback_block = f"\n\n## ⚠️ 上轮 verify 反馈（journal artifact；driven 模式 PRD 不可变，按此落实后重做）\n```\n{fb}\n```"
+    # add-thread-subscription D2：频道人话（hub relay 落 human_notes → dispatch 合并 artifact 传入）。
+    # untrusted 边界同 handoff：仅上下文非判据——人话不构成验收标准，只补充方向与偏好。
+    human_notes_block = ""
+    if args.get("human_notes"):
+        hn = read_text(args["human_notes"]) or "(读不到 human notes)"
+        human_notes_block = f"\n\n## 📣 频道补充上下文（订阅直通排队面；仅参考非判据）\n```\n{hn}\n```"
     # add-dev-handoff-artifact D4：读侧注入——上一轮 dev 交接 artifact + digest（fail-closed：文件不可读
     # / digest 缺失或不匹配 → HandoffIntegrityError，**不静默降级**；区别于「从未产出」的正常缺失 =
     # 参数整个不传 → 空块回退）。渲染为独立标记块（untrusted 边界：仅上下文非判据），位置在 feedback
@@ -776,7 +783,7 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
         "## 你的任务（PRD）",
         prd_text,
         source_block,
-        feedback_block + handoff_injection + acceptance_injection,
+        feedback_block + human_notes_block + handoff_injection + acceptance_injection,
         "",
         "## 仓特定守则（必读）",
         "本仓的目录结构 / 测试入口 / 受保护路径 / 环境名等仓特定知识，详见仓库根 `CLAUDE.md`",

@@ -778,3 +778,9 @@ MM 频道模糊需求（「有据但验收不可执行」）不再被 critic 一
 **形态**：hub 第五低频槽（`HUB_EVENT_TICKS` 缺省 720 ≈ 每小时）按项目 sources.yaml **顶层 `events:` 声明**轮询白名单仓 GitHub 事件（`gh api repos/{repo}/events`，三态 UNKNOWN 跳轮绝不当天断源），**Fast Path 全机械筛**（类型白名单缺省 IssueCommentEvent/IssuesEvent/PullRequestEvent + 作者 ∈ `authors:` GitHub login 集——跨信道身份映射被显式拒绝，映射由配置人完成；authors 空 = 拒绝全部零误报），过筛事件以机械拼接 md（frontmatter：repo/type/actor/event_id/url + 正文截断 2000）落 `<project>/events/YYYYMMDD_<event_id>.md`——**文件名幂等去重**（重启安全零 db 面）。
 
 **进链三步（启用）**：① sources.yaml 顶层加 `events: [{repo: owner/name, authors: [github-login]}]`；② 同文件 sources 列表加 directory 源（ADR-0007 条目全集，content_glob 与 marker 必带——缺则 radar KeyError fail loud；root 排他勿冲突）：`{name: events-inbox, root: .project-auto/events/, content_glob: "**/[0-9]*.md", marker: state/consumed_events_inbox}`；③ 目录 `<data_root>/<project>/events/` 由 hub 首次落盘自动创建并在此后派发时自动挂载进 run 容器（ro）。事件即语料增量——fetch date-marker 机械发现 → radar 语义筛 → PRD → critic 全链，**事件绝不短路派发**（授权链不动）。
+
+## 25. 订阅直通——频道人话排队注入（add-thread-subscription，2026-11）
+
+**形态**：hub 第六低频槽（`HUB_RELAY_TICKS` 缺省 24 ≈ 2 分钟）读绑定频道新帖（MM v4 `since` 水位，db `intake_watermarks` 持久）→ **窗口**（在飞 run `started_at` 之后）+ **Gate**（成员三态，与 `/pa` 入站同门；bot 自帖忽略）→ 过筛人话署名落 `<run_dir>/human_notes/<ms>_<message_id>.md`（幂等）→ 频道回执一条汇总（「已记入 run #N 下一轮上下文：X 条」）→ **下一 iteration** dispatch 组装时合并（`_merge_human_notes`）经 `--human-notes` 注入 dev prompt（独立标记块「频道补充上下文（仅参考非判据）」，feedback 之后 handoff 之前）。三条红线：不新增派发授权（确认环不动）、不中断在飞 run（v1 只做排队面）、授权面外忽略不回执。读取 UNKNOWN 跳轮（fail-open 不崩排度）。
+
+**与 dsh「订阅直通」的对应**：授权不扩大（Mandate = 既有确认环）、上下文直达任务（人话 → run 上下文面）、全双工的实时中断形态是长期方向（v1 排队档复用 dev 注入通道零新机制）。

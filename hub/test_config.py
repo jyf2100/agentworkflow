@@ -184,3 +184,11 @@ def test_event_ticks_validation():
     for bad in ("0", "-1", "x"):
         with pytest.raises(config.ConfigError, match="HUB_EVENT_TICKS"):
             config.load_config(_full_env(HUB_EVENT_TICKS=bad))
+
+
+def test_relay_ticks_validation():
+    assert config.load_config(_full_env()).relay_ticks == config.DEFAULT_RELAY_TICKS
+    assert config.load_config(_full_env(HUB_RELAY_TICKS="12")).relay_ticks == 12
+    for bad in ("0", "-1", "x"):
+        with pytest.raises(config.ConfigError, match="HUB_RELAY_TICKS"):
+            config.load_config(_full_env(HUB_RELAY_TICKS=bad))

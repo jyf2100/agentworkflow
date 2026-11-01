@@ -77,6 +77,11 @@ DEFAULT_DIGEST_TICKS = 17280
 EVENT_TICKS_ENV = "HUB_EVENT_TICKS"
 DEFAULT_EVENT_TICKS = 720  # ≈ 5s tick 下每小时一轮（GitHub events 流窗口宽，小时级足够）
 
+# 订阅直通轮询周期（add-thread-subscription）：绑定频道在飞 run 窗口内的人话捕获
+# （读 MM 新帖 → 成员授权筛 → human_notes 落盘 → 下一 iteration 注入 + 频道回执）。
+RELAY_TICKS_ENV = "HUB_RELAY_TICKS"
+DEFAULT_RELAY_TICKS = 24  # ≈ 5s tick 下每 2 分钟一轮（近实时的排队面捕获）
+
 # 可选远程 runner 面（add-hub-remote-runner，ADR-0009）：两键全不配 = 本机 daemon +
 # data_root 挂载，现状 byte-identical。add-hub-runner-pool 后两键降级为**首启 seed
 # 一次性消费**（serve 表空才灌一行 runners，此后面板 runners 表是唯一真相，env 再改
@@ -150,6 +155,8 @@ class HubConfig:
     digest_ticks: int = DEFAULT_DIGEST_TICKS
     # 事件轮询面（add-event-sources）：白名单仓事件拉取周期（N tick 一次）
     event_ticks: int = DEFAULT_EVENT_TICKS
+    # 订阅直通面（add-thread-subscription）：频道人话捕获轮询周期（N tick 一次）
+    relay_ticks: int = DEFAULT_RELAY_TICKS
 
     def user_env(self) -> dict[str, str]:
         """容器 env-file 内容：三值 + 可选模型路由（与切片 2 保险箱同通道）。"""
@@ -246,6 +253,15 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
     if event_ticks < 1:
         raise ConfigError(f"{EVENT_TICKS_ENV} 须 ≥1：{event_ticks}")
 
+    # add-thread-subscription：直通轮询周期同型校验
+    rt_raw = e.get(RELAY_TICKS_ENV)
+    try:
+        relay_ticks = int(rt_raw) if rt_raw else DEFAULT_RELAY_TICKS
+    except ValueError:
+        raise ConfigError(f"{RELAY_TICKS_ENV} 非整数：{rt_raw!r}") from None
+    if relay_ticks < 1:
+        raise ConfigError(f"{RELAY_TICKS_ENV} 须 ≥1：{relay_ticks}")
+
     # add-hub-runner-pool 6.1：docker_host 限形校验移至注册/seed 入口（db 层
     # _validate_runner_fields 单点）——本层只解析透传（seed 消费；表空态坏值 =
     # serve seed_runner 抛 DBError 启动 fail loud，行为等价原 ConfigError 拒起）。
@@ -282,4 +298,5 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         image_sync_timeout=image_sync_timeout,
         digest_ticks=digest_ticks,
         event_ticks=event_ticks,
+        relay_ticks=relay_ticks,
     )

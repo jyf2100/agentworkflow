@@ -2566,11 +2566,35 @@ def _write_per_cmd_outputs(log_file: Path, matched: dict) -> dict[str, str]:
 
 
 # ─── verify 闭环辅助（dev→独立验证→pa-verify，docs/verify-commit-loop-design.md §3/§5）──
+def _merge_human_notes(project: str, prd_abs: str) -> str | None:
+    """频道人话合并 artifact（add-thread-subscription D2 排队面）：扫描该项目最新 run 目录的
+    human_notes/*.md（hub relay 落盘于 state 卷同树——容器内可达），按文件名序合并成单 md；
+    无 notes → None（cmd 零参数 baseline）。每轮组装现扫现并——round 1 通常为空，retry/revise
+    轮自然带上途中累积的人话（幂等：消费不删盘，dev 侧仅上下文非判据）。"""
+    runs_root = STATE_DIR / "runs" / project
+    if not runs_root.is_dir():
+        return None
+    slug = _slugify(Path(prd_abs).stem)
+    dirs = sorted((d for d in runs_root.iterdir() if d.is_dir() and d.name.endswith(slug)),
+                  key=lambda d: d.name)
+    if not dirs:
+        return None
+    notes = sorted((dirs[-1] / "human_notes").glob("*.md"))
+    if not notes:
+        return None
+    out = STATE_DIR / f"human_notes_merged_{project}_{slug}.md"
+    out.write_text("\n\n---\n\n".join(
+        f"<!-- {n.name} -->\n{n.read_text(encoding='utf-8', errors='replace')}" for n in notes),
+        encoding="utf-8")
+    return str(out)
+
+
 def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
              feedback_artifact: str | None = None, *,
              state_dir: str | None = None, iteration_seq: int = 0,
              resume_session: str | None = None, fork_session: bool = False,
              lessons_artifact: str | None = None,
+             human_notes: str | None = None,
              round_n: int = 0,
              expect_handoff: bool = False,
              handoff_artifact: str | None = None,
@@ -2607,6 +2631,8 @@ def _dev_cmd(prof: dict, prd_abs: str, base: str, src_abs: str,
         cmd += ["--feedback-artifact", feedback_artifact]
     if lessons_artifact:     # Section 5 接线：lesson block artifact path（None=不注入，dev-agent baseline prompt）
         cmd += ["--lessons-artifact", lessons_artifact]
+    if human_notes:         # add-thread-subscription：频道人话合并 artifact（排队面，仅上下文非判据）
+        cmd += ["--human-notes", human_notes]
     # add-dev-handoff-artifact 组4：dev 亲笔交接透传（镜像 --feedback-artifact 模式，ADR-0001：path 送达、
     #   dev-agent 不读控制面 state）。expect_handoff=dev_handoff flag（写侧契约启用，2.4）；artifact+digest
     #   成对（round≥2 / retry 注入，digest 由 dev-agent fail-closed 校验）；baseline 缺省 → cmd 零 handoff 参数。
@@ -3734,11 +3760,12 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
             rec["_learning_promotion_count"] = _lessons_pkg["promotion_count"]
             if _lessons_pkg["degraded_class"]:
                 rec["_learning_injection_degraded"] = _lessons_pkg["degraded_class"]
+        _human_notes_artifact = _merge_human_notes(entry["project"], prd_abs)
         if _coord.flags.session_aware_retry:   # task 3.3 P0-3：retry 模式注入 state_dir+session 参数（baseline flag 关→原 cmd 零变化）
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
                            state_dir=str(STATE_DIR), iteration_seq=round_n,
                            resume_session=cur_resume_session, fork_session=cur_fork_session,
-                           lessons_artifact=_lessons_artifact, round_n=round_n,
+                           lessons_artifact=_lessons_artifact, human_notes=_human_notes_artifact, round_n=round_n,
                            expect_handoff=_coord.flags.dev_handoff,
                            handoff_artifact=(str((STATE_DIR / "artifacts" / _run) / _parent_handoff_ref["path"])
                                              if _parent_handoff_ref else None),
@@ -3748,7 +3775,7 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
                            acceptance_digest=(_suite_snap["digest"] if _suite_snap else None))
         else:
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
-                           lessons_artifact=_lessons_artifact, round_n=round_n,
+                           lessons_artifact=_lessons_artifact, human_notes=_human_notes_artifact, round_n=round_n,
                            expect_handoff=_coord.flags.dev_handoff,
                            handoff_artifact=(str((STATE_DIR / "artifacts" / _run) / _parent_handoff_ref["path"])
                                              if _parent_handoff_ref else None),

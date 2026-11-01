@@ -19,6 +19,7 @@ import config_drift
 import daily_digest
 import db
 import event_poller
+import thread_relay
 import events
 import health_probe
 import image_sync
@@ -559,6 +560,14 @@ class Lifecycle:
         """事件轮询挂点（add-event-sources 1.1，daemon 第五低频槽）：全声明项目拉取过筛
         落语料增量文件。fail-open——单 repo 异常不连坐，任何异常不崩排度循环。"""
         event_poller.poll_events(self.cfg)
+
+    def relay_human_notes(self) -> None:
+        """订阅直通挂点（add-thread-subscription 1.3，daemon 第六低频槽）：绑定频道在飞
+        run 窗口内的授权人话 → human_notes 落盘 + 频道回执。fail-open——任何异常不崩
+        排度循环；bot 通道未配 = 直通关闭零行为。"""
+        if self.notifier is None:
+            return  # bot 通道未配置——直通关闭（与 /pa 入站同语义）
+        thread_relay.relay_channel_notes(self.cfg, self._db, self.notifier._mm, notifier=self.notifier)
 
     def reconcile_running(self) -> None:
         """轮询 running run 行：exited → 记终态走状态机；gone → 按卷证据归档。"""

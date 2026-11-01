@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS confirmation_requests (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_confirm_item ON confirmation_requests(item_id);
 CREATE INDEX IF NOT EXISTS idx_confirm_status ON confirmation_requests(status);
 CREATE INDEX IF NOT EXISTS idx_confirm_origin ON confirmation_requests(origin_sha);
+CREATE TABLE IF NOT EXISTS intake_watermarks (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runners (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     name              TEXT NOT NULL UNIQUE,
@@ -184,6 +188,20 @@ class HubDB:
         if "image_sync_json" not in runner_cols:
             self._conn.execute("ALTER TABLE runners ADD COLUMN image_sync_json TEXT")
             self._conn.commit()
+
+    @_locked
+    def get_watermark(self, key: str) -> str | None:
+        """读取水位（add-thread-subscription D3：relay 增量游标）。"""
+        row = self._conn.execute("SELECT value FROM intake_watermarks WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    @_locked
+    def set_watermark(self, key: str, value: str) -> None:
+        """写水位（幂等覆盖）。"""
+        self._conn.execute(
+            "INSERT INTO intake_watermarks (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        self._conn.commit()
 
     @_locked
     def set_runner_image_sync(self, runner_id: int, ok: bool, tag: str, detail: str) -> None:
