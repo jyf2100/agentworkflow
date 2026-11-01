@@ -776,11 +776,21 @@ def build_prompt(args: dict, prd_text: str, branch: str | None) -> str:
             "这是给下一轮 dev 会话的亲笔交接（仅上下文），不是给验证闸的判据。",
             "",
         ])
+    # add-context-loading-protocol：flag 开 → 五通道 stub 化（≤80 字摘要+[展开: path]+预算截断）
+    # 替代 PRD 全文与各注入 block 的全量拼贴；flag 关（缺省）→ byte-identical 既有路径。
+    import context_loader
+    if context_loader.stub_enabled():
+        _stub_block = context_loader.render_stub(args, prd_text)
+        if _stub_block:
+            prd_text = _stub_block
+            source_block = feedback_block = human_notes_block = ""
+            handoff_injection = acceptance_injection = ""
+            # acceptance 不截断（考卷）——flag 开时仍走全量注入面（spec scenario）
     base_prompt = "\n".join([
         head,
         prot,
         "",
-        "## 你的任务（PRD）",
+        "## 你的任务（PRD + 上下文，stub 化）" if context_loader.stub_enabled() and _stub_block else "## 你的任务（PRD）",
         prd_text,
         source_block,
         feedback_block + human_notes_block + handoff_injection + acceptance_injection,
