@@ -63,3 +63,27 @@ fetch 的 date-marker 按自然日、digest 的终态计数按滚动 24h（ended
 ## 四、总裁定
 
 本批 10 需求的本体纪律**整体良好**：每个 change 有显式范畴声明与被拒清单；两处 P1 均为「模型的层/归属切分未展开到底」而非概念混用——立后续 change 处置（建议名：`add-drift-l5-health-probe` / `harden-human-notes-lineage`）。P2 四项注记在案，不阻归档路径。
+
+---
+
+## 附录：P2-①② 补审（2026-11-01 实施后追加）
+
+**背景**：P2-①（observer）与 P2-②（attention）实装未走对抗评审/冷评审（时间压力直实施）——用户指出后补审。
+
+### P1-3（当场修复）：attention 页 dispatch 路径推导 bug
+
+**证据**：代码用子目录 `state/dispatch/YYYYMMDD.json` 但实际文件是**平级** `state/dispatch_YYYYMMDD.json`（真机 ls 实证），且 stamp 有 m 后缀形态（dispatch_20261028m11.json）——`started_at[:10].replace('-','')` 推导恒落空 → 阻断 triage 节**名存实亡**（恒空）。
+**修法**：改为 `glob("dispatch_*.json")` 平级全扫 + run_dir slug 段匹配行（commit 已落）。
+
+### P2-5：observer 事件页 100 条可能不足 7d 基线
+
+活跃仓 events 端点一页 100 条可能只覆盖数小时——基线偏高 → 激增检测偏保守（少报不误报）。observe v1 取保守侧可接受；design Open Questions 已有自适应基线预告。**注记在案不阻塞**。
+
+### 通过项
+
+- streak 锚逻辑正确（API 新→旧序，streak[-1]=最老 ✓；增长锚不变幂等 ✓；恢复后新 streak 新锚 ✓）
+- observer token 全为参数名/注释——提案文件零 token 值（值不入面 ✓）
+- 提案仅日报不即时推送（三档报告面分离 ✓）；auto 降级 warn ✓
+- attention 纯投影零新真相源（四节各链回源实体 ✓）；空节隐藏/全空安静 ✓
+
+**总裁定**：P1 一处已当场修复；P2 一处注记。两 change 可进 P2-③。
