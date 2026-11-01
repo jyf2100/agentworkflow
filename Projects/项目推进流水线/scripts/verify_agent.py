@@ -34,7 +34,12 @@ VERIFY_AGENT_NAME = "pa-verify-agent"
 # 墙钟分档（D13）：env 覆盖 > hub 探测 > 本机默认
 HUB_WALL_CLOCK = 3600.0     # 容器形态对齐 dev 会话语义（m14 教训：300s 壳装 900s 活）
 LOCAL_WALL_CLOCK = 1200.0   # 本机形态 = VERIFY_INSTALL/TEST_TIMEOUT 量级合并
-HUB_MARK = "/data/pa"       # hub 容器挂载卷标记（run 容器内必挂）
+# hub 形态判据（#111 修复，2026-11-01）：/input = PRD 只读输入卷挂点（spec: execution-hub
+# A2 担保 hub 派发必挂；容器内路径与挂载源无关——runner-pool 远程机也必然存在）；
+# /data/pa = 旧本机 runner 时代形态兼容保留。原判据只有 /data/pa：runner-pool 后 run
+# 容器改挂 <mount_root>/...（如 /mnt/nfs_jyf/pa），/data/pa 不在——#111 verify 被按
+# 本机档 1200s 误杀（max_turns 同根因静默回退 30）。
+HUB_MARKS = ("/input", "/data/pa")
 
 # maxTurns 分档（run 92 真机，2026-10-28）：hub 容器 30 turn 全花在环境装配（npm ci + 绕
 # scope-bash 探查），考卷一条没跑就 max_turns_reached → claude 退出 1。D13 只给墙钟分了档，
@@ -72,8 +77,9 @@ class VerifyExecutor(Protocol):
 
 
 def _is_hub_env() -> bool:
-    """hub 容器形态探测（D13）：挂载卷标记目录存在即容器态（run 容器内必挂 /data/pa）。"""
-    return Path(HUB_MARK).is_dir()
+    """hub 容器形态探测（D13 + #111 修复）：任一挂载标记目录存在即容器态——
+    /input（PRD 只读卷挂点，spec 担保、远程 runner 通吃）或 /data/pa（旧形态兼容）。"""
+    return any(Path(m).is_dir() for m in HUB_MARKS)
 
 
 def resolve_wall_clock() -> float:

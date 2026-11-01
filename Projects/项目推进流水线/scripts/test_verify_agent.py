@@ -100,6 +100,21 @@ def test_wall_clock_hub_tier(monkeypatch):
     assert VA.resolve_wall_clock() == VA.HUB_WALL_CLOCK == 3600.0
 
 
+def test_hub_env_marker_regression(monkeypatch, tmp_path):
+    """#111 回归：判据级（非 mock _is_hub_env）——/input（PRD 卷挂点，远程 runner 形态）
+    或 /data/pa（旧形态）任一存在即 hub 档；两者皆无 = 本机档。"""
+    import pathlib
+    marks = set()   # 完全由集合控制（不透真实 fs——宿主自身可能就是 hub 机有 /data/pa）
+    monkeypatch.setattr(pathlib.Path, "is_dir", lambda self, *a, **k: str(self) in marks)
+    marks.add("/input")                                   # 远程 runner run 容器形态
+    assert VA._is_hub_env() and VA.resolve_wall_clock() == 3600.0 and VA.resolve_max_turns() == 150
+    marks.clear(); marks.add("/data/pa")                  # 旧本机 runner 时代形态
+    assert VA._is_hub_env()
+    marks.clear()                                         # 本机形态（两标记皆无）
+    monkeypatch.setenv("PA_VERIFY_WALL_CLOCK", "")  # 隔离宿主环境残留
+    assert not VA._is_hub_env()
+
+
 def test_wall_clock_local_tier(monkeypatch):
     monkeypatch.delenv("PA_VERIFY_WALL_CLOCK", raising=False)
     monkeypatch.setattr(VA, "_is_hub_env", lambda: False)
