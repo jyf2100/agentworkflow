@@ -82,6 +82,11 @@ DEFAULT_EVENT_TICKS = 720  # ≈ 5s tick 下每小时一轮（GitHub events 流�
 RELAY_TICKS_ENV = "HUB_RELAY_TICKS"
 DEFAULT_RELAY_TICKS = 24  # ≈ 5s tick 下每 2 分钟一轮（近实时的排队面捕获）
 
+# 主动观察者周期（add-proactive-observer）：白名单仓机械信号（CI 连红/issue 激增）
+# → 影子提案（observe 模式——仅日报聚合，不进执行链）。
+OBSERVER_TICKS_ENV = "HUB_OBSERVER_TICKS"
+DEFAULT_OBSERVER_TICKS = 720  # ≈ 每小时一轮（信号窗口小时级，更密无增益）
+
 # 可选远程 runner 面（add-hub-remote-runner，ADR-0009）：两键全不配 = 本机 daemon +
 # data_root 挂载，现状 byte-identical。add-hub-runner-pool 后两键降级为**首启 seed
 # 一次性消费**（serve 表空才灌一行 runners，此后面板 runners 表是唯一真相，env 再改
@@ -157,6 +162,8 @@ class HubConfig:
     event_ticks: int = DEFAULT_EVENT_TICKS
     # 订阅直通面（add-thread-subscription）：频道人话捕获轮询周期（N tick 一次）
     relay_ticks: int = DEFAULT_RELAY_TICKS
+    # 主动观察者面（add-proactive-observer）：仓信号观察周期（N tick 一次）
+    observer_ticks: int = DEFAULT_OBSERVER_TICKS
 
     def user_env(self) -> dict[str, str]:
         """容器 env-file 内容：三值 + 可选模型路由（与切片 2 保险箱同通道）。"""
@@ -262,6 +269,15 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
     if relay_ticks < 1:
         raise ConfigError(f"{RELAY_TICKS_ENV} 须 ≥1：{relay_ticks}")
 
+    # add-proactive-observer：观察周期同型校验
+    ob_raw = e.get(OBSERVER_TICKS_ENV)
+    try:
+        observer_ticks = int(ob_raw) if ob_raw else DEFAULT_OBSERVER_TICKS
+    except ValueError:
+        raise ConfigError(f"{OBSERVER_TICKS_ENV} 非整数：{ob_raw!r}") from None
+    if observer_ticks < 1:
+        raise ConfigError(f"{OBSERVER_TICKS_ENV} 须 ≥1：{observer_ticks}")
+
     # add-hub-runner-pool 6.1：docker_host 限形校验移至注册/seed 入口（db 层
     # _validate_runner_fields 单点）——本层只解析透传（seed 消费；表空态坏值 =
     # serve seed_runner 抛 DBError 启动 fail loud，行为等价原 ConfigError 拒起）。
@@ -299,4 +315,5 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         digest_ticks=digest_ticks,
         event_ticks=event_ticks,
         relay_ticks=relay_ticks,
+        observer_ticks=observer_ticks,
     )

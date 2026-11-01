@@ -67,6 +67,22 @@ def build_digest(cfg, database, drift_seen: set | None = None) -> str:
     except Exception as e:  # noqa: BLE001
         lines.append(f"池：（读取失败 {type(e).__name__}）")
 
+    # ③½ 影子提案（add-proactive-observer：观察面产物——仅日报聚合，采纳 = PRD frontmatter 关联）
+    try:
+        total_sp = adopted = 0
+        for sp_dir in sorted(cfg.data_root.glob("*/shadow_proposals")):
+            sps = list(sp_dir.glob("*.md"))
+            total_sp += len(sps)
+            prds = list((cfg.data_root / sp_dir.parent.name / "prd").glob("*.md"))
+            adopted += sum(
+                1 for sp in sps
+                if any(f"shadow-proposal:{sp.stem.split('_')[-1]}" in p.read_text(encoding="utf-8", errors="replace")
+                       for p in prds))
+        if total_sp:
+            lines.append(f"影子提案：现存 {total_sp} 条（已采纳 {adopted}——采纳方式见 RUNBOOK §26）")
+    except Exception as e:  # noqa: BLE001——单节 fail-open
+        lines.append(f"影子提案：（读取失败 {type(e).__name__}）")
+
     # ③ 配置漂移（drift_seen 去抖集合直读：drift 类键 = 未消解漂移项）
     if drift_seen is None:
         lines.append("漂移：（看门狗未运行——HUB_DRIFT_TICKS 槽未触发过）")

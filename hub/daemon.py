@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 
+import proactive_observer   # add-proactive-observer：挂点经 daemon 直调（lifecycle 零改动——纠缠文件）
 import stale_check
 
 ALERT_AFTER = 3  # 连续异常告警阈值：≥3 次连续失败升 ALERT 级日志（不中断循环）
@@ -91,6 +92,12 @@ def run_forever(
                 lc.relay_human_notes()
         except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
             print(f"[relay][warn] 直通挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
+        try:  # add-proactive-observer：第七低频槽——主动观察（影子提案，observe 模式）
+            # （同型防御——观察任何异常绝不崩排度循环；单仓异常在 poll 内不连坐）
+            if tick % lc.cfg.observer_ticks == 0:
+                proactive_observer.poll_proactive_signals(lc.cfg)
+        except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
+            print(f"[observer][warn] 观察挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
         if not stop_event.is_set():
             sleep(interval)
     print(f"[daemon] 优雅退出：当前迭代已收尾，连续异常 {consecutive}（在跑容器不动，重启经对账接管）")

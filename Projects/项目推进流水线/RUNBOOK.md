@@ -790,3 +790,20 @@ MM 频道模糊需求（「有据但验收不可执行」）不再被 critic 一
 **归属语义（harden-human-notes-lineage，审核 P1-2 修复）**：notes 归 **queue_item 谱系**而非 run 实例——队列重派（attempt+1）新 run 新树不改谱系键，attempt 1 窗口内的人话在重派后的 iteration 组装中同树可见（不因换树成死信，与 handoff「同 PRD 跨 run 连续」承诺对齐）；同一 queue item 再次入队（新 item id）开新谱系目录，两代需求上下文不串味。回执文案中的 run 编号是采集窗口事实陈述（哪棵在飞树的窗口里说的），非归属声明。切换前 `<run_dir>/human_notes/` 旧树不迁移不消费（未归档 change 自身修正，无存量承诺）。
 
 **与 dsh「订阅直通」的对应**：授权不扩大（Mandate = 既有确认环）、上下文直达任务（人话 → 需求谱系上下文面）、全双工的实时中断形态是长期方向（v1 排队档复用 dev 注入通道零新机制）。
+
+## 26. 主动观察者——影子提案（add-proactive-observer，2026-11）
+
+**本体**：影子提案 = 未经请求的**提议记录**（观察面产物——非 Trigger 非 PRD 非告警）；主动工作与被动工作授权方向相反（先观察后**请求**授权）。信号 = 仓的状态事实，与 event-sources 的 Trigger 范畴互斥（同一 GitHub API 按「actor 是不是人」分流）。
+
+**启用**：profiles/<name>.yaml 顶层加（pa load_profiles 只读 admission/name——零影响）：
+```yaml
+proactive:
+  mode: observe            # v1 唯一实装值；auto = 解析后降级 observe + warn（防「配了以为在跑」）
+  watch_repos: [owner/repo]
+  rules: {ci_red_streak: 2, issue_surge_ratio: 3.0, issue_surge_min: 3}   # 可省（缺省即此）
+```
+**判据全机械零 LLM**：T1 默认分支 CI 连红（连败段 ≥ ci_red_streak；**streak 锚 = 段最老 run id**——streak 增长同锚同提案、恢复后再红新 streak 新提案）；T2 issue 激增（24h opened > 7d 日均×ratio 且绝对数 ≥ min——防小仓 1→3 误报）。拉取三态 UNKNOWN 绝不提案（提错误比不提案更糟——信任流失）。
+
+**产物与采纳**：提案落 `<project>/shadow_proposals/YYYYMMDD_sp<hash8>.md`（幂等 = 文件名 hash(repo|signal|锚)）——**仅日报聚合节（现存 N/已采纳 M），永不即时 MM 推送**（「不需要时保持安静」）。采纳 = 人决定：`/pa run <需求>` 的 evidence 填 `shadow-proposal:sp-xxxx` → frontmatter `source:` 关联 → digest 计入命中率（**auto 放量的唯一依据**）。auto 三重前置（预算闸/置信门/全链 critic 不豁免）列后续 change。
+
+**与既有面的边界**：漂移项=需要修的错（MM 即时）；事件增量=进链原料（零推送）；提案=可选的机会（仅日报）。观察挂点经 daemon 直调（`HUB_OBSERVER_TICKS` 缺省 720≈每小时），lifecycle 零改动。

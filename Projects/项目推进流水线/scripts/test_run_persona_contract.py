@@ -23,6 +23,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 import run_daily  # noqa: E402
 
+# run_persona 契约面需 claude CLI 在场（resolve_claude_bin 的 which/nvm 探测不经
+# subprocess mock——无 CLI 时 sys.exit 而非断言失败）。CI runner 无 CLI → skip 整面
+# （本地面（roc/vault 双 checkout）恒有 CLI = 契约面恒被守）。纯逻辑测试（exit_diag
+# 直比等）不受影响——它们不触 CLI 解析。
+_HAS_CLAUDE_CLI = bool(os.environ.get("PA_CLAUDE_BIN") and Path(os.environ["PA_CLAUDE_BIN"]).is_file()) or bool(__import__("shutil").which("claude"))
+pytestmark = [pytest.mark.skipif(not _HAS_CLAUDE_CLI, reason="无 claude CLI（CI runner）——run_persona 契约面仅本地面实跑")]
+
 
 def _envelope(payload: dict) -> str:
     """构造 claude --output-format json 的两层信封：outer.result = json(inner payload)。"""

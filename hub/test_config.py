@@ -192,3 +192,11 @@ def test_relay_ticks_validation():
     for bad in ("0", "-1", "x"):
         with pytest.raises(config.ConfigError, match="HUB_RELAY_TICKS"):
             config.load_config(_full_env(HUB_RELAY_TICKS=bad))
+
+
+def test_observer_ticks_validation():
+    assert config.load_config(_full_env()).observer_ticks == config.DEFAULT_OBSERVER_TICKS
+    assert config.load_config(_full_env(HUB_OBSERVER_TICKS="360")).observer_ticks == 360
+    for bad in ("0", "-1", "x"):
+        with pytest.raises(config.ConfigError, match="HUB_OBSERVER_TICKS"):
+            config.load_config(_full_env(HUB_OBSERVER_TICKS=bad))

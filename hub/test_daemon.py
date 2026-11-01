@@ -25,7 +25,7 @@ class FakeLC:
         self.raise_at: set[int] = set()
         # 三低频槽默认天文数——既有测试零触发（各挂点测试单独设小值）
         self.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
-                                       digest_ticks=10**9, event_ticks=10**9, relay_ticks=10**9)
+                                       digest_ticks=10**9, event_ticks=10**9, relay_ticks=10**9, observer_ticks=10**9)
         self.notifier = None
 
     def reconcile_startup(self):
@@ -218,7 +218,25 @@ def test_relay_runs_every_n_ticks_and_survives_errors(capsys):
 
     lc, se = BoomRelay(), threading.Event()
     lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
-                                   digest_ticks=10**9, event_ticks=10**9, relay_ticks=2)
+                                   digest_ticks=10**9, event_ticks=10**9, relay_ticks=2, observer_ticks=10**9)
     rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
     assert rc == 0 and lc.ticks == 5 and lc.relays == 2
     assert "[relay][warn]" in capsys.readouterr().err
+
+
+def test_observer_slot_every_n_ticks_and_survives_errors(capsys, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_poll(cfg):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("gh 抽风")
+
+    monkeypatch.setattr(daemon.proactive_observer, "poll_proactive_signals", fake_poll)
+    lc, se = FakeLC(), threading.Event()
+    lc.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
+                                   digest_ticks=10**9, event_ticks=10**9, relay_ticks=10**9,
+                                   observer_ticks=2)
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
+    assert rc == 0 and lc.ticks == 5 and calls["n"] == 2  # tick 2/4 触发；首轮回炉不崩
+    assert "[observer][warn]" in capsys.readouterr().err
