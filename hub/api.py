@@ -625,12 +625,18 @@ def create_app(
             if r["ended_at"] < cutoff:
                 continue
             import json as _json
-            try:
-                disp = _json.loads((Path(r["run_dir"]).parent.parent.parent / "dispatch"
-                                    / f"{r['run_dir'].split('_')[0][:8] and r['started_at'][:10].replace('-', '')}.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                disp = []
-            for d in disp if isinstance(disp, list) else []:
+            # state 卷根下 dispatch_*.json 平级文件（非子目录——审核修正）；stamp 有 m 后缀
+            # 形态（dispatch_20261028m11.json），按 run_dir 的 slug 段匹配行——glob 全扫
+            slug = Path(r["run_dir"]).name.split("_", 1)[1] if "_" in Path(r["run_dir"]).name else ""
+            disp = []
+            for df in sorted(Path(r["run_dir"]).parent.parent.parent.glob("dispatch_*.json")):
+                try:
+                    day = _json.loads(df.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(day, list):
+                    disp.extend(d for d in day if isinstance(d, dict) and d.get("slug", "").endswith(slug))
+            for d in disp:
                 status = str(d.get("status") or "")
                 if status in ("blocked_test_gate",) or "triage" in str(d.get("skip_reason") or "") or str(d.get("status") or "").startswith("verify_invalid"):
                     item_id = r.get("queue_item_id") or 0
