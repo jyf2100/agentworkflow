@@ -2566,22 +2566,44 @@ def _write_per_cmd_outputs(log_file: Path, matched: dict) -> dict[str, str]:
 
 
 # ─── verify 闭环辅助（dev→独立验证→pa-verify，docs/verify-commit-loop-design.md §3/§5）──
-def _merge_human_notes(project: str, prd_abs: str) -> str | None:
-    """频道人话合并 artifact（add-thread-subscription D2 排队面）：扫描该项目最新 run 目录的
-    human_notes/*.md（hub relay 落盘于 state 卷同树——容器内可达），按文件名序合并成单 md；
-    无 notes → None（cmd 零参数 baseline）。每轮组装现扫现并——round 1 通常为空，retry/revise
-    轮自然带上途中累积的人话（幂等：消费不删盘，dev 侧仅上下文非判据）。"""
+def _queue_item_id_for_stamp(project: str, stamp: str) -> int | None:
+    """谱系回链（harden-human-notes-lineage D3）：本 dispatch 的 queue_item_id。
+
+    hub 派发时把 queue_item_id 署进 run 树的 `<stamp>_<slug>.meta.json`（meta_sign F10，
+    state 挂载 pa 可读）——在 `runs/<project>/` 下取名字以 `<stamp>_` 开头的目录（hub 建
+    目录、pa 只写平铺文件，lifecycle 布局事实；钉 `<stamp>_` 前缀防撞同日重派树 `…m` 后缀）
+    读其 meta 的 queue_item_id。stamp 收敛性：hub allocate_fresh_stamp 与 inject bump 查同
+    一 manifest 判据，single-flight 下两侧同 stamp；发散/坏 meta/无目录 → None（fail-open）。"""
     runs_root = STATE_DIR / "runs" / project
     if not runs_root.is_dir():
         return None
-    slug = _slugify(Path(prd_abs).stem)
-    dirs = sorted((d for d in runs_root.iterdir() if d.is_dir() and d.name.endswith(slug)),
-                  key=lambda d: d.name)
-    if not dirs:
+    for d in sorted(p for p in runs_root.iterdir() if p.is_dir() and p.name.startswith(stamp + "_")):
+        metas = sorted(d.glob("*.meta.json"))
+        if not metas:
+            continue
+        try:
+            qi = json.loads(metas[0].read_text(encoding="utf-8")).get("queue_item_id")
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError, AttributeError):
+            continue   # 单目录坏 meta 不连坐（观察面 fail-open）
+        if isinstance(qi, int):
+            return qi
+    return None
+
+
+def _merge_human_notes(project: str, prd_abs: str, stamp: str) -> str | None:
+    """频道人话合并 artifact（add-thread-subscription D2 排队面；harden-human-notes-lineage
+    谱系读面）：经 hub 署名 meta 回链 queue_item_id（``_queue_item_id_for_stamp``）→ 读谱系
+    目录 ``<state>/human_notes/qi-<id>/*.md``（hub relay 写面同树）按文件名序合并成单 md。
+    谱系键跨 run 实例连续——attempt 1 窗口内的人话在重派（attempt+1 新 stamp 新树）后照常
+    可见（审核 P1-2 断链修复）。meta 缺失/谱系目录不存在/无 notes → None（cmd 零参数
+    baseline，不拦派发）。每轮组装现扫现并——幂等：消费不删盘，dev 侧仅上下文非判据。"""
+    qi = _queue_item_id_for_stamp(project, stamp)
+    if qi is None:
         return None
-    notes = sorted((dirs[-1] / "human_notes").glob("*.md"))
+    notes = sorted((STATE_DIR / "human_notes" / f"qi-{qi}").glob("*.md"))
     if not notes:
         return None
+    slug = dev_slugify(Path(prd_abs).stem)   # ADR-0006 单一源头（原 _slugify 引用系死码，D6 修复）
     out = STATE_DIR / f"human_notes_merged_{project}_{slug}.md"
     out.write_text("\n\n---\n\n".join(
         f"<!-- {n.name} -->\n{n.read_text(encoding='utf-8', errors='replace')}" for n in notes),
@@ -3760,7 +3782,7 @@ def _dispatch_one_inner(entry: dict, prof: dict, stamp: str, args, *, slot_handl
             rec["_learning_promotion_count"] = _lessons_pkg["promotion_count"]
             if _lessons_pkg["degraded_class"]:
                 rec["_learning_injection_degraded"] = _lessons_pkg["degraded_class"]
-        _human_notes_artifact = _merge_human_notes(entry["project"], prd_abs)
+        _human_notes_artifact = _merge_human_notes(entry["project"], prd_abs, stamp)
         if _coord.flags.session_aware_retry:   # task 3.3 P0-3：retry 模式注入 state_dir+session 参数（baseline flag 关→原 cmd 零变化）
             cmd = _dev_cmd(prof, prd_abs, cur_base, src_abs, feedback_artifact=_fb_artifact,
                            state_dir=str(STATE_DIR), iteration_seq=round_n,

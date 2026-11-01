@@ -4,7 +4,8 @@
 MUST NOT 断言——排障入口在 RUNBOOK 六层模型节）/ L3 hub.env（env_file 仅容器创建时读入，restart
 不重读）/ L4 凭据保险箱（vault 优先、env 兜底）/ L5 网关注册面（模型名按网关分家）/ L6 run 容器实况。
 
-断言范围 = hub 可达四层（R1 L3意图vs快照 / R2 L4vsL3兜底源 / R3 L5 membership+alias 形态 /
+断言范围 = hub 可达四层（R1 L3意图vs快照 / R2 L4vsL3兜底源 / R3 L5 membership+消费面探活+alias 形态
+（add-drift-l5-health-probe：名册在册≠上游可用，L5 健康=存在∧可用两判据合取——审核 P1-1）/
 R4 L6 在场+形态），全部机械判据零人工判读，网络依赖三态分流（UNKNOWN 绝不进漂移项）。
 
 纪律：只读不写（绝不自动修复）；逐规则吞异常（单规则挂不连坐）；值绝不入面（键名/长度先例：
@@ -41,6 +42,14 @@ _EXEC_TIMEOUT = 15
 # 去抖键形态：("drift", rule, key) 参与消解清空；（"info"/"premise"/"off"/"degrade", ...）
 # 是持续态提示不参与消解（防消解后 info 项重复刷屏）。
 HttpGet = Callable[[str, str], tuple[int, list[str] | None]]
+# 探活接缝（add-drift-l5-health-probe）：(url, token, model) -> HTTP status（2xx 折叠 200；0=网络/超时）。
+HttpPost = Callable[[str, str, str], int]
+
+# 探活确定性死链闭合集：固定 canonical 最小补全遭 4xx 拒绝是「注册的属性而非请求的属性」
+# （404 = model_not_found/no deployments 网关权威裁决「此名无可用部署」；400 = invalid_request 类
+# 确定性拒绝）。排除 429（负载瞬态）/401/403（探活凭据作用域非模型死活）/5xx（死链原始连接错与
+# 过载同形，单发不可机械分辨——非确定性错绝不进漂移，RUNBOOK §23 排障速查给人工复测通道）。
+PROBE_DEAD_CODES = frozenset({400, 404})
 
 
 @dataclass
@@ -72,6 +81,27 @@ def _default_http_get(url: str, token: str) -> tuple[int, list[str] | None]:
     data = payload.get("data") if isinstance(payload, dict) else None
     ids = [m.get("id") for m in data if isinstance(m, dict) and m.get("id")] if isinstance(data, list) else []
     return 200, ids
+
+
+def _default_http_probe(url: str, token: str, model: str) -> int:
+    """默认消费面探活：POST {base}/v1/messages 最小补全（Bearer token 同 membership）。
+
+    请求体固定 canonical（三必填字段 + max_tokens=1 + "ping"）——4xx 拒绝因此是注册的属性而非
+    请求的属性（PROBE_DEAD_CODES 判据根基）。返回 HTTP status（2xx 一律折叠 200）；0 = 网络错/
+    超时（UNKNOWN 形态）。响应体不参与判据（status 码锚定，不嗅探 body 错误文本）也不落日志。
+    """
+    body = json.dumps({"model": model, "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "ping"}]}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT):
+            return 200
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return 0
 
 
 def _parse_intent(path: Path) -> tuple[dict[str, str], list[str]]:
@@ -189,8 +219,9 @@ def _rule_r2(cfg, vault, drift: list, pending: list, states: dict) -> None:
     states["r2"] = "ok"
 
 
-def _rule_r3(cfg, vault, drift: list, pending: list, states: dict, http_client: HttpGet) -> None:
-    """R3：L5 membership（三态）+ alias 形态预检（负向黑名单，零网络）。"""
+def _rule_r3(cfg, vault, drift: list, pending: list, states: dict,
+             http_client: HttpGet, probe_client: HttpPost) -> None:
+    """R3：L5 membership（三态）+ 消费面探活（三态）+ alias 形态预检（负向黑名单，零网络）。"""
     base, token, model = _dispatch_source(cfg, vault)
     names: set[str] = set()
     for k, v in os.environ.items():
@@ -220,7 +251,28 @@ def _rule_r3(cfg, vault, drift: list, pending: list, states: dict, http_client: 
                 "网关 /v1/models 未注册该模型名（精确匹配，大小写敏感——roc 认 Qwen3.8-27B 不认"
                 " qwen3.8-27b-fast 的分家实证）",
                 "LiteLLM admin API /model/new 注册/修正（需 master key = litellm 容器 env LITELLM_MASTER_KEY）"))
-        states["r3"] = "ok"
+        # 探活步（add-drift-l5-health-probe，审核 P1-1）：名册在册 ≠ 上游可用——在册名逐名一次
+        # 最小补全（max_tokens=1，与 membership 同轮内、缺名者不探活不重复计费）三态分流：
+        # 2xx 可用零报 / 404·400 确定性死链进漂移 / 其余（网络/超时/5xx/429/401/403）UNKNOWN
+        # 绝不进漂移——确定性错绝不归 UNKNOWN 静默，反向同样成立（design D1）。
+        # 键面 = 模型名（探活）——与 membership 缺名项（键 = 裸模型名）去抖身份独立：修复路径的
+        # 跨轮形态转换（/model/delete 删注册→缺名 / 重新注册→死链）无消解轮隔开也恢复告警
+        # （冷评审 R2：共用裸键会让「按指引删除」后的缺名被 new_drift 吞掉且永不消解）。
+        unknown = 0
+        for m in sorted((names - ALIAS_BLACKLIST) & registered):
+            code = probe_client(f"{base.rstrip('/')}/v1/messages", token, m)
+            if 200 <= code < 300:
+                continue
+            if code in PROBE_DEAD_CODES:
+                drift.append(DriftItem(
+                    "R3", "L5名册→L5可用", f"{m}（探活）",
+                    f"网关名册在册但消费面探活遭确定性拒绝（HTTP {code}，max_tokens=1 最小补全）——"
+                    "名册在册≠上游可达（2026-10-31 死链 qwen3.6-35b→8896 形态，审核 P1-1）",
+                    "LiteLLM admin API 修正该注册上游（/model/update 改 litellm_params 指向活上游）"
+                    "或下线死注册（/model/delete；需 master key = litellm 容器 env LITELLM_MASTER_KEY）"))
+            else:
+                unknown += 1  # 瞬时族：单发探活无法机械分辨持续死与瞬时抖（心跳可见不进 MM）
+        states["r3"] = "ok" if not unknown else f"ok（探活 UNKNOWN×{unknown}）"
     elif status in (401, 403):
         pending.append(("degrade", ("degrade", "r3_403"),
                         "[drift][warn] R3 membership 断言降级：网关 /v1/models 401/403"
@@ -275,22 +327,26 @@ def _rule_r4(dbm, drift: list, states: dict, docker_bin: str) -> None:
 
 
 def check_drift(cfg, vault, dbm, *, seen: set, notifier=None,
-                http_client: HttpGet | None = None, docker_bin: str = "docker") -> None:
+                http_client: HttpGet | None = None, probe_client: HttpPost | None = None,
+                docker_bin: str = "docker") -> None:
     """单轮漂移检查（daemon 每 drift_ticks 个 tick 调一次）。
 
     seen = 去抖集合（调用方持有，进程生命周期）；notifier = 通道（None = 全降级 stderr）。
     报告三分：漂移项 → MM + stderr 去抖一次；前提故障 → MM 一次性 + 心跳降级标注；
     信息项 → 仅 stderr 去抖（不进 MM，值班私信只承载真漂移）。每轮 stderr 一行心跳。
     异常逐规则吞（单规则挂不连坐），本函数正常返回；不写任何面（只读观察）。
+    probe_client（add-drift-l5-health-probe）缺省 _default_http_probe——lifecycle 挂点零改动。
     """
     if http_client is None:
         http_client = _default_http_get
+    if probe_client is None:
+        probe_client = _default_http_probe
     drift: list[DriftItem] = []
     pending: list[tuple[str, tuple, str]] = []  # (kind, 去抖键, 文本)
     states: dict[str, str] = {}
     for rid, fn in (("r1", lambda: _rule_r1(cfg, drift, pending, states)),
                     ("r2", lambda: _rule_r2(cfg, vault, drift, pending, states)),
-                    ("r3", lambda: _rule_r3(cfg, vault, drift, pending, states, http_client)),
+                    ("r3", lambda: _rule_r3(cfg, vault, drift, pending, states, http_client, probe_client)),
                     ("r4", lambda: _rule_r4(dbm, drift, states, docker_bin))):
         try:
             fn()

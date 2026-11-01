@@ -1,4 +1,5 @@
-"""订阅直通——绑定频道在飞 run 窗口内的授权人话 → human_notes 排队面（add-thread-subscription，spec: hub-mm-intake「订阅直通」）。
+"""订阅直通——绑定频道在飞 run 窗口内的授权人话 → human_notes 排队面（add-thread-subscription，spec: hub-mm-intake「订阅直通」；
+harden-human-notes-lineage：落点谱系化）。
 
 三条红线：不新增派发授权（Gate = 成员三态既有判据，与 /pa 入站同门）；不中断/不改写
 在飞 run（v1 只做排队面——落盘 + 下一 iteration 经 --human-notes 注入，仅上下文非判据）；
@@ -8,6 +9,12 @@
 作者 → 归该频道最老在飞 run（single-flight 串行下同频道天然单 run）。水位（D3） =
 db intake_watermarks 键 thread_relay:{channel_id}，存上次见到的最大 create_at(ms)——
 重启安全（水位持久），(message_id 在文件名) 双保险幂等。
+
+归属本体（harden-human-notes-lineage D1/D2，审核 P1-2）：notes 归 **queue_item 谱系**
+而非 run 实例——落 `<data_root>/<project>/state/human_notes/qi-<queue_item_id>/`（cfg
+data_root 推导，与 lifecycle state_root 同拼法）。谱系键 = run 行 queue_item_id（重派
+attempt+1 新 run 新树不改键）→ 旧 iteration 窗口的人话在重派后 pa 合并读面同树可见，
+不因换树成死信；hub 写 pa 读同树（state 挂载既有面，零新挂载）。
 """
 from __future__ import annotations
 
@@ -23,6 +30,16 @@ def _post_ms(post: dict) -> int:
         return int(post.get("create_at") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _lineage_notes_dir(cfg, project: str, run: dict) -> Path:
+    """谱系落点（harden-human-notes-lineage D2）：<data_root>/<project>/state/human_notes/qi-<id>/。
+
+    键 = run 行 queue_item_id（NOT NULL 列，idx_runs_item）——重派不改键；与 lifecycle 的
+    state_root 拼法同源（cfg.data_root / project / "state"），pa 容器内即 STATE_DIR/human_notes/
+    qi-<id>（state 挂载同树）。cfg 而非 run_dir.parent.parent 推导：部署路径归属 config，
+    不耦合目录层级布局。"""
+    return Path(cfg.data_root) / project / "state" / "human_notes" / f"qi-{run['queue_item_id']}"
 
 
 def relay_channel_notes(cfg, database, mm, notifier=None, *, member_cache=None) -> int:
@@ -55,7 +72,7 @@ def relay_channel_notes(cfg, database, mm, notifier=None, *, member_cache=None) 
                 print(f"[relay] {project} 频道读取 UNKNOWN（网络/权限），下轮再查", file=sys.stderr)
                 continue
             bot_id = mm.bot_user_id()
-            notes_dir = Path(run["run_dir"]) / "human_notes" if run else None
+            notes_dir = _lineage_notes_dir(cfg, project, run) if run else None
             taken, newest = 0, since
             for p in posts:
                 ms = _post_ms(p)

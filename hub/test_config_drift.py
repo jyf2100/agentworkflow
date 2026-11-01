@@ -2,6 +2,8 @@
 
 fake 注入（FakeCfg/FakeVault/FakeDB/FakeNotifier/FakeGateway + monkeypatch subprocess.run）：
 零网络零 docker；值不入面断言（键名/长度面）。紧凑写法是仓库既有 test 风格（ruff 仅 E9+F）。
+add-drift-l5-health-probe 增量：R3 消费面探活（_probe fake 与 _gw 列表 fake 分别注入）——
+确定性死链（404/400）→漂移 / 瞬时（0/5xx/429/40x 鉴权）→UNKNOWN / 可用 2xx 零报 / 与 membership 共存。
 """
 from __future__ import annotations
 
@@ -56,10 +58,16 @@ def _gw(status=200, ids=()):
     return lambda url, token: (status, list(ids))
 
 
-def _run_check(cfg, vault=None, dbm=None, seen=None, notifier=None, http=None):
+def _probe(status=200):
+    """探活 fake（add-drift-l5-health-probe）：缺省 2xx=可用，保既有测试密闭零网络。"""
+    return lambda url, token, model: status
+
+
+def _run_check(cfg, vault=None, dbm=None, seen=None, notifier=None, http=None, probe=None):
     seen = set() if seen is None else seen
     config_drift.check_drift(cfg, vault, dbm or FakeDB([]), seen=seen,
-                             notifier=notifier, http_client=http or _gw(200, []))
+                             notifier=notifier, http_client=http or _gw(200, []),
+                             probe_client=probe or _probe(200))
     return seen
 
 
@@ -160,6 +168,74 @@ def test_r3_unknown_two_states_and_degrade_once(monkeypatch, capsys):
     assert capsys.readouterr().err.count("membership 断言降级") == 0
 
 
+# ── R3 探活（add-drift-l5-health-probe，审核 P1-1：名册在册≠上游可用）──
+
+def test_r3_probe_deterministic_dead_link_and_dedup(monkeypatch, capsys):
+    monkeypatch.setenv("PA_DEV_MODEL", "m404")
+    monkeypatch.setenv("PA_PERSONA_MODEL_PA_PRD", "m400")
+    cfg, n = _mk_cfg(), FakeNotifier()
+    http = _gw(200, ["m404", "m400"])                          # 两名都在册（membership 全过）
+    probe = lambda u, t, m: {"m404": 404, "m400": 400}[m]      # 404/400 确定性闭合集两形态
+    seen = _run_check(cfg, notifier=n, http=http, probe=probe)
+    err = capsys.readouterr().err
+    assert "m404（探活）" in err and "HTTP 404" in err and "L5名册→L5可用" in err  # 在册死链 = 漂移（键面带形态标记）
+    assert "m400（探活）" in err and "HTTP 400" in err                            # 400 同属确定性集
+    assert "名册在册≠上游可达" in err and "qwen3.6-35b" in err                      # 事故形态口径
+    assert "/model/update" in err and "/model/delete" in err                      # 修复指引（修上游/下线）
+    assert len(n.sent) == 2 and all("Bearer" not in s for s in n.sent)            # 各一私信；token 不入面
+    _run_check(cfg, seen=seen, notifier=n, http=http, probe=probe)
+    assert len(n.sent) == 2 and "本轮新报 0" in capsys.readouterr().err           # 复用 drift 键去抖不重发
+
+
+def test_r3_probe_key_independent_from_membership_on_delete(monkeypatch, capsys):
+    # 冷评审 R2：死链→按指引 /model/delete→缺名，无消解轮隔开——缺名告警不得被探活同键吞掉
+    monkeypatch.setenv("PA_DEV_MODEL", "m-dead")
+    cfg, n = _mk_cfg(), FakeNotifier()
+    seen = _run_check(cfg, notifier=n, http=_gw(200, ["m-dead"]), probe=_probe(404))
+    assert len(n.sent) == 1 and "m-dead（探活）" in capsys.readouterr().err        # 轮 N：死链告警入 seen
+    _run_check(cfg, seen=seen, notifier=n, http=_gw(200, []), probe=_probe(200))  # 删注册后名册缺名（无零漂移轮）
+    err = capsys.readouterr().err
+    assert "m-dead" in err and "L5注册→消费面" in err and len(n.sent) == 2         # 缺名漂移照报（键身份独立）
+    assert "已消解" not in err                                                    # 漂移非空不消解（语义自洽）
+
+
+def test_r3_probe_transient_unknown_no_drift(monkeypatch, capsys):
+    monkeypatch.setenv("PA_DEV_MODEL", "m1")
+    n = FakeNotifier()
+    for code in (0, 500, 429, 403):                            # 网络/5xx/限流/鉴权 → 全 UNKNOWN
+        _run_check(_mk_cfg(), notifier=n, http=_gw(200, ["m1"]), probe=_probe(code))
+    err = capsys.readouterr().err
+    assert "L5名册→L5可用" not in err and not n.sent           # 绝不进漂移不进 MM
+    assert err.count("探活 UNKNOWN×1") == 4                    # 心跳可见（stderr）但不告警
+
+
+def test_r3_probe_available_zero_report(monkeypatch, capsys):
+    monkeypatch.setenv("PA_DEV_MODEL", "m1")
+    n = FakeNotifier()
+    _run_check(_mk_cfg(), notifier=n, http=_gw(200, ["m1"]), probe=_probe(200))
+    err = capsys.readouterr().err
+    assert "R3=ok" in err and "UNKNOWN" not in err             # 2xx 可用 → 零报零标注
+    assert "漂移 0 项" in err and not n.sent
+
+
+def test_r3_probe_coexists_with_membership_no_crossfire(monkeypatch, capsys):
+    monkeypatch.setenv("PA_DEV_MODEL", "m-dead")               # 在册（探活 404 死链）
+    monkeypatch.setenv("PA_PERSONA_MODEL_PA_PRD", "m-missing")  # 缺名（membership 漂移）
+    calls: list[str] = []
+
+    def probe(url, token, model):
+        calls.append(model)
+        return 404
+
+    n = FakeNotifier()
+    _run_check(_mk_cfg(), notifier=n, http=_gw(200, ["m-dead"]), probe=probe)
+    err = capsys.readouterr().err
+    assert "m-missing" in err and "L5注册→消费面" in err        # 缺名漂移照常报
+    assert "m-dead" in err and "L5名册→L5可用" in err           # 在册死链漂移同轮共存
+    assert calls == ["m-dead"]                                 # 缺名者不探活（成本面+判据互斥不连坐）
+    assert len(n.sent) == 2                                    # 两漂移项各一私信
+
+
 # ── R4：L6 在场 + 形态 ──────────────────────────────────────────
 
 def _fake_exec(monkeypatch, stdout="", rc=0, raise_exc=None):
@@ -200,18 +276,22 @@ def test_dedup_once_and_resolution_receipt(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PA_DEV_MODEL", "x" * 8)
     intent.write_text("PA_DEV_MODEL=" + "y" * 6 + "\n", encoding="utf-8")
     cfg, n, seen = _mk_cfg(intent=intent), FakeNotifier(), set()
-    gw = _gw(200, ["x" * 8, "y" * 6])  # 网关两侧名都注册（隔离出 R1 单一漂移源）
-    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n, http_client=gw)
+    gw, pgw = _gw(200, ["x" * 8, "y" * 6]), _probe(200)  # 网关两侧名都注册（隔离出 R1 单一漂移源）
+    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n,
+                             http_client=gw, probe_client=pgw)
     assert len(n.sent) == 1
-    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n, http_client=gw)
+    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n,
+                             http_client=gw, probe_client=pgw)
     assert len(n.sent) == 1                                       # 同项去抖不重发
     assert "本轮新报 0" in capsys.readouterr().err
     monkeypatch.setenv("PA_DEV_MODEL", "y" * 6)                   # 修复（两侧一致）
-    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n, http_client=gw)
+    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n,
+                             http_client=gw, probe_client=pgw)
     err = capsys.readouterr().err
     assert "已消解（1 项）" in err and len(n.sent) == 2           # 消解回执一次
     monkeypatch.setenv("PA_DEV_MODEL", "x" * 8)                   # 复发可再告警
-    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n, http_client=gw)
+    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n,
+                             http_client=gw, probe_client=pgw)
     assert len(n.sent) == 3
 
 
