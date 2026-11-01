@@ -50,6 +50,22 @@ RUN useradd -m -s /bin/bash pa \
     && mkdir -p /workspace \
     && chown -R pa:pa /home/pa /workspace /opt/pa
 
+# helix 技能面（add-helix-target-harness）：快照随 COPY . 进投影，拷至同一容器用户级技能目录合并。
+# tdd / code-review 与 executor-skills 同名——incumbent 让位原则排除（helix 版深度绑定 /helix:*
+# 工作流且依赖插件运行时，容器内不装插件主体；executor-skills 自包含通用版保留），勿改成全量 cp
+# （会静默覆盖 v0.1.8 起交付的 mattpocock 版）。守卫比对 executor-skills 快照源目录：上游新增
+# 表外撞名（implement/pr 等通用名高风险）build 即 fail loud，不静默覆盖（见 PROVENANCE 刷新流程）。
+RUN for d in /opt/pa/hub/deploy/helix-skills/*/; do \
+        n="$(basename "$d")"; \
+        case "$n" in tdd|code-review) continue ;; esac; \
+        if [ -e "/opt/pa/hub/deploy/executor-skills/$n" ]; then \
+            echo "helix-skills: '$n' 与 executor-skills 同名（case 排除表外新撞名）——扩排除表（让位）或上游更名后重跑" >&2; \
+            exit 1; \
+        fi; \
+        cp -r "$d" /home/pa/.claude/skills/; \
+    done \
+    && chown -R pa:pa /home/pa/.claude/skills
+
 USER pa
 ENV HOME=/home/pa
 # onboarding 预置：claude --version 冒烟 + 跳过首次交互向导（headless 前提）

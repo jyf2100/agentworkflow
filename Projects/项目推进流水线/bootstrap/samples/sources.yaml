@@ -1,11 +1,32 @@
 # sources.yaml — 采集源配置（实例数据，位于 .project-auto/ 不入仓）
 # 空模板：signal 链（fetch/radar/prd）需要时在此加源；手动 PRD 注入（--from-stage inject 起）不需要本文件。
 # 结构以 scripts/run_daily.py load_sources/FETCH_CONFIG 为准；name 全局唯一、root 全局排他（硬错不静默）。
+# hub 形态：每项目一份 HUB_DATA_ROOT/<project>/sources.yaml（同结构，随项目启动必读面）。
 sources: []
 # 每项结构示例（kind 决定 fetch 行为；缺省 directory = 只扫已有文件、不主动抓取）：
+# kind 专属参数一律嵌在 params 下（fetch prompt 只读 params.*，run_daily.py github_repo_prompt 等）：
 # - name: my-github-watch        # 采集源身份（必须全局唯一）
 #   root: Knowledge/github-watch/  # 内容根（必须全局排他——一个 root 只属一个源）
-#   kind: github-repo            # directory | github-repo | wechat-url | agent-deepresearch
-#   repos: [owner/repo]          # github-repo：监控的仓（gh CLI 拉 window 内 commits/pulls）
-#   urls: [https://mp.weixin.qq.com/s/xxxx]   # wechat-url：抓取的公众号文章
-#   topic: 某主题的深研问题        # agent-deepresearch：研究主题（合成一份带引用报告）
+#   kind: github-repo            # directory | github-repo | forge-repo | wechat-url | agent-deepresearch
+#                                 #   （forge-repo 多平台多维度监控，字段契约见 openspec forge-watch spec）
+#   params:
+#     repos: [owner/repo]        # github-repo：监控的仓（gh CLI 拉 window 内 commits/pulls）
+#     window: "7d"               # github-repo/forge-repo 共用：回看窗口（Nd/Nh，缺省 7d）
+#     urls: [https://mp.weixin.qq.com/s/xxxx]   # wechat-url：抓取的公众号文章
+#     prompts: [某主题的深研问题]  # agent-deepresearch：研究主题列表（合成一份带引用报告）
+#
+# ── github-repo 完整示例（didi/helixharness；add-helix-signal-source 2026-10-31）────────────
+# 字段 = ADR-0007 条目全集；整块取消注释、按需改 target_projects 即跟踪（live 段保持 sources: []
+# ——template 不替实例默认跟踪，本注释块只是教学载体）。radar 只喂 target_projects 里已准入的
+# 项目（缺省一个不喂——防新源误喂不相关项目）；content_glob/marker 是 radar 消费面必填
+# （discover 今日新文件 + 水位线 bump，marker 相对仓根 .project-auto/）。
+# 参考克隆（vault 外只读）：didi/helixharness main @ 44ffc536（2026-10-30）。
+# - name: helix-watch
+#   kind: github-repo
+#   root: Knowledge/github-watch/
+#   content_glob: "**/[0-9]*.md"
+#   params:
+#     repos: [didi/helixharness]
+#     window: "7d"
+#   target_projects: [<已准入项目名>]   # 填 profiles/ 里 admission: true 的项目名
+#   marker: state/consumed_helix_watch

@@ -121,6 +121,14 @@
 #   修：already_dispatched github 面（fapi=None 且有 owner_repo）分支扫描走 _scan_branches_via_gh
 #   （gh api repos/<o>/branches --paginate，与 PR 扫描同通道同凭据，数据同源）；forge 面保留
 #   ls-remote+重试（无 gh）。2 文件增量（run_daily + test_github_container_dispatch 4 新用例）。
+# 2026-10-31 v0.1.35（add-helix-target-harness）：镜像内置 helix 技能面——HelixHarness
+#   （github.com/didi/helixharness，Apache-2.0，快照钉 commit 44ffc53）skills 面 8 个 skill
+#   入库快照 hub/deploy/helix-skills/（1.3M + PROVENANCE），COPY 进投影并拷至
+#   /home/pa/.claude/skills/（6/8：tdd / code-review 与 executor-skills 同名让位 incumbent，
+#   守卫对表外新撞名 fail loud）；纯技能快照不含插件运行时（commands/hooks/scripts/agents
+#   不进；d-d2c 上游 frontmatter hooks 块已中和，见 PROVENANCE 偏差记录），无遥测 consent 面。
+#   实际 build 走全量版 pa-executor.Dockerfile + rsync 投影副本 context（§15 演进注记：
+#   v0.1.19 起未走 patch 面，勿据本文件 FROM 行推断最新 tag）；本文件同步加层仅作层序真理源。
 FROM pa-executor:v0.1.17
 
 USER root
@@ -141,6 +149,23 @@ COPY .dockerignore /opt/pa/.dockerignore
 COPY hub/deploy/executor-skills /opt/pa/hub/deploy/executor-skills
 RUN mkdir -p /home/pa/.claude/skills \
     && cp -r /opt/pa/hub/deploy/executor-skills/. /home/pa/.claude/skills/ \
+    && chown -R pa:pa /home/pa/.claude/skills
+# helix 技能面（add-helix-target-harness，v0.1.35）：进投影 + 拷至容器用户级技能目录与
+# executor-skills 同目录合并（dev loop 可见；PROVENANCE.md 随包进镜像，容器内可溯源）。
+# tdd / code-review 与 executor-skills 同名——incumbent 让位原则排除（helix 版深度绑定
+# /helix:* 工作流且依赖插件运行时，容器内不装插件主体；mattpocock 自包含通用版保留），
+# 勿改成全量 cp（会静默覆盖 base 层 v0.1.8 起交付的同名 skill）。守卫比对 executor-skills
+# 快照源目录：上游新增表外撞名 build 即 fail loud，不静默覆盖（见 PROVENANCE 刷新流程）。
+COPY hub/deploy/helix-skills /opt/pa/hub/deploy/helix-skills
+RUN for d in /opt/pa/hub/deploy/helix-skills/*/; do \
+        n="$(basename "$d")"; \
+        case "$n" in tdd|code-review) continue ;; esac; \
+        if [ -e "/opt/pa/hub/deploy/executor-skills/$n" ]; then \
+            echo "helix-skills: '$n' 与 executor-skills 同名（case 排除表外新撞名）——扩排除表（让位）或上游更名后重跑" >&2; \
+            exit 1; \
+        fi; \
+        cp -r "$d" /home/pa/.claude/skills/; \
+    done \
     && chown -R pa:pa /home/pa/.claude/skills
 # critic 手写 PRD 判据修复（v0.1.9）：/home/pa 侧 agent 定义在 base 层拷贝，
 # patch 层目录级 COPY 只覆盖 /opt/pa，须重刷 critic 定义到容器用户级目录。

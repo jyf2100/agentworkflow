@@ -19,5 +19,7 @@ Projects/项目推进流水线/release/.dockerignore
 # executor 镜像内置技能快照（add-executor-eng-skills，spec: execution-hub）——patch.Dockerfile
 # COPY 引用该路径，投影不纳管 = 后续 tag build context 缺源 fail loud
 hub/deploy/executor-skills/
+# executor 镜像 helix 技能面快照（add-helix-target-harness，spec: execution-hub）——同理纳管
+hub/deploy/helix-skills/
 openspec/specs/
 docs/adr/
