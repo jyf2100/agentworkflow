@@ -22,6 +22,18 @@ import event_poller
 import router_relay
 import thread_relay
 import events
+
+# add-effects-queue D2：副作用包裹接缝（先落账再执行）
+def _effect(dbm, kind: str, payload: dict):
+    """context manager：enter 先 insert pending，exit 标 done/failed。"""
+    class _Ctx:
+        def __enter__(self):
+            self.id = dbm.insert_effect(kind, payload)
+            return self
+        def __exit__(self, exc_type, *_):
+            dbm.complete_effect(self.id, "failed" if exc_type else "done")
+            return False  # 不吞异常
+    return _Ctx()
 import health_probe
 import image_sync
 import notify
@@ -241,7 +253,9 @@ class Lifecycle:
         if outcome is None:
             print(f"[notify][info] run#{rid} 无 pipeline_outcome——通知回退 exit-code 文本", file=sys.stderr)
         try:
-            self.notifier.notify_run(
+            with _effect(self._db, "mm_notify",
+                         {"action": "run_finished", "run_id": rid, "status": status}):
+                self.notifier.notify_run(
                 run_id=rid, project=project, run_dir_name=run_dir_name, status=status,
                 exit_code=exit_code, enqueued_by=(item or {}).get("enqueued_by"),
                 initiator=(item or {}).get("initiator"), last_error=last_error,
@@ -380,12 +394,11 @@ class Lifecycle:
                 # PA_SINGLE_FLIGHT_AUTO_MERGE 经 hub.env → hub 进程 env → run 容器；破坏性
                 # flag 默认关，部署机按需在 hub.env 本地面开，不进 compose/仓）。sorted 保
                 # 确定性；PA_REPORT_DIR 本处生成，排除防重复。
-                # GIT_CONFIG_*（run 183 真机实证）：git 原生 env 注入 config 机制（≥2.31），
                 # 远程 runner 机容器直连 github 被断时经 hub.env 配 per-URL 代理——只路由
                 # git 流量，LLM/roc 代理流量不经此通道（与 https_proxy 全局 env 的关键差别）。
                 container_env=(f"PA_REPORT_DIR={CONTAINER_STATE}/reports",
                                *(f"{k}={v}" for k, v in sorted(os.environ.items())
-                                 if k.startswith(("PA_", "GIT_CONFIG_")) and k != "PA_REPORT_DIR")),
+                                 if k.startswith("PA_") and k != "PA_REPORT_DIR")),
             )
             try:
                 ref = self._runner.start(spec, docker_host=docker_host)

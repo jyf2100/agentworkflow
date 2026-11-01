@@ -463,3 +463,26 @@ def test_migrate_legacy_runs_table_adds_runner_columns_keeps_rows(tmp_path):
 def test_list_requested_confirmations(tmp_path):
     d = db.HubDB(tmp_path / "h.sqlite3")
     assert d.list_requested_confirmations() == []
+
+
+# ── add-effects-queue D1/D3：Effects 队列表 ─────────────────────────
+
+def test_effects_insert_complete_pending(tmp_path):
+    d = db.HubDB(tmp_path / "h.sqlite3")
+    eid = d.insert_effect("state_write", {"action": "test", "k": "v"})
+    assert eid > 0
+    pending = d.list_pending_effects()
+    assert len(pending) == 1 and pending[0]["kind"] == "state_write"
+    assert pending[0]["status"] == "pending"
+    d.complete_effect(eid, "done")
+    assert d.list_pending_effects() == []
+    d.insert_effect("mm_notify", {"x": 1})
+    d.complete_effect(2, "failed")
+    assert d.list_pending_effects() == []  # failed 也不是 pending
+
+
+def test_effects_kind_validation(tmp_path):
+    d = db.HubDB(tmp_path / "h.sqlite3")
+    import pytest, sqlite3
+    with pytest.raises(sqlite3.IntegrityError):
+        d.insert_effect("bad_kind", {})

@@ -70,6 +70,14 @@ CREATE TABLE IF NOT EXISTS confirmation_requests (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_confirm_item ON confirmation_requests(item_id);
 CREATE INDEX IF NOT EXISTS idx_confirm_status ON confirmation_requests(status);
 CREATE INDEX IF NOT EXISTS idx_confirm_origin ON confirmation_requests(origin_sha);
+CREATE TABLE IF NOT EXISTS effects (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL CHECK (kind IN ('commit','push','pr_open','mm_notify','state_write','reconcile')),
+    payload_json TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('pending','done','failed')),
+    created_at   TEXT NOT NULL,
+    completed_at TEXT
+);
 CREATE TABLE IF NOT EXISTS intake_watermarks (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -188,6 +196,31 @@ class HubDB:
         if "image_sync_json" not in runner_cols:
             self._conn.execute("ALTER TABLE runners ADD COLUMN image_sync_json TEXT")
             self._conn.commit()
+
+    @_locked
+    def insert_effect(self, kind: str, payload: dict) -> int:
+        """Effects 队列写入（add-effects-queue D1）：先落账再执行。返回 effect id。"""
+        import json as _json
+        cur = self._conn.execute(
+            "INSERT INTO effects (kind, payload_json, status, created_at) VALUES (?, ?, 'pending', ?)",
+            (kind, _json.dumps(payload, ensure_ascii=False), _now()))
+        self._conn.commit()
+        return cur.lastrowid
+
+    @_locked
+    def complete_effect(self, effect_id: int, status: str) -> None:
+        """Effects 完成标记（done/failed——单向不回滚）。"""
+        self._conn.execute(
+            "UPDATE effects SET status=?, completed_at=? WHERE id=?",
+            (status, _now(), effect_id))
+        self._conn.commit()
+
+    @_locked
+    def list_pending_effects(self) -> list[dict]:
+        """崩溃恢复面：pending 项全列（add-effects-queue D3）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM effects WHERE status='pending' ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
 
     @_locked
     def get_watermark(self, key: str) -> str | None:
