@@ -117,7 +117,9 @@ run 进行中绑定频道里的人话（MM 频道讨论），经 **Gate 直发�
 
 `openspec/changes/langgraph-workflow-upgrade/proposal.md` 的 feature_flag 渐进 cutover 收尾是 P1 依赖——事件驱动入队后编排层的图表达/类型守边界（verdict 只在 PersonaNode 暴露写入）直接消费高频事件流，`scripts/run_daily.py` 命令式状态机（上游 change 立项时 ~3400 行，本次落档实测 5502 行）的维护成本会随事件频率上升。
 
-## 4. P2 主动 Agent（2–3 月，方向章节·不立项）
+## 4. P2 主动 Agent（2–3 月）
+
+> **2026-11-01 立项注记**：P2 三件已起草为极细 change 包（`add-proactive-observer` / `add-router-persona` / `add-panel-attention`，各含本体论声明/状态机/schema/拒绝清单/验收场景与勘察前置 0.x）。实施顺序：observer → attention（消费提案面）→ router（解释一切面）；observer 的 auto 模式钉死为后续 change（预算闸+置信门+全链 critic 三重前置，§4.1 防线已在 spec 落档）。
 
 ### 4.1 add-proactive-observer：目标仓观察者
 
