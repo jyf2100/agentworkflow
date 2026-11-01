@@ -51,6 +51,13 @@ HttpPost = Callable[[str, str, str], int]
 # 过载同形，单发不可机械分辨——非确定性错绝不进漂移，RUNBOOK §23 排障速查给人工复测通道）。
 PROBE_DEAD_CODES = frozenset({400, 404})
 
+# 探活连续失败升级阈值（add-drift-l5-health-probe 补强）：单发 5xx/连接错与瞬时过载同形归
+# UNKNOWN（零误报），但**持续不可用跨轮不变**——连续 N 轮（漂移缺省每小时一轮 ≈ 3 小时）
+# UNKNOWN 升级为漂移项（daemon ALERT_AFTER=3 连续异常计数先例；2026-10-31 死链 qwen3.6-35b
+# →8896 的真机形态即此族：网关 500 InternalServerError 连接拒绝，永不自愈）。轮间恢复（2xx）
+# 即清零——过载恢复不告警。
+PROBE_STREAK_ALERT = 3
+
 
 @dataclass
 class DriftItem:
@@ -219,8 +226,16 @@ def _rule_r2(cfg, vault, drift: list, pending: list, states: dict) -> None:
     states["r2"] = "ok"
 
 
+def _streak_of(seen: set, model: str) -> int:
+    """读某模型当前探活连败轮数（seen 内键 ("probe_streak", model, n) 的 n；无 = 0）。"""
+    for s in seen:
+        if len(s) == 3 and s[0] == "probe_streak" and s[1] == model:
+            return int(s[2])
+    return 0
+
+
 def _rule_r3(cfg, vault, drift: list, pending: list, states: dict,
-             http_client: HttpGet, probe_client: HttpPost) -> None:
+             http_client: HttpGet, probe_client: HttpPost, seen: set) -> None:
     """R3：L5 membership（三态）+ 消费面探活（三态）+ alias 形态预检（负向黑名单，零网络）。"""
     base, token, model = _dispatch_source(cfg, vault)
     names: set[str] = set()
@@ -262,6 +277,7 @@ def _rule_r3(cfg, vault, drift: list, pending: list, states: dict,
         for m in sorted((names - ALIAS_BLACKLIST) & registered):
             code = probe_client(f"{base.rstrip('/')}/v1/messages", token, m)
             if 200 <= code < 300:
+                seen.discard(("probe_streak", m, _streak_of(seen, m)))  # 恢复即清连败（过载恢复不告警）
                 continue
             if code in PROBE_DEAD_CODES:
                 drift.append(DriftItem(
@@ -272,6 +288,16 @@ def _rule_r3(cfg, vault, drift: list, pending: list, states: dict,
                     "或下线死注册（/model/delete；需 master key = litellm 容器 env LITELLM_MASTER_KEY）"))
             else:
                 unknown += 1  # 瞬时族：单发探活无法机械分辨持续死与瞬时抖（心跳可见不进 MM）
+                n = _streak_of(seen, m) + 1
+                seen.discard(("probe_streak", m, n - 1))
+                seen.add(("probe_streak", m, n))
+                if n >= PROBE_STREAK_ALERT:  # 持续不可用：过载会恢复、死链不会——升级漂移（补强）
+                    drift.append(DriftItem(
+                        "R3", "L5名册→L5可用", f"{m}（连续不可用）",
+                        f"消费面探活连续 {n} 轮 UNKNOWN（5xx/连接错族）——瞬时过载不跨轮持续，"
+                        "持续不可用即死链形态（2026-10-31 qwen3.6-35b→8896 真机形态的完整闭环）",
+                        "LiteLLM admin API 修正该注册上游或下线死注册（master key = litellm 容器"
+                        " env LITELLM_MASTER_KEY）；人工复测通道 docker exec 直调一次确认"))
         states["r3"] = "ok" if not unknown else f"ok（探活 UNKNOWN×{unknown}）"
     elif status in (401, 403):
         pending.append(("degrade", ("degrade", "r3_403"),
@@ -346,7 +372,7 @@ def check_drift(cfg, vault, dbm, *, seen: set, notifier=None,
     states: dict[str, str] = {}
     for rid, fn in (("r1", lambda: _rule_r1(cfg, drift, pending, states)),
                     ("r2", lambda: _rule_r2(cfg, vault, drift, pending, states)),
-                    ("r3", lambda: _rule_r3(cfg, vault, drift, pending, states, http_client, probe_client)),
+                    ("r3", lambda: _rule_r3(cfg, vault, drift, pending, states, http_client, probe_client, seen)),
                     ("r4", lambda: _rule_r4(dbm, drift, states, docker_bin))):
         try:
             fn()

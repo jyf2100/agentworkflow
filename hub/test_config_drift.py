@@ -311,3 +311,49 @@ def test_heartbeat_always_and_no_notifier_degrades(capsys):
     _run_check(_mk_cfg(), vault=None, notifier=None, http=_gw(200, []))
     err = capsys.readouterr().err
     assert "[drift] 心跳" in err and "R1=关闭" in err   # 未配 bot 全降级 stderr（可见的丢）
+
+
+# ── add-drift-l5-health-probe 补强：连续失败升级（真死链 500 族闭环） ──
+
+def _r3_env(monkeypatch, model):
+    monkeypatch.setenv("PA_DEV_MODEL", model)
+
+
+def test_probe_streak_escalation_and_recovery(monkeypatch, capsys):
+    cfg = _mk_cfg()  # 既有 helper：base/token
+    _r3_env(monkeypatch, "dead-model")
+    gw = _gw(200, ["dead-model"])          # 名册在册
+    n_call = {"i": 0}
+    def probe(url, token, model):
+        n_call["i"] += 1
+        return n_call["code"]
+    seen = set()
+    n = FakeNotifier()
+    def run(code):
+        n_call["code"] = code
+        config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n, http_client=gw, probe_client=probe)
+    run(500); run(500)                     # 连续两轮 UNKNOWN：不告警（零误报）
+    assert len(n.sent) == 0
+    run(500)                               # 第三轮：升级漂移
+    assert len(n.sent) == 1 and "连续" in n.sent[0] and "dead-model" in n.sent[0]
+    err = capsys.readouterr().err
+    assert "连续 3 轮" in err and "死链形态" in err
+    run(500)                               # 第四轮：漂移键去抖不重发
+    assert len(n.sent) == 1
+    run(200)                               # 恢复：连败清零 + 消解回执
+    err2 = capsys.readouterr().err
+    assert "已消解" in err2
+    run(500)                               # 恢复后再失败：从 1 重新计数
+    assert len(n.sent) == 2  # 仅消解回执，无新漂移
+    assert capsys.readouterr().err.count("连续") == 0
+
+
+def test_probe_deterministic_dead_immediate(monkeypatch):
+    cfg = _mk_cfg()
+    _r3_env(monkeypatch, "dead-model")
+    n = FakeNotifier()
+    seen = set()
+    config_drift.check_drift(cfg, None, FakeDB([]), seen=seen, notifier=n,
+                             http_client=_gw(200, ["dead-model"]),
+                             probe_client=lambda u, t, m: 404)
+    assert len(n.sent) == 1 and "确定性拒绝" in n.sent[0]  # 404 单发即漂移（不等待连败）
