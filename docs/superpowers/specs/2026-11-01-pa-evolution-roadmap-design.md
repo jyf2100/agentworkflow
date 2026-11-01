@@ -135,6 +135,8 @@ hub 面板（`hub/panel.py`）从「全量状态视图」升级为注意力分�
 
 ## 5. P3 上下文经济学与长程记忆（长线，方向章节·不立项）
 
+> **2026-11-01 立项注记**：P3 三件已起草为极细 change 包（`add-context-loading-protocol` / `add-effects-queue` / `add-long-term-memory-graph`）。实施顺序：context-loading（最大价值面）→ effects-queue（durable 升级）→ memory-graph（与 loading 正交可并行）。
+
 ### 5.1 add-context-loading-protocol：stub + 按需展开
 
 persona/dev 的上下文注入从「整块拼 prompt」升级为 **stub + 按需展开**（dsh admission-context 参照）：注入面先给摘要桩，agent 按需取全文。与 HelixHarness 的 context loading protocol 合流（vault 外参考克隆 `/mnt/disk01/workspaces/worksummary/helixharness/helixharness/reference/loading-protocol.md`；引用出处 = 仓库**顶层** `/mnt/disk01/workspaces/worksummary/helixharness/README.md:37`，该行定义 Harness 约束「what to read, which boundaries to respect and what evidence is required to finish」并链接 loading protocol——非嵌套的 `helixharness/helixharness/README.md`，后者 :37 是项目结构节、无此引文）。收益面：dev loop 长会话的 token 成本 + 跨 persona 的重复注入。
