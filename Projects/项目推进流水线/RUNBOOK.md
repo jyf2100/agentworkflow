@@ -775,6 +775,8 @@ MM 频道模糊需求（「有据但验收不可执行」）不再被 critic 一
 
 **runner 镜像自动分发（add-runner-image-sync，2026-11）**：探针报「daemon 项 ok 且镜像项非 ok」→ hub 自动 `docker save <默认tag> | docker -H <runner> load` 流式分发（两端 CLI 都在 hub 容器内，与 2026-10-31 人工修复同构；断连机不烧传输）。load 后源/目标 image ID（内容寻址）比对，不一致删目标侧按失败处理。成功后**复测探针**转绿回调度候选（绝不直写 probe_ok——探针是唯一绿灯权威）；失败 = MM 管理面告警（同组合去抖、成功重置）+ runner 保持红 + item 保持 pending（绝不静默跳过，绝不公网拉取顶替——镜像源恒 = hub 本机 daemon，hub 侧也缺源时告警文案指明先在 hub 本机 build）。单 worker 串行（多机缺片各自入队），`HUB_IMAGE_SYNC_TIMEOUT`（缺省 900s）超时终止两端。手动分发：`POST /runners/{id}/image-sync`（admins 门，判据同自动触发）；面板池页「分发」列显示上次结果。**同步失败排查**：先查 hub 本机 daemon 有无源镜像（`docker image inspect <tag>`），再查目标 2375 可达性；期间 item 持续 pending 属设计等待（非故障）。
 
+**注意力视图（add-panel-attention，2026-11）**：`/panel/attention` 四类人等态聚合（阻断 triage（近 72h dispatch json 扫 blocked/triage/verify_invalid，行动=重跑按钮复用 admin 门）/ 确认环 requested / 影子提案未采纳（行动=采纳命令复制框）/ 漂移未消解计数）——纯投影零新真相源（每行链回源实体，绝不引入第五种待办实体）；空类整节隐藏、全空「无事需要你」；导航徽标带总数。与日报一拉一推同源不同面互不缓存；漂移源在 hub 内存（重启归零属去抖已知语义，页脚注说明）。
+
 **运维日报（add-hub-daily-digest，2026-11）**：daemon 第四低频槽每 `HUB_DIGEST_TICKS`（缺省 17280 ≈ 每日）聚合一日一条 MM 私信（`notify_admin`，未配 bot 降级 stderr）：① 队列（pending 数 + 最老等待、running、近 24h succeeded/failed）；② runner 池（各行探针红绿+坏项名、忙闲、上次分发结果）；③ 配置漂移未消解项数。纯只读零写面、值不入面（计数/名称/时长 only）；单节异常独立吞不连坐。重启即重发一条（tick 计数重置，可接受）。
 
 ## 24. 事件轮询接入（add-event-sources，2026-11）

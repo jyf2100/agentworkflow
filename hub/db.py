@@ -494,6 +494,14 @@ class HubDB:
         except sqlite3.IntegrityError:
             return None
 
+    @_locked
+    def list_requested_confirmations(self) -> list[dict]:
+        """待决确认环行（add-panel-attention：requested 态全列——人等态投影源）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM confirmation_requests WHERE status='requested' ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_confirmation(self, rid: int) -> dict | None:
         row = self._conn.execute(
             "SELECT * FROM confirmation_requests WHERE id=?", (rid,)

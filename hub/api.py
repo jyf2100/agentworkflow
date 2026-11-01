@@ -600,6 +600,69 @@ def create_app(
             return guard
         return HTMLResponse(panel.render_queue(database.list_items()))
 
+    @app.get("/panel/attention")
+    def panel_attention(request: Request):
+        """注意力视图（add-panel-attention）：四类人等态聚合——纯投影零新真相源。
+
+        ① 阻断 triage：近 72h 终态 run 的 dispatch json（state 卷本机可达）含
+        blocked_test_gate/verify_invalid/triage；② 确认环 requested（db 直查）；
+        ③ 影子提案未采纳（shadow_proposals 目录扫描，采纳 = PRD frontmatter 关联——
+        digest 同源扫描法）；④ 漂移未消解（lc._drift_seen 计数——lifecycle 内存面，
+        重启归零属已知语义，页脚注说明）。行动面：重跑复用 /panel/queue/{id}/retry
+        （admin 门），确认/采纳 = 命令复制框（v1 保守——采纳是人的决定）。
+        """
+        guard = _panel_get(request)
+        if guard is not None:
+            return guard
+        from datetime import datetime, timedelta, timezone
+        items: list[dict] = []
+        # ① 阻断 triage
+        rows = []
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat(timespec="seconds")
+        for r in database.list_all_runs():
+            if r.get("status") not in ("failed", "failed_to_start") or not r.get("ended_at"):
+                continue
+            if r["ended_at"] < cutoff:
+                continue
+            import json as _json
+            try:
+                disp = _json.loads((Path(r["run_dir"]).parent.parent.parent / "dispatch"
+                                    / f"{r['run_dir'].split('_')[0][:8] and r['started_at'][:10].replace('-', '')}.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                disp = []
+            for d in disp if isinstance(disp, list) else []:
+                status = str(d.get("status") or "")
+                if status in ("blocked_test_gate",) or "triage" in str(d.get("skip_reason") or "") or str(d.get("status") or "").startswith("verify_invalid"):
+                    item_id = r.get("queue_item_id") or 0
+                    act = (f'<form method="post" action="/panel/queue/{item_id}/retry">'
+                           f'<button type="submit">重跑</button></form>') if item_id else ""
+                    rows.append({"title": f"#{r['id']} {r['project']}",
+                                 "detail": f"{d.get('skip_reason') or status}",
+                                 "action_html": act or '<span class="muted">—</span>'})
+        items.append({"kind": "blocked", "rows": rows})
+        # ② 确认环
+        rows2 = [{"title": f"#{c['id']} {c['project']}",
+                  "detail": (c.get("metrics_json") or "")[:80],
+                  "action_html": '<code>/pa confirm</code>（频道内执行）'}
+                 for c in database.list_requested_confirmations()]
+        items.append({"kind": "confirm", "rows": rows2})
+        # ③ 影子提案（采纳 = 命令复制框）
+        rows3 = []
+        for sp_dir in sorted(lc.cfg.data_root.glob("*/shadow_proposals")):
+            for sp in sp_dir.glob("*.md"):
+                sp_id = sp.stem.split("_")[-1]
+                rows3.append({"title": f"{sp_id} {sp_dir.parent.name}",
+                              "detail": sp.stem[:10] + " " + (sp.read_text(encoding="utf-8", errors="replace").split('signal: "')[1].split('"')[0] if 'signal: "' in sp.read_text(encoding="utf-8", errors="replace") else ""),
+                              "action_html": f'<code>/pa run … evidence: shadow-proposal:{sp_id}</code>'})
+        items.append({"kind": "proposal", "rows": rows3})
+        # ④ 漂移未消解（lifecycle 内存面）
+        n_drift = sum(1 for s in (getattr(lc, "_drift_seen", None) or set())
+                      if isinstance(s, tuple) and s and s[0] == "drift")
+        rows4 = ([{"title": f"{n_drift} 项未消解", "detail": "详见 hub stderr 心跳行与 MM 私信",
+                   "action_html": '<span class="muted">修复后自动消解</span>'}] if n_drift else [])
+        items.append({"kind": "drift", "rows": rows4})
+        return HTMLResponse(panel.render_attention(items))
+
     @app.get("/panel/runs")
     def panel_runs(request: Request):
         guard = _panel_get(request)

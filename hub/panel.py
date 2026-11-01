@@ -48,13 +48,17 @@ def _esc(v: Any) -> str:
     return escape(str(v if v is not None else ""))
 
 
-def _page(title: str, body: str) -> str:
+def _page(title: str, body: str, *, attention_n: int | None = None) -> str:
+    # add-panel-attention：导航徽标（None = 不渲染徽标——旧调用面零变化）
+    badge = "" if attention_n is None else f'<a href="/panel/attention">待办({attention_n})</a>'
     return (
         "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         f"<title>{_esc(title)} · pa-hub</title><style>{_STYLE}</style></head>"
         "<body><main>"
-        "<nav><a href=\"/panel\">提交 PRD</a><a href=\"/panel/queue\">队列</a>"
+        "<nav><a href=\"/panel/attention\">待办</a>"
+        + badge +
+        "<a href=\"/panel\">提交 PRD</a><a href=\"/panel/queue\">队列</a>"
         "<a href=\"/panel/runs\">runs</a><a href=\"/panel/projects/new\">建项目</a>"
         "<a href=\"/panel/credentials\">凭据</a><a href=\"/panel/runners\">服务器池</a>"
         "<a href=\"/auth/logout\">登出</a></nav>"
@@ -456,3 +460,33 @@ def render_runners(rows: list[dict], *, current_user: str = "", error: str | Non
         "<button type=\"submit\">保存</button></form>"
     )
     return _page("服务器池", body)
+
+
+# ── 注意力视图（add-panel-attention：四类人等态聚合——纯投影零新真相源） ──────
+
+def render_attention(items: list[dict]) -> str:
+    """四类人等事项聚合页（每类 = {kind, rows: [{title, detail, action_html}]}）。
+
+    空类整节隐藏（dsh「不需要时保持安静」的 UI 形态）；全空 = 一行「无事需要你」。
+    行动面复用既有 admin 门端点或命令复制框（采纳 = 命令框——人的决定，v1 无一键）。
+    页脚标注实时视图与日报的分工（一拉一推，同源不同面）。
+    """
+    _KIND_TITLES = {"blocked": "阻断待 triage", "confirm": "确认环待决",
+                    "proposal": "影子提案待采纳", "drift": "漂移未消解"}
+    total = sum(len(k["rows"]) for k in items)
+    if total == 0:
+        body = "<h1>待办（0）</h1><p>无事需要你——四类人等态全空（实时视图；日报为每日快照）。</p>"
+        return _page("待办", body, attention_n=0)
+    parts = [f"<h1>待办（{total}）</h1>"]
+    for k in items:
+        if not k["rows"]:
+            continue  # 空类整节隐藏
+        parts.append(f'<h2>{_esc(_KIND_TITLES.get(k["kind"], k["kind"]))}（{len(k["rows"])}）</h2>'
+                     '<div class="tablewrap"><table><tr><th>事项</th><th>详情</th><th>行动</th></tr>')
+        for r in k["rows"]:
+            parts.append(f"<tr><td>{_esc(r['title'])}</td>"
+                         f"<td>{_esc(r['detail'])}</td>"
+                         f"<td>{r['action_html']}</td></tr>")
+        parts.append("</table></div>")
+    parts.append('<p class="hint">实时视图（本页拉取）——日报为每日快照（推送），两者同源不同面。</p>')
+    return _page("待办", "".join(parts), attention_n=total)

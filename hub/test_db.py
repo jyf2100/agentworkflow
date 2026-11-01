@@ -458,3 +458,8 @@ def test_migrate_legacy_runs_table_adds_runner_columns_keeps_rows(tmp_path):
     cols = {r[1] for r in d._conn.execute("PRAGMA table_info(runs)")}
     assert {"runner_name", "runner_docker_host"} <= cols
     assert d.list_all_runs()[0]["runner_name"] is None  # 旧行保留且 NULL = 本机
+
+
+def test_list_requested_confirmations(tmp_path):
+    d = db.HubDB(tmp_path / "h.sqlite3")
+    assert d.list_requested_confirmations() == []
