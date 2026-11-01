@@ -2,6 +2,30 @@
 
 本项目推进流水线（pa-pipeline）版本记录。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵从 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-11-01
+
+「**观察面闭环 + 外部生态整合第一步**」——六层配置漂移事故根治、P0 观察面四件套（看门狗/镜像分发/auto-triage/日报）、HelixHarness 整合落地、SuperAgent 演进路线立项。真机全程实证（#110/#111 全链 + 事故复演闭环）。
+
+### 六层配置漂移事故根治（2026-10-31 生产事故）
+- 模型路由/凭据在六层独立存在（settings env / 路由文件 / hub.env / vault / 网关注册 / 容器实况）互不知晓——「改了无数次都没改回来」根因定位与逐层修复（vault 重导入 + up -d 重建语义 + roc 注册 qwen3.8-27b-fast + 模型名三层统一）。
+- RUNBOOK §23「配置六层漂移模型」节（层表/正确写法/事故链/排障速查 + intent inode 盲窗注记）。
+
+### P0 观察面四件套（演进路线第一批落地）
+- **add-config-drift-watchdog**：四规则层间断言（R1 意图vs快照 / R2 vault vs env 兜底 / R3 网关 membership+alias 预检 / R4 容器实况），MM 告警+修复指引+消解回执，值不入面；daemon 第三低频槽 + compose intent ro 挂载。真机四规则心跳全绿。
+- **add-runner-image-sync**：探针报缺自动 save|load 流式分发（ID 内容寻址校验 / 单 worker 双重去重 / 失败告警去抖）；复测探针唯一绿灯权威；手动 API + 面板分发列。真机闭环：183 删镜像→自动恢复→run 自动派发。
+- **add-test-gate-auto-triage**：发布门 test_stale 编排器侧重验一次（fresh 按构造成立，门语义零放松；仅 stale 分支、一次上限）；flag 默认关、hub 已启用。
+- **add-hub-daily-digest**：队列/池/漂移三面一日一条聚合 MM；daemon 第四低频槽。
+
+### HelixHarness 整合第一步
+- 采集源接入（didi/helixharness github-repo 源示例）+ executor 镜像 helix 技能面 v0.1.35（8 skill 快照 commit 钉定 + Apache-2.0 notice + 同名让位 + d-d2c hooks 中和）；真机 #110 全链实证。
+
+### 演进路线与 P1 立项
+- `docs/superpowers/specs/2026-11-01-pa-evolution-roadmap-design.md`：dsh-superagent 四特征映射、P0-P3 四阶段、不采纳清单、度量体系。
+- P1 双 change 起草 + 勘察闭环：add-event-sources（事件轮询接入，Fast Path 纯机械筛）、add-thread-subscription（订阅直通，human_notes 排队注入）——四处接缝实证可行（MM bot 读权限 200 探通）。
+
+### 生产排障实证链（真机 #110/#111）
+- runner 池远程执行链路坐实（183 远程 daemon + NFS 双挂 + 镜像分发前人工 save|load 的 10 分钟事故即 image-sync 立项依据）；qwen3.8-27b-fast 全链（critic/test-author/dev 24+ turns 稳定）；verify 墙钟档位疑点（hub 形态按本机 1200s 杀）记录待修。
+
 ## [1.1.0] - 2026-10-30
 
 从单机 cron 编排器到「**hub 服务器集中式执行 + MM 渠道入口 + 验收面闭环**」。自 1.0.0 起 178+ commits，OpenSpec change 全程驱动（提案 → 多轮评审 → 落地 → 归档 delta sync）。
