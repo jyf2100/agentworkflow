@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from evidence import (  # noqa: E402
     GATE_FAILED, GATE_NOT_RUN, GATE_PUBLISH, GATE_STALE,
-    TestEvidence, evaluate_gate, mark_stale,
+    TestEvidence, auto_reverify, evaluate_gate, mark_stale,
 )
 
 
@@ -67,3 +67,22 @@ def test_original_evidence_immutable():
     ev = TestEvidence(command="pytest", exit_code=0, completed_at="20260720-1200", fresh=True)
     mark_stale(ev)
     assert ev.fresh is True
+
+
+# ── add-test-gate-auto-triage：test_stale 编排器侧自动重验 ──────────
+
+def test_auto_reverify_green_yields_fresh_publishable_evidence():
+    stale = TestEvidence(command="npm test", exit_code=0, completed_at="t0", fresh=False)
+    new_ev, rec = auto_reverify(stale, runner=lambda cmd: (0, "t1"))
+    assert rec["outcome"] == "green" and rec["command"] == "npm test"  # 命令原文传递
+    assert new_ev is not None and new_ev.fresh and new_ev.completed_at == "t1"
+    v, _ = evaluate_gate(new_ev)
+    assert v == GATE_PUBLISH  # 新证据按构造 fresh → 复评放行（门语义零放松）
+
+
+def test_auto_reverify_red_and_timeout_block_with_record():
+    stale = TestEvidence(command="npm test", exit_code=0, completed_at="t0", fresh=False)
+    ev, rec = auto_reverify(stale, runner=lambda cmd: (2, "t1"))
+    assert ev is None and rec["outcome"] == "red" and rec["exit_code"] == 2
+    ev2, rec2 = auto_reverify(stale, runner=lambda cmd: (None, "t2"))  # 超时约定：None
+    assert ev2 is None and rec2["outcome"] == "timeout" and rec2["exit_code"] is None

@@ -60,3 +60,25 @@ def evaluate_gate(evidence: TestEvidence | None) -> tuple[str, str]:
     if not evidence.fresh:
         return GATE_STALE, "绿色测试后又发生候选写，证据已不反映当前待提交内容"
     return GATE_PUBLISH, f"证据新鲜且绿（{evidence.completed_at}, cmd={evidence.command}）"
+
+
+def auto_reverify(evidence: TestEvidence, *, runner) -> tuple[TestEvidence | None, dict]:
+    """编排器侧自动重验（add-test-gate-auto-triage D2，仅 test_stale 分支消费）。
+
+    在 worktree 内重跑**同一条**干净测试命令取新证据：采集时点晚于全部候选写
+    （dev loop 已终止、重验期间零写）——fresh=True 按构造成立，非豁免（spec 场景
+    「blocked until a new green test completes」的又一种完成方式，门语义零放松）。
+    runner(command) -> (exit_code, completed_at_stamp) 由调用侧注入（单测 fake /
+    dev-agent subprocess）；一次为上限（调用方守卫），红/超时不重试。
+    返回 (新证据 | None, 记录 dict{attempted, command, exit_code, completed_at, outcome})。
+    """
+    exit_code, completed_at = runner(evidence.command)
+    record: dict = {"attempted": True, "command": evidence.command,
+                    "exit_code": exit_code, "completed_at": completed_at}
+    if exit_code is None:  # 调用侧超时约定（runner 捕 TimeoutExpired 转 None）
+        return None, {**record, "outcome": "timeout"}
+    if exit_code != 0:
+        return None, {**record, "outcome": "red"}
+    return (TestEvidence(command=evidence.command, exit_code=0,
+                         completed_at=completed_at, fresh=True),
+            {**record, "outcome": "green"})

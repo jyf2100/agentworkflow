@@ -60,7 +60,8 @@ from claude_agent_sdk import (
 from slug_utils import dev_slugify, make_branch   # ADR-0006 #5：dev_slugify 单一源头 + verify-loop-discipline A1 make_branch（均无依赖，避免顶部 import 触发 sdk 连带加载拖垮 cron）
 import handoff   # add-dev-handoff-artifact：dev 亲笔交接契约纯模块（写侧吸收/快照 + 读侧注入校验渲染；纯 stdlib）
 from bash_allowlist import decide_bash   # ADR-0006 #7：Bash 命令放行判定（无依赖模块，同上）
-from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH   # OpenSpec verified-dev-execution：结构化测试证据 + 发布硬门（无依赖模块，同上）
+from evidence import TestEvidence, evaluate_gate, mark_stale, GATE_PUBLISH, GATE_STALE, auto_reverify   # OpenSpec verified-dev-execution：结构化测试证据 + 发布硬门（无依赖模块，同上）；auto_reverify = add-test-gate-auto-triage
+import feature_flags   # add-test-gate-auto-triage：PA_TEST_GATE_AUTO_TRIAGE 域切割 flag（默认 off）
 import test_cmd_primitives   # agent-verify-injection 2.2：链式拆段原语层（D5.1 一份语义两消费点；无依赖模块，同上）
 from prompt_stream import prompt_stream   # ADR-0006 #7 streaming 修正：string prompt→AsyncIterable（无依赖模块，单测可零 SDK 锁定 dict 结构）
 import sdk_compat_patch                   # ADR-0006 #7（migrate-dev-agent-streaming-with-1106-patch）：#1106 keep-alive 定向 patch，根治 #1105（零依赖模块，apply 内延迟 import SDK）
@@ -85,6 +86,8 @@ INPUT_TRUNC = 500            # tool_use.input 落盘截断
 # contract tests 尾声），当年「宽松」校准对分钟级长思考后端失效；PA_DEV_MAX_BUDGET 可
 # 覆盖（hub.env PA_* 透传链直达容器，调预算不重建镜像）。
 MAX_BUDGET = float(os.environ.get("PA_DEV_MAX_BUDGET") or "25")
+# add-test-gate-auto-triage：test_stale 自动重验超时（秒，PA_TEST_GATE_TRIAGE_TIMEOUT 可覆盖）
+TRIAGE_TIMEOUT_S = float(os.environ.get("PA_TEST_GATE_TRIAGE_TIMEOUT") or "600")
 STATE_RUNS_DIR = REPO_ROOT / "state" / "runs"
 
 # run #105 真机（2026-10-29）：推理网关后端（qwen3.8-27b-coding）reasoning effort 只认
@@ -1345,6 +1348,25 @@ async def main() -> int:
     # 4.5 发布硬门（OpenSpec verified-dev-execution）：无新鲜绿色证据 → 不 commit/push/PR。
     # 宁拦勿错放：dev 自治产出的「绿」必须落到结构化证据、且采集后无后续候选写，才允许发布动作。
     verdict, reason = evaluate_gate(state.get("test_evidence"))
+    # add-test-gate-auto-triage：test_stale 自动重验一次（flag 默认关）——编排器侧重跑同条
+    # 干净测试命令取新证据（fresh 按构造成立：采集晚于全部候选写），红/超时不重试走原阻断。
+    auto_triage = None
+    if (verdict == GATE_STALE and state.get("test_evidence") is not None
+            and feature_flags.resolve_flags().get("test_gate_auto_triage")):
+        def _triage_runner(cmd: str):
+            try:
+                r = subprocess.run(cmd, shell=True, cwd=str(REPO_ROOT), capture_output=True,
+                                   text=True, timeout=TRIAGE_TIMEOUT_S)
+                return r.returncode, stamp()
+            except subprocess.TimeoutExpired:
+                return None, stamp()
+        new_ev, auto_triage = auto_reverify(state["test_evidence"], runner=_triage_runner)
+        if new_ev is not None:
+            state["test_evidence"] = new_ev
+            verdict, reason = evaluate_gate(new_ev)
+            sys.stderr.write(f"🔁 test_stale 自动重验绿（{new_ev.command}）→ 复评放行\n")
+        else:
+            sys.stderr.write(f"🔁 test_stale 自动重验未过（outcome={auto_triage.get('outcome')}）→ 维持阻断\n")
     if verdict != GATE_PUBLISH:
         ev = state.get("test_evidence")
         gate_status = verdict   # test_not_run | test_failed | test_stale
@@ -1354,7 +1376,8 @@ async def main() -> int:
                           "cost": cost, "turns": turns,
                           "test_cmd": (ev.command if ev else state.get("last_test_cmd")),
                           "test_status": ("green" if (ev and ev.exit_code == 0) else ("red" if ev else "none")),
-                          "evidence_fresh": bool(ev and ev.fresh)}, state), ensure_ascii=False))
+                          "evidence_fresh": bool(ev and ev.fresh),
+                          "auto_triage": auto_triage}, state), ensure_ascii=False))
         return 14
 
     # 5. commit + push + 开 PR（branch protection 要求走 PR；verify-loop-discipline A2 开 PR 幂等）
@@ -1368,7 +1391,8 @@ async def main() -> int:
                               "acceptance_digest": args.get("acceptance_digest")}, state),
         # 发布门已放行 → test_passed=True 现为可证（新鲜绿色证据），补结构化 gate/test 字段（2.5 truthful JSON）
         on_success={"test_passed": True, "test_status": "green",
-                    "gate_status": GATE_PUBLISH, "evidence_fresh": bool(ev and ev.fresh)},
+                    "gate_status": GATE_PUBLISH, "evidence_fresh": bool(ev and ev.fresh),
+                    "auto_triage": auto_triage},
         on_no_changes={"test_passed": state.get("last_test") == "green"},
         on_error={"test_passed": state.get("last_test") == "green"})   # R3：error 路径对称带 test_passed（契约完整性）
 

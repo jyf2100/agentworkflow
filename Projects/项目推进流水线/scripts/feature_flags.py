@@ -70,6 +70,7 @@ class LoopFlags:
     pa_graph_orchestrator: bool = False           # langgraph-workflow-upgrade task 5.1：cron 分流 graph_pa.py（gated on shadow+parity+canary；D7 flag off = run_daily 完整保留）
     dev_handoff: bool = False                     # add-dev-handoff-artifact D2：dev 亲笔交接（--expect-handoff 写侧契约 + K-turn 快照收养 + 注入）。默认 off = dev-agent 全零变化（prompt/JSON/文件 byte-identical）
     verify_agent_track: bool = False              # agent-verify-injection 2.4：independent_verify 走 agent 轨（verify agent 执行 + 三机械锚 + verify-report）。off = 现机械轨 byte-identical
+    test_gate_auto_triage: bool = False           # add-test-gate-auto-triage：发布门 test_stale 编排器侧自动重验一次（off = 阻断行为 byte-identical）
 
 
 # flag 名 → 环境变量名（运维/CI 文档化的稳定开关名）。改这些 = 改对外契约。
@@ -100,6 +101,9 @@ FLAGS_ENV_MAP: dict[str, str] = {
     "dev_handoff": "PA_LOOP_DEV_HANDOFF",
     # agent-verify-injection 2.4：verify 质量闸能力域（同 verify_anchor_evidence 惯例，PA_VERIFY_ 前缀）。
     "verify_agent_track": "PA_VERIFY_AGENT",
+    # add-test-gate-auto-triage D3：发布门 test_stale 自动重验能力域（PA_TEST_GATE_ 前缀域切割，
+    # 非 PA_LOOP_——发布门是 verified-dev-execution 能力域非 loop runtime 六大渐进面）。默认 off。
+    "test_gate_auto_triage": "PA_TEST_GATE_AUTO_TRIAGE",
 }
 
 # 真值集合（strip + lower 后判定）。其余一律 False（保守：未知字符串不开）。

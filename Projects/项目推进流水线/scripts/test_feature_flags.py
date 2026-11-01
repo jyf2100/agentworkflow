@@ -90,6 +90,8 @@ def test_all_env_names_mapped():
         "dev_handoff": "PA_LOOP_DEV_HANDOFF",
         # agent-verify-injection 2.4：verify agent 轨（verify 质量闸域，PA_VERIFY_ 前缀）
         "verify_agent_track": "PA_VERIFY_AGENT",
+        # add-test-gate-auto-triage：发布门 test_stale 自动重验（gate 域，PA_TEST_GATE_ 前缀）
+        "test_gate_auto_triage": "PA_TEST_GATE_AUTO_TRIAGE",
     }
 
 
@@ -288,3 +290,9 @@ def test_graph_env_overrides_profile():
     flags = resolve_flags(env={"PA_GRAPH_ORCHESTRATOR": "false"},
                           profile={"loop": {"pa_graph_orchestrator": True}})
     assert flags.pa_graph_orchestrator is False
+
+
+def test_test_gate_auto_triage_flag_default_off_and_truthy():
+    assert resolve_flags({}).test_gate_auto_triage is False  # 默认 off（渐进启用惯例）
+    assert resolve_flags({"PA_TEST_GATE_AUTO_TRIAGE": "1"}).test_gate_auto_triage is True
+    assert resolve_flags({"PA_TEST_GATE_AUTO_TRIAGE": "true"}).test_gate_auto_triage is True
