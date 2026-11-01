@@ -1021,3 +1021,19 @@ def test_runner_image_sync_endpoint_gate_and_judgment(tmp_path, monkeypatch):
     assert offered == [(rid, "pa-executor:v0.1.3")]  # 真实 offer 恰一次（第二次被去重吞）
     v = client.get("/runners").json()[0]
     assert "image_sync" in v  # 读面任何有效会话可见（含分发状态列）
+
+
+def test_attention_page_guarded_and_renders(tmp_path):
+    """add-panel-attention：读面守卫（无会话 302）+ 登录后 200 含导航徽标与提案节。"""
+    import types as _t
+    client, d, eng, lc = _mk(tmp_path, extra_env=_MM_ENV)
+    lc._drift_seen = {("drift", "R1", "K")}          # 漂移 1 项（lifecycle 内存面替身）
+    r0 = client.get("/panel/attention", follow_redirects=False)
+    assert r0.status_code == 302                       # 无会话重定向登录
+    _login(client, lc)
+    r = client.get("/panel/attention")
+    assert r.status_code == 200
+    assert "待办（1）" in r.text and "漂移未消解（1）" in r.text   # 漂移节入页（唯一非空类 → 总数 1）
+    assert "影子提案待采纳" not in r.text                # 空类整节隐藏
+    assert "阻断待 triage" not in r.text                 # 空类整节隐藏
+    assert "无事需要你" not in r.text                     # 非全空态
