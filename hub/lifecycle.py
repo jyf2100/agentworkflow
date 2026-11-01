@@ -19,6 +19,7 @@ import config_drift
 import daily_digest
 import db
 import event_poller
+import router_relay
 import thread_relay
 import events
 import health_probe
@@ -379,9 +380,12 @@ class Lifecycle:
                 # PA_SINGLE_FLIGHT_AUTO_MERGE 经 hub.env → hub 进程 env → run 容器；破坏性
                 # flag 默认关，部署机按需在 hub.env 本地面开，不进 compose/仓）。sorted 保
                 # 确定性；PA_REPORT_DIR 本处生成，排除防重复。
+                # GIT_CONFIG_*（run 183 真机实证）：git 原生 env 注入 config 机制（≥2.31），
+                # 远程 runner 机容器直连 github 被断时经 hub.env 配 per-URL 代理——只路由
+                # git 流量，LLM/roc 代理流量不经此通道（与 https_proxy 全局 env 的关键差别）。
                 container_env=(f"PA_REPORT_DIR={CONTAINER_STATE}/reports",
                                *(f"{k}={v}" for k, v in sorted(os.environ.items())
-                                 if k.startswith("PA_") and k != "PA_REPORT_DIR")),
+                                 if k.startswith(("PA_", "GIT_CONFIG_")) and k != "PA_REPORT_DIR")),
             )
             try:
                 ref = self._runner.start(spec, docker_host=docker_host)
@@ -567,7 +571,12 @@ class Lifecycle:
         排度循环；bot 通道未配 = 直通关闭零行为。"""
         if self.notifier is None:
             return  # bot 通道未配置——直通关闭（与 /pa 入站同语义）
-        thread_relay.relay_channel_notes(self.cfg, self._db, self.notifier._mm, notifier=self.notifier)
+        # thread_relay 直通分流 → 拒帖集（授权外/窗外）给 router 解释层
+        candidates = thread_relay.relay_channel_notes(self.cfg, self._db, self.notifier._mm,
+                                                      notifier=self.notifier)
+        if isinstance(candidates, list) and candidates:
+            router_relay.relay_router_answers(self.cfg, self._db, self.notifier._mm,
+                                              notifier=self.notifier, candidates=candidates)
 
     def reconcile_running(self) -> None:
         """轮询 running run 行：exited → 记终态走状态机；gone → 按卷证据归档。"""

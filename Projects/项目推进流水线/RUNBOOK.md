@@ -809,3 +809,13 @@ proactive:
 **产物与采纳**：提案落 `<project>/shadow_proposals/YYYYMMDD_sp<hash8>.md`（幂等 = 文件名 hash(repo|signal|锚)）——**仅日报聚合节（现存 N/已采纳 M），永不即时 MM 推送**（「不需要时保持安静」）。采纳 = 人决定：`/pa run <需求>` 的 evidence 填 `shadow-proposal:sp-xxxx` → frontmatter `source:` 关联 → digest 计入命中率（**auto 放量的唯一依据**）。auto 三重前置（预算闸/置信门/全链 critic 不豁免）列后续 change。
 
 **与既有面的边界**：漂移项=需要修的错（MM 即时）；事件增量=进链原料（零推送）；提案=可选的机会（仅日报）。观察挂点经 daemon 直调（`HUB_OBSERVER_TICKS` 缺省 720≈每小时），lifecycle 零改动。
+
+## 27. Router persona 解释层（add-router-persona，2026-11）
+
+**本体**：Router = **解释者**非调度者（dsh Router 是分派者——关键分野）。行动权=零：不 enqueue/不 abandon/不改状态——行动建议仅命令文本（人复制执行）。
+
+**启用**：`PA_ROUTER_PERSONA=1`（hub.env PA_* 透传链，默认关 byte-identical）。persona 定义 `.claude/agents/pa-router.md`（tools 仅 Read，haiku 档）。
+
+**链路**：绑定频道非 slash 消息 → 直通分流（在飞 run 窗口内授权人话走 dev 上下文，其余进 router 候选——一帖绝不双消费）→ **机械预筛**（`#N`/`sp-*`/问句关键词——`HUB_ROUTER_PATTERN` 可配，零 LLM 判定调不调）→ **预算闸**（`HUB_ROUTER_RATE` 缺省 6 次/频道/小时，超限静默）→ 注入块机械拼装（run 摘要/提案/计数，值不入面）→ headless `claude --agent pa-router`（60s 上限）→ 频道回帖 `[router] <答案>`（≤200 词，只引事实）。
+
+**失败静默**：persona 超时/异常 → 无回帖 stderr 留痕（fail-open 零阻塞主链）。

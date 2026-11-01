@@ -42,7 +42,7 @@ def _lineage_notes_dir(cfg, project: str, run: dict) -> Path:
     return Path(cfg.data_root) / project / "state" / "human_notes" / f"qi-{run['queue_item_id']}"
 
 
-def relay_channel_notes(cfg, database, mm, notifier=None, *, member_cache=None) -> int:
+def relay_channel_notes(cfg, database, mm, notifier=None, *, member_cache=None) -> list[dict]:
     """单轮直通捕获（daemon 每 relay_ticks 调一次）：全部绑定频道 → 各自最老在飞 run。
 
     返回本轮采纳笔记数。逐绑定 fail-open（单频道异常不连坐）；无在飞 run 的频道只推
@@ -50,8 +50,9 @@ def relay_channel_notes(cfg, database, mm, notifier=None, *, member_cache=None) 
     天然去抖，绝不逐条刷屏）。
     """
     import mm_intake  # 延迟导入破环（见模块头注）
+    router_candidates: list[dict] = []  # add-router-persona：直通拒帖集（授权外/窗外）给解释层
     if mm is None:
-        return 0  # bot 通道未配置 = 直通关闭（fail-closed 与 /pa 入站同语义）
+        return router_candidates  # bot 通道未配置 = 直通关闭（fail-closed 与 /pa 入站同语义）
     try:
         bindings = database.list_channel_bindings()
         running = database.runs_in_status("running")
@@ -59,7 +60,6 @@ def relay_channel_notes(cfg, database, mm, notifier=None, *, member_cache=None) 
         print(f"[relay][warn] 绑定/在飞读取失败（fail-open）: {type(e).__name__}", file=sys.stderr)
         return 0
     cache = member_cache if member_cache is not None else mm_intake.MemberCache()
-    total = 0
     for b in bindings:
         channel_id, project = b["channel_id"], b["project"]
         try:
@@ -82,9 +82,15 @@ def relay_channel_notes(cfg, database, mm, notifier=None, *, member_cache=None) 
                 if bot_id and str(p.get("user_id")) == bot_id:
                     continue  # bot 自己（事件转发/回执）绝不采
                 if run is None or ms <= _iso_ms(run.get("started_at")):
-                    continue  # 无在飞 run / 窗口外（run 起点之前的话）
+                    router_candidates.append({"channel_id": channel_id,
+                                              "user_id": str(p.get("user_id")),
+                                              "message": str(p.get("message"))})
+                    continue  # 窗外——不直通但可问答（add-router-persona D6 互斥分流）
                 if mm_intake.check_membership(mm, channel_id, str(p.get("user_id")), cache) != mm_intake.MEMBER:
-                    continue  # 授权面外忽略（与 /pa 入站同门，不回执）
+                    router_candidates.append({"channel_id": channel_id,
+                                              "user_id": str(p.get("user_id")),
+                                              "message": str(p.get("message"))})
+                    continue  # 授权面外不直通（与 /pa 入站同门）但可问答
                 path = notes_dir / f"{ms}_{p['id']}.md"
                 if path.exists():
                     continue  # (message_id 文件名) 幂等
@@ -102,10 +108,10 @@ def relay_channel_notes(cfg, database, mm, notifier=None, *, member_cache=None) 
                     f"[订阅直通] 已记入 run #{run['id']}（{project}）下一轮上下文：{taken} 条"
                     f"（仅参考非判据，不影响验收）", f"relay-run{run['id']}")
                 print(f"[relay] {project} 采纳 {taken} 条人话 → {notes_dir}", file=sys.stderr)
-            total += taken
+            pass  # taken 计数已移入回执文本
         except Exception as e:  # noqa: BLE001——单频道 fail-open 不连坐
             print(f"[relay][warn] {project} 频道直通异常（fail-open）: {type(e).__name__}: {e}", file=sys.stderr)
-    return total
+    return router_candidates
 
 
 def _iso_ms(iso: str | None) -> int:
