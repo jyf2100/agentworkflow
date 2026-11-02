@@ -5,14 +5,17 @@ spec: hub-stuck-run-watchdog）。
 三类：告警 / kill / 回执。**绝不产终态**——kill 只制造确定性 exited 事实，终态归 reconcile
 既有对账单写者（不调 _finish_run / on_exit）。
 
-监督面（实施期核实的确定性可寻址面，design「监督面构成」表）：
-- 平铺 journal `<run_dir.name>.journal.jsonl`（run_dir 平铺兄弟，_journal_exists 同款拼法，
-  iteration/stage 级写面）
-- 平铺 events `<stamp>_<prd_stem>.events.jsonl`（events.locate_pa_artifact 既有寻址——
-  stem 来自 queue_item.prd_path 非 run_dir slug，stamp 翻倍 glob 兜底同源）
-- 不入面：worktree 侧遥测（run_log/handoff-latest，dev-agent STATE_RUNS_DIR = worktree）与
-  pa 侧摘要命名的 artifacts/reports 面（ids.run_id = 内容摘要 hub 不可重建）——不可寻址的
-  面误用必串扰。
+监督面（真机 7.x 实证后的生产形态事实，design「监督面构成」表）：
+- **stdout tee `<stamp>.stdout.log`（主面）**：run_daily.py:5444 流水线启动即开 tee，全程
+  增量写；stamp = run_dir.name 前缀（hub 自知）→ **确定性可寻址**，state 根 =
+  run_dir.parent.parent.parent（与 lifecycle state_root 拼法同源）
+- 平铺 events `<stamp>_<prd_stem>.events.jsonl`（辅面）：events.locate_pa_artifact 既有寻址
+  （stem 来自 queue_item.prd_path）——MM/面板路径注入 stem 为拼音 slug，glob 不可达
+  （locate_pa_artifact docstring 明文缺口「另行立项」），此形态下该面自然缺席
+- **不入面**：平铺 journal（`journal_driven_dispatch` flag 生产关闭——真机实证 124+ run
+  零 journal，未来 flag 开启后可作为第二面回归）；worktree 侧遥测（run_log/handoff-latest，
+  dev-agent STATE_RUNS_DIR = worktree）；pa 侧摘要命名的 artifacts/reports 面（ids.run_id =
+  内容摘要 hub 不可重建）。
 
 阈值语义（design D2）：hub 可见合法静默 = 单次 dev SDK 会话全长（小时量级）——AFTER 是
 可见性非精确判定；kill 的防误杀主力是 FLOOR 标定前置（config 层 kill=1 无 FLOOR 即拒起），
@@ -40,16 +43,17 @@ TIER_KILL_FAILED = "kill_failed"
 
 
 def supervision_mtime(run_dir: Path, prd_stem: str | None) -> float | None:
-    """监督面 max(mtime)；双缺返回 None（不判 stuck——failed_to_start 归 reconcile）。
+    """监督面 max(mtime)；全缺返回 None（不判 stuck——failed_to_start 归 reconcile）。
 
-    journal 按 run_dir.name 直接拼（_journal_exists 同款）；events 经 locate_pa_artifact
-    （stem 来自 prd_path，孤儿 queue_item → None = 本面跳过，journal 面仍可用）。
+    stdout tee = run_dir.name 前缀 stamp 直拼（run_daily 流水线启动即写，主面）；
+    events 经 locate_pa_artifact（拼音 slug 形态下缺席，不视为故障）。
     """
     mtimes: list[float] = []
-    journal = run_dir.parent / f"{run_dir.name}.journal.jsonl"
+    stamp = run_dir.name.split("_", 1)[0]
+    stdout_log = run_dir.parent.parent.parent / f"{stamp}.stdout.log"
     try:
-        if journal.is_file():
-            mtimes.append(journal.stat().st_mtime)
+        if stdout_log.is_file():
+            mtimes.append(stdout_log.stat().st_mtime)
     except OSError:
         pass  # 单面 stat 异常 = 该面本轮缺席，不抬异常（fail-open）
     if prd_stem:

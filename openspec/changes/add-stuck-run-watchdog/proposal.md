@@ -15,7 +15,7 @@ pa 对「卡住」的干预源目前全是 **turn / iteration 边界的 in-band 
 
 ## What Changes
 
-- **带外墙钟判据**：run 的监督面 = hub 可见卷上证据面 `max(mtime)`，只取两个**确定性可寻址面**——平铺 journal `<stamp>_<slug>.journal.jsonl`（run_dir 平铺兄弟，`_journal_exists` 同款拼法）与平铺 events `<stamp>_<prd_stem>.events.jsonl`（`events.locate_pa_artifact` 既有寻址，stem 来自 queue_item.prd_path）；静默超过 `HUB_STUCK_AFTER_MINUTES`（默认 120）即判 stuck。全机械零 LLM；worktree 侧 dev 遥测与 pa 侧摘要命名的 artifacts/reports 面 hub 不可寻址不入面（实施期核实，误用必串扰）。**推论：hub 可见面的合法静默 = 单次 dev SDK 会话全长（小时量级）**——阈值语义是可见性非精确判定，kill 阈值带标定前置（见下）
+- **带外墙钟判据**：run 的监督面 = hub 可见卷上证据面 `max(mtime)`——**主面 stdout tee `<stamp>.stdout.log`**（run_daily 启动即写全程增量，stamp = run_dir.name 前缀 hub 自知）+ 辅面平铺 events（`locate_pa_artifact` 寻址，拼音 slug 形态缺席）；静默超过 `HUB_STUCK_AFTER_MINUTES`（默认 120）即判 stuck。全机械零 LLM。**真机实证更正（2026-11-02）**：hub 形态平铺 journal 不存在（flag 生产关闭，124+ run 零 journal），journal 面移除；worktree 遥测与摘要命名面不入面。**推论：hub 可见面的合法静默 = 单次 dev SDK 会话全长（小时量级）**——阈值语义是可见性非精确判定，kill 阈值带标定前置（见下）
 - **检测落点 = daemon 第八低频槽**（现状已有七个：stale/probe/drift/digest/events/relay/observer；同型 N-tick 计数，`HUB_STUCK_TICKS` 默认 36 ≈ 3 分钟——stat 便宜可较密），逻辑归新模块 `hub/stuck_check.py` + `Lifecycle.check_stuck_runs()` 薄挂点（`probe_runners` 同构）；只监督 DB `status=running` 且容器事实 running 的 run（对账按 per-run 快照路由既有语义）
 - **动作阶梯两级**：
   - **告警（默认唯一动作）**：`notify_admin` MM 私信（含 run 号 / 项目 / 停写时长 / 名额占用提示 / 人工 kill 指针），进程内去抖一次、恢复消解回执一次、自然终态终态回执一次（drift-watchdog 去抖/消解先例）

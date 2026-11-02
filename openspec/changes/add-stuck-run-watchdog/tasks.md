@@ -9,8 +9,8 @@
 
 ## 2. 检测模块（hub/stuck_check.py）
 
-- [x] 2.1 监督面 mtime 判据：平铺 journal（`run_dir.name` 直接拼，`_journal_exists` 同款）+ 平铺 events（`events.locate_pa_artifact` 既有寻址，stem 来自 queue_item.prd_path，stamp 翻倍 glob 兜底同源），取 max(mtime)；双缺 → 不判 stuck（failed_to_start 归 reconcile）；pa 侧摘要命名的 artifacts/reports 面与 worktree 侧遥测不入面（`ids.run_id` = 内容摘要 hub 不可重建——实施期核实更正）；clock/stat 注入接缝（fake clock 测试）
-  - 实证：`supervision_mtime`（now_fn 注入；单面 stat 异常吞为缺席）；实施期发现 artifacts 目录为 `run_<digest>`（ids.py:44 内容摘要）不可寻址，spec/design/proposal/tasks 四文件已同步更正
+- [x] 2.1 监督面 mtime 判据：**stdout tee `<stamp>.stdout.log`（主面，stamp = run_dir.name 前缀）** + 平铺 events（`events.locate_pa_artifact` 既有寻址），取 max(mtime)；全缺 → 不判 stuck（failed_to_start 归 reconcile）；journal 面移除（真机实证：`journal_driven_dispatch` flag 生产关闭，124+ run 零 journal——2026-11-02 #137–#139 现场核查）；pa 侧摘要命名的 artifacts/reports 面与 worktree 侧遥测不入面（`ids.run_id` = 内容摘要 hub 不可重建）；clock/stat 注入接缝（fake clock 测试）
+  - 实证：`supervision_mtime`（now_fn 注入；单面 stat 异常吞为缺席）；两轮实施期更正均已同步 spec/design/proposal/tasks 四文件
 - [x] 2.2 去抖与消解：进程内 set 键 `(run_id, 档)` 三档 `alerted` / `kill_done` / `kill_failed`；告警一次 → mtime 前进消解回执清键 → 自然终态终态回执清键；grace 按「mtime 龄 ≥ max(AFTER+GRACE, FLOOR)」一次度量（无时间戳键，design D5 等价关系）；重启丢失最多重告一次（stale_check 同款）
   - 实证：`check_stuck_runs` 离场清理循环 + `_supervise_one` 消解分支；`test_departure_sends_terminal_receipt_and_clears_all_tiers`（kill_failed 档静默清断言）/ `test_recovery_sends_resolution_receipt_and_clears` 绿
 - [x] 2.3 告警与回执面：`notify_admin`（run 号 / 项目 / 停写时长 / 「串行名额被占」提示 / 人工处置指针；kill 回执含「终态归对账」；终态回执闭环已告警 run）；文本零凭据零 env 值（值不入面）；通道 fail-open
@@ -57,4 +57,6 @@
 ## 7. 真机验证
 
 - [ ] 7.1 **阈值标定（kill 启用前置门）**：kill 关档跑真机，采集单 dev SDK 会话时长分布（hub 可见面静默实测），标定 FLOOR = 实测上限写入部署配置；告警阈值 AFTER 按误报率校准——FLOOR 未标定前 kill 保持关闭（配置面已机械强制）
+  - 部分实证（2026-11-02 真机，run #139 全程观察）：健康(近)会话的 hub 可见静默实测达 **50+ 分钟**（dev 单会话 263 turn、3600s wall-clock 超时收场）——120min AFTER 缺省在整个观察窗内零误报；跨机形态（runner-pool 派 183）下 stdout face 经 NFS 双挂可读、监督有效（D7 的 attribute cache 延迟未构成问题）。FLOOR 标定仍欠长会话样本，未写入部署配置
 - [ ] 7.2 受控停摆全链（本机 + 跨机各一轮）：构造真停摆（容器内挂起 / 断 LLM 网络）→ 告警到达 → kill 开档双窗后 stop（`DockerRunner.stop` 首次真机使用）→ kill 回执 → reconcile 归 failed → on_exit 重派状态机接管；跨机轮含 NFS attribute cache 复测盲窗观察（D7）——**标注：模块就绪待真机，不虚报完成**
+  - **检测半链已真机验证 ✓**（2026-11-02 合成演练）：假 running 行 + 陈旧 stdout 面（3h）→ stuck 槽 ≤3 分钟检出告警（`[stuck][warn]` + notify_admin DM 精确含 run 号/停写时长/名额提示/RUNBOOK 指针）→ 去抖恰一次 → kill 关档零 stop → 行离场后闭环回执。**kill 半链未真机验证**（FLOOR 未标定，配置面禁止开）——`DockerRunner.stop` 首次真机使用与 kill 回执待 7.1 标定后补；集成测试已覆盖（test_lifecycle kill→exited 137→failed→重派）

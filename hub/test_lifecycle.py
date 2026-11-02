@@ -747,10 +747,10 @@ def test_stuck_kill_then_reconcile_archives_failed_and_redispatches(tmp_path):
     qid = lc1.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
     lc1.tick_dispatch()
     run_dir = Path(d.runs_for_item(qid)[0]["run_dir"])
-    jf = run_dir.parent / f"{run_dir.name}.journal.jsonl"
-    jf.write_text("{}\n", encoding="utf-8")
+    sf = run_dir.parent.parent.parent / f"{run_dir.name.split('_', 1)[0]}.stdout.log"
+    sf.write_text("[run] tee\n", encoding="utf-8")  # stdout tee 监督面（真机实证：hub 形态无 journal）
     old = _time.time() - 200 * 60
-    _os.utime(jf, (old, old))
+    _os.utime(sf, (old, old))
     lc1.check_stuck_runs()
     assert fake.calls.count(("stop", None)) == 1  # kill 恰一次（Runner.stop 首个生产调用点）
     lc1.reconcile_running()  # exited(137) → 既有 exited 分支归档（watchdog 不产终态）

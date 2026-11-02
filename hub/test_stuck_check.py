@@ -68,15 +68,15 @@ def _run(rid=1, project="proj-a", item_id=10, run_dir=None, host=None):
             "container_ref": f"c-{rid}", "run_dir": str(run_dir), "runner_docker_host": host}
 
 
-def _face(tmp_path: Path, *, journal_age_min=None, events_age_min=None, double_stamp=False,
+def _face(tmp_path: Path, *, stdout_age_min=None, events_age_min=None, double_stamp=False,
           stem="my-prd", stamp="20261102_100000_my-prd"):
     """构造监督面树；age_min=None = 该面缺席。返回 run_dir。"""
     run_dir = tmp_path / "state" / "runs" / "proj-a" / stamp
     run_dir.mkdir(parents=True)
-    if journal_age_min is not None:
-        jf = run_dir.parent / f"{run_dir.name}.journal.jsonl"
-        jf.write_text("{}\n", encoding="utf-8")
-        os.utime(jf, (NOW - journal_age_min * 60, NOW - journal_age_min * 60))
+    if stdout_age_min is not None:
+        sf = tmp_path / "state" / f"{stamp.split('_', 1)[0]}.stdout.log"
+        sf.write_text("[run] tee\n", encoding="utf-8")
+        os.utime(sf, (NOW - stdout_age_min * 60, NOW - stdout_age_min * 60))
     if events_age_min is not None:
         prefix = f"m_{stamp.split('_', 1)[0]}" if double_stamp else stamp.split("_", 1)[0]
         ef = run_dir.parent / f"{prefix}_{stem}.events.jsonl"
@@ -101,12 +101,12 @@ def _go(cfg, database, runner=None, notifier=None, seen=None, stop_raise=None):
 # ── supervision_mtime 判据 ─────────────────────────────────────────
 
 def test_mtime_takes_max_of_present_faces(tmp_path):
-    rd = _face(tmp_path, journal_age_min=10, events_age_min=50)
+    rd = _face(tmp_path, stdout_age_min=10, events_age_min=50)
     assert stuck_check.supervision_mtime(rd, "my-prd") == NOW - 10 * 60  # max = 最近写面
-    rd2 = _face(tmp_path / "b", journal_age_min=50, events_age_min=10)
+    rd2 = _face(tmp_path / "b", stdout_age_min=50, events_age_min=10)
     assert stuck_check.supervision_mtime(rd2, "my-prd") == NOW - 10 * 60
-    rd3 = _face(tmp_path / "c", journal_age_min=30)
-    assert stuck_check.supervision_mtime(rd3, "my-prd") == NOW - 30 * 60  # 单 journal 面
+    rd3 = _face(tmp_path / "c", stdout_age_min=30)
+    assert stuck_check.supervision_mtime(rd3, "my-prd") == NOW - 30 * 60  # 单 stdout 面
     rd4 = _face(tmp_path / "d", events_age_min=30)
     assert stuck_check.supervision_mtime(rd4, "my-prd") == NOW - 30 * 60  # 单 events 面
 
@@ -118,13 +118,13 @@ def test_mtime_both_missing_returns_none(tmp_path):
 def test_mtime_double_stamp_glob_fallback_hits(tmp_path):
     # pa inject 双前缀形态（run #73/#74 实证）：精确拼未命中 → *_{stem} glob 兜底命中
     rd = _face(tmp_path, events_age_min=20, double_stamp=True)
-    assert stuck_check.supervision_mtime(rd, "my-prd") == NOW - 20 * 60  # journal 缺席、events 兜底命中
+    assert stuck_check.supervision_mtime(rd, "my-prd") == NOW - 20 * 60  # stdout 缺席、events 兜底命中
 
 
 # ── 告警档（默认唯一动作）─────────────────────────────────────────
 
 def test_stale_triggers_alert_once_debounced(tmp_path):
-    rd = _face(tmp_path, journal_age_min=150)
+    rd = _face(tmp_path, stdout_age_min=150)
     n = FakeNotifier()
     seen: set = set()
     _go(_cfg(), _db(rd), notifier=n, seen=seen)
@@ -134,7 +134,7 @@ def test_stale_triggers_alert_once_debounced(tmp_path):
 
 
 def test_below_threshold_zero_behavior(tmp_path):
-    rd = _face(tmp_path, journal_age_min=100)  # 单 dev 会话中段：100 < 120
+    rd = _face(tmp_path, stdout_age_min=100)  # 单 dev 会话中段：100 < 120
     n = FakeNotifier()
     r, _ = _go(_cfg(), _db(rd), notifier=n)
     assert n.msgs == [] and r.stops == []
@@ -147,13 +147,13 @@ def test_both_faces_missing_not_judged(tmp_path):
 
 
 def test_recovery_sends_resolution_receipt_and_clears(tmp_path):
-    rd = _face(tmp_path, journal_age_min=150)
+    rd = _face(tmp_path, stdout_age_min=150)
     seen: set = set()
     n = FakeNotifier()
     _go(_cfg(), _db(rd), notifier=n, seen=seen)
     assert (1, stuck_check.TIER_ALERTED) in seen
-    os.utime(rd.parent / "20261102_100000_my-prd.journal.jsonl",
-             (NOW - 5 * 60, NOW - 5 * 60))  # 恢复写进
+    os.utime(rd.parent.parent.parent / "20261102.stdout.log",
+             (NOW - 5 * 60, NOW - 5 * 60))  # 恢复写进（stdout tee 面推进）
     _go(_cfg(), _db(rd), notifier=n, seen=seen)
     assert (1, stuck_check.TIER_ALERTED) not in seen
     assert any("消解此前卡死告警" in m for m in n.msgs)
@@ -170,7 +170,7 @@ def test_departure_sends_terminal_receipt_and_clears_all_tiers(tmp_path):
 
 
 def test_container_exited_zero_behavior(tmp_path):
-    rd = _face(tmp_path, journal_age_min=150)
+    rd = _face(tmp_path, stdout_age_min=150)
     runner = FakeStatusRunner(states={"c-1": "exited"})
     n = FakeNotifier()
     r, _ = _go(_cfg(), _db(rd), runner, notifier=n)
@@ -178,8 +178,8 @@ def test_container_exited_zero_behavior(tmp_path):
 
 
 def test_per_run_exception_no_crosstalk(tmp_path):
-    rd1 = _face(tmp_path / "a", journal_age_min=150)
-    rd2 = _face(tmp_path / "b", journal_age_min=150)
+    rd1 = _face(tmp_path / "a", stdout_age_min=150)
+    rd2 = _face(tmp_path / "b", stdout_age_min=150)
     db = FakeDB([_run(1, run_dir=rd1), _run(2, run_dir=rd2)], {10: {"prd_path": "/x/y/my-prd.md"}})
     runner = FakeStatusRunner(status_raise={"c-1": RuntimeError("daemon 不可达")})
     n = FakeNotifier()
@@ -190,28 +190,28 @@ def test_per_run_exception_no_crosstalk(tmp_path):
 # ── kill 通道（flag 默认关 + FLOOR 前置 + 双窗 + 失败闩）──────────
 
 def test_kill_off_alert_only_no_stop(tmp_path):
-    rd = _face(tmp_path, journal_age_min=300)
+    rd = _face(tmp_path, stdout_age_min=300)
     r, _ = _go(_cfg(), _db(rd))  # stuck_kill 缺省 False
     assert r.stops == []
 
 
 def test_kill_below_max_threshold_no_stop(tmp_path):
-    rd = _face(tmp_path, journal_age_min=140)  # 140 < max(120+30, 90)=150
+    rd = _face(tmp_path, stdout_age_min=140)  # 140 < max(120+30, 90)=150
     r, _ = _go(_cfg(stuck_kill=True, stuck_kill_floor_minutes=90), _db(rd))
     assert r.stops == []
 
 
 def test_kill_floor_dominates_grace(tmp_path):
-    rd = _face(tmp_path, journal_age_min=140)  # 140 < max(150, 200)=200
+    rd = _face(tmp_path, stdout_age_min=140)  # 140 < max(150, 200)=200
     r, _ = _go(_cfg(stuck_kill=True, stuck_kill_floor_minutes=200), _db(rd))
     assert r.stops == []  # FLOOR 主导：标定上限未到
-    rd2 = _face(tmp_path / "x", journal_age_min=210)
+    rd2 = _face(tmp_path / "x", stdout_age_min=210)
     r2, _ = _go(_cfg(stuck_kill=True, stuck_kill_floor_minutes=200), _db(rd2))
     assert len(r2.stops) == 1  # 超 FLOOR → kill
 
 
 def test_kill_double_window_met_stops_once_with_receipt(tmp_path):
-    rd = _face(tmp_path, journal_age_min=160)  # 160 ≥ max(150, 0)
+    rd = _face(tmp_path, stdout_age_min=160)  # 160 ≥ max(150, 0)
     seen: set = set()
     n = FakeNotifier()
     r, seen = _go(_cfg(stuck_kill=True), _db(rd), notifier=n, seen=seen)
@@ -224,13 +224,13 @@ def test_kill_double_window_met_stops_once_with_receipt(tmp_path):
 
 
 def test_kill_routes_per_run_docker_host_snapshot(tmp_path):
-    rd = _face(tmp_path, journal_age_min=160)
+    rd = _face(tmp_path, stdout_age_min=160)
     r, _ = _go(_cfg(stuck_kill=True), _db(rd, host="tcp://10.0.0.9:2375"))
     assert r.stops == [("c-1", "tcp://10.0.0.9:2375")]  # per-run 快照路由（runner-pool D2）
 
 
 def test_kill_recheck_recovered_aborts_with_receipt(tmp_path, monkeypatch):
-    rd = _face(tmp_path, journal_age_min=160)
+    rd = _face(tmp_path, stdout_age_min=160)
     reads = {"n": 0}
     real = stuck_check.supervision_mtime
 
@@ -251,7 +251,7 @@ def test_kill_recheck_recovered_aborts_with_receipt(tmp_path, monkeypatch):
 
 
 def test_stop_failure_latches_no_retry_bombardment(tmp_path):
-    rd = _face(tmp_path, journal_age_min=160)
+    rd = _face(tmp_path, stdout_age_min=160)
     seen: set = set()
     n = FakeNotifier()
     r, seen = _go(_cfg(stuck_kill=True), _db(rd), notifier=n, seen=seen,

@@ -824,7 +824,7 @@ proactive:
 
 **背景**：pa 对「卡住」的干预源全是 turn/iteration 边界的 in-band 机制（dev STALLED 数 turn、semantic_gate 数 turn、iteration 级数迭代、hub reconcile 只见 exited/gone）——真卡死（SDK 会话挂起/LLM 调用不返回/无超时子进程挂死）= 消息停止到达 = 刹车永不被评估，容器活着内部停摆将**永远占住 project 串行名额与峰值名额**。本节描述的看门狗是墙钟轴的带外监督，与上述四者互补。
 
-**监督面与判据**：hub 可见卷上证据面 = 平铺 journal `<stamp>_<slug>.journal.jsonl` + 平铺 events `<stamp>_<prd_stem>.events.jsonl`（与 run 目录同名同层的兄弟文件），取 max(mtime)；静默 ≥ `HUB_STUCK_AFTER_MINUTES`（默认 120 分钟）判 stuck。**阈值语义是可见性非精确判定**——hub 可见面的合法静默 = 单次 dev SDK 会话全长（小时量级），超长健康会话可能误报（代价 = 一条私信）。worktree 侧遥测与 `state/artifacts/run_<digest>/` 等 pa 侧摘要命名面对 hub 不可寻址，不在判据内。
+**监督面与判据**：hub 可见卷上证据面 = **stdout tee `<stamp>.stdout.log`**（流水线启动即写全程增量，stamp 从 run 目录名前缀解析）+ 平铺 events（MM 拼音 slug 形态缺席），取 max(mtime)；静默 ≥ `HUB_STUCK_AFTER_MINUTES`（默认 120 分钟）判 stuck。**阈值语义是可见性非精确判定**——hub 可见面的合法静默 = 单次 dev SDK 会话全长（小时量级），超长健康会话可能误报（代价 = 一条私信）。注意：平铺 journal 在 hub 形态不存在（journal_driven_dispatch flag 生产关闭），不作为判据；worktree 侧遥测与 `state/artifacts/run_<digest>/` 等 pa 侧摘要命名面对 hub 不可寻址，不在判据内。
 
 **告警（默认唯一动作）**：stuck → `notify_admin` 私信（run 号 / 项目 / 停写时长 / 名额占用提示），进程内去抖一次；恢复写进 → 消解回执；run 自然终态 → 终态回执。
 

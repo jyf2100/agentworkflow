@@ -6,21 +6,21 @@
 
 与既有干预的关系：STALLED / semantic_gate（turn 级 in-band）、iteration STALLED（iteration 级 in-band）、reconcile（容器 exited/gone）——本 change 补**墙钟轴的带外监督**，四者互补成全谱。
 
-## 监督面构成（实施期更正：只保留确定性可寻址面）
+## 监督面构成（真机 7.x 实证更正：stdout tee 为主面）
 
 | 面 | 路径 | 写者 | 粒度 | 寻址 |
 |---|---|---|---|---|
-| 平铺 journal | `<stamp>_<slug>.journal.jsonl`（run_dir 的**平铺兄弟**） | run_daily 编排层 | iteration/stage 级 | `run_dir.name` 直接拼（`_journal_exists` lifecycle.py:122 同款） |
-| 平铺 events | `<stamp>_<prd_stem>.events.jsonl`（同为平铺兄弟） | pa 事件出口（critic/verify 裁决、pr_opened 等） | 语义事件级 | `events.locate_pa_artifact(run_dir, prd_stem, suffix)`（stem 来自 queue_item.prd_path；stamp 翻倍 glob 兜底，`events.py:55-67`） |
+| **stdout tee（主面）** | `<state根>/<stamp>.stdout.log` | run_daily 流水线启动即开 tee、全程增量（`run_daily.py:5444`；每 stage 多次 log） | stage 级 | stamp = `run_dir.name` 前缀（hub 自知）；state 根 = run_dir 三层向上 |
+| 平铺 events（辅面） | `<stamp>_<prd_stem>.events.jsonl`（run_dir 平铺兄弟） | pa 事件出口（critic/verify 裁决、pr_opened 等） | 语义事件级 | `events.locate_pa_artifact(run_dir, prd_stem, suffix)`（stem 来自 queue_item.prd_path；MM/面板拼音 slug 形态 glob 不可达——docstring 明文缺口「另行立项」，此形态该面自然缺席） |
 
-取 **max(mtime)**（任一面前进 = 活着）。
+取 **max(mtime)**（任一面前进 = 活着）。**真机实证（2026-11-02，#137–#139 现场核查）**：hub 形态下平铺 journal 不存在（`journal_driven_dispatch` flag 生产关闭——124+ run 全量核查 0 个 journal 文件），原 journal 面设计在生产形态下是盲面，已从判据移除；flag 开启后可回归为第二面。
 
-**明确不入面**（实施期核实，均不可确定性归因到单个 run）：
+**明确不入面**（均不可确定性归因到单个 run）：
 - worktree 侧 `state/runs/` 的 `run_log.jsonl`（dev 每 turn）与 `handoff-latest.json`（K-turn 快照）——`dev-agent.py:1224/:584` STATE_RUNS_DIR = worktree，hub 看不见；
-- `state/artifacts/run_<digest>/`——`ids.run_id = "run_" + 内容摘要`（`ids.py:44`），摘要含 pa 侧 scope 语义，hub 不可重建，冒充可寻址必串扰（r2 冷评审放行的「stamp_slug 前缀过滤」在实现级核实后不成立，本行即更正）；
-- `state/reports/` 的 verify-report 双写——文件名 = pa 侧 log stem 系，同不可稳定归因；且其粒度（每 verify 轮一次）不高于 journal，弃之无信息损失。
+- `state/artifacts/run_<digest>/`——`ids.run_id = "run_" + 内容摘要`（`ids.py:44`），摘要含 pa 侧 scope 语义，hub 不可重建，冒充可寻址必串扰；
+- `state/reports/` 的 verify-report 双写——文件名 = pa 侧 log stem 系，同不可稳定归因。
 
-**推论（D2 的基础）不变**：hub 可见面的合法静默 = 单次 dev SDK 会话全长（会话内 journal/events 均不写；canary 实证单会话 325 turn，小时量级）。
+**推论（D2 的基础）不变**：hub 可见面的合法静默 = 单次 dev SDK 会话全长（dev 子进程期间 run_daily 不 log，stdout tee 在 dev 段静止；canary 实证单会话 325 turn，小时量级）。
 
 ## D 决策
 
