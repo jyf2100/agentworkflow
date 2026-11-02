@@ -1,7 +1,7 @@
 {
   "pa-fetch-deepresearch": "sonnet",
-  "pa-fetch-wechat-url": "qwen3.8-27b-fast",
-  "pa-fetch-github-repo": "qwen3.8-27b-fast",
+  "pa-fetch-wechat-url": "haiku",
+  "pa-fetch-github-repo": "haiku",
   "pa-radar": "haiku",
   "pa-prd": "sonnet",
   "pa-prd-critic": "sonnet",
