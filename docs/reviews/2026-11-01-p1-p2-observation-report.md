@@ -69,3 +69,24 @@
 |---|---|---|
 | P2-8 | effects 缺 state_write（容器启动）包裹——编辑时在途文件文本不匹配导致断言静默失败 | 列 follow-up `add-effects-state-write-wrap` |
 | P2-9 | dispatch 面连续 skip「跳过-超额」——无在飞 run 仍判超额（single-flight 锁误判？） | 独立问题与 P3 无关，列 follow-up 排查 |
+
+---
+
+## 附录二更新：P2-8/P2-9 处置结果（2026-11-02）
+
+### P2-8（已修复）：state_write Effects 包裹
+
+- **修法**：lifecycle.py:405 精确锚定 `self._runner.start()` 补 `with _effect(self._db, "state_write", ...)` 包裹（commit `6dcb5ff`）
+- **验证**：本轮 run #115 被旧 hub 派发（修复前），state_write 首验待下一轮 run
+
+### P2-9（非 bug——设计正确行为澄清）
+
+- **根因**：`count_inflight_prs` 数的是 **GitHub OPEN PR 数**（不是 hub running run 数）。PR #62（run #111 verify_invalid 产物）一直是 OPEN → 在途 1 ≥ single_flight 上限 1 → 正确跳过
+- **修法**：关闭过期 PR #62（`gh pr close`）→ 下一次入队即正常派发（run #115 即证）
+- **教训**：跳过消息「跳过-超额（在途 1 ≥ 1）」的「在途」指 GitHub PR 面，不是 hub 容器面——RUNBOOK 应补注
+
+### P3-① stub 真机验证（关键证据）
+
+**dev run_log turn 2**：`Read → /opt/pa/.project-auto/state/prd/cc-web-control/20261102_readme-kuaisuqidong.md`
+
+没有 stub 时 PRD 全文已在 prompt 内，dev 无需 Read。dev 在 turn 2 主动 Read PRD 文件 = **看到了 stub 摘要 + `[展开: path]` 标记后按需展开**——链式召回（dsh「按需加载协议」）在 pa 的首次真机实证。
