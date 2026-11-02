@@ -98,6 +98,12 @@ test_stale 阻断（`Projects/项目推进流水线/scripts/evidence.py:25` GATE
 
 otlp_export 骨架已在（`Projects/项目推进流水线/scripts/otlp_export.py:3,37,43`——OTLP exporter 抽象 + bounded timeout + 降级事件）。P0 候选：watchdog 漂移项 + 探针红 + 队列水位汇成每日一报——「只显示需要人的地方」的日报形态，为 P2 北极星（人工介入次数）预埋采集点。**注意**：watchdog change 本体范围不含日报（其 proposal 显式「不建日报/面板面」）——日报骨架是其后的顺路候选，立项时另案；未立项期间度量采集走既有落盘面（见 §6 推进纪律的条件式）。
 
+### 2.5 add-stuck-run-watchdog（候选 → **2026-11-02 已立项**）
+
+> **2026-11-02 立项注记**：change 包已建成（`openspec/changes/add-stuck-run-watchdog/`，proposal/design/tasks/spec delta），经对抗评审（r1：3×P1 全部结构性修复——监督面落点更正为平铺兄弟文件+前缀面、`Runner.stop` 首个生产调用点事实更正、stop 失败进闩）与冷评审（r2：APPROVE），`openspec validate --strict` 通过。
+
+卡死 run 的带外墙钟监督：pa 对「卡住」的干预源全是 turn/iteration 边界的 in-band 机制（STALLED 数 turn / semantic_gate 数 turn / iteration 级数迭代 / hub reconcile 只见 exited/gone），真卡死 = 消息停止到达 = 刹车永不被评估，容器活着内部停摆将永远占住串行与峰值名额。这是 dsh **Watchdog 外部控制环**的 pa 翻译（§1 P0 未覆盖的第五个 dsh 特征位）——in-band 机制在循环停摆时必然失效，带外墙钟监督是补这个象限的唯一手段。动作阶梯：告警默认唯一动作；kill 三重闸（flag 默认关 + FLOOR 标定前置 ConfigError + 双窗），终态归 reconcile 单写者。7.1 阈值标定为 kill 放量前置门（观察先行的既有纪律）。
+
 ## 3. P1 事件驱动化（1–2 月，方向章节·不立项）
 
 ### 3.1 add-event-sources：fetch 源升级订阅型 Trigger
@@ -165,6 +171,7 @@ persona/dev 的上下文注入从「整块拼 prompt」升级为 **stub + 按需
 3. **不做 dev loop 异步 start/stop 工具改造**——dsh 的工具面异步化适配其宿主，pa 的 dev loop 语义（journal/handoff/证据门）不依赖它。
 4. **不追 BYOM 多设备叙事**——pa 的部署拓扑（hub 服务器 + runner 池）已定（`docs/superpowers/specs/2026-10-20-pa-server-deployment-design.md`），多设备 bring-your-own-model 与 per-user 凭据面（F9）正交且无需求。
 5. **dsh 文章实验数据不当依据**——其评测为合成负载 + 部分机制在原型中未实现；本路线只取**原型实况层**（代码可核的机制形态），实验数字一律不引用。
+   **素材源层级注记（2026-11-02 补）**：dsh 素材存在两层——原型代码（实况层，本路线主素材源）与 DSH 设计文章及其二手解读（如 cxuan《通了个宵，终于把 Super-Agent 架构玩明白了》，设计叙事层，含原型未实现的机制：链式召回全工件 ID 图、投机执行后台预活、watchdog 定时消息注入会话）。纪律：设计叙事层只取**机制形态**做翻译候选与交叉验证（例：DSH 全双工中断实为「消息进 Thread 上下文、Worker 工具间隙消费」，与 thread-subscription v1 排队注入同构——支撑既有设计并给出实时中断的解锁路径 = iteration 边界注入 → Path A interrupt 级注入；stuck-run-watchdog（§2.5）是 Watchdog 外部控制环的形态翻译），实验数字与未实证的性能主张一律不当依据。
 
 ## 8. 度量
 
