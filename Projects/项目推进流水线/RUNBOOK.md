@@ -607,7 +607,7 @@ hub 观察面三件套：读面会话守卫 + MM 通知 bot + 镜像陈旧检测
 
 **容器形态：执行链段范围与模型路由（fix-hub-form-parity，2026-10，spec: execution-hub「执行链段范围」）**：
 - **段范围**：派发 cmd 已补 `--to-stage report`（此前止于 dispatch 默认——report 段从不跑、`state/reports/` 恒空、面板恒「无报告」）。现在执行链 inject→critic→dispatch→report 跑满，report 双写产物真实落卷。**容器内 report 段 SMTP 必走 fail-open 告警**（SMTP env 不透传容器，只透 `PA_*`）——run 尾恒一条 SMTP 告警日志属预期，勿为此配 SMTP env（hub 形态通知面是 MM bot，见 §16）。
-- **模型路由 env-only**：容器形态**仅 env 点**可配（`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL`）——executor 镜像不含 `config/`，文件主点 `config/model-routing.json` 是 vault 本机形态专属（有意选择：路由随 hub.env 差异化、改后即刻生效，烤进镜像反而钉死在发布时点）。hub.env 示例：`PA_PERSONA_MODEL_PA_PROGRESS=haiku`、`PA_DEV_MODEL=sonnet`；改后 `docker compose up -d` 重建 hub 进程即生效（`PA_*` 经派发透传进 run 容器），**无需重发镜像**。容器内优先级 env > roc（无文件点可降级）。
+- **模型路由 env-only**：容器形态**仅 env 点**可配（`PA_PERSONA_MODEL_<AGENT>` / `PA_DEV_MODEL`）——executor 镜像不含 `config/`，文件主点 `config/model-routing.json` 是 vault 本机形态专属（有意选择：路由随 hub.env 差异化、改后即刻生效，烤进镜像反而钉死在发布时点）。hub.env 示例（9001 智翼形态，裸模型名——alias 容器内不解析）：`PA_PERSONA_MODEL_PA_PRD=qwen3.8-27b-coding`、`PA_PERSONA_MODEL_PA_PROGRESS=qwen3.8-27b-fast`、`PA_DEV_MODEL=qwen3.8-27b-fast`；改后 `docker compose up -d` 重建 hub 进程即生效（`PA_*` 经派发透传进 run 容器），**无需重发镜像**。容器内优先级 env > roc（无文件点可降级）。
 
 **无 run 放弃告警**：create_run 前的五类放弃（project 名非法 / PRD 缺失 / 启动必读面缺失 / 凭据缺失 / meta 署名失败）收敛经 `_abandon` → bot 私信管理员（含队列项 id + project + 原因摘要）；通道关闭 = stderr 降级留痕（fail_item 不受影响）。与 run 终态通知（4a notify_run）互补：无 run 的放弃也有可见性。
 

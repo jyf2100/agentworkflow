@@ -7,10 +7,7 @@ flag PA_MEMORY_GRAPH 默认 off = 全量注入 byte-identical。
 from __future__ import annotations
 
 import os
-import re
-import sys
 from collections import defaultdict
-from pathlib import Path
 
 TOP_K_DEFAULT = 3
 DORMANT_THRESHOLD = 10
