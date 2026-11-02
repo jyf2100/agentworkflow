@@ -401,7 +401,9 @@ class Lifecycle:
                                  if k.startswith("PA_") and k != "PA_REPORT_DIR")),
             )
             try:
-                ref = self._runner.start(spec, docker_host=docker_host)
+                with _effect(self._db, "state_write",
+                             {"action": "container_start", "project": project, "tag": item["image_tag"]}):
+                    ref = self._runner.start(spec, docker_host=docker_host)
             except ImageMissingError as e:
                 self._finish_run(rid, "failed_to_start", project=project, run_dir_name=run_dir.name,
                                  item=item, last_error=str(e))
