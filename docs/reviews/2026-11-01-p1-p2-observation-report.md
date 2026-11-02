@@ -90,3 +90,25 @@
 **dev run_log turn 2**：`Read → /opt/pa/.project-auto/state/prd/cc-web-control/20261102_readme-kuaisuqidong.md`
 
 没有 stub 时 PRD 全文已在 prompt 内，dev 无需 Read。dev 在 turn 2 主动 Read PRD 文件 = **看到了 stub 摘要 + `[展开: path]` 标记后按需展开**——链式召回（dsh「按需加载协议」）在 pa 的首次真机实证。
+
+---
+
+## 附录三：两项「最严重」修复最终报告（2026-11-02）
+
+### G1 Router 直连 API：✅ 修复并真机验证
+
+- **修法**：`router_relay.py` 的 `answer_question` 从 `subprocess.run(["claude", ...])` 改为 `urllib POST {base}/v1/messages`（Anthropic 协议，vault 凭据同 R3 探活面；ROUTER_SYSTEM 常量内联 persona 纪律）
+- **真机**：hub 容器内直连 API → 正确回答（104 词，≤200 词纪律遵守，诚实「查不到」+建议命令）
+- **commit**：`b30ee0c`
+
+### P3-③ Memory Graph：代码全通，数据接入有阻塞
+
+- **Effects 队列（P2-8）**：✅ 完全验证——`state_write done ×4` + `mm_notify done ×7`（每容器启动/每 run 终态均有 Effect 记录）
+- **Memory graph 代码**：✅ 接线完成（run_daily `_build_lessons_pkg` step 4 后 wire `memory_graph.top_k`）
+- **Catalog 数据**：✅ 手动创建 3 条种子 lessons（含 refs 引用图边）
+- **Flags**：hub 容器有 `PA_LEARNING_SHADOW=1 / PA_LEARNING_INJECTION=1 / PA_MEMORY_GRAPH=1`
+- **❌ 注入未生效**：4 轮 run 均 `injection_on=False / candidate_count=0`。排查方向：
+  1. executor 容器内 PA_* env 是否真正到位（hub→docker run -e 链）
+  2. catalog JSON schema 是否与 `load_catalog_file` 期望的格式匹配
+  3. `resolve_flags()` 在 executor 容器内的实际返回值
+  列 follow-up 排查（不是 memory_graph 代码问题——是学习记忆面的 env/catalog 接入问题）

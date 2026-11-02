@@ -3039,6 +3039,25 @@ def _build_lessons_pkg(prof: dict, prd_abs: str, *, project_id: str, run_id: str
         result = LMRet.retrieve_from_source(source, task_metadata)
         if result.degraded_class is not None:
             pkg["degraded_class"] = result.degraded_class
+        # add-long-term-memory-graph：flag 开 → 用引用图 Top-K 替代全量 selected
+        # （中心度×2 + PRD 关键词×3；k=0 全量 baseline——与 retrieval 结果等价）
+        import os as _os
+        if _os.environ.get("PA_MEMORY_GRAPH", "").strip().lower() in ("1", "true", "yes", "on"):
+            try:
+                import memory_graph as MG
+                _entries = list(result.selected) if result.selected else []
+                if _entries:
+                    _g = MG.build_graph(_entries)
+                    _prd_lower = prd_text.lower() if prd_text else ""
+                    _k = int(_os.environ.get("PA_LESSONS_TOP_K") or 3)
+                    _top = MG.top_k(_g, _prd_lower, k=_k)
+                    if _top and _k > 0:
+                        _by_id = {e.get("lesson_id", ""): e for e in _entries}
+                        result = type(result)(selected=tuple(_by_id[lid] for lid in _top if lid in _by_id),
+                                             selected_lesson_ids=tuple(_top),
+                                             degraded_class=result.degraded_class)
+            except Exception:
+                pass  # memory_graph 失败 → 保持 retrieval 原结果（fail-open）
         pkg["selected_lesson_ids"] = tuple(result.selected_lesson_ids)
         if not result.selected:
             return pkg   # 无 applicable lessons → 无注入（baseline prompt）；非 degraded
