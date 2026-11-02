@@ -1,11 +1,11 @@
 {
-  "pa-fetch-deepresearch": "sonnet",
-  "pa-fetch-wechat-url": "haiku",
-  "pa-fetch-github-repo": "haiku",
-  "pa-radar": "haiku",
-  "pa-prd": "sonnet",
-  "pa-prd-critic": "sonnet",
-  "pa-verify": "sonnet",
-  "pa-progress": "haiku",
+  "pa-fetch-deepresearch": "glm-5.2",
+  "pa-fetch-wechat-url": "glm-5.1",
+  "pa-fetch-github-repo": "glm-5.1",
+  "pa-radar": "glm-5.1",
+  "pa-prd": "glm-5.2",
+  "pa-prd-critic": "glm-5.2",
+  "pa-verify": "glm-5.2",
+  "pa-progress": "glm-5.1",
   "dev": "qwen3.8-27b-fast"
 }
