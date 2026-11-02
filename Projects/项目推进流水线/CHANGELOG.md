@@ -2,6 +2,30 @@
 
 本项目推进流水线（pa-pipeline）版本记录。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵从 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [2.0.0] - 2026-11-02
+
+「**从 cron 批处理到事件驱动常驻 agent**」——dsh-superagent 演进路线（P0–P3）全面落地并收口归档：连续性（事件源/订阅直通/Router 解释层）、主动（影子观察者/注意力面板）、资源（跨机 runner 池）、监督（卡死看门狗 kill 真机）、上下文经济学与长程记忆（P3 三件实装）五大板块齐备；openspec 在途 change 全部归档（spec 53/53 严格全绿）。真机（184 hub + 183 runner）全程实证。
+
+### dsh 演进路线 P1–P3 实装落地
+- **add-context-loading-protocol**：dev prompt 五通道注入 stub 化（≤80 字摘要 + `[展开: path]` 按需展开 + 4000 token 预算截断 + 引用链标注）——上下文经济学主面。
+- **add-effects-queue**：副作用「先落账再执行」Effects 持久队列（六类副作用 + 幂等键 + 崩溃恢复先清队列再对账），与 journal 事实流互补的意图流。
+- **add-long-term-memory-graph**：lessons/repo_facts 引用图（refs 机械提边 + 邻域 Top-K 注入 + dormant 修剪 + 冲突对检测），lessons 注入从全量切图邻域。
+- **P1/P2 收口归档**：add-event-sources（GitHub 事件两级过滤入语料链）、add-thread-subscription（频道人话排队直通 + 谱系化）、add-router-persona（MM 解释层，零调度权）、add-proactive-observer（影子提案）、add-panel-attention（/attention 聚合）、add-drift-l5-health-probe（网关探活三态）。
+- **真机运维闭环**：add-hub-remote-runner + add-hub-runner-pool（跨机派发 + 负载调度 + 探针兼调度门，7.2 远程真机 183 实证勾选）、add-runner-image-sync、add-config-drift-watchdog、add-hub-daily-digest 全部归档。
+
+### 卡死 run 带外墙钟监督（全新 capability：hub-stuck-run-watchdog）
+- **add-stuck-run-watchdog** 全程（立项对抗评审+冷评审 → 实施 → 真机更正 → 真机验证 → 归档，20/20）：in-band 干预源（turn/iteration 刹车）在循环停摆时必然失效的带外补位——监督面 = stdout tee `<stamp>.stdout.log`（真机实证 journal 面生产形态不存在后更正）max(mtime) 停写判据。
+- 动作阶梯：告警唯一动作（notify_admin 去抖/消解/离场三回执）+ kill 三重闸（flag + FLOOR 标定前置 ConfigError + 双窗 max(AFTER+GRACE, FLOOR)）；kill = `Runner.stop` 首个生产调用点，终态归 reconcile 单写者；stop 失败进闩零重试。
+- 真机验证：合成演练 ×3 全 ≤3.5 分钟闭环（检测/本机 kill/跨机 kill tcp://183）；阈值标定 FLOOR=75 落地部署配置（dev wall-clock 3600s 上界推导），生产 kill 线 150 分钟。
+
+### 模型路由与网关体系
+- 9001 智翼网关恢复 + 全 qwen 系 per-agent 差异化路由（PA_PERSONA_MODEL_* env 通道；fetch×2 切 haiku）；Router API 直连替代 claude CLI（hub thin 容器无 CLI 根治）；executor 镜像 v0.1.39 → v0.1.40。
+- GIT_CONFIG_* env 透传进 run 容器——git per-URL 代理只路由 git 流量（远程 runner 直连 github 被断的真机修复）。
+
+### 工程流程与文档
+- opsx skill（openspec+本体论 7 步工作流 skill 化）+ CLAUDE.md 评审纪律/开发工作流程强制节；docs-drift 语义的 CHANGELOG/徽章同步。
+- 演进路线图 v2：素材源层级注记（原型实况层 vs 设计叙事层）+ §2.5 watchdog 立项注记。
+
 ## [1.2.0] - 2026-11-01
 
 「**观察面闭环 + 外部生态整合第一步**」——六层配置漂移事故根治、P0 观察面四件套（看门狗/镜像分发/auto-triage/日报）、HelixHarness 整合落地、SuperAgent 演进路线立项。真机全程实证（#110/#111 全链 + 事故复演闭环）。
