@@ -60,7 +60,7 @@ hub SHALL 经事件转发管道收 `metrics_proposed`（事件须已注册进 hu
 
 ### Requirement: reject 与 metrics 补充
 
-`/pa reject #<id>`（发起人）置 rejected + 频道回执；`/pa metrics #<id> <补充>` 将补充并入 PRD 快照后重新入队走 critic→spec-author 链自然重拟（受上述重入队上界约束）。两者对非发起人拒绝、对非 requested 态幂等回执。
+`/pa reject #<id>`（发起人）SHALL 置 rejected + 频道回执；`/pa metrics #<id> <补充>` SHALL 将补充并入 PRD 快照后重新入队走 critic→spec-author 链自然重拟（受上述重入队上界约束）。两者对非发起人拒绝、对非 requested 态幂等回执。
 
 #### Scenario: 补充上下文重拟
 

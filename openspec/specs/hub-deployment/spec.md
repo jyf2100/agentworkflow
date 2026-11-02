@@ -2,7 +2,7 @@
 
 ## Purpose
 
-hub 的 docker compose 部署形态与运维口径。
+hub 的 docker compose 部署形态与运维口径。覆盖：thin 镜像单常驻服务的 compose 定义、docker socket 属主对齐（group_add 补组）、env_file 注入时机（up -d 重建生效，restart 不重读）、数据卷与凭据挂载布局，以及换机部署/回滚的运维检查单。
 
 ## Requirements
 

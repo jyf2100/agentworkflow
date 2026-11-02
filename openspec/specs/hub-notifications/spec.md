@@ -3,9 +3,7 @@
 ## Purpose
 
 hub 侧通知能力：Mattermost bot 通道（独立凭据实体 + 注入接缝 + 未配置零行为）、run 终态 per-user 私信（事件面钉死为 hub DB 自有事实的 run 终态行，收件人按 enqueued_by 值形态三代分流）、通知 fail-open（观察面不阻断执行面、零新增持久化写面）、可选 per-project 失败频道广播、镜像陈旧告警（F13 推迟项：remote release tag 周期比对 + 三态分流 + 去抖）。
-
 ## Requirements
-
 ### Requirement: bot 通道（独立凭据实体 + 注入接缝）
 hub SHALL 经 Mattermost bot token（`HUB_MM_BOT_TOKEN`，独立凭据实体——与 OAuth app 四项分离，F14「身份与通道两范畴」）提供推通知通道。MM API 推递 SHALL 经注入式 client 接缝（生产 httpx 同鸭子面、测试 Fake 同判，对齐 auth.D8 模式）；bot token 绝不进错误消息与日志。未配置 bot token（通道关闭态）SHALL 零通知零行为——流水线与端点面完全不变；复用的 `HUB_MM_BASE_URL` 未配置时通道同样关闭。
 
@@ -134,3 +132,24 @@ hub SHALL 在队列项**无 run 行放弃**（create_run 前的 fail_item 路径
 #### Scenario: 未绑定项目回落 admin DM
 - **WHEN** 同类无 run 放弃但 project 未绑定频道
 - **THEN** 配置单用户收到告警私信（含 project 与原因）；未配 bot token 时 stderr 可见
+
+### Requirement: 运维日报（一日一条聚合）
+
+hub SHALL 每日（`HUB_DIGEST_TICKS`，默认 17280 tick ≈ 5s tick 下一日，≥1 整数非法值启动 fail fast）产出一条运维日报并经管理面告警通道（`notify_admin` MM 私信）投递配置单用户，同时 stderr 恒留痕；未配 bot 通道 = 降级 stderr（可见的丢）。日报 SHALL 聚合三面且仅含现状事实（计数/名称/时长/红绿标记——凭据值与报文全文 MUST NOT 入面）：① 队列（pending 数、最老 pending 等待时长、running 数、近 24h succeeded/failed 终态计数）；② runner 池（各行探针红绿与坏项名、忙闲 load/capacity、上次镜像分发结果标记）；③ 配置漂移（未消解漂移项计数；看门狗未运行时标注无数据）。日报槽异常 MUST NOT 崩排度循环（观察面纪律），MUST NOT 建立任何新持久化写面。
+
+#### Scenario: 每日一条聚合投递
+- **WHEN** daemon 累计 `HUB_DIGEST_TICKS` 个 tick
+- **THEN** 配置单用户收到一条含队列/池/漂移三节的日报私信，stderr 同文留痕；中间 tick 零产出
+
+#### Scenario: 未配通道降级
+- **WHEN** 未配 MM bot 通道
+- **THEN** 日报全文降级 stderr（可见的丢而非静默吞），周期与内容不变
+
+#### Scenario: 周期键非法启动拒起
+- **WHEN** `HUB_DIGEST_TICKS` 为 0、负数或非整数
+- **THEN** load_config 抛 ConfigError 拒绝启动（与既有周期键同口径）
+
+#### Scenario: 日报异常不崩循环
+- **WHEN** 单轮聚合或投递抛异常（db 故障等）
+- **THEN** 记 warn 后排度循环照常，派发与对账不受影响
+

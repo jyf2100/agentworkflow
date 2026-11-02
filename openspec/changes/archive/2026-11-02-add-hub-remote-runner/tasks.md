@@ -23,4 +23,5 @@
 ## 5. 验证
 
 - [x] 5.1 本机回归：不设两 env 起一次干跑（FakeRunner 全链：入队树内 PRD → tick_dispatch → 四路挂载源 = data_root 派生 byte-identical、prd_path 存 hub 视角、docker_host=runner_mount_root=None）——已实证
-- [ ] 5.2 远程真机验证（需目标机 ops 前提就绪，可与代码合入解耦）：183 开 2375 + 预载镜像 + 共享存储双挂后 `/pa run` 一次，确认容器出现在目标机、通知正常回流（此项 ops 依赖外部，单独追踪不强阻塞归档）
+- [x] 5.2 远程真机验证（需目标机 ops 前提就绪，可与代码合入解耦）：183 开 2375 + 预载镜像 + 共享存储双挂后 `/pa run` 一次，确认容器出现在目标机、通知正常回流（此项 ops 依赖外部，单独追踪不强阻塞归档）
+  - 2026-10-30 真机实证（与 add-hub-runner-pool 7.2 同会话）：ops 三前提就绪（183 开 2375 + 镜像在场 + NFS 双挂探针三项绿）→ 假项目入队派发 → 容器落 183（runner_name 快照正确）→ 机械失败对账 → 重派×2 耗尽终态 failed——远程派发/对账/重派全链走通。范围注记：入队走假项目 API 通道非 MM `/pa run` 字面；MM 终态通知回流随 hub 通知面既有行为（本会话未单独逐字确认），MM 端到端由 add-thread-subscription 真机 showcase 后续覆盖

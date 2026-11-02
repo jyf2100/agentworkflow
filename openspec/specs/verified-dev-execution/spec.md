@@ -196,7 +196,7 @@ Any anchor violation invalidates the result fail-closed. A session that exceeds 
 
 ### Requirement: pa-verify three-party review scope
 
-`pa-verify` is positioned as a publish-time independent verification gate that runs **in parallel with** — not replacing — the project's own development-time review. Its `verdict` is composed by the persona over three review dimensions (functional alignment, completeness, quality bar) with the independent test result as a confirming input. **The orchestrator's contract is to supply the inputs and forbid the mechanical mapping, not to assert the persona's reasoning** — the three-dimension composition, the green-but-blocking-defect judgement, and the "skeptical but not harsh" baseline live in the `pa-verify` persona definition (design guidance), not in these scenarios.
+`pa-verify` is positioned as a publish-time independent verification gate that runs **in parallel with** — not replacing — the project's own development-time review. Its `verdict` is composed by the persona over three review dimensions (functional alignment, completeness, quality bar) with the independent test result as a confirming input. **The orchestrator MUST supply the inputs and forbid the mechanical mapping, not assert the persona's reasoning** — the three-dimension composition, the green-but-blocking-defect judgement, and the "skeptical but not harsh" baseline live in the `pa-verify` persona definition (design guidance), not in these scenarios.
 
 The orchestrator SHALL:
 
