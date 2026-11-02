@@ -1,11 +1,11 @@
 {
-  "pa-fetch-deepresearch": "glm-5.2",
-  "pa-fetch-wechat-url": "glm-5.1",
-  "pa-fetch-github-repo": "glm-5.1",
-  "pa-radar": "glm-5.1",
-  "pa-prd": "glm-5.2",
-  "pa-prd-critic": "glm-5.2",
-  "pa-verify": "glm-5.2",
-  "pa-progress": "glm-5.1",
+  "pa-fetch-deepresearch": "qwen3.8-27b",
+  "pa-fetch-wechat-url": "qwen3.8-27b-fast",
+  "pa-fetch-github-repo": "qwen3.8-27b-fast",
+  "pa-radar": "qwen3.8-27b-fast",
+  "pa-prd": "qwen3.8-27b-coding",
+  "pa-prd-critic": "qwen3.8-27b-coding",
+  "pa-verify": "qwen3.8-27b-coding",
+  "pa-progress": "qwen3.8-27b-fast",
   "dev": "qwen3.8-27b-fast"
 }
