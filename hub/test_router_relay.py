@@ -57,8 +57,14 @@ def test_flag_off_zero_behavior(monkeypatch):
 
 
 def test_answer_failure_silent(monkeypatch, capsys):
-    def boom(cmd, **k):
-        raise __import__("subprocess").TimeoutExpired("claude", 60)
-    monkeypatch.setattr(RR.subprocess, "run", boom)
-    assert RR.answer_question(_cfg(Path("/tmp")), FakeDB(), "x") is None
+    """API 调用超时 → None 静默（fail-open）。"""
+    import urllib.error
+    def boom(req, timeout=None):
+        raise urllib.error.URLError("timeout")
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    cfg = _cfg(Path("/tmp"))
+    cfg.anthropic_base_url = "http://bad:9999"
+    cfg.anthropic_auth_token = "t"
+    cfg.user_model = "m"
+    assert RR.answer_question(cfg, FakeDB(), "x") is None
     assert "静默" in capsys.readouterr().err or "超时" in capsys.readouterr().err

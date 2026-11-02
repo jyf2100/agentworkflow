@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -66,23 +65,47 @@ def build_context_block(cfg, database, run_ref: str | None = None) -> str:
     return "\n".join(lines)
 
 
+ROUTER_SYSTEM = (
+    "你是 pa-hub 的只读值班解释员。回答关于 run 状态、阻断原因、影子提案、今日计数的问题。\n"
+    "纪律：只引事实（注入块是唯一真相源，引用来源）；查不到就明说；"
+    "行动建议 = 命令文本（你绝不代执行）；≤200 词中文；开头一行直接答案，证据随后。"
+)
+
+
 def answer_question(cfg, database, question: str, run_ref: str | None = None) -> str | None:
-    """headless 调 pa-router persona（60s 上限）——返回回答文本或 None（失败/超时）。"""
+    """直连 API 回答（G1 修复：hub thin 容器无 claude CLI——改 urllib POST Anthropic 协议）。
+
+    模型走 cfg.user_model（vault 派发同源）；base_url/token 走 vault 凭据（与 R3 探活同面）。
+    60s 上限；失败/超时 → None（fail-open 静默）。
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
     prompt = f"{build_context_block(cfg, database, run_ref)}\n\n---\n\n用户问题：{question}"
+    body = _json.dumps({
+        "model": cfg.user_model or "qwen3.8-27b-fast",
+        "max_tokens": 500,
+        "system": ROUTER_SYSTEM,
+        "messages": [{"role": "user", "content": prompt}],
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{cfg.anthropic_base_url.rstrip('/')}/v1/messages",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "x-api-key": cfg.anthropic_auth_token,
+                 "anthropic-version": "2023-06-01"},
+    )
     try:
-        r = subprocess.run(
-            ["claude", "--agent", "pa-router", "-p", prompt,
-             "--output-format", "text", "--max-turns", "4"],
-            capture_output=True, text=True, timeout=_ANSWER_TIMEOUT,
-            cwd=str(Path.cwd()),
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        print("[router][warn] 回答超时/失败（静默跳过——fail-open）", file=sys.stderr)
+        with urllib.request.urlopen(req, timeout=_ANSWER_TIMEOUT) as resp:
+            payload = _json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        print("[router][warn] API 调用超时/失败（静默跳过——fail-open）", file=sys.stderr)
         return None
-    if r.returncode != 0 or not r.stdout.strip():
-        print("[router][warn] persona 非零退出（静默）", file=sys.stderr)
-        return None
-    return r.stdout.strip()[:1200]
+    for block in (payload.get("content") or []):
+        if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+            return block["text"].strip()[:1200]
+    print("[router][warn] API 响应无文本块（静默）", file=sys.stderr)
+    return None
 
 
 def relay_router_answers(cfg, database, mm, notifier=None, *,
