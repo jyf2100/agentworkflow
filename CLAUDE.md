@@ -134,3 +134,27 @@ vault 是**双 checkout**：运行时真身在 roc mac（`/Users/roc/…`，cron
 -  **任何 change 无论大小，实施后必须走对抗评审 + 冷评审再合入。** 单测 + 质量门 + openspec 校验 ≠ 评审——它们只证明「代码跑得通」，不证明「本体正确」（范畴混用/判据错位/静默破坏既有面这类问题只有独立评审员能抓）。2026-11-01 P2 ①② 与 P3 三件两次直实施跳过评审，均被补审抓出 P1 级 bug（attention 页 dispatch 路径推导恒空；context_loader stub 路径静默清空验收测试注入 + effects 表缺既有库迁移）。
 -  **评审两轮最少**：对抗评审（专找结构性缺陷——本体错位/范畴混用/与既有判据冲突）→ 独立冷评审（没看过实施过程的人核对 finding 是否被**结构性**解决——纸面认领不算）。
 -  **在途文件禁改清单**：实施前先 `git status` 列出用户在途 hunk（lifecycle.py、hub.env.example、test_events.py 等纠缠文件），列禁改红线进实施简报。commit 时用切片法分离——`git add -u` 是禁手（2026-11-01 曾误打包用户在途三文件后被 revert 恢复）。
+
+### 开发工作流程（openspec + 本体论——每个 change 的强制步骤）
+
+> 2026-11-01 固化。P2/P3 期间 5 个 change 直实施跳过评审，被补审抓出 4 个 P1 级 bug。
+> 本节是从教训中提炼的**强制流程**——不做完就不许 commit。
+
+**步骤（严格按序，缺一不可）：**
+
+1. **起草 change 包**（openspec）：proposal（Why/What/Non-Goals）→ design（本体论声明 + D 编号决策 + 状态机 + schema）→ spec delta（ADDED/MODIFIED + Scenario WHEN/THEN）→ tasks（编号可勾选）。`.openspec.yaml` 写 `schema: spec-driven`。
+2. **对抗评审**（实施后）：独立评审员专找结构性缺陷——本体错位（范畴混用/归属实体错位/判据切分未展开）/惯例偏差/与既有 spec 冲突。每条 finding 按 REVIEW-GUIDELINES §3 格式（Contract/Code behavior/Counterexample/Impact/Minimal fix/Severity）。
+3. **冷评审**（换人复审）：没看过实施过程的人核对上轮 finding 是否被**结构性**解决（纸面认领不算），另查红线（在途文件禁改 / 值不入面 / fail-open / 三态精神）。
+4. **实施修复**：按冷评审意见逐条修。修完 scoped pytest 到绿。
+5. **确定性门**：`openspec validate <id> --strict` + 对应质量门（hub/quality.sh 或 pa quality.sh）。红了回炉一次。
+6. **真机验证**：条件允许时入队一个真实 run 走全链。不允许时明确标注「模块就绪待真机」——**不许虚报完成**。
+7. **勾任务**：每项行内补证据（命令+关键输出摘要），不空勾。
+
+**本体论检查清单**（design.md 必须覆盖）：
+- 新概念的**范畴归属**是什么？（Trigger / 告警 / 提案 / 上下文 / 事实——互斥的类别）
+- **真相源**在哪？谁写谁读？（一个事实一个权威源）
+- **同一性**怎么定义？（文件名 hash / (kind, payload_sha) / streak 锚——幂等重放依据）
+- **时态**：先落账再执行还是先执行后对账？（crash 安全）
+- **值不入面**：报文/日志只含键名/长度/计数，绝不回显凭据值。
+
+**在途文件禁改**：实施前 `git status` 列出用户在途 hunk（lifecycle.py / hub.env.example / test_events.py 等），列禁改红线进实施简报。commit 时用切片法分离，**`git add -u` 是禁手**。
