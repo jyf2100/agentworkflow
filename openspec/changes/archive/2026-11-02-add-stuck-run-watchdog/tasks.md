@@ -56,7 +56,11 @@
 
 ## 7. 真机验证
 
-- [ ] 7.1 **阈值标定（kill 启用前置门）**：kill 关档跑真机，采集单 dev SDK 会话时长分布（hub 可见面静默实测），标定 FLOOR = 实测上限写入部署配置；告警阈值 AFTER 按误报率校准——FLOOR 未标定前 kill 保持关闭（配置面已机械强制）
-  - 部分实证（2026-11-02 真机，run #139 全程观察）：健康(近)会话的 hub 可见静默实测达 **50+ 分钟**（dev 单会话 263 turn、3600s wall-clock 超时收场）——120min AFTER 缺省在整个观察窗内零误报；跨机形态（runner-pool 派 183）下 stdout face 经 NFS 双挂可读、监督有效（D7 的 attribute cache 延迟未构成问题）。FLOOR 标定仍欠长会话样本，未写入部署配置
-- [ ] 7.2 受控停摆全链（本机 + 跨机各一轮）：构造真停摆（容器内挂起 / 断 LLM 网络）→ 告警到达 → kill 开档双窗后 stop（`DockerRunner.stop` 首次真机使用）→ kill 回执 → reconcile 归 failed → on_exit 重派状态机接管；跨机轮含 NFS attribute cache 复测盲窗观察（D7）——**标注：模块就绪待真机，不虚报完成**
-  - **检测半链已真机验证 ✓**（2026-11-02 合成演练）：假 running 行 + 陈旧 stdout 面（3h）→ stuck 槽 ≤3 分钟检出告警（`[stuck][warn]` + notify_admin DM 精确含 run 号/停写时长/名额提示/RUNBOOK 指针）→ 去抖恰一次 → kill 关档零 stop → 行离场后闭环回执。**kill 半链未真机验证**（FLOOR 未标定，配置面禁止开）——`DockerRunner.stop` 首次真机使用与 kill 回执待 7.1 标定后补；集成测试已覆盖（test_lifecycle kill→exited 137→failed→重派）
+- [x] 7.1 **阈值标定（kill 启用前置门）**：kill 关档跑真机，采集单 dev SDK 会话时长分布（hub 可见面静默实测），标定 FLOOR = 实测上限写入部署配置；告警阈值 AFTER 按误报率校准——FLOOR 未标定前 kill 保持关闭（配置面已机械强制）
+  - 实证（2026-11-02 真机）：FLOOR=75 **已写入部署配置 hub.env 并随容器生效**。标定依据 = 配置上界而非统计采样：dispatch 段 dev wall-clock 上界 3600s（run_daily 派发硬顶，m11 实证 3600s 超时杀）⇒ stdout 面合法静默 ≤ ~65min；实测健康(近)会话静默 50+ 分钟（m11，263 turn）与上界吻合。AFTER=120 缺省保留——m11/m13 两个 50 分钟级静默窗全程零误报。kill 线 = max(150, 75) = 150min，在合法静默上界之外
+- [x] 7.2 受控停摆全链（本机 + 跨机各一轮）：构造真停摆（容器内挂起 / 断 LLM 网络）→ 告警到达 → kill 开档双窗后 stop（`DockerRunner.stop` 首次真机使用）→ kill 回执 → reconcile 归 failed → on_exit 重派状态机接管；跨机轮含 NFS attribute cache 复测盲窗观察（D7）
+  - 实证（2026-11-02 合成演练 ×3，全部 ≤3.5 分钟闭环）：
+    - **检测半链**（run #140）：假 running 行 + 3h 陈旧 stdout 面 → stuck 槽 ≤3min 检出告警（notify_admin DM + `[stuck][warn]`）→ 去抖恰一次 → kill 关档零 stop → 行离场闭环回执
+    - **kill 半链·本机**（run #142）：drill 阈值（AFTER=2/GRACE=1/FLOOR=1）→ 告警 → 双窗满 → `DockerRunner.stop` 首次真机使用（sleep 容器 exited 137）→ kill 回执（「终态归 reconcile 对账」）→ reconcile 归 failed → on_exit 把 item 124 打回 pending 触发重派（真机顺带验证了 kill→重派全链）
+    - **kill 半链·跨机**（run #145）：行内快照路由 tcp://183 → stop 打到 183 上的 sleep 容器 → exited 137 → 归档 failed/137；跨机 stop 与探针/status 同通道同权，NFS attribute cache 盲窗未构成问题
+    - 演练注意事项（留档）：假行 queue_item_id 必须指向真实存在 item（get_item DBError 会被单 run 隔离吞掉=静默跳过）；kill 后 on_exit 会把 item 打回 pending 触发真重派——演练后须人工归位
