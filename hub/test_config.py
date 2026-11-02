@@ -200,3 +200,40 @@ def test_observer_ticks_validation():
     for bad in ("0", "-1", "x"):
         with pytest.raises(config.ConfigError, match="HUB_OBSERVER_TICKS"):
             config.load_config(_full_env(HUB_OBSERVER_TICKS=bad))
+
+
+# ── add-stuck-run-watchdog：监督五键 ──────────────────────────────
+
+def test_stuck_keys_defaults():
+    cfg = config.load_config(_full_env())
+    assert cfg.stuck_ticks == 36
+    assert cfg.stuck_after_minutes == 120
+    assert cfg.stuck_kill is False
+    assert cfg.stuck_kill_grace_minutes == 30
+    assert cfg.stuck_kill_floor_minutes is None
+
+
+def test_stuck_kill_requires_floor_fail_fast():
+    # 未标定禁开 kill（spec 场景「未标定禁开 kill」）：kill=1 无 FLOOR → ConfigError 拒起
+    with pytest.raises(config.ConfigError, match="HUB_STUCK_KILL_FLOOR_MINUTES"):
+        config.load_config(_full_env(HUB_STUCK_KILL="1"))
+    cfg = config.load_config(_full_env(HUB_STUCK_KILL="1", HUB_STUCK_KILL_FLOOR_MINUTES="240"))
+    assert cfg.stuck_kill is True and cfg.stuck_kill_floor_minutes == 240
+
+
+def test_stuck_kill_only_accepts_0_or_1():
+    with pytest.raises(config.ConfigError, match="只接受 0/1"):
+        config.load_config(_full_env(HUB_STUCK_KILL="true"))
+
+
+def test_stuck_invalid_values_rejected():
+    with pytest.raises(config.ConfigError, match="HUB_STUCK_TICKS"):
+        config.load_config(_full_env(HUB_STUCK_TICKS="0"))
+    with pytest.raises(config.ConfigError, match="HUB_STUCK_TICKS"):
+        config.load_config(_full_env(HUB_STUCK_TICKS="abc"))
+    with pytest.raises(config.ConfigError, match="HUB_STUCK_AFTER_MINUTES"):
+        config.load_config(_full_env(HUB_STUCK_AFTER_MINUTES="0"))
+    with pytest.raises(config.ConfigError, match="HUB_STUCK_KILL_GRACE_MINUTES"):
+        config.load_config(_full_env(HUB_STUCK_KILL_GRACE_MINUTES="-1"))
+    with pytest.raises(config.ConfigError, match="HUB_STUCK_KILL_FLOOR_MINUTES"):
+        config.load_config(_full_env(HUB_STUCK_KILL_FLOOR_MINUTES="abc"))

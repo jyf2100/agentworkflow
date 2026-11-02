@@ -143,7 +143,11 @@ class FakeRunner:
         self.calls.append(("stop", docker_host))
         c = self.containers.get(container_ref)
         if c is not None and c["state"] == "running":
-            c["state"] = "gone"  # 已终态容器 stop 幂等，不复活不改码
+            # 与 DockerRunner.stop 真实语义对齐（add-stuck-run-watchdog 3.0：kill 是
+            # Runner.stop 首个生产调用点，替身先行一致——docker stop 终止 = exited，
+            # SIGKILL 兜底 ExitCode 137；非 gone。终态容器 stop 幂等，不复活不改码）
+            c["state"] = "exited"
+            c["exit_code"] = 137
 
 
 class DockerRunner:

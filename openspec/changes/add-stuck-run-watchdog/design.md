@@ -6,18 +6,21 @@
 
 与既有干预的关系：STALLED / semantic_gate（turn 级 in-band）、iteration STALLED（iteration 级 in-band）、reconcile（容器 exited/gone）——本 change 补**墙钟轴的带外监督**，四者互补成全谱。
 
-## 监督面构成（r1 评审更正后的真实落点）
+## 监督面构成（实施期更正：只保留确定性可寻址面）
 
-| 面 | 路径 | 写者 | 粒度 |
-|---|---|---|---|
-| 平铺 journal | `<stamp>_<slug>.journal.jsonl`（run_dir 的**平铺兄弟**，`_journal_exists` lifecycle.py:122 同款拼法） | run_daily 编排层 | iteration/stage 级 |
-| 平铺 events | `<stamp>_<slug>.events.jsonl`（同为平铺兄弟，经 `events.locate_pa_artifact`（`events.py:55-67`）既有寻址，`rd.parent / f"{stamp}_{stem}.events.jsonl"`） | pa 事件出口（critic/verify 裁决、pr_opened 等） | 语义事件级 |
-| artifacts | `state/artifacts/<stamp>_<slug>/`（跨 run 共享树，**按 stamp_slug 前缀过滤**后取 max） | verify feedback / handoff 工件（`artifact_store`，content-addressed） | iteration 级 |
-| reports | `state/reports/`（同前缀过滤；PA_REPORT_DIR 落点） | report 段 | run 级 |
+| 面 | 路径 | 写者 | 粒度 | 寻址 |
+|---|---|---|---|---|
+| 平铺 journal | `<stamp>_<slug>.journal.jsonl`（run_dir 的**平铺兄弟**） | run_daily 编排层 | iteration/stage 级 | `run_dir.name` 直接拼（`_journal_exists` lifecycle.py:122 同款） |
+| 平铺 events | `<stamp>_<prd_stem>.events.jsonl`（同为平铺兄弟） | pa 事件出口（critic/verify 裁决、pr_opened 等） | 语义事件级 | `events.locate_pa_artifact(run_dir, prd_stem, suffix)`（stem 来自 queue_item.prd_path；stamp 翻倍 glob 兜底，`events.py:55-67`） |
 
 取 **max(mtime)**（任一面前进 = 活着）。
 
-**明确不入面**（hub 可见性无保证）：worktree 侧 `state/runs/` 下的 `run_log.jsonl`（dev 每 turn，`dev-agent.py:1224` STATE_RUNS_DIR = worktree）与 `handoff-latest.json`（K-turn 快照，`dev-agent.py:584` 写 `state["run_log"].parent` = 同一 worktree 目录）——remote runner 上 worktree 路径不经 data_root，hub 看不见。**推论（D2 的基础）：hub 可见面的合法静默 = 单次 dev SDK 会话全长**（会话内 journal/events 均不写；canary 实证单会话 325 turn，小时量级）。
+**明确不入面**（实施期核实，均不可确定性归因到单个 run）：
+- worktree 侧 `state/runs/` 的 `run_log.jsonl`（dev 每 turn）与 `handoff-latest.json`（K-turn 快照）——`dev-agent.py:1224/:584` STATE_RUNS_DIR = worktree，hub 看不见；
+- `state/artifacts/run_<digest>/`——`ids.run_id = "run_" + 内容摘要`（`ids.py:44`），摘要含 pa 侧 scope 语义，hub 不可重建，冒充可寻址必串扰（r2 冷评审放行的「stamp_slug 前缀过滤」在实现级核实后不成立，本行即更正）；
+- `state/reports/` 的 verify-report 双写——文件名 = pa 侧 log stem 系，同不可稳定归因；且其粒度（每 verify 轮一次）不高于 journal，弃之无信息损失。
+
+**推论（D2 的基础）不变**：hub 可见面的合法静默 = 单次 dev SDK 会话全长（会话内 journal/events 均不写；canary 实证单会话 325 turn，小时量级）。
 
 ## D 决策
 

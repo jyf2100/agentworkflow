@@ -4,11 +4,11 @@
 
 ### Requirement: 停摆判据（带外墙钟）
 
-hub SHALL 以 hub 可见的卷上证据面 `max(mtime)` 作为 run 进度的带外信号。监督面构成：平铺 journal `<stamp>_<slug>.journal.jsonl`、平铺 events `<stamp>_<slug>.events.jsonl`（二者均为 run_dir 的平铺兄弟文件，寻址复用 `events.locate_pa_artifact` 既有拼法）、`state/artifacts/<stamp>_<slug>/` 前缀树、`state/reports/` 同前缀文件（跨 run 共享树 MUST 按 stamp_slug 前缀过滤后取 max）。监督面静默超过 `HUB_STUCK_AFTER_MINUTES`（默认 120）且容器事实为 running 的 run MUST 被判 stuck。判据全机械零 LLM。journal 与 events 均缺失或 run_dir 不存在 MUST NOT 判 stuck（该形态归 execution-hub 既有 failed_to_start 对账范畴）。检测周期 = daemon 低频槽 `HUB_STUCK_TICKS`（默认 36 tick ≈ 3 分钟）。worktree 侧执行遥测（`run_log.jsonl` / `handoff-latest.json`）hub 不可见，MUST NOT 入监督面。
+hub SHALL 以 hub 可见的卷上证据面 `max(mtime)` 作为 run 进度的带外信号。监督面 = 两个**确定性可寻址面**：平铺 journal `<run_dir.name>.journal.jsonl`（run_dir 的平铺兄弟文件，`_journal_exists` 同款拼法）与平铺 events `<stamp>_<prd_stem>.events.jsonl`（经 `events.locate_pa_artifact` 既有寻址——stem 来自 queue_item.prd_path 非 run_dir slug，stamp 翻倍 glob 兜底同源）。实施期更正：pa 侧摘要命名的面（`state/artifacts/run_<digest>/`，id 为内容摘要 hub 不可重建）与 reports 双写（log stem 系命名）**MUST NOT 入面**——无稳定寻址的面误用必串扰；worktree 侧执行遥测（`run_log.jsonl` / `handoff-latest.json`）同样 MUST NOT 入面。监督面静默超过 `HUB_STUCK_AFTER_MINUTES`（默认 120）且容器事实为 running 的 run MUST 被判 stuck。判据全机械零 LLM。journal 与 events 均缺失 MUST NOT 判 stuck（该形态归 execution-hub 既有 failed_to_start 对账范畴）。检测周期 = daemon 低频槽 `HUB_STUCK_TICKS`（默认 36 tick ≈ 3 分钟）。
 
 #### Scenario: 静默超阈值检出
 
-- **WHEN** run #N 容器事实 running，监督面（平铺 journal + events + 前缀 artifacts）mtime 距今 150 分钟（阈值 120）
+- **WHEN** run #N 容器事实 running，监督面（平铺 journal + events）mtime 距今 150 分钟（阈值 120）
 - **THEN** 判 stuck，`notify_admin` 告警一条（run 号 / 项目 / 停写时长 / 名额占用提示 / 人工处置指针）
 
 #### Scenario: 合法静默窗内零误报
@@ -18,13 +18,13 @@ hub SHALL 以 hub 可见的卷上证据面 `max(mtime)` 作为 run 进度的带�
 
 #### Scenario: 监督面缺失不误判
 
-- **WHEN** run_dir 存在但平铺 journal 与 events 文件均未落盘（启动窗口）
+- **WHEN** 平铺 journal 与 events 文件均未落盘（启动窗口）
 - **THEN** 该 run 不进 stuck 判定（failed_to_start 归 reconcile）
 
-#### Scenario: 共享树前缀过滤不串扰
+#### Scenario: events 兜底寻址命中
 
-- **WHEN** `state/artifacts/` 下其他 run 的工件刚写入，本 run 前缀树静默超阈
-- **THEN** 本 run 判 stuck（max(mtime) 仅取本 stamp_slug 前缀面）
+- **WHEN** events 文件名带 pa 侧注入双前缀（`{actual}_{actual}_{stem}.events.jsonl`），精确拼未命中
+- **THEN** 经 `locate_pa_artifact` 的 `*_{stem}{suffix}` 后缀 glob 兜底命中，其 mtime 正常入监督面
 
 ### Requirement: 动作阶梯与 flag 闸
 

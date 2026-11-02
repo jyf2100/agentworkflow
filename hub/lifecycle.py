@@ -39,6 +39,7 @@ import image_sync
 import notify
 import queue_engine
 import runner as runner_mod
+import stuck_check
 import vault_store
 from meta_sign import MetaSignError, allocate_fresh_stamp, sign_meta
 from pypinyin import lazy_pinyin
@@ -162,6 +163,9 @@ class Lifecycle:
         # 漂移看门狗去抖集合（add-config-drift-watchdog D4：进程内持有，重启重报可接受——
         # stale_check 同款语义；漂移类键消解时清、info/premise 持续态键不清）
         self._drift_seen: set = set()
+        # 卡死监督去抖集合（add-stuck-run-watchdog：进程内三档键 (run_id, 档)，重启重告警
+        # 可接受——stale_check 同款；消解/自然离场清键，kill_failed 闩随消解或离场清）
+        self._stuck_seen: set = set()
         # 镜像分发 worker（add-runner-image-sync D3：单线程后台，绝不阻塞排度 tick；
         # 惰性起线程——首次 offer 才 spawn）
         self.image_sync = image_sync.ImageSyncWorker(
@@ -567,6 +571,16 @@ class Lifecycle:
         路径，内部逐规则吞异常，任何异常不崩排度循环（daemon 槽再兜底一层）。"""
         config_drift.check_drift(
             self.cfg, self._vault, self._db, seen=self._drift_seen, notifier=self.notifier
+        )
+
+    def check_stuck_runs(self) -> None:
+        """卡死 run 监督挂点（add-stuck-run-watchdog 4.1，daemon 第八低频槽）：监督面
+        停写判据 + 动作阶梯（probe_runners 同构薄挂点——装配 cfg/db/runner/notifier 调
+        stuck_check.check_stuck_runs，seen 由本对象持有跨周期）。纯观察面 + kill 显式
+        开关（默认关）：绝不进派发路径、绝不产终态（kill 只制造 exited 事实，终态归
+        reconcile 单写者）；内部逐 run 吞异常，任何异常不崩排度循环（daemon 槽再兜底）。"""
+        stuck_check.check_stuck_runs(
+            self.cfg, self._db, self._runner, notifier=self.notifier, seen=self._stuck_seen
         )
 
     def emit_daily_digest(self) -> None:

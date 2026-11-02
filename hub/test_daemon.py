@@ -25,7 +25,8 @@ class FakeLC:
         self.raise_at: set[int] = set()
         # 三低频槽默认天文数——既有测试零触发（各挂点测试单独设小值）
         self.cfg = types.SimpleNamespace(stale_check_ticks=10**9, probe_ticks=10**9, drift_ticks=10**9,
-                                       digest_ticks=10**9, event_ticks=10**9, relay_ticks=10**9, observer_ticks=10**9)
+                                       digest_ticks=10**9, event_ticks=10**9, relay_ticks=10**9,
+                                       observer_ticks=10**9, stuck_ticks=10**9)
         self.notifier = None
 
     def reconcile_startup(self):
@@ -53,6 +54,9 @@ class FakeLC:
 
     def relay_human_notes(self):  # add-thread-subscription 1.3 挂点替身（计数供断言）
         self.relays = getattr(self, "relays", 0) + 1
+
+    def check_stuck_runs(self):  # add-stuck-run-watchdog 4.2 挂点替身（计数供断言）
+        self.stuck_checks = getattr(self, "stuck_checks", 0) + 1
 
 
 class StopAfter:
@@ -240,3 +244,27 @@ def test_observer_slot_every_n_ticks_and_survives_errors(capsys, monkeypatch):
     rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
     assert rc == 0 and lc.ticks == 5 and calls["n"] == 2  # tick 2/4 触发；首轮回炉不崩
     assert "[observer][warn]" in capsys.readouterr().err
+
+
+# ── add-stuck-run-watchdog 4.2：第八低频槽 ────────────────────────
+
+def test_stuck_check_runs_every_n_ticks():
+    lc = FakeLC()
+    lc.cfg.stuck_ticks = 2
+    se = threading.Event()
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 5))
+    assert rc == 0 and lc.stuck_checks == 2  # tick 2/4 各一轮
+
+
+def test_stuck_check_exception_does_not_kill_loop(capsys):
+    lc = FakeLC()
+    lc.cfg.stuck_ticks = 2
+
+    def boom():
+        raise RuntimeError("监督面炸了")
+
+    lc.check_stuck_runs = boom
+    se = threading.Event()
+    rc = daemon.run_forever(lc, 0.01, se, sleep=StopAfter(se, 3))
+    assert rc == 0
+    assert "[stuck][warn]" in capsys.readouterr().err  # 槽内异常续跑不崩排度循环

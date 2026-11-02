@@ -87,6 +87,19 @@ DEFAULT_RELAY_TICKS = 24  # ≈ 5s tick 下每 2 分钟一轮（近实时的排�
 OBSERVER_TICKS_ENV = "HUB_OBSERVER_TICKS"
 DEFAULT_OBSERVER_TICKS = 720  # ≈ 每小时一轮（信号窗口小时级，更密无增益）
 
+# 卡死 run 带外墙钟监督（add-stuck-run-watchdog）：监督面停写判据 + 动作阶梯。
+# AFTER 语义 = 可见性非精确判定（hub 可见合法静默 = 单次 dev SDK 会话全长，design D2）；
+# kill 带 FLOOR 标定前置——kill=1 而 FLOOR 未配 = ConfigError 拒起（未标定禁开 kill，
+# 配置面机械断言；FLOOR = 7.1 标定的实测会话时长上限）。
+STUCK_TICKS_ENV = "HUB_STUCK_TICKS"
+DEFAULT_STUCK_TICKS = 36  # ≈ 5s tick 下每 3 分钟一轮（stat 调用便宜，可较密）
+STUCK_AFTER_MINUTES_ENV = "HUB_STUCK_AFTER_MINUTES"
+DEFAULT_STUCK_AFTER_MINUTES = 120
+STUCK_KILL_ENV = "HUB_STUCK_KILL"
+STUCK_KILL_GRACE_MINUTES_ENV = "HUB_STUCK_KILL_GRACE_MINUTES"
+DEFAULT_STUCK_KILL_GRACE_MINUTES = 30
+STUCK_KILL_FLOOR_MINUTES_ENV = "HUB_STUCK_KILL_FLOOR_MINUTES"
+
 # 可选远程 runner 面（add-hub-remote-runner，ADR-0009）：两键全不配 = 本机 daemon +
 # data_root 挂载，现状 byte-identical。add-hub-runner-pool 后两键降级为**首启 seed
 # 一次性消费**（serve 表空才灌一行 runners，此后面板 runners 表是唯一真相，env 再改
@@ -164,6 +177,12 @@ class HubConfig:
     relay_ticks: int = DEFAULT_RELAY_TICKS
     # 主动观察者面（add-proactive-observer）：仓信号观察周期（N tick 一次）
     observer_ticks: int = DEFAULT_OBSERVER_TICKS
+    # 卡死 run 监督面（add-stuck-run-watchdog）：周期 + 阈值 + kill 三键（FLOOR=None = 未标定）
+    stuck_ticks: int = DEFAULT_STUCK_TICKS
+    stuck_after_minutes: int = DEFAULT_STUCK_AFTER_MINUTES
+    stuck_kill: bool = False
+    stuck_kill_grace_minutes: int = DEFAULT_STUCK_KILL_GRACE_MINUTES
+    stuck_kill_floor_minutes: int | None = None
 
     def user_env(self) -> dict[str, str]:
         """容器 env-file 内容：三值 + 可选模型路由（与切片 2 保险箱同通道）。"""
@@ -278,6 +297,50 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
     if observer_ticks < 1:
         raise ConfigError(f"{OBSERVER_TICKS_ENV} 须 ≥1：{observer_ticks}")
 
+    # add-stuck-run-watchdog：监督周期/阈值同型校验 + kill 三键跨键断言
+    sk_raw = e.get(STUCK_TICKS_ENV)
+    try:
+        stuck_ticks = int(sk_raw) if sk_raw else DEFAULT_STUCK_TICKS
+    except ValueError:
+        raise ConfigError(f"{STUCK_TICKS_ENV} 非整数：{sk_raw!r}") from None
+    if stuck_ticks < 1:
+        raise ConfigError(f"{STUCK_TICKS_ENV} 须 ≥1：{stuck_ticks}")
+
+    sa_raw = e.get(STUCK_AFTER_MINUTES_ENV)
+    try:
+        stuck_after_minutes = int(sa_raw) if sa_raw else DEFAULT_STUCK_AFTER_MINUTES
+    except ValueError:
+        raise ConfigError(f"{STUCK_AFTER_MINUTES_ENV} 非整数：{sa_raw!r}") from None
+    if stuck_after_minutes < 1:
+        raise ConfigError(f"{STUCK_AFTER_MINUTES_ENV} 须 ≥1：{stuck_after_minutes}")
+
+    kill_raw = (e.get(STUCK_KILL_ENV) or "0").strip()
+    if kill_raw not in ("0", "1"):
+        raise ConfigError(f"{STUCK_KILL_ENV} 只接受 0/1：{kill_raw!r}")
+    stuck_kill = kill_raw == "1"
+
+    sg_raw = e.get(STUCK_KILL_GRACE_MINUTES_ENV)
+    try:
+        stuck_kill_grace_minutes = int(sg_raw) if sg_raw else DEFAULT_STUCK_KILL_GRACE_MINUTES
+    except ValueError:
+        raise ConfigError(f"{STUCK_KILL_GRACE_MINUTES_ENV} 非整数：{sg_raw!r}") from None
+    if stuck_kill_grace_minutes < 1:
+        raise ConfigError(f"{STUCK_KILL_GRACE_MINUTES_ENV} 须 ≥1：{stuck_kill_grace_minutes}")
+
+    sf_raw = e.get(STUCK_KILL_FLOOR_MINUTES_ENV)
+    try:
+        stuck_kill_floor_minutes = int(sf_raw) if sf_raw else None
+    except ValueError:
+        raise ConfigError(f"{STUCK_KILL_FLOOR_MINUTES_ENV} 非整数：{sf_raw!r}") from None
+    if stuck_kill_floor_minutes is not None and stuck_kill_floor_minutes < 1:
+        raise ConfigError(f"{STUCK_KILL_FLOOR_MINUTES_ENV} 须 ≥1：{stuck_kill_floor_minutes}")
+    # 未标定禁开 kill（design D2：FLOOR = 7.1 标定的实测会话时长上限；配置错必须响）
+    if stuck_kill and stuck_kill_floor_minutes is None:
+        raise ConfigError(
+            f"{STUCK_KILL_ENV}=1 要求 {STUCK_KILL_FLOOR_MINUTES_ENV} 已配置"
+            "（未标定会话时长上限前 kill 被机械禁止——先跑 tasks 7.1 标定）"
+        )
+
     # add-hub-runner-pool 6.1：docker_host 限形校验移至注册/seed 入口（db 层
     # _validate_runner_fields 单点）——本层只解析透传（seed 消费；表空态坏值 =
     # serve seed_runner 抛 DBError 启动 fail loud，行为等价原 ConfigError 拒起）。
@@ -316,4 +379,9 @@ def load_config(env: Mapping[str, str] | None = None) -> HubConfig:
         event_ticks=event_ticks,
         relay_ticks=relay_ticks,
         observer_ticks=observer_ticks,
+        stuck_ticks=stuck_ticks,
+        stuck_after_minutes=stuck_after_minutes,
+        stuck_kill=stuck_kill,
+        stuck_kill_grace_minutes=stuck_kill_grace_minutes,
+        stuck_kill_floor_minutes=stuck_kill_floor_minutes,
     )

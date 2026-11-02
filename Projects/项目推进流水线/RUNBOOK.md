@@ -819,3 +819,17 @@ proactive:
 **链路**：绑定频道非 slash 消息 → 直通分流（在飞 run 窗口内授权人话走 dev 上下文，其余进 router 候选——一帖绝不双消费）→ **机械预筛**（`#N`/`sp-*`/问句关键词——`HUB_ROUTER_PATTERN` 可配，零 LLM 判定调不调）→ **预算闸**（`HUB_ROUTER_RATE` 缺省 6 次/频道/小时，超限静默）→ 注入块机械拼装（run 摘要/提案/计数，值不入面）→ headless `claude --agent pa-router`（60s 上限）→ 频道回帖 `[router] <答案>`（≤200 词，只引事实）。
 
 **失败静默**：persona 超时/异常 → 无回帖 stderr 留痕（fail-open 零阻塞主链）。
+
+## 28. 卡死 run 看门狗（add-stuck-run-watchdog，2026-11）
+
+**背景**：pa 对「卡住」的干预源全是 turn/iteration 边界的 in-band 机制（dev STALLED 数 turn、semantic_gate 数 turn、iteration 级数迭代、hub reconcile 只见 exited/gone）——真卡死（SDK 会话挂起/LLM 调用不返回/无超时子进程挂死）= 消息停止到达 = 刹车永不被评估，容器活着内部停摆将**永远占住 project 串行名额与峰值名额**。本节描述的看门狗是墙钟轴的带外监督，与上述四者互补。
+
+**监督面与判据**：hub 可见卷上证据面 = 平铺 journal `<stamp>_<slug>.journal.jsonl` + 平铺 events `<stamp>_<prd_stem>.events.jsonl`（与 run 目录同名同层的兄弟文件），取 max(mtime)；静默 ≥ `HUB_STUCK_AFTER_MINUTES`（默认 120 分钟）判 stuck。**阈值语义是可见性非精确判定**——hub 可见面的合法静默 = 单次 dev SDK 会话全长（小时量级），超长健康会话可能误报（代价 = 一条私信）。worktree 侧遥测与 `state/artifacts/run_<digest>/` 等 pa 侧摘要命名面对 hub 不可寻址，不在判据内。
+
+**告警（默认唯一动作）**：stuck → `notify_admin` 私信（run 号 / 项目 / 停写时长 / 名额占用提示），进程内去抖一次；恢复写进 → 消解回执；run 自然终态 → 终态回执。
+
+**人工处置（kill 关档，默认）**：收到告警后按现行人工路径处置——`docker stop <container_ref>`（run 行可查 container_ref；stop 后容器 exited，**下轮 reconcile 自动归档 failed 并走重派状态机**，attempt 预算耗尽才终态 failed，14 permanent 不重派语义不变）。**不要**手工改 DB 终态——watchdog 与 reconcile 都只认容器事实。
+
+**watchdog kill（破坏性，默认关）**：`HUB_STUCK_KILL=1` 后，对停写 ≥ `max(AFTER + GRACE, FLOOR)` 的 run 自动 docker stop（开工前复测，恰恢复则放弃）。**启用前置**：先跑 change tasks 7.1 标定（采集实测单 dev 会话时长上限），把上限写入 `HUB_STUCK_KILL_FLOOR_MINUTES`——未配 FLOOR 而配 kill=1 = hub 拒起（ConfigError，机械禁止未标定开 kill）。kill 执行有回执（「终态归对账」）；stop 失败进闩（进程生命周期不重试，升级告警一条请人工接手）。**跨机形态注意**：remote runner 下共享面 mtime 受 NFS attribute cache（≤60s）延迟，kill 复测语义在该形态下为「≥ 检测周期前仍停写」。
+
+**回滚**：kill 改 0（或删键）`docker compose up -d` 重建即回告警档；已 stop 的 run 对账全自动，无需人工补账。检测整体关闭：`HUB_STUCK_TICKS` 配超大值即事实关闭（同 digest 先例）。

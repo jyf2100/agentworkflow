@@ -68,15 +68,18 @@ def test_fake_crash_injection_on_start():
     assert raised  # 可编程崩溃注入（6.1）
 
 
-def test_fake_stop_transitions_and_gone_status():
+def test_fake_stop_exited_137_and_terminal_idempotent():
     fake = runner.FakeRunner(images={"t:v1"})
     ref = fake.start(_spec("t:v1"))
     fake.stop(ref)
-    assert fake.status(ref).state == "gone"
+    # 与 DockerRunner.stop 真实语义对齐（add-stuck-run-watchdog 3.0）：stop 终止 = exited
+    # （SIGKILL ExitCode 137），非 gone——kill 后 reconcile 走 exited 分支归档 failed
+    st = fake.status(ref)
+    assert st.state == "exited" and st.exit_code == 137
     ref2 = fake.start(_spec("t:v1"))
     fake.finish(ref2, exit_code=3)
     st = fake.status(ref2)
-    assert st.state == "exited" and st.exit_code == 3  # 终态容器 stop 幂等不复活
+    assert st.state == "exited" and st.exit_code == 3  # 终态容器 stop 幂等不复活不改码
     fake.stop(ref2)
     assert fake.status(ref2).state == "exited" and fake.status(ref2).exit_code == 3
 

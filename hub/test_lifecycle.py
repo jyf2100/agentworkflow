@@ -339,7 +339,7 @@ def test_crash_restart_gone_container_archived_by_volume_evidence(tmp_path):
     qid = lc1.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
     lc1.tick_dispatch()
     ref = d.runs_for_item(qid)[0]["container_ref"]
-    fake.stop(ref)  # 容器消失（如 daemon 清理）
+    fake.containers[ref]["state"] = "gone"  # 容器消失（如 daemon 清理）——直接置 gone（stop 现为 exited 语义，add-stuck-run-watchdog 3.0）
     run_dir = Path(d.runs_for_item(qid)[0]["run_dir"])
     # pa 事实布局：journal 是 runs/<proj>/ 下平铺文件（与 run 目录同名同层），非目录内
     (run_dir.parent / "20261021_my-feature.journal.jsonl").write_text("{}\n", encoding="utf-8")  # 卷上证据：跑过
@@ -355,7 +355,7 @@ def test_crash_restart_gone_without_journal_is_failed_to_start(tmp_path):
     lc1, d, fake, _ = _mk(tmp_path)
     qid = lc1.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
     lc1.tick_dispatch()
-    fake.stop(d.runs_for_item(qid)[0]["container_ref"])
+    fake.containers[d.runs_for_item(qid)[0]["container_ref"]]["state"] = "gone"  # 容器消失（非 stop——stop 现为 exited 语义）
     lc1.reconcile_running()
     run = d.runs_for_item(qid)[0]
     assert run["status"] == "failed_to_start"  # 无 journal：容器从未跑成（A7 粒度）
@@ -718,3 +718,43 @@ def test_reconcile_missing_outcome_fallback_logged(tmp_path, capsys):
     lc.reconcile_running()
     assert "→ succeeded，exit 0" in mm.dms[0][1]      # 既有回退文本回归锁
     assert "无 pipeline_outcome" in capsys.readouterr().err
+
+
+# ── add-stuck-run-watchdog 4.1：监督薄挂点 + kill→reconcile 集成 ──
+
+def test_check_stuck_runs_thin_hook_assembles_deps(monkeypatch, tmp_path):
+    lc, d, fake, _ = _mk(tmp_path)
+    captured = {}
+
+    def spy(cfg, database, runner, notifier=None, seen=None, **kw):
+        captured.update(cfg=cfg, database=database, runner=runner, notifier=notifier, seen=seen)
+
+    monkeypatch.setattr(lifecycle.stuck_check, "check_stuck_runs", spy)
+    lc.check_stuck_runs()
+    assert captured["cfg"] is lc.cfg and captured["database"] is d and captured["runner"] is fake
+    assert captured["seen"] is lc._stuck_seen  # 跨周期持有
+
+
+def test_stuck_kill_then_reconcile_archives_failed_and_redispatches(tmp_path):
+    import dataclasses
+    import os as _os
+    import time as _time
+
+    lc1, d, fake, data = _mk(tmp_path)
+    # 阈值全压到 1 分钟：age 200min 必超 max(AFTER+GRACE, FLOOR)=2（真 cfg 经 replace 注入 kill 面）
+    lc1.cfg = dataclasses.replace(lc1.cfg, stuck_kill=True, stuck_after_minutes=1,
+                                  stuck_kill_grace_minutes=1, stuck_kill_floor_minutes=1)
+    qid = lc1.engine.enqueue("proj-a", str(_prd(tmp_path)), "roc")
+    lc1.tick_dispatch()
+    run_dir = Path(d.runs_for_item(qid)[0]["run_dir"])
+    jf = run_dir.parent / f"{run_dir.name}.journal.jsonl"
+    jf.write_text("{}\n", encoding="utf-8")
+    old = _time.time() - 200 * 60
+    _os.utime(jf, (old, old))
+    lc1.check_stuck_runs()
+    assert fake.calls.count(("stop", None)) == 1  # kill 恰一次（Runner.stop 首个生产调用点）
+    lc1.reconcile_running()  # exited(137) → 既有 exited 分支归档（watchdog 不产终态）
+    run = d.runs_for_item(qid)[0]
+    assert run["status"] == "failed" and run["exit_code"] == 137
+    assert d.get_item(qid)["status"] == "pending"  # on_exit 重派状态机接管（attempt 1 < max_retries 2）
+    assert any(k[1] == "kill_done" for k in lc1._stuck_seen)  # kill_done 档在键

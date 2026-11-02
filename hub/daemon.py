@@ -98,6 +98,13 @@ def run_forever(
                 proactive_observer.poll_proactive_signals(lc.cfg)
         except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
             print(f"[observer][warn] 观察挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
+        try:  # add-stuck-run-watchdog 4.2：第八低频槽——卡死 run 带外墙钟监督
+            # （同型防御——监督任何异常绝不崩排度循环；单 run 异常在 check_stuck_runs 内
+            # 不连坐，本层兜底整体异常如配置异常值。kill 默认关：告警是唯一动作）
+            if tick % lc.cfg.stuck_ticks == 0:
+                lc.check_stuck_runs()
+        except Exception as e:  # noqa: BLE001——观察面绝不崩执行面
+            print(f"[stuck][warn] 卡死监督挂点异常（续跑不崩循环）: {type(e).__name__}: {e}", file=sys.stderr)
         if not stop_event.is_set():
             sleep(interval)
     print(f"[daemon] 优雅退出：当前迭代已收尾，连续异常 {consecutive}（在跑容器不动，重启经对账接管）")
